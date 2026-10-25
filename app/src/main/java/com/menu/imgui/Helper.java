@@ -39,6 +39,18 @@ public class Helper {
     private static Object sCurrentActivity = null;
     private static Object sApplicationContext = null;
 
+    public static class PatchRecord {
+        public int id;
+        public String type;
+        public String className;
+        public String targetName;
+        public String originalValue;
+        public String currentValue;
+        public boolean isActive = true;
+    }
+    private static final List<PatchRecord> sActivePatches = new ArrayList<>();
+    private static int sPatchCounter = 1;
+
     static {
         try {
             Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
@@ -186,6 +198,58 @@ public class Helper {
         return sInstances.get(instanceName);
     }
 
+    // ========== PATCH MANAGER ==========
+    public static void requestPatchMethod(String className, String methodSig, String returnType) {
+        PatchRecord p = new PatchRecord();
+        p.id = sPatchCounter++;
+        p.type = "Method";
+        p.className = className;
+        p.targetName = methodSig;
+        p.originalValue = "(original)";
+        p.currentValue = "0";
+        sActivePatches.add(p);
+        syncPatches();
+    }
+
+    public static void requestPatchField(String className, String fieldName, String currentValue) {
+        PatchRecord p = new PatchRecord();
+        p.id = sPatchCounter++;
+        p.type = "Field";
+        p.className = className;
+        p.targetName = fieldName;
+        p.originalValue = currentValue;
+        p.currentValue = currentValue;
+        sActivePatches.add(p);
+        syncPatches();
+    }
+
+    public static void togglePatch(int id, boolean active) {
+        for (PatchRecord p : sActivePatches) {
+            if (p.id == id) { p.isActive = active; break; }
+        }
+        syncPatches();
+    }
+
+    public static void updatePatchValue(int id, String newValue) {
+        for (PatchRecord p : sActivePatches) {
+            if (p.id == id) { p.currentValue = newValue; break; }
+        }
+        syncPatches();
+    }
+
+    public static void removePatch(int id) {
+        sActivePatches.removeIf(p -> p.id == id);
+        syncPatches();
+    }
+
+    private static void syncPatches() {
+        List<String> serialized = new ArrayList<>();
+        for (PatchRecord p : sActivePatches) {
+            serialized.add(p.id + "|" + p.type + "|" + p.className + "|" + p.targetName + "|" + p.originalValue + "|" + p.currentValue + "|" + p.isActive);
+        }
+        nativeSetPatches(serialized.toArray(new String[0]));
+    }
+
     // ========== METHOD CALL & ARGUMENT PROVIDER ==========
     public static int getArgWidgetType(String typeName) {
         try {
@@ -307,6 +371,25 @@ public class Helper {
         return Class.forName(s);
     }
 
+    // Missing parseArg method (was missing)
+    private static Object parseArg(Class<?> type, String s) {
+        if (s == null || s.equals("null") || s.isEmpty()) return null;
+        if (type == int.class || type == Integer.class) return Integer.parseInt(s);
+        if (type == long.class || type == Long.class) return Long.parseLong(s);
+        if (type == short.class || type == Short.class) return Short.parseShort(s);
+        if (type == byte.class || type == Byte.class) return Byte.parseByte(s);
+        if (type == float.class || type == Float.class) return Float.parseFloat(s);
+        if (type == double.class || type == Double.class) return Double.parseDouble(s);
+        if (type == boolean.class || type == Boolean.class) return s.equalsIgnoreCase("true") || s.equals("1");
+        if (type == char.class || type == Character.class) return s.charAt(0);
+        if (type == String.class) return s;
+        if (type.isEnum()) {
+            for (Object c : type.getEnumConstants()) if (((Enum<?>)c).name().equalsIgnoreCase(s)) return c;
+            return null;
+        }
+        return null;
+    }
+
     // ========== STATIC CLASS LIST ==========
     private static List<String> listAllClasses(Context ctx) {
         List<String> out = new ArrayList<>();
@@ -348,6 +431,7 @@ public class Helper {
         }
     }
 
+    // Natives
     static native void nativeInit(android.view.Surface s);
     static native void nativeResize(int w, int h);
     static native void nativeRender();
@@ -359,4 +443,5 @@ public class Helper {
     static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
     static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
     static native void nativeSetFieldValue(int sectionId, String className, String fieldName, String value, boolean isSet);
+    static native void nativeSetPatches(String[] patches);
 }
