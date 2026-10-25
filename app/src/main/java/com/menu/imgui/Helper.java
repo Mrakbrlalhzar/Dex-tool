@@ -23,14 +23,19 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 public class Helper {
     private static final String TAG = "ImGuiTool";
     private static OverlaySurfaceView overlay;
+    
+    // Cache for instances so they don't get GC'd during testing
+    private static final Map<String, Object> sInstances = new HashMap<>();
 
     static {
         try {
@@ -317,6 +322,7 @@ public class Helper {
                     c.setAccessible(true);
                     ret = c.newInstance(argValues);
                     result = "Created: " + (ret == null ? "null" : ret.toString());
+                    sInstances.put(className, ret); // Cache it
                 } else if (isStatic) {
                     Method m = cls.getDeclaredMethod(methodName, paramClasses);
                     m.setAccessible(true);
@@ -325,14 +331,22 @@ public class Helper {
                 } else {
                     Method m = cls.getDeclaredMethod(methodName, paramClasses);
                     m.setAccessible(true);
-                    Object instance = tryCreateInstance(cls);
-                    if (instance == null) result = "Error: Cannot create instance";
-                    else {
+                    Object instance = sInstances.get(className);
+                    if (instance == null) {
+                        instance = tryCreateInstance(cls);
+                        if (instance != null) sInstances.put(className, instance);
+                    }
+                    
+                    if (instance == null) {
+                        result = "Error: Cannot find or create instance of " + className;
+                    } else {
                         ret = m.invoke(instance, argValues);
                         result = "Returned: " + (ret == null ? "null" : ret.toString());
                     }
                 }
-            } catch (Throwable t) { result = "Error: " + t; }
+            } catch (Throwable t) { 
+                result = "Error: " + t.toString(); 
+            }
             nativeSetMethodResult(sectionId, className, methodSig, result);
         };
         if (runInMain) new Handler(Looper.getMainLooper()).post(r);

@@ -8,7 +8,6 @@
 #include "dex_data.h"
 #include <pthread.h>
 #include <unistd.h>
-#include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <cstring>
@@ -21,9 +20,7 @@
 #include <mutex>
 #include <algorithm>
 
-#ifndef MY_PI
 #define MY_PI 3.14159265358979323846f
-#endif
 #define LOG_TAG "ImGuiTool"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
@@ -32,7 +29,6 @@ static jclass gHelperClass = nullptr;
 static ANativeWindow* gWindow = nullptr;
 static bool gInitialized = false;
 static int gWidth = 0, gHeight = 0;
-static int g_log_fd = -1;
 
 static std::vector<std::string> gClassList;
 static std::mutex gClassListMutex;
@@ -107,7 +103,6 @@ static float g_fabDragStartX = 0, g_fabDragStartY = 0;
 static float g_virtX = 0, g_virtY = 0;
 static float g_realPrevX = 0, g_realPrevY = 0;
 static float g_titleH = 30.0f;
-static bool g_firstFrame = false;
 
 static void splitStr(const std::string& s, char d, std::vector<std::string>& out) {
     out.clear(); size_t start = 0;
@@ -145,24 +140,6 @@ static void closeSectionImpl(int id) {
 static void requestClassDetails(int sectionId, const std::string& className) {
     std::lock_guard<std::mutex> lk(gQueuesMutex);
     gPendingDetailReqs.push_back({sectionId, className});
-}
-
-static void get_pkg_name(char* out, size_t outsz) {
-    out[0] = 0; FILE* f = fopen("/proc/self/cmdline", "r"); if (!f) return;
-    char buf[256] = {0}; size_t n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f);
-    if (n == 0) return; for (size_t i = 0; i < n; i++) if (buf[i] == 0 || buf[i] == ':') { buf[i] = 0; break; }
-    strncpy(out, buf, outsz - 1); out[outsz - 1] = 0;
-}
-static int try_open(const char* path) { return open(path, O_WRONLY | O_CREAT | O_APPEND | O_SYNC, 0666); }
-static void init_log() {
-    int fd = try_open("/sdcard/Download/ImGuiMenu_crash.log"); if (fd >= 0) { g_log_fd = fd; return; }
-    char pkg[256]; get_pkg_name(pkg, sizeof(pkg));
-    if (pkg[0]) {
-        char p1[512], p2[512];
-        snprintf(p1, sizeof(p1), "/sdcard/Android/data/%s", pkg); mkdir(p1, 0770);
-        snprintf(p2, sizeof(p2), "/sdcard/Android/data/%s/crash.log", pkg);
-        fd = try_open(p2); if (fd >= 0) { g_log_fd = fd; return; }
-    }
 }
 
 static void drawSigil(ImDrawList* dl, ImVec2 c, float r) {
@@ -237,29 +214,41 @@ static void* pollThread(void*) {
     gVM->DetachCurrentThread(); return nullptr;
 }
 
+// Restored Gold Theme
 static void setupStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 8; s.ChildRounding = 6; s.FrameRounding = 6; s.GrabRounding = 6; s.PopupRounding = 8; s.ScrollbarRounding = 8;
-    s.WindowBorderSize = 1; s.ChildBorderSize = 1; s.FrameBorderSize = 0;
-    s.WindowPadding = ImVec2(12, 12); s.FramePadding = ImVec2(10, 6); s.ItemSpacing = ImVec2(8, 6);
+    s.WindowRounding = 16; s.ChildRounding = 12; s.FrameRounding = 10;
+    s.GrabRounding = 10; s.PopupRounding = 14; s.ScrollbarRounding = 10;
+    s.WindowBorderSize = 1; s.ChildBorderSize = 1; s.FrameBorderSize = 0; s.PopupBorderSize = 1;
+    s.WindowPadding = ImVec2(18, 18); s.FramePadding = ImVec2(12, 8);
+    s.ItemSpacing = ImVec2(10, 10); s.ItemInnerSpacing = ImVec2(8, 8);
+    s.ScrollbarSize = 16; s.GrabMinSize = 14;
     ImVec4* c = s.Colors;
-    c[ImGuiCol_Text] = ImVec4(0.92f, 0.92f, 0.92f, 1.00f);
-    c[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
-    c[ImGuiCol_WindowBg] = ImVec4(0.12f, 0.08f, 0.15f, 0.98f); // Dark purple from screenshot
-    c[ImGuiCol_ChildBg] = ImVec4(0.15f, 0.10f, 0.18f, 1.00f);
-    c[ImGuiCol_Border] = ImVec4(0.40f, 0.20f, 0.50f, 0.50f);
-    c[ImGuiCol_FrameBg] = ImVec4(0.20f, 0.15f, 0.25f, 1.00f);
-    c[ImGuiCol_FrameBgHovered] = ImVec4(0.30f, 0.20f, 0.35f, 1.00f);
-    c[ImGuiCol_FrameBgActive] = ImVec4(0.40f, 0.25f, 0.45f, 1.00f);
-    c[ImGuiCol_TitleBg] = ImVec4(0.15f, 0.10f, 0.20f, 1.00f);
-    c[ImGuiCol_TitleBgActive] = ImVec4(0.25f, 0.15f, 0.30f, 1.00f);
-    c[ImGuiCol_Button] = ImVec4(0.60f, 0.15f, 0.40f, 1.00f); // Pink/Magenta buttons
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.75f, 0.20f, 0.50f, 1.00f);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.85f, 0.25f, 0.60f, 1.00f);
-    c[ImGuiCol_Header] = ImVec4(0.40f, 0.20f, 0.50f, 0.55f);
-    c[ImGuiCol_HeaderHovered] = ImVec4(0.50f, 0.25f, 0.60f, 0.80f);
-    c[ImGuiCol_HeaderActive] = ImVec4(0.60f, 0.30f, 0.70f, 1.00f);
-    c[ImGuiCol_Separator] = ImVec4(0.40f, 0.20f, 0.50f, 0.50f);
+    c[ImGuiCol_Text]                 = ImVec4(0.93f, 0.94f, 0.96f, 1.00f);
+    c[ImGuiCol_TextDisabled]         = ImVec4(0.50f, 0.53f, 0.58f, 1.00f);
+    c[ImGuiCol_WindowBg]             = ImVec4(0.05f, 0.06f, 0.08f, 0.97f);
+    c[ImGuiCol_ChildBg]              = ImVec4(0.07f, 0.08f, 0.11f, 1.00f);
+    c[ImGuiCol_PopupBg]              = ImVec4(0.08f, 0.09f, 0.13f, 0.98f);
+    c[ImGuiCol_Border]               = ImVec4(1.00f, 0.78f, 0.34f, 0.35f);
+    c[ImGuiCol_FrameBg]              = ImVec4(0.13f, 0.15f, 0.19f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.17f, 0.20f, 0.25f, 1.00f);
+    c[ImGuiCol_FrameBgActive]        = ImVec4(0.22f, 0.25f, 0.31f, 1.00f);
+    c[ImGuiCol_TitleBg]              = ImVec4(0.08f, 0.09f, 0.13f, 1.00f);
+    c[ImGuiCol_TitleBgActive]        = ImVec4(0.30f, 0.23f, 0.04f, 1.00f);
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.05f, 0.06f, 0.08f, 0.60f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(1.00f, 0.78f, 0.34f, 0.35f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(1.00f, 0.78f, 0.34f, 0.55f);
+    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(1.00f, 0.78f, 0.34f, 0.75f);
+    c[ImGuiCol_CheckMark]            = ImVec4(0.30f, 0.82f, 0.88f, 1.00f);
+    c[ImGuiCol_SliderGrab]           = ImVec4(0.30f, 0.82f, 0.88f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.40f, 0.92f, 0.98f, 1.00f);
+    c[ImGuiCol_Button]               = ImVec4(1.00f, 0.78f, 0.34f, 0.50f);
+    c[ImGuiCol_ButtonHovered]        = ImVec4(1.00f, 0.78f, 0.34f, 0.75f);
+    c[ImGuiCol_ButtonActive]         = ImVec4(1.00f, 0.78f, 0.34f, 1.00f);
+    c[ImGuiCol_Header]               = ImVec4(1.00f, 0.78f, 0.34f, 0.22f);
+    c[ImGuiCol_HeaderHovered]        = ImVec4(1.00f, 0.78f, 0.34f, 0.42f);
+    c[ImGuiCol_HeaderActive]         = ImVec4(1.00f, 0.78f, 0.34f, 0.60f);
+    c[ImGuiCol_Separator]            = ImVec4(1.00f, 0.78f, 0.34f, 0.25f);
 }
 
 static void doInit(JNIEnv* env, jclass, jobject surface) {
@@ -276,23 +265,17 @@ static void doInit(JNIEnv* env, jclass, jobject surface) {
 static void doResize(JNIEnv*, jclass, jint w, jint h) { gWidth = w; gHeight = h; glViewport(0, 0, w, h); }
 
 static void renderMethodPanel(Section& sec, const std::string& className, MethodInfo& m, MethodCallState& st) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.18f, 0.12f, 0.22f, 1.0f));
-    ImGui::BeginChild(m.raw.c_str(), ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysAutoResize);
-
-    ImGui::TextDisabled("Return Type: %s", m.returnType.c_str());
-    ImGui::Spacing();
-
+    ImGui::Indent(20);
+    ImGui::TextDisabled("Return: %s", m.returnType.c_str());
     for (int i = 0; i < st.numParams; i++) {
         ImGui::PushID(i);
-        ImGui::TextDisabled("Arg %d (%s)", i, m.paramTypes[i].c_str());
+        ImGui::TextDisabled("arg%d (%s)", i, m.paramTypes[i].c_str());
         ImGui::SetNextItemWidth(-1);
         ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
         ImGui::PopID();
     }
-
     ImGui::Checkbox("Call in Main Thread", &st.runInMain);
-    ImGui::Spacing();
-
+    
     if (ImGui::Button("Call", ImVec2(100, 0))) {
         PendingCallReq c;
         c.sectionId = sec.id; c.className = className;
@@ -304,35 +287,29 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
         { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); }
         st.calling = true; st.hasResult = false;
     }
-    ImGui::SameLine();
-    if (st.calling) { ImGui::TextDisabled("Executing..."); }
+    if (st.calling) { ImGui::SameLine(); ImGui::TextDisabled("Executing..."); }
     else if (st.hasResult) {
+        ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
         ImGui::TextWrapped("%s", st.result.c_str());
         ImGui::PopStyleColor();
     }
-
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
+    ImGui::Unindent(20);
 }
 
 static void renderClassDetail(Section& sec, const std::string& className) {
     auto it = sec.details.find(className); if (it == sec.details.end()) return;
     ClassDetail& det = it->second;
-
     ImGui::Indent(20);
     if (det.loading) { ImGui::TextDisabled("Loading..."); ImGui::Unindent(20); return; }
 
     if (!det.fields.empty()) {
-        ImGui::TextColored(ImVec4(0.8f, 0.4f, 0.9f, 1.0f), "Static / Instance Fields");
-        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "Fields");
         for (auto& f : det.fields) ImGui::BulletText("%s", f.c_str());
         ImGui::Spacing();
     }
-
     if (!det.methods.empty()) {
-        ImGui::TextColored(ImVec4(0.8f, 0.4f, 0.9f, 1.0f), "Methods");
-        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "Methods");
         for (auto& m : det.methods) {
             bool exp = det.expandedMethods.count(m.raw) > 0;
             ImGui::PushID(m.raw.c_str());
@@ -366,7 +343,6 @@ static void renderSectionContent(Section& sec) {
         else visible = gClassList;
     }
     ImGui::TextDisabled("%zu classes", visible.size());
-
     ImGui::BeginChild("##list", ImVec2(0, 0), true);
     for (auto& name : visible) {
         bool isExpanded = sec.expandedClasses.count(name) > 0;
@@ -382,7 +358,6 @@ static void renderSectionContent(Section& sec) {
         } else if (isExpanded) {
             sec.expandedClasses.erase(name);
         }
-
         if (ImGui::IsItemClicked()) {
             gPressedClassName = name;
             gPressedClassSectionId = sec.id;
@@ -411,6 +386,23 @@ static void renderFAB() {
     ImGui::End(); ImGui::PopStyleColor(); ImGui::PopStyleVar(2);
 }
 
+static void renderSettingsTab() {
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0.78f,0.34f,1)); ImGui::TextUnformatted("Appearance"); ImGui::PopStyleColor();
+    ImGui::SetNextItemWidth(-1); ImGui::SliderFloat("Font scale", &g_settingFontScale, 0.60f, 2.50f, "%.2fx");
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0.78f,0.34f,1)); ImGui::TextUnformatted("Touch"); ImGui::PopStyleColor();
+    ImGui::SetNextItemWidth(-1); ImGui::SliderFloat("Drag speed", &g_settingDragSpeed, 0.20f, 1.50f, "%.2fx");
+    ImGui::SetNextItemWidth(-1); ImGui::SliderFloat("Scroll speed", &g_settingScrollSpeed, 0.50f, 3.00f, "%.2fx");
+    ImGui::Spacing();
+    if (ImGui::Button("Reset to defaults", ImVec2(-1, 0))) {
+        g_settingFontScale = 1.00f; g_settingDragSpeed = 0.55f; g_settingScrollSpeed = 1.40f;
+    }
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+    ImGui::TextDisabled("Made with love in Iran");
+    ImGui::TextDisabled("github.com/Mrakbrlalhzar");
+}
+
 static void renderMainWindow() {
     ImGuiIO& io = ImGui::GetIO(); float w = io.DisplaySize.x * 0.92f; float h = io.DisplaySize.y * 0.85f;
     ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - w) * 0.5f, io.DisplaySize.y * 0.075f), ImGuiCond_FirstUseEver);
@@ -418,55 +410,65 @@ static void renderMainWindow() {
     ImGui::Begin("DexTool", nullptr, ImGuiWindowFlags_None);
     ImVec2 wp = ImGui::GetWindowPos(); ImVec2 ws = ImGui::GetWindowSize();
     gWinX = wp.x; gWinY = wp.y; gWinW = ws.x; gWinH = ws.y; g_titleH = ImGui::GetFrameHeight();
-    float startX = ImGui::GetCursorScreenPos().x; float startY = ImGui::GetCursorScreenPos().y;
 
-    for (auto& sec : gSections) {
-        if (sec.detached) continue;
-        ImGui::PushID(sec.id); bool isActive = (sec.id == gActiveSection);
-        if (isActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f,0.27f,0.05f,1.0f));
-        char label[256]; if (sec.filter[0]) snprintf(label, sizeof(label), "S%d: %s", sec.id, sec.filter); else snprintf(label, sizeof(label), "Section %d", sec.id);
-        ImGui::Button(label, ImVec2(0, 32));
-        if (ImGui::IsItemClicked()) { gPressedTabId = sec.id; gPressedTabStart = ImGui::GetTime(); }
-        ImGui::SameLine();
-        if (isActive) ImGui::PopStyleColor(); ImGui::PopID();
-    }
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f,0.82f,0.88f,0.6f));
-    if (ImGui::Button("+", ImVec2(32, 32))) gRequestAddSection = true;
-    ImGui::PopStyleColor();
-    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-    gTabBarX = startX; gTabBarY = startY;
+    if (ImGui::BeginTabBar("##main_tabs")) {
+        if (ImGui::BeginTabItem("Classes")) {
+            float startX = ImGui::GetCursorScreenPos().x; float startY = ImGui::GetCursorScreenPos().y;
+            for (auto& sec : gSections) {
+                if (sec.detached) continue;
+                ImGui::PushID(sec.id); bool isActive = (sec.id == gActiveSection);
+                if (isActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f,0.27f,0.05f,1.0f));
+                char label[256]; if (sec.filter[0]) snprintf(label, sizeof(label), "S%d: %s", sec.id, sec.filter); else snprintf(label, sizeof(label), "Section %d", sec.id);
+                ImGui::Button(label, ImVec2(0, 32));
+                if (ImGui::IsItemClicked()) { gPressedTabId = sec.id; gPressedTabStart = ImGui::GetTime(); }
+                ImGui::SameLine();
+                if (isActive) ImGui::PopStyleColor(); ImGui::PopID();
+            }
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f,0.82f,0.88f,0.6f));
+            if (ImGui::Button("+", ImVec2(32, 32))) gRequestAddSection = true;
+            ImGui::PopStyleColor();
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+            gTabBarX = startX; gTabBarY = startY;
 
-    if (gPressedTabId != -1) {
-        if (!ImGui::IsMouseDown(0)) { if (ImGui::GetTime() - gPressedTabStart < 0.6) gActiveSection = gPressedTabId; gPressedTabId = -1; }
-        else if (ImGui::GetTime() - gPressedTabStart > 0.6) {
-            auto* s = findSection(gPressedTabId);
-            if (s && !s->detached) { s->detached = true; s->detX = 100; s->detY = startY + 90; s->detachTime = ImGui::GetTime(); }
-            gPressedTabId = -1;
-        }
-    }
-
-    if (!gPressedClassName.empty()) {
-        if (!ImGui::IsMouseDown(0)) {
-            if (!gClassLongPressed) {
-                auto* src = findSection(gPressedClassSectionId);
-                if (src) {
-                    if (src->expandedClasses.count(gPressedClassName)) src->expandedClasses.erase(gPressedClassName);
-                    else { src->expandedClasses.insert(gPressedClassName); if (src->details.count(gPressedClassName) == 0) { src->details[gPressedClassName].loading = true; requestClassDetails(src->id, gPressedClassName); } }
+            if (gPressedTabId != -1) {
+                if (!ImGui::IsMouseDown(0)) { if (ImGui::GetTime() - gPressedTabStart < 0.6) gActiveSection = gPressedTabId; gPressedTabId = -1; }
+                else if (ImGui::GetTime() - gPressedTabStart > 0.6) {
+                    auto* s = findSection(gPressedTabId);
+                    if (s && !s->detached) { s->detached = true; s->detX = 100; s->detY = startY + 90; s->detachTime = ImGui::GetTime(); }
+                    gPressedTabId = -1;
                 }
             }
-            gPressedClassName.clear(); gClassLongPressed = false;
-        } else if (!gClassLongPressed && ImGui::GetTime() - gPressedClassStart > 0.5) {
-            gClassLongPressed = true;
-            Section s; s.id = gNextSectionId++; s.detached = false; s.expandedClasses.insert(gPressedClassName);
-            gSections.push_back(s); gActiveSection = s.id;
-            requestClassDetails(s.id, gPressedClassName);
-            gPressedClassName.clear();
-        }
-    }
 
-    Section* active = findSection(gActiveSection);
-    if (!active || active->detached) { active = nullptr; for (auto& s : gSections) if (!s.detached) { active = &s; gActiveSection = s.id; break; } }
-    if (active) renderSectionContent(*active); else ImGui::TextDisabled("No sections. Press + to add one.");
+            if (!gPressedClassName.empty()) {
+                if (!ImGui::IsMouseDown(0)) {
+                    if (!gClassLongPressed) {
+                        auto* src = findSection(gPressedClassSectionId);
+                        if (src) {
+                            if (src->expandedClasses.count(gPressedClassName)) src->expandedClasses.erase(gPressedClassName);
+                            else { src->expandedClasses.insert(gPressedClassName); if (src->details.count(gPressedClassName) == 0) { src->details[gPressedClassName].loading = true; requestClassDetails(src->id, gPressedClassName); } }
+                        }
+                    }
+                    gPressedClassName.clear(); gClassLongPressed = false;
+                } else if (!gClassLongPressed && ImGui::GetTime() - gPressedClassStart > 0.5) {
+                    gClassLongPressed = true;
+                    // Create a new detached window specifically for this class
+                    Section s; s.id = gNextSectionId++; s.detached = true; s.expandedClasses.insert(gPressedClassName);
+                    s.detX = io.DisplaySize.x / 2 - 250; s.detY = io.DisplaySize.y / 2 - 250; s.detW = 500; s.detH = 500;
+                    s.filter[0] = 0; snprintf(s.filter, sizeof(s.filter), "%s", gPressedClassName.c_str());
+                    gSections.push_back(s);
+                    requestClassDetails(s.id, gPressedClassName);
+                    gPressedClassName.clear();
+                }
+            }
+
+            Section* active = findSection(gActiveSection);
+            if (!active || active->detached) { active = nullptr; for (auto& s : gSections) if (!s.detached) { active = &s; gActiveSection = s.id; break; } }
+            if (active) renderSectionContent(*active); else ImGui::TextDisabled("No sections. Press + to add one.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Settings")) { renderSettingsTab(); ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
     ImGui::End();
 }
 
@@ -512,7 +514,8 @@ static void processPendingCalls() {
             }
         }
     }
-    if (env->ExceptionCheck()) env->ExceptionClear(); if (attached) gVM->DetachCurrentThread();
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    if (attached) gVM->DetachCurrentThread();
 }
 
 static void doRender(JNIEnv*, jclass) {
@@ -604,7 +607,7 @@ static void doSetMethodResult(JNIEnv* env, jclass, jint sectionId, jstring class
 }
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
-    init_log(); JNIEnv* env = nullptr;
+    JNIEnv* env = nullptr;
     if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return JNI_VERSION_1_6;
     gVM = vm; if (!loadDex(env)) return JNI_VERSION_1_6;
     JNINativeMethod methods[] = {
