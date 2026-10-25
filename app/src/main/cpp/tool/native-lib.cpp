@@ -480,7 +480,7 @@ static void renderMainWindow() {
     ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - w) * 0.5f, io.DisplaySize.y * 0.075f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
 
-    ImGui::Begin("DexTool", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
+    ImGui::Begin("DexTool", nullptr, ImGuiWindowFlags_None);
 
     ImVec2 wp = ImGui::GetWindowPos();
     ImVec2 ws = ImGui::GetWindowSize();
@@ -607,6 +607,26 @@ static void doSetClassList(JNIEnv* env, jclass, jobjectArray arr) {
     LOGI("Class list stored: %zu", gClassList.size());
 }
 
+static jboolean doWantKeyboard(JNIEnv*, jclass) {
+    if (!gInitialized) return JNI_FALSE;
+    return ImGui::GetIO().WantTextInput ? JNI_TRUE : JNI_FALSE;
+}
+static void doAddInputChar(JNIEnv*, jclass, jint cp) {
+    if (!gInitialized || cp <= 0) return;
+    ImGui::GetIO().AddInputCharacter((unsigned int)cp);
+}
+static void doAddKeyEvent(JNIEnv*, jclass, jint keycode, jboolean down) {
+    if (!gInitialized) return;
+    ImGuiKey k = ImGuiKey_None;
+    switch (keycode) {
+        case 67: k = ImGuiKey_Backspace; break;
+        case 66: k = ImGuiKey_Enter; break;
+        case 65: k = ImGuiKey_Tab; break;
+        default: return;
+    }
+    ImGui::GetIO().AddKeyEvent(k, down ? true : false);
+}
+
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     init_log();
     install_crash_handlers();
@@ -621,8 +641,11 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
         {(char*)"nativeRender",       (char*)"()V",                      (void*)doRender},
         {(char*)"nativeTouch",        (char*)"(IFF)Z",                    (void*)doTouch},
         {(char*)"nativeSetClassList", (char*)"([Ljava/lang/String;)V",    (void*)doSetClassList},
+    {(char*)"nativeWantKeyboard", (char*)"()Z", (void*)doWantKeyboard},
+    {(char*)"nativeAddInputChar", (char*)"(I)V", (void*)doAddInputChar},
+    {(char*)"nativeAddKeyEvent", (char*)"(IZ)V", (void*)doAddKeyEvent},
     };
-    if (env->RegisterNatives(gHelperClass, methods, 5) != 0) {
+    if (env->RegisterNatives(gHelperClass, methods, 8) != 0) {
         env->ExceptionClear();
         return JNI_VERSION_1_6;
     }

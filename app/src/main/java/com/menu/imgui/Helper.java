@@ -2,11 +2,8 @@ package com.menu.imgui;
 
 import android.app.Activity;
 import android.content.Context;
-import android.graphics.PixelFormat;
-import android.opengl.GLSurfaceView;
 import android.util.Log;
 import android.view.MotionEvent;
-import android.view.Surface;
 import android.view.ViewGroup;
 
 import java.io.ByteArrayOutputStream;
@@ -25,13 +22,9 @@ import java.util.Locale;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
-import javax.microedition.khronos.egl.EGLConfig;
-import javax.microedition.khronos.opengles.GL10;
-
 public class Helper {
     private static final String TAG = "ImGuiTool";
-    private static GLSurfaceView overlay;
-    private static volatile boolean ready = false;
+    private static OverlaySurfaceView overlay;
 
     static {
         try {
@@ -70,22 +63,16 @@ public class Helper {
     }
 
     private static String getLogDir() {
-        // Primary: Downloads (needs WRITE_EXTERNAL_STORAGE)
         File downloads = new File("/sdcard/Download");
         if (downloads.exists() && downloads.canWrite()) {
             File test = new File(downloads, ".wtest");
-            try {
-                test.createNewFile();
-                test.delete();
-                return downloads.getAbsolutePath();
-            } catch (Throwable ignored) { }
+            try { test.createNewFile(); test.delete(); return downloads.getAbsolutePath(); }
+            catch (Throwable ignored) { }
         }
-        // Fallback: app's external data dir (no permission)
         File ext = new File("/sdcard/Android/data/" + getPkgName());
         if (ext.exists()) return ext.getAbsolutePath();
         try { ext.mkdirs(); } catch (Throwable ignored) { }
         if (ext.exists() && ext.canWrite()) return ext.getAbsolutePath();
-        // Last resort
         return "/data/data/" + getPkgName();
     }
 
@@ -100,60 +87,22 @@ public class Helper {
     }
 
     public static void attach(Context ctx) {
-        log("Helper.attach entered, ctx=" + (ctx != null ? ctx.getClass().getSimpleName() : "null"));
-        if (!(ctx instanceof Activity)) {
-            log("Helper.attach: ctx is not Activity, abort");
-            return;
-        }
+        log("Helper.attach entered");
+        if (!(ctx instanceof Activity)) return;
         final Activity activity = (Activity) ctx;
         try {
             activity.runOnUiThread(() -> attachOnUi(activity));
         } catch (Throwable t) {
-            log("Helper.attach: runOnUiThread failed: " + t);
+            log("runOnUiThread failed: " + t);
         }
     }
 
     private static void attachOnUi(Activity activity) {
-        log("attachOnUi entered");
-        if (overlay != null) {
-            log("attachOnUi: overlay already set, abort");
-            return;
-        }
+        if (overlay != null) return;
         try {
-            log("attachOnUi: creating GLSurfaceView");
-            overlay = new GLSurfaceView(activity);
-            log("attachOnUi: setting EGL context 3");
-            overlay.setEGLContextClientVersion(3);
-            overlay.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
-            overlay.setZOrderOnTop(true);
-            overlay.getHolder().setFormat(PixelFormat.TRANSLUCENT);
-            log("attachOnUi: setting renderer");
-            overlay.setRenderer(new GLSurfaceView.Renderer() {
-                @Override public void onSurfaceCreated(GL10 gl, EGLConfig c) {
-                    log("Renderer.onSurfaceCreated");
-                    Surface s = overlay.getHolder().getSurface();
-                    if (s != null) {
-                        log("Renderer: calling nativeInit");
-                        try { nativeInit(s); }
-                        catch (Throwable t) { log("nativeInit threw: " + t); }
-                        ready = true;
-                        log("Renderer: nativeInit returned OK");
-                    } else {
-                        log("Renderer: Surface is null!");
-                    }
-                }
-                @Override public void onSurfaceChanged(GL10 gl, int w, int h) {
-                    log("Renderer.onSurfaceChanged: " + w + "x" + h);
-                    nativeResize(w, h);
-                }
-                @Override public void onDrawFrame(GL10 gl) {
-                    if (ready) nativeRender();
-                }
-            });
-            overlay.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
-            log("attachOnUi: setting touch listener");
+            overlay = new OverlaySurfaceView(activity);
             overlay.setOnTouchListener((v, e) -> {
-                if (!ready) return false;
+                if (!overlay.isReady()) return false;
                 int action;
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:   action = 0; break;
@@ -164,20 +113,18 @@ public class Helper {
                 }
                 return nativeTouch(action, e.getX(), e.getY());
             });
-            log("attachOnUi: adding to decor");
             ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
             decor.addView(overlay, new ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
             ));
-            log("attachOnUi: overlay attached successfully");
+            log("overlay attached");
+
             new Thread(() -> {
                 try {
-                    log("classLister: starting");
                     List<String> classes = listAllClasses(activity);
-                    log("classLister: found " + classes.size() + " classes");
+                    log("classLister: found " + classes.size());
                     nativeSetClassList(classes.toArray(new String[0]));
-                    log("classLister: sent to native");
                 } catch (Throwable t) {
                     log("classLister failed: " + t);
                 }
@@ -191,22 +138,18 @@ public class Helper {
         List<String> out = new ArrayList<>();
         String apkPath;
         try { apkPath = ctx.getPackageCodePath(); }
-        catch (Throwable t) { log("getPackageCodePath failed: " + t); return out; }
-        log("listAllClasses: apk=" + apkPath);
+        catch (Throwable t) { return out; }
         try (ZipFile zip = new ZipFile(apkPath)) {
             for (ZipEntry entry : Collections.list(zip.entries())) {
                 String n = entry.getName();
                 if (n.equals("classes.dex") || n.matches("classes\\d+\\.dex")) {
                     try (InputStream in = zip.getInputStream(entry)) {
                         byte[] data = readAll(in);
-                        log("listAllClasses: parsing " + n + " (" + data.length + " bytes)");
                         parseDex(data, out);
                     } catch (IOException ignored) { }
                 }
             }
-        } catch (Throwable t) {
-            log("listAllClasses error: " + t);
-        }
+        } catch (Throwable t) { log("listAllClasses error: " + t); }
         Collections.sort(out);
         return out;
     }
@@ -225,20 +168,14 @@ public class Helper {
 
     private static void parseDex(byte[] d, List<String> out) {
         if (d.length < 0x70) return;
-        if (d[0] != 'd' || d[1] != 'e' || d[2] != 'x' || d[3] != '\n') {
-            log("parseDex: bad magic");
-            return;
-        }
+        if (d[0] != 'd' || d[1] != 'e' || d[2] != 'x' || d[3] != '\n') return;
         int strIdsSize = rd32(d, 0x38);
         int strIdsOff  = rd32(d, 0x3C);
         int typeIdsSize= rd32(d, 0x40);
         int typeIdsOff = rd32(d, 0x44);
         int classDefSize=rd32(d, 0x60);
         int classDefOff= rd32(d, 0x64);
-        if (classDefOff + classDefSize * 32 > d.length) {
-            log("parseDex: classDef out of bounds");
-            return;
-        }
+        if (classDefOff + classDefSize * 32 > d.length) return;
         for (int i = 0; i < classDefSize; i++) {
             int cd = classDefOff + i * 32;
             int classIdx = rd32(d, cd);
@@ -261,9 +198,12 @@ public class Helper {
         }
     }
 
-    private static native void nativeInit(Surface s);
-    private static native void nativeResize(int w, int h);
-    private static native void nativeRender();
-    private static native boolean nativeTouch(int action, float x, float y);
-    private static native void nativeSetClassList(String[] classNames);
+    static native void nativeInit(android.view.Surface s);
+    static native void nativeResize(int w, int h);
+    static native void nativeRender();
+    static native boolean nativeTouch(int action, float x, float y);
+    static native void nativeSetClassList(String[] classNames);
+    static native boolean nativeWantKeyboard();
+    static native void nativeAddInputChar(int codepoint);
+    static native void nativeAddKeyEvent(int keycode, boolean down);
 }
