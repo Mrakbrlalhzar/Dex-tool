@@ -2,6 +2,8 @@ package com.menu.imgui;
 
 import android.app.Activity;
 import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.view.ViewGroup;
@@ -16,7 +18,6 @@ import java.io.PrintWriter;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -53,11 +54,9 @@ public class Helper {
     }
     private static String getPkgName() {
         try (FileInputStream fis = new FileInputStream("/proc/self/cmdline")) {
-            byte[] buf = new byte[256];
-            int n = fis.read(buf);
+            byte[] buf = new byte[256]; int n = fis.read(buf);
             if (n > 0) {
-                int end = 0;
-                while (end < n && buf[end] != 0) end++;
+                int end = 0; while (end < n && buf[end] != 0) end++;
                 String pkg = new String(buf, 0, end, "UTF-8");
                 int colon = pkg.indexOf(':');
                 return colon > 0 ? pkg.substring(0, colon) : pkg;
@@ -67,13 +66,8 @@ public class Helper {
     }
     private static String getLogDir() {
         File d = new File("/sdcard/Download");
-        if (d.exists() && d.canWrite()) {
-            File t = new File(d, ".wt");
-            try { t.createNewFile(); t.delete(); return d.getAbsolutePath(); } catch (Throwable ignored) { }
-        }
+        if (d.exists() && d.canWrite()) return d.getAbsolutePath();
         File e = new File("/sdcard/Android/data/" + getPkgName());
-        if (e.exists()) return e.getAbsolutePath();
-        try { e.mkdirs(); } catch (Throwable ignored) { }
         if (e.exists() && e.canWrite()) return e.getAbsolutePath();
         return "/data/data/" + getPkgName();
     }
@@ -90,51 +84,44 @@ public class Helper {
     public static void attach(Context ctx) {
         if (!(ctx instanceof Activity)) return;
         final Activity activity = (Activity) ctx;
-        try { activity.runOnUiThread(() -> attachOnUi(activity)); }
-        catch (Throwable t) { log("runOnUiThread failed: " + t); }
-    }
-
-    private static void attachOnUi(Activity activity) {
-        if (overlay != null) return;
-        try {
-            overlay = new OverlaySurfaceView(activity);
-            overlay.setOnTouchListener((v, e) -> {
-                if (!overlay.isReady()) return false;
-                int action;
-                switch (e.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:   action = 0; break;
-                    case MotionEvent.ACTION_UP:     action = 1; break;
-                    case MotionEvent.ACTION_MOVE:   action = 2; break;
-                    case MotionEvent.ACTION_CANCEL: action = 3; break;
-                    default: return false;
-                }
-                return nativeTouch(action, e.getX(), e.getY());
-            });
-            ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
-            decor.addView(overlay, new ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-            log("overlay attached");
-            new Thread(() -> {
-                try {
-                    List<String> classes = listAllClasses(activity);
-                    log("classLister: " + classes.size());
-                    nativeSetClassList(classes.toArray(new String[0]));
-                } catch (Throwable t) { log("classLister failed: " + t); }
-            }, "ImGuiClassLister").start();
-        } catch (Throwable t) { log("attachOnUi FAILED: " + t); }
+        activity.runOnUiThread(() -> {
+            if (overlay != null) return;
+            try {
+                overlay = new OverlaySurfaceView(activity);
+                overlay.setOnTouchListener((v, e) -> {
+                    if (!overlay.isReady()) return false;
+                    int action;
+                    switch (e.getActionMasked()) {
+                        case MotionEvent.ACTION_DOWN:   action = 0; break;
+                        case MotionEvent.ACTION_UP:     action = 1; break;
+                        case MotionEvent.ACTION_MOVE:   action = 2; break;
+                        case MotionEvent.ACTION_CANCEL: action = 3; break;
+                        default: return false;
+                    }
+                    return nativeTouch(action, e.getX(), e.getY());
+                });
+                ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
+                decor.addView(overlay, new ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                log("overlay attached");
+                new Thread(() -> {
+                    try {
+                        List<String> classes = listAllClasses(activity);
+                        nativeSetClassList(classes.toArray(new String[0]));
+                    } catch (Throwable t) { log("classLister failed: " + t); }
+                }, "ImGuiClassLister").start();
+            } catch (Throwable t) { log("attach failed: " + t); }
+        });
     }
 
     private static List<String> listAllClasses(Context ctx) {
         List<String> out = new ArrayList<>();
-        String apkPath;
-        try { apkPath = ctx.getPackageCodePath(); } catch (Throwable t) { return out; }
-        try (ZipFile zip = new ZipFile(apkPath)) {
+        try (ZipFile zip = new ZipFile(ctx.getPackageCodePath())) {
             for (ZipEntry entry : Collections.list(zip.entries())) {
                 String n = entry.getName();
                 if (n.equals("classes.dex") || n.matches("classes\\d+\\.dex")) {
                     try (InputStream in = zip.getInputStream(entry)) {
-                        byte[] data = readAll(in);
-                        parseDexClasses(data, out);
+                        parseDexClasses(readAll(in), out);
                     } catch (IOException ignored) { }
                 }
             }
@@ -153,12 +140,7 @@ public class Helper {
     private static int rd32(byte[] d, int off) { return (d[off]&0xFF) | ((d[off+1]&0xFF)<<8) | ((d[off+2]&0xFF)<<16) | ((d[off+3]&0xFF)<<24); }
     private static int readUleb128(byte[] d, int[] pos) {
         int r = 0, s = 0;
-        while (true) {
-            byte b = d[pos[0]++];
-            r |= (b & 0x7F) << s;
-            if ((b & 0x80) == 0) break;
-            s += 7;
-        }
+        while (true) { byte b = d[pos[0]++]; r |= (b & 0x7F) << s; if ((b & 0x80) == 0) break; s += 7; }
         return r;
     }
     private static String readString(byte[] d, int strIdsOff, int strIdx) {
@@ -178,14 +160,10 @@ public class Helper {
     private static String prettyType(String desc) {
         if (desc == null || desc.isEmpty()) return "?";
         switch (desc.charAt(0)) {
-            case 'V': return "void";
-            case 'Z': return "boolean";
-            case 'B': return "byte";
-            case 'S': return "short";
-            case 'C': return "char";
-            case 'I': return "int";
-            case 'J': return "long";
-            case 'F': return "float";
+            case 'V': return "void";   case 'Z': return "boolean";
+            case 'B': return "byte";   case 'S': return "short";
+            case 'C': return "char";   case 'I': return "int";
+            case 'J': return "long";   case 'F': return "float";
             case 'D': return "double";
             case 'L': return desc.endsWith(";") ? desc.substring(1, desc.length() - 1).replace('/', '.') : desc;
             case '[': return prettyType(desc.substring(1)) + "[]";
@@ -194,17 +172,13 @@ public class Helper {
     }
 
     private static void parseDexClasses(byte[] d, List<String> out) {
-        if (d.length < 0x70) return;
-        if (d[0] != 'd' || d[1] != 'e' || d[2] != 'x' || d[3] != '\n') return;
-        int strIdsOff   = rd32(d, 0x3C);
-        int typeIdsSize = rd32(d, 0x40);
-        int typeIdsOff  = rd32(d, 0x44);
-        int classDefSize= rd32(d, 0x60);
+        if (d.length < 0x70 || d[0] != 'd' || d[1] != 'e' || d[2] != 'x') return;
+        int strIdsOff = rd32(d, 0x3C); int typeIdsSize = rd32(d, 0x40);
+        int typeIdsOff = rd32(d, 0x44); int classDefSize= rd32(d, 0x60);
         int classDefOff = rd32(d, 0x64);
         if (classDefOff + classDefSize * 32 > d.length) return;
         for (int i = 0; i < classDefSize; i++) {
-            int cd = classDefOff + i * 32;
-            int classIdx = rd32(d, cd);
+            int cd = classDefOff + i * 32; int classIdx = rd32(d, cd);
             if (classIdx < 0 || classIdx >= typeIdsSize) continue;
             String desc = getTypeDesc(d, typeIdsOff, strIdsOff, classIdx);
             if (desc.startsWith("L") && desc.endsWith(";"))
@@ -212,7 +186,6 @@ public class Helper {
         }
     }
 
-    // ============ Class details ============
     public static void requestClassDetails(int sectionId, String className) {
         new Thread(() -> {
             String[] fields = new String[0];
@@ -221,10 +194,9 @@ public class Helper {
                 ClassMembers m = parseClassMembers(className);
                 fields = m.fields.toArray(new String[0]);
                 methods = m.methods.toArray(new String[0]);
-                log("details sec=" + sectionId + " " + className + " f=" + fields.length + " m=" + methods.length);
             } catch (Throwable t) { log("requestClassDetails failed: " + t); }
             nativeSetClassDetails(sectionId, className, fields, methods);
-        }, "ImGuiClassDetails").start();
+        }).start();
     }
 
     private static class ClassMembers {
@@ -235,8 +207,7 @@ public class Helper {
     private static ClassMembers parseClassMembers(String className) {
         ClassMembers out = new ClassMembers();
         String targetDesc = "L" + className.replace('.', '/') + ";";
-        File apk = new File(getApkPath());
-        try (ZipFile zip = new ZipFile(apk)) {
+        try (ZipFile zip = new ZipFile(getApkPath())) {
             for (ZipEntry entry : Collections.list(zip.entries())) {
                 String n = entry.getName();
                 if (n.equals("classes.dex") || n.matches("classes\\d+\\.dex")) {
@@ -248,6 +219,7 @@ public class Helper {
         } catch (Throwable t) { log("parseClassMembers error: " + t); }
         return out;
     }
+
     private static String cachedApkPath = null;
     private static String getApkPath() {
         if (cachedApkPath != null) return cachedApkPath;
@@ -263,53 +235,41 @@ public class Helper {
     }
 
     private static void parseDexMembers(byte[] d, String targetDesc, ClassMembers out) {
-        if (d.length < 0x70) return;
-        if (d[0] != 'd' || d[1] != 'e' || d[2] != 'x' || d[3] != '\n') return;
-        int strIdsOff    = rd32(d, 0x3C);
-        int typeIdsSize  = rd32(d, 0x40);
-        int typeIdsOff   = rd32(d, 0x44);
-        int protoIdsOff  = rd32(d, 0x4C);
-        int fieldIdsOff  = rd32(d, 0x54);
-        int methodIdsOff = rd32(d, 0x5C);
-        int classDefSize = rd32(d, 0x60);
-        int classDefOff  = rd32(d, 0x64);
+        if (d.length < 0x70 || d[0] != 'd' || d[1] != 'e' || d[2] != 'x') return;
+        int strIdsOff=rd32(d,0x3C); int typeIdsSize=rd32(d,0x40); int typeIdsOff=rd32(d,0x44);
+        int protoIdsOff=rd32(d,0x4C); int fieldIdsOff=rd32(d,0x54); int methodIdsOff=rd32(d,0x5C);
+        int classDefSize=rd32(d,0x60); int classDefOff=rd32(d,0x64);
         if (classDefOff + classDefSize * 32 > d.length) return;
 
         for (int i = 0; i < classDefSize; i++) {
-            int cd = classDefOff + i * 32;
-            int classIdx = rd32(d, cd);
+            int cd = classDefOff + i * 32; int classIdx = rd32(d, cd);
             if (classIdx < 0 || classIdx >= typeIdsSize) continue;
             if (!targetDesc.equals(getTypeDesc(d, typeIdsOff, strIdsOff, classIdx))) continue;
-            int classDataOff = rd32(d, cd + 24);
-            if (classDataOff == 0) return;
+            int classDataOff = rd32(d, cd + 24); if (classDataOff == 0) return;
+
             int[] pos = { classDataOff };
-            int staticFields   = readUleb128(d, pos);
-            int instanceFields = readUleb128(d, pos);
-            int directMethods  = readUleb128(d, pos);
-            int virtualMethods = readUleb128(d, pos);
+            int staticFields=readUleb128(d,pos); int instanceFields=readUleb128(d,pos);
+            int directMethods=readUleb128(d,pos); int virtualMethods=readUleb128(d,pos);
+
             int fieldIdx = 0;
             for (int j = 0; j < staticFields; j++) {
-                int diff = readUleb128(d, pos); readUleb128(d, pos);
-                fieldIdx += diff;
-                out.fields.add(getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx) + " [static]");
+                int diff = readUleb128(d, pos); readUleb128(d, pos); fieldIdx += diff;
+                out.fields.add("[static] " + getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx));
             }
             fieldIdx = 0;
             for (int j = 0; j < instanceFields; j++) {
-                int diff = readUleb128(d, pos); readUleb128(d, pos);
-                fieldIdx += diff;
-                out.fields.add(getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx) + " [instance]");
+                int diff = readUleb128(d, pos); readUleb128(d, pos); fieldIdx += diff;
+                out.fields.add("[instance] " + getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx));
             }
             int methodIdx = 0;
             for (int j = 0; j < directMethods; j++) {
-                int diff = readUleb128(d, pos); readUleb128(d, pos); readUleb128(d, pos);
-                methodIdx += diff;
-                out.methods.add(getMethodRaw(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx, "direct"));
+                int diff = readUleb128(d, pos); readUleb128(d, pos); readUleb128(d, pos); methodIdx += diff;
+                out.methods.add(getMethodRaw(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx));
             }
             methodIdx = 0;
             for (int j = 0; j < virtualMethods; j++) {
-                int diff = readUleb128(d, pos); readUleb128(d, pos); readUleb128(d, pos);
-                methodIdx += diff;
-                out.methods.add(getMethodRaw(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx, "virtual"));
+                int diff = readUleb128(d, pos); readUleb128(d, pos); readUleb128(d, pos); methodIdx += diff;
+                out.methods.add(getMethodRaw(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx));
             }
             return;
         }
@@ -322,12 +282,9 @@ public class Helper {
         return type + " " + name;
     }
 
-    // Format: name|returnType|isStatic(0/1)|isConstructor(0/1)|p1;p2;...
-    private static String getMethodRaw(byte[] d, int methodIdsOff, int protoIdsOff, int typeIdsOff, int strIdsOff, int methodIdx, String kind) {
-        int mi = methodIdsOff + methodIdx * 8;
-        int protoIdx = rd16(d, mi + 2);
-        int nameIdx  = rd32(d, mi + 4);
-        String name = readString(d, strIdsOff, nameIdx);
+    private static String getMethodRaw(byte[] d, int methodIdsOff, int protoIdsOff, int typeIdsOff, int strIdsOff, int methodIdx) {
+        int mi = methodIdsOff + methodIdx * 8; int protoIdx = rd16(d, mi + 2);
+        String name = readString(d, strIdsOff, rd32(d, mi + 4));
         int pi = protoIdsOff + protoIdx * 12;
         String returnType = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd32(d, pi + 4)));
         int paramsOff = rd32(d, pi + 8);
@@ -341,27 +298,18 @@ public class Helper {
                 params.append(prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd16(d, off))));
             }
         }
-        boolean isCtor = "<init>".equals(name);
-        // Static: check access flags — we don't parse them here, use heuristic
-        // For simplicity: mark methods starting with "static" in kind, or check constructor
-        boolean isStatic = name.contains("$") || kind.equals("direct") && (name.startsWith("access$") || name.equals("<clinit>"));
-        return name + "|" + returnType + "|" + (isStatic ? "1" : "0") + "|" + (isCtor ? "1" : "0") + "|" + params;
+        return name + "|" + returnType + "|" + (name.contains("$") || name.equals("<clinit>") ? "1" : "0") + "|" + ("<init>".equals(name) ? "1" : "0") + "|" + params;
     }
 
-    // ============ Method call ============
-    public static void requestMethodCall(int sectionId, String className, String methodSig,
-                                         String methodName, String[] paramTypes, String[] args,
-                                         boolean isStatic, boolean isConstructor) {
-        new Thread(() -> {
+    public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName, String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
+        Runnable r = () -> {
             String result;
             try {
                 Class<?> cls = Class.forName(className);
                 Class<?>[] paramClasses = new Class<?>[paramTypes.length];
-                for (int i = 0; i < paramTypes.length; i++)
-                    paramClasses[i] = classFromString(paramTypes[i]);
+                for (int i = 0; i < paramTypes.length; i++) paramClasses[i] = classFromString(paramTypes[i]);
                 Object[] argValues = new Object[args.length];
-                for (int i = 0; i < args.length; i++)
-                    argValues[i] = parseArg(paramClasses[i], args[i]);
+                for (int i = 0; i < args.length; i++) argValues[i] = parseArg(paramClasses[i], args[i]);
 
                 Object ret;
                 if (isConstructor) {
@@ -384,11 +332,11 @@ public class Helper {
                         result = "Returned: " + (ret == null ? "null" : ret.toString());
                     }
                 }
-            } catch (Throwable t) {
-                result = "Error: " + t;
-            }
+            } catch (Throwable t) { result = "Error: " + t; }
             nativeSetMethodResult(sectionId, className, methodSig, result);
-        }, "ImGuiMethodCall").start();
+        };
+        if (runInMain) new Handler(Looper.getMainLooper()).post(r);
+        else new Thread(r).start();
     }
 
     private static Object tryCreateInstance(Class<?> cls) {
@@ -398,33 +346,27 @@ public class Helper {
             return c.newInstance();
         } catch (Throwable t) { return null; }
     }
-
     private static Class<?> classFromString(String s) throws ClassNotFoundException {
         switch (s) {
-            case "int": return int.class;
-            case "long": return long.class;
-            case "short": return short.class;
-            case "byte": return byte.class;
-            case "char": return char.class;
-            case "boolean": return boolean.class;
-            case "float": return float.class;
-            case "double": return double.class;
+            case "int": return int.class;     case "long": return long.class;
+            case "short": return short.class; case "byte": return byte.class;
+            case "char": return char.class;   case "boolean": return boolean.class;
+            case "float": return float.class; case "double": return double.class;
             case "void": return void.class;
         }
         if (s.endsWith("[]")) return Array.newInstance(classFromString(s.substring(0, s.length() - 2)), 0).getClass();
         return Class.forName(s);
     }
-
     private static Object parseArg(Class<?> type, String s) {
         String t = s == null ? "" : s.trim();
-        if (type == int.class || type == Integer.class) return Integer.parseInt(t);
-        if (type == long.class || type == Long.class) return Long.parseLong(t);
-        if (type == short.class || type == Short.class) return Short.parseShort(t);
-        if (type == byte.class || type == Byte.class) return Byte.parseByte(t);
-        if (type == char.class || type == Character.class) return t.isEmpty() ? '\0' : t.charAt(0);
-        if (type == boolean.class || type == Boolean.class) return Boolean.parseBoolean(t);
-        if (type == float.class || type == Float.class) return Float.parseFloat(t);
-        if (type == double.class || type == Double.class) return Double.parseDouble(t);
+        if (type == int.class) return Integer.parseInt(t);
+        if (type == long.class) return Long.parseLong(t);
+        if (type == short.class) return Short.parseShort(t);
+        if (type == byte.class) return Byte.parseByte(t);
+        if (type == char.class) return t.isEmpty() ? '\0' : t.charAt(0);
+        if (type == boolean.class) return Boolean.parseBoolean(t);
+        if (type == float.class) return Float.parseFloat(t);
+        if (type == double.class) return Double.parseDouble(t);
         if (type == String.class) return t;
         return null;
     }
