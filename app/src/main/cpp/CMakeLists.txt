@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 include_directories(
     imgui
     imgui/backends
+    tool
 )
 
 add_library(tool SHARED
