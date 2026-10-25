@@ -986,4 +986,400 @@ jobs:
                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoInputs |
                   ImGuiWindowFlags_NoScrollWithMouse);
-             
+              ImDrawList* dl = ImGui::GetWindowDrawList();
+              ImVec2 center(g_fabX + g_fabSize * 0.5f, g_fabY + g_fabSize * 0.5f);
+              float r = g_fabSize * 0.5f;
+              int alpha = g_fabMoved ? 30 : 15;
+              for (int i = 4; i >= 1; i--) dl->AddCircle(center, r - 1 + i * 1.5f, IM_COL32(255, 200, 87, alpha), 40, 1.2f);
+              dl->AddCircleFilled(center, r - 3, IM_COL32(10, 12, 16, 230), 40);
+              dl->AddCircle(center, r - 3, IM_COL32(255, 200, 87, g_fabMoved ? 255 : 220), 40, 2.5f);
+              drawSigil(dl, center, (r - 6) * 0.85f);
+              ImGui::End();
+              ImGui::PopStyleColor();
+              ImGui::PopStyleVar(2);
+          }
+
+          // ---------- Settings ----------
+          static void renderSettingsTab() {
+              ImGui::Spacing();
+              ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.78f, 0.34f, 1.00f));
+              ImGui::TextUnformatted("Appearance");
+              ImGui::PopStyleColor();
+              ImGui::Spacing();
+              ImGui::SetNextItemWidth(-1);
+              ImGui::SliderFloat("Font scale", &g_settingFontScale, 0.60f, 2.50f, "%.2fx");
+              ImGui::TextDisabled("  0.6x - 2.5x (default 1.0x)");
+              ImGui::Spacing();
+              ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.78f, 0.34f, 1.00f));
+              ImGui::TextUnformatted("Touch");
+              ImGui::PopStyleColor();
+              ImGui::Spacing();
+              ImGui::SetNextItemWidth(-1);
+              ImGui::SliderFloat("Drag speed", &g_settingDragSpeed, 0.20f, 1.50f, "%.2fx");
+              ImGui::TextDisabled("  Lower = slower window drag");
+              ImGui::Spacing();
+              ImGui::SetNextItemWidth(-1);
+              ImGui::SliderFloat("Scroll speed", &g_settingScrollSpeed, 0.50f, 3.00f, "%.2fx");
+              ImGui::TextDisabled("  Higher = faster list scroll");
+              ImGui::Spacing(); ImGui::Spacing();
+              if (ImGui::Button("Reset to defaults", ImVec2(-1, 0))) {
+                  g_settingFontScale = 1.00f;
+                  g_settingDragSpeed = 0.55f;
+                  g_settingScrollSpeed = 1.40f;
+              }
+              ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+              ImGui::TextDisabled("Made with love in Iran");
+              ImGui::TextDisabled("github.com/Mrakbrlalhzar");
+          }
+
+          // ---------- Main window ----------
+          static void renderMainWindow() {
+              ImGuiIO& io = ImGui::GetIO();
+              float w = io.DisplaySize.x * 0.92f;
+              float h = io.DisplaySize.y * 0.85f;
+              ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - w) * 0.5f, io.DisplaySize.y * 0.075f), ImGuiCond_FirstUseEver);
+              ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
+              ImGui::Begin("DexTool", nullptr, ImGuiWindowFlags_None);
+
+              ImVec2 wp = ImGui::GetWindowPos();
+              ImVec2 ws = ImGui::GetWindowSize();
+              g_winX = wp.x; g_winY = wp.y;
+              g_winW = ws.x; g_winH = ws.y;
+              g_titleH = ImGui::GetFrameHeight();
+
+              if (ImGui::BeginTabBar("##main_tabs", ImGuiTabBarFlags_None)) {
+                  if (ImGui::BeginTabItem("Classes")) {
+                      if (ImGui::BeginTabBar("##sections", ImGuiTabBarFlags_AutoSelectNewTabs | ImGuiTabBarFlags_FittingPolicyScroll)) {
+                          for (auto& sec : gSections) {
+                              if (sec.detached) continue;
+                              char tabLabel[256];
+                              if (sec.filter[0]) {
+                                  snprintf(tabLabel, sizeof(tabLabel), "S%d: %s", sec.id, sec.filter);
+                              } else {
+                                  snprintf(tabLabel, sizeof(tabLabel), "Section %d", sec.id);
+                              }
+                              if (ImGui::BeginTabItem(tabLabel)) {
+                                  renderSectionContent(sec, false);
+                                  ImGui::EndTabItem();
+                              }
+                          }
+                          if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) {
+                              gRequestAddSection = true;
+                          }
+                          ImGui::EndTabBar();
+                      }
+                      ImGui::EndTabItem();
+                  }
+                  if (ImGui::BeginTabItem("Settings")) {
+                      renderSettingsTab();
+                      ImGui::EndTabItem();
+                  }
+                  ImGui::EndTabBar();
+              }
+              ImGui::End();
+          }
+
+          // ---------- Detached windows ----------
+          static void renderDetachedWindows() {
+              for (auto& sec : gSections) {
+                  if (!sec.detached) continue;
+                  ImGui::SetNextWindowPos(ImVec2(sec.detX, sec.detY), ImGuiCond_FirstUseEver);
+                  ImGui::SetNextWindowSize(ImVec2(sec.detW, sec.detH), ImGuiCond_FirstUseEver);
+                  char title[256];
+                  if (sec.filter[0]) {
+                      snprintf(title, sizeof(title), "S%d: %s##det_%d", sec.id, sec.filter, sec.id);
+                  } else {
+                      snprintf(title, sizeof(title), "Section %d##det_%d", sec.id, sec.id);
+                  }
+                  bool open = true;
+                  ImGui::Begin(title, &open, ImGuiWindowFlags_None);
+                  ImVec2 p = ImGui::GetWindowPos();
+                  ImVec2 s = ImGui::GetWindowSize();
+                  sec.detX = p.x; sec.detY = p.y;
+                  sec.detW = s.x; sec.detH = s.y;
+                  renderSectionContent(sec, true);
+                  ImGui::End();
+                  if (!open) gPendingCloseSections.push_back(sec.id);
+              }
+          }
+
+          // ---------- Pending ----------
+          static void processPendingClassRequests() {
+              if (gPendingRequests.empty() || !gHelperClass || !gVM) return;
+              PendingRequest req;
+              {
+                  std::lock_guard<std::mutex> lk(gPendingMutex);
+                  if (gPendingRequests.empty()) return;
+                  req = gPendingRequests.front();
+                  gPendingRequests.erase(gPendingRequests.begin());
+              }
+              JNIEnv* env = nullptr;
+              bool attached = false;
+              if (gVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+                  if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+                  attached = true;
+              }
+              jmethodID reqM = env->GetStaticMethodID(gHelperClass, "requestClassDetails", "(ILjava/lang/String;)V");
+              if (reqM) {
+                  jstring js = env->NewStringUTF(req.className.c_str());
+                  env->CallStaticVoidMethod(gHelperClass, reqM, (jint)req.sectionId, js);
+                  env->DeleteLocalRef(js);
+              }
+              if (env->ExceptionCheck()) env->ExceptionClear();
+              if (attached) gVM->DetachCurrentThread();
+          }
+
+          static void applyPendingChanges() {
+              if (gRequestAddSection) {
+                  addSectionImpl();
+                  gRequestAddSection = false;
+              }
+              if (!gPendingCloseSections.empty()) {
+                  std::vector<int> toClose = gPendingCloseSections;
+                  gPendingCloseSections.clear();
+                  for (int id : toClose) closeSectionImpl(id);
+              }
+          }
+
+          static void doRender(JNIEnv*, jclass) {
+              if (!gInitialized) return;
+              if (!g_firstFrame) { log_step("doRender: first frame"); g_firstFrame = true; }
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui_ImplAndroid_NewFrame();
+              ImGuiIO& io = ImGui::GetIO();
+              io.FontGlobalScale = g_settingFontScale;
+              ImGui::NewFrame();
+
+              if (g_menuVisible) {
+                  renderMainWindow();
+                  renderDetachedWindows();
+              }
+              renderFAB();
+              processPendingClassRequests();
+
+              ImGui::Render();
+              glClearColor(0, 0, 0, 0);
+              glClear(GL_COLOR_BUFFER_BIT);
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+              applyPendingChanges();
+          }
+
+          // ---------- Touch ----------
+          static jboolean doTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
+              if (!gInitialized) return JNI_FALSE;
+              ImGuiIO& io = ImGui::GetIO();
+              io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+
+              if (action == 0) {
+                  bool inFAB = (g_fabX >= 0 && x >= g_fabX && x <= g_fabX + g_fabSize &&
+                                g_fabY >= 0 && y >= g_fabY && y <= g_fabY + g_fabSize);
+                  if (inFAB) {
+                      g_fabDown = true;
+                      g_fabMoved = false;
+                      g_fabDownAtX = x; g_fabDownAtY = y;
+                      g_fabDragStartX = g_fabX; g_fabDragStartY = g_fabY;
+                      return JNI_TRUE;
+                  }
+              } else if (g_fabDown) {
+                  if (action == 2) {
+                      float dx = x - g_fabDownAtX;
+                      float dy = y - g_fabDownAtY;
+                      if (fabsf(dx) > 20.0f || fabsf(dy) > 20.0f) g_fabMoved = true;
+                      if (g_fabMoved) {
+                          g_fabX = g_fabDragStartX + dx;
+                          g_fabY = g_fabDragStartY + dy;
+                          if (g_fabX < 0) g_fabX = 0;
+                          if (g_fabY < 0) g_fabY = 0;
+                          if (g_fabX > io.DisplaySize.x - g_fabSize) g_fabX = io.DisplaySize.x - g_fabSize;
+                          if (g_fabY > io.DisplaySize.y - g_fabSize) g_fabY = io.DisplaySize.y - g_fabSize;
+                      }
+                      return JNI_TRUE;
+                  }
+                  if (action == 1 || action == 3) {
+                      g_fabDown = false;
+                      if (!g_fabMoved) g_menuVisible = !g_menuVisible;
+                      return JNI_TRUE;
+                  }
+              }
+
+              if (!g_menuVisible) return JNI_FALSE;
+
+              if (action == 0) {
+                  g_virtX = x; g_virtY = y;
+                  g_realPrevX = x; g_realPrevY = y;
+                  io.AddMousePosEvent(g_virtX, g_virtY);
+                  io.AddMouseButtonEvent(0, true);
+              } else if (action == 1 || action == 3) {
+                  io.AddMousePosEvent(g_virtX, g_virtY);
+                  io.AddMouseButtonEvent(0, false);
+              } else if (action == 2) {
+                  float dx = x - g_realPrevX;
+                  float dy = y - g_realPrevY;
+                  g_realPrevX = x; g_realPrevY = y;
+                  bool inWindow = (g_virtX >= g_winX && g_virtX <= g_winX + g_winW &&
+                                   g_virtY >= g_winY && g_virtY <= g_winY + g_winH);
+                  bool inTitleBar = inWindow && (g_virtY <= g_winY + g_titleH);
+                  float scale = 1.0f;
+                  if (inTitleBar) scale = g_settingDragSpeed;
+                  else if (inWindow) scale = g_settingScrollSpeed;
+                  g_virtX += dx * scale;
+                  g_virtY += dy * scale;
+                  if (g_virtX < 0) g_virtX = 0;
+                  if (g_virtY < 0) g_virtY = 0;
+                  if (g_virtX > io.DisplaySize.x) g_virtX = io.DisplaySize.x;
+                  if (g_virtY > io.DisplaySize.y) g_virtY = io.DisplaySize.y;
+                  io.AddMousePosEvent(g_virtX, g_virtY);
+              }
+              return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
+          }
+
+          // ---------- Natives ----------
+          static jboolean doWantKeyboard(JNIEnv*, jclass) {
+              if (!gInitialized) return JNI_FALSE;
+              return ImGui::GetIO().WantTextInput ? JNI_TRUE : JNI_FALSE;
+          }
+          static void doAddInputChar(JNIEnv*, jclass, jint cp) {
+              if (!gInitialized || cp <= 0) return;
+              ImGui::GetIO().AddInputCharacter((unsigned int)cp);
+          }
+          static void doAddKeyEvent(JNIEnv*, jclass, jint keycode, jboolean down) {
+              if (!gInitialized) return;
+              ImGuiKey k = ImGuiKey_None;
+              switch (keycode) {
+                  case 67: k = ImGuiKey_Backspace; break;
+                  case 66: k = ImGuiKey_Enter; break;
+                  case 65: k = ImGuiKey_Tab; break;
+                  default: return;
+              }
+              ImGui::GetIO().AddKeyEvent(k, down ? true : false);
+          }
+          static void doSetClassList(JNIEnv* env, jclass, jobjectArray arr) {
+              std::lock_guard<std::mutex> lk(gClassListMutex);
+              gClassList.clear();
+              if (!arr) return;
+              jsize n = env->GetArrayLength(arr);
+              gClassList.reserve((size_t)n);
+              for (jsize i = 0; i < n; i++) {
+                  jstring js = (jstring)env->GetObjectArrayElement(arr, i);
+                  const char* cs = env->GetStringUTFChars(js, nullptr);
+                  if (cs) { gClassList.emplace_back(cs); env->ReleaseStringUTFChars(js, cs); }
+                  env->DeleteLocalRef(js);
+              }
+          }
+
+          static std::string jstrToStd(JNIEnv* env, jstring s) {
+              if (!s) return "";
+              const char* c = env->GetStringUTFChars(s, nullptr);
+              std::string r(c ? c : "");
+              if (c) env->ReleaseStringUTFChars(s, c);
+              return r;
+          }
+          static std::vector<std::string> jarrToStrs(JNIEnv* env, jobjectArray arr) {
+              std::vector<std::string> out;
+              if (!arr) return out;
+              jsize n = env->GetArrayLength(arr);
+              out.reserve(n);
+              for (jsize i = 0; i < n; i++) {
+                  jstring s = (jstring)env->GetObjectArrayElement(arr, i);
+                  if (s) {
+                      const char* c = env->GetStringUTFChars(s, nullptr);
+                      if (c) out.emplace_back(c);
+                      if (c) env->ReleaseStringUTFChars(s, c);
+                      env->DeleteLocalRef(s);
+                  }
+              }
+              return out;
+          }
+          static void doSetClassDetails(JNIEnv* env, jclass, jint sectionId,
+                                        jstring className, jobjectArray fields, jobjectArray methods) {
+              std::string name = jstrToStd(env, className);
+              Section* sec = findSection((int)sectionId);
+              if (!sec) return;
+              if (name != sec->selectedClass) return;
+              sec->fields = jarrToStrs(env, fields);
+              sec->methods = jarrToStrs(env, methods);
+              sec->loading = false;
+          }
+
+          JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
+              init_log();
+              install_crash_handlers();
+              log_step("JNI_OnLoad: started");
+              JNIEnv* env = nullptr;
+              if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return JNI_VERSION_1_6;
+              gVM = vm;
+              if (!loadDex(env)) { log_step("loadDex failed"); return JNI_VERSION_1_6; }
+              JNINativeMethod methods[] = {
+                  {(char*)"nativeInit",            (char*)"(Landroid/view/Surface;)V",   (void*)doInit},
+                  {(char*)"nativeResize",          (char*)"(II)V",                        (void*)doResize},
+                  {(char*)"nativeRender",          (char*)"()V",                          (void*)doRender},
+                  {(char*)"nativeTouch",           (char*)"(IFF)Z",                       (void*)doTouch},
+                  {(char*)"nativeSetClassList",    (char*)"([Ljava/lang/String;)V",       (void*)doSetClassList},
+                  {(char*)"nativeWantKeyboard",    (char*)"()Z",                          (void*)doWantKeyboard},
+                  {(char*)"nativeAddInputChar",    (char*)"(I)V",                         (void*)doAddInputChar},
+                  {(char*)"nativeAddKeyEvent",     (char*)"(IZ)V",                        (void*)doAddKeyEvent},
+                  {(char*)"nativeSetClassDetails", (char*)"(ILjava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetClassDetails},
+              };
+              if (env->RegisterNatives(gHelperClass, methods, 9) != 0) {
+                  env->ExceptionClear();
+                  return JNI_VERSION_1_6;
+              }
+              log_step("JNI_OnLoad: natives registered");
+              pthread_t t;
+              if (pthread_create(&t, nullptr, pollThread, nullptr) == 0) pthread_detach(t);
+              return JNI_VERSION_1_6;
+          }
+          CPP_EOF
+
+      - name: Regenerate DEX
+        run: |
+          set -e
+          rm -rf /tmp/dex && mkdir -p /tmp/dex
+          D8=$(find $ANDROID_HOME/build-tools -name d8 | sort -V | tail -1)
+          ANDROID_JAR=$(find $ANDROID_HOME/platforms -name android.jar | sort -V | tail -1)
+          javac -source 8 -target 8 -cp "$ANDROID_JAR" -d /tmp/dex \
+                app/src/main/java/com/menu/imgui/Helper.java \
+                app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
+          echo "=== Compile output ==="
+          find /tmp/dex -name "*.class"
+          $D8 --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex \
+              $(find /tmp/dex -name "*.class")
+          xxd -i -n imgui_dex /tmp/dex/classes.dex | sed 's/unsigned char/const unsigned char/' > app/src/main/cpp/tool/dex_data.h
+          grep -q "imgui_dex\[\]" app/src/main/cpp/tool/dex_data.h && echo "OK: dex_data.h"
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+
+      - name: Build
+        run: |
+          if [ ! -s gradlew ]; then gradle wrapper --gradle-version 8.5; fi
+          chmod +x gradlew
+          rm -rf app/.cxx app/build .gradle
+          ./gradlew :app:assembleDebug --no-build-cache --stacktrace
+
+      - name: Upload artifacts
+        run: |
+          mkdir -p /tmp/so-out
+          find app/build -name "libtool.so" -exec cp {} /tmp/so-out/ \;
+          ls -la /tmp/so-out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libtool-multi-sections
+          path: /tmp/so-out/libtool.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imgui-test-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Commit
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "feat: multi-section workspace with detach/close [skip ci]"
+          git push
