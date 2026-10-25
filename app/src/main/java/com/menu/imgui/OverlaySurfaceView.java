@@ -37,16 +37,12 @@ public class OverlaySurfaceView extends GLSurfaceView {
     public boolean isReady() { return ready; }
 
     private void showKeyboard() {
-        try {
-            requestFocus();
-            imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
-        } catch (Throwable ignored) { }
+        try { requestFocus(); imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT); }
+        catch (Throwable ignored) { }
     }
-
     private void hideKeyboard() {
-        try {
-            imm.hideSoftInputFromWindow(getWindowToken(), 0);
-        } catch (Throwable ignored) { }
+        try { imm.hideSoftInputFromWindow(getWindowToken(), 0); }
+        catch (Throwable ignored) { }
     }
 
     private class MyRenderer implements GLSurfaceView.Renderer {
@@ -61,12 +57,10 @@ public class OverlaySurfaceView extends GLSurfaceView {
             final boolean want = Helper.nativeWantKeyboard();
             long now = System.currentTimeMillis();
             if (want && !keyboardShown) {
-                keyboardShown = true;
-                lastActionMs = now;
+                keyboardShown = true; lastActionMs = now;
                 post(() -> showKeyboard());
             } else if (!want && keyboardShown) {
-                keyboardShown = false;
-                lastActionMs = now;
+                keyboardShown = false; lastActionMs = now;
                 post(() -> hideKeyboard());
             } else if (want && keyboardShown && !imm.isAcceptingText() && now - lastActionMs > 400) {
                 lastActionMs = now;
@@ -86,16 +80,11 @@ public class OverlaySurfaceView extends GLSurfaceView {
                 | EditorInfo.IME_FLAG_NO_EXTRACT_UI;
         return new BaseInputConnection(this, false) {
             @Override public boolean commitText(CharSequence text, int pos) {
-                if (text != null) {
-                    for (int i = 0; i < text.length(); i++) {
-                        Helper.nativeAddInputChar(text.charAt(i));
-                    }
-                }
+                if (text != null) for (int i = 0; i < text.length(); i++)
+                    Helper.nativeAddInputChar(text.charAt(i));
                 return true;
             }
-            @Override public boolean setComposingText(CharSequence text, int pos) {
-                return commitText(text, pos);
-            }
+            @Override public boolean setComposingText(CharSequence text, int pos) { return commitText(text, pos); }
             @Override public boolean deleteSurroundingText(int before, int after) {
                 for (int i = 0; i < before; i++) {
                     Helper.nativeAddKeyEvent(67, true);
@@ -112,9 +101,7 @@ public class OverlaySurfaceView extends GLSurfaceView {
                     return true;
                 }
                 if (ev.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
-                    if (ev.getAction() == KeyEvent.ACTION_DOWN) {
-                        Helper.nativeAddInputChar('\n');
-                    }
+                    if (ev.getAction() == KeyEvent.ACTION_DOWN) Helper.nativeAddInputChar('\n');
                     return true;
                 }
                 return super.sendKeyEvent(ev);

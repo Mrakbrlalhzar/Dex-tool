@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <algorithm>
 #include <unwind.h>
 
 #ifndef MY_PI
@@ -36,38 +37,46 @@ static int g_log_fd = -1;
 
 static std::vector<std::string> gClassList;
 static std::mutex gClassListMutex;
-static char gFilter[128] = {0};
+
+// ---------- Sections ----------
+struct Section {
+    int id = 0;
+    char filter[128] = {0};
+    bool detached = false;
+    float detX = 100, detY = 100, detW = 550, detH = 550;
+    bool showDetails = false;
+    std::string selectedClass;
+    std::vector<std::string> fields;
+    std::vector<std::string> methods;
+    bool loading = false;
+};
+
+static std::vector<Section> gSections;
+static int gNextSectionId = 1;
+static std::vector<int> gPendingCloseSections;
+static bool gRequestAddSection = false;
+
+struct PendingRequest { int sectionId; std::string className; };
+static std::vector<PendingRequest> gPendingRequests;
+static std::mutex gPendingMutex;
+
+static float g_settingFontScale = 1.00f;
+static float g_settingDragSpeed = 0.55f;
+static float g_settingScrollSpeed = 1.40f;
+
+static bool g_menuVisible = true;
+static float g_fabSize = 58.0f;
+static float g_fabX = -1.0f, g_fabY = -1.0f;
+static bool g_fabDown = false, g_fabMoved = false;
+static float g_fabDownAtX = 0, g_fabDownAtY = 0;
+static float g_fabDragStartX = 0, g_fabDragStartY = 0;
 
 static float g_winX = 0, g_winY = 0, g_winW = 0, g_winH = 0, g_titleH = 30.0f;
 static float g_virtX = 0, g_virtY = 0;
 static float g_realPrevX = 0, g_realPrevY = 0;
 static bool g_firstFrame = false;
 
-static float g_settingFontScale   = 1.00f;
-static float g_settingDragSpeed   = 0.55f;
-static float g_settingScrollSpeed = 1.40f;
-
-static bool  g_menuVisible = true;
-static float g_fabSize = 58.0f;
-static float g_fabX = -1.0f;
-static float g_fabY = -1.0f;
-
-// FAB drag state
-static bool  g_fabDown = false;
-static bool  g_fabMoved = false;
-static float g_fabDownAtX = 0, g_fabDownAtY = 0;
-static float g_fabDragStartX = 0, g_fabDragStartY = 0;
-
-// View mode: 0 = class list, 1 = class details
-static int g_viewMode = 0;
-static std::string g_selectedClass;
-static std::vector<std::string> g_selectedFields;
-static std::vector<std::string> g_selectedMethods;
-static bool g_classDetailsLoading = false;
-static std::string g_pendingClassRequest;
-static std::mutex gClassDetailsMutex;
-
-// ---------------- Logging ----------------
+// ---------- Logging ----------
 static void get_pkg_name(char* out, size_t outsz) {
     out[0] = 0;
     FILE* f = fopen("/proc/self/cmdline", "r");
@@ -85,17 +94,17 @@ static void init_log() {
     if (fd >= 0) { g_log_fd = fd; return; }
     char pkg[256]; get_pkg_name(pkg, sizeof(pkg));
     if (pkg[0]) {
-        char p2[512], p3[512];
-        snprintf(p2, sizeof(p2), "/sdcard/Android/data/%s", pkg); mkdir(p2, 0770);
-        snprintf(p3, sizeof(p3), "/sdcard/Android/data/%s/crash.log", pkg);
-        fd = try_open(p3); if (fd >= 0) { g_log_fd = fd; return; }
+        char p1[512], p2[512];
+        snprintf(p1, sizeof(p1), "/sdcard/Android/data/%s", pkg); mkdir(p1, 0770);
+        snprintf(p2, sizeof(p2), "/sdcard/Android/data/%s/crash.log", pkg);
+        fd = try_open(p2); if (fd >= 0) { g_log_fd = fd; return; }
     }
 }
 static void log_step(const char* msg) {
     if (g_log_fd >= 0) { write(g_log_fd, "[N] ", 4); write(g_log_fd, msg, strlen(msg)); write(g_log_fd, "\n", 1); fsync(g_log_fd); }
 }
 
-// ---------------- Crash handlers ----------------
+// ---------- Crash handler ----------
 struct BtState { void** cur; void** end; };
 static _Unwind_Reason_Code bt_cb(struct _Unwind_Context* ctx, void* arg) {
     BtState* s = (BtState*)arg;
@@ -107,36 +116,36 @@ static size_t capture_bt(void** b, size_t max) { BtState s = {b, b+max}; _Unwind
 static char g_alt[16384];
 static void crash_handler(int sig, siginfo_t*, void*) {
     if (g_log_fd >= 0) {
-        write(g_log_fd, "\n=== NATIVE CRASH ===\nSignal: ", 32);
+        write(g_log_fd, "\n=== NATIVE CRASH ===\n", 22);
         void* bt[32]; size_t n = capture_bt(bt, 32);
         for (size_t i = 0; i < n; i++) {
-            uintptr_t a=(uintptr_t)bt[i]; char hx[20]; hx[0]='0'; hx[1]='x';
-            const char* H="0123456789abcdef";
-            for (int j=0;j<16;j++) hx[2+j]=H[(a>>((15-j)*4))&0xF];
-            hx[18]='\n'; write(g_log_fd, hx, 19);
+            uintptr_t a = (uintptr_t)bt[i]; char hx[20]; hx[0]='0'; hx[1]='x';
+            const char* H = "0123456789abcdef";
+            for (int j = 0; j < 16; j++) hx[2+j] = H[(a>>((15-j)*4))&0xF];
+            hx[18] = '\n'; write(g_log_fd, hx, 19);
         }
         write(g_log_fd, "=== END ===\n", 12); fsync(g_log_fd);
     }
     signal(sig, SIG_DFL); raise(sig);
 }
 static void install_crash_handlers() {
-    stack_t ss; ss.ss_sp=g_alt; ss.ss_size=sizeof(g_alt); ss.ss_flags=0;
+    stack_t ss; ss.ss_sp = g_alt; ss.ss_size = sizeof(g_alt); ss.ss_flags = 0;
     sigaltstack(&ss, nullptr);
-    struct sigaction sa; memset(&sa,0,sizeof(sa));
-    sa.sa_sigaction=crash_handler;
-    sa.sa_flags=SA_SIGINFO|SA_ONSTACK|SA_RESETHAND;
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV,&sa,nullptr); sigaction(SIGABRT,&sa,nullptr);
-    sigaction(SIGFPE,&sa,nullptr);  sigaction(SIGILL,&sa,nullptr);
-    sigaction(SIGBUS,&sa,nullptr);  sigaction(SIGTRAP,&sa,nullptr);
+    sigaction(SIGSEGV, &sa, nullptr); sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGFPE, &sa, nullptr);  sigaction(SIGILL, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);  sigaction(SIGTRAP, &sa, nullptr);
 }
 
-// ---------------- Sigil ----------------
+// ---------- Sigil ----------
 static void drawSigil(ImDrawList* dl, ImVec2 c, float r) {
     const ImU32 gold = IM_COL32(255, 200, 87, 255);
     const ImU32 cyan = IM_COL32(77, 208, 225, 220);
     const ImU32 dark = IM_COL32(10, 12, 16, 255);
-    const ImU32 red  = IM_COL32(255, 80, 80, 210);
+    const ImU32 red = IM_COL32(255, 80, 80, 210);
     for (int i = 5; i >= 1; i--) dl->AddCircle(c, r + i * 1.5f, IM_COL32(255, 200, 87, 10), 32, 1.0f);
     ImVec2 top(c.x, c.y - r), right(c.x + r, c.y), bot(c.x, c.y + r), left(c.x - r, c.y);
     dl->AddQuad(top, right, bot, left, gold, 2.0f);
@@ -173,7 +182,24 @@ static void drawSigil(ImDrawList* dl, ImVec2 c, float r) {
     }
 }
 
-// ---------------- DEX load ----------------
+// ---------- Sections ----------
+static Section* findSection(int id) {
+    for (auto& s : gSections) if (s.id == id) return &s;
+    return nullptr;
+}
+static void addSectionImpl() {
+    Section s;
+    s.id = gNextSectionId++;
+    s.detached = false;
+    s.detX = 100; s.detY = 100; s.detW = 550; s.detH = 550;
+    gSections.push_back(std::move(s));
+}
+static void closeSectionImpl(int id) {
+    gSections.erase(std::remove_if(gSections.begin(), gSections.end(),
+                    [id](const Section& s) { return s.id == id; }), gSections.end());
+}
+
+// ---------- DEX load ----------
 static bool loadDex(JNIEnv* env) {
     jclass clCls = env->FindClass("java/lang/ClassLoader");
     if (!clCls) return false;
@@ -239,7 +265,7 @@ static void* pollThread(void*) {
     return nullptr;
 }
 
-// ---------------- Style ----------------
+// ---------- Style ----------
 static void setupStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 16; s.ChildRounding = 12; s.FrameRounding = 10;
@@ -276,7 +302,6 @@ static void setupStyle() {
     c[ImGuiCol_Separator]            = ImVec4(1.00f, 0.78f, 0.34f, 0.25f);
 }
 
-// ---------------- Lifecycle ----------------
 static void doInit(JNIEnv* env, jclass, jobject surface) {
     if (gInitialized || !surface) return;
     gWindow = ANativeWindow_fromSurface(env, surface);
@@ -288,74 +313,75 @@ static void doInit(JNIEnv* env, jclass, jobject surface) {
     if (!ImGui_ImplAndroid_Init(gWindow)) return;
     if (!ImGui_ImplOpenGL3_Init("#version 300 es")) return;
     gInitialized = true;
+    if (gSections.empty()) addSectionImpl();
 }
 static void doResize(JNIEnv*, jclass, jint w, jint h) { gWidth = w; gHeight = h; glViewport(0, 0, w, h); }
 
-// ---------------- FAB ----------------
-static void renderFAB() {
-    ImGuiIO& io = ImGui::GetIO();
-    if (g_fabX < 0) g_fabX = io.DisplaySize.x - g_fabSize - 18;
-    if (g_fabY < 0) g_fabY = io.DisplaySize.y - g_fabSize - 36;
+// ---------- Section content ----------
+static void renderSectionContent(Section& sec, bool isDetached) {
+    if (sec.showDetails) {
+        if (ImGui::Button("< Back", ImVec2(90, 0))) {
+            sec.showDetails = false;
+            sec.selectedClass.clear();
+            sec.fields.clear();
+            sec.methods.clear();
+            sec.loading = false;
+            return;
+        }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.78f, 0.34f, 1.00f));
+        ImGui::TextWrapped("%s", sec.selectedClass.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
 
-    ImGui::SetNextWindowPos(ImVec2(g_fabX, g_fabY));
-    ImGui::SetNextWindowSize(ImVec2(g_fabSize, g_fabSize));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-    ImGui::Begin("##fab", nullptr,
-        ImGuiWindowFlags_NoDecoration |
-        ImGuiWindowFlags_NoBackground |
-        ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoFocusOnAppearing |
-        ImGuiWindowFlags_NoInputs |
-        ImGuiWindowFlags_NoScrollWithMouse);
+        if (sec.loading) { ImGui::TextDisabled("Loading members..."); return; }
 
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 center(g_fabX + g_fabSize * 0.5f, g_fabY + g_fabSize * 0.5f);
-    float r = g_fabSize * 0.5f;
+        ImGui::BeginChild("##details", ImVec2(0, 0), true);
+        if (!sec.fields.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.82f, 0.88f, 1.00f));
+            ImGui::Text("Fields (%zu)", sec.fields.size());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+            for (const auto& f : sec.fields) ImGui::BulletText("%s", f.c_str());
+            ImGui::Spacing();
+        }
+        if (!sec.methods.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.82f, 0.88f, 1.00f));
+            ImGui::Text("Methods (%zu)", sec.methods.size());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+            for (const auto& m : sec.methods) ImGui::BulletText("%s", m.c_str());
+        }
+        if (sec.fields.empty() && sec.methods.empty())
+            ImGui::TextDisabled("No declared members");
+        ImGui::EndChild();
+        return;
+    }
 
-    int alpha = g_fabMoved ? 30 : 15;
-    for (int i = 4; i >= 1; i--) dl->AddCircle(center, r - 1 + i * 1.5f, IM_COL32(255, 200, 87, alpha), 40, 1.2f);
-    dl->AddCircleFilled(center, r - 3, IM_COL32(10, 12, 16, 230), 40);
-    dl->AddCircle(center, r - 3, IM_COL32(255, 200, 87, g_fabMoved ? 255 : 220), 40, 2.5f);
-    drawSigil(dl, center, (r - 6) * 0.85f);
-
-    ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(2);
-}
-
-// ---------------- Tab: Classes (list) ----------------
-static void renderClassesTab() {
-    size_t total;
-    { std::lock_guard<std::mutex> lk(gClassListMutex); total = gClassList.size(); }
-
-    float lineH = ImGui::GetTextLineHeight();
-    float iconS = lineH * 1.3f;
-    ImVec2 cursor = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(iconS, iconS));
-    drawSigil(ImGui::GetWindowDrawList(),
-              ImVec2(cursor.x + iconS * 0.5f, cursor.y + iconS * 0.5f),
-              iconS * 0.42f);
-    ImGui::SameLine(0, 10);
-    ImGui::BeginGroup();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.78f, 0.34f, 1.00f));
-    ImGui::TextUnformatted("Classes");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(0, 8);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.82f, 0.88f, 1.00f));
-    ImGui::Text("%zu", total);
-    ImGui::PopStyleColor();
-    ImGui::TextDisabled("tap any to view members");
-    ImGui::EndGroup();
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##filter", "Search classes...", gFilter, sizeof(gFilter));
+    float detachW = isDetached ? 80.0f : 100.0f;
+    float closeW = 30.0f;
+    float avail = ImGui::GetContentRegionAvail().x;
+    ImGui::SetNextItemWidth(avail - detachW - closeW - 20);
+    ImGui::InputTextWithHint("##filter", "Search classes...", sec.filter, sizeof(sec.filter));
+    ImGui::SameLine();
+    if (isDetached) {
+        if (ImGui::Button("Dock", ImVec2(detachW, 0))) sec.detached = false;
+    } else {
+        if (ImGui::Button("Detach", ImVec2(detachW, 0))) {
+            sec.detached = true;
+            sec.detX = g_winX + 60;
+            sec.detY = g_winY + 80;
+            sec.detW = 550;
+            sec.detH = 550;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("X", ImVec2(closeW, 0))) {
+        gPendingCloseSections.push_back(sec.id);
+        return;
+    }
     ImGui::Spacing();
 
     int shown = 0;
@@ -363,9 +389,9 @@ static void renderClassesTab() {
     {
         std::lock_guard<std::mutex> lk(gClassListMutex);
         visible.reserve(gClassList.size());
-        if (gFilter[0]) {
+        if (sec.filter[0]) {
             for (int i = 0; i < (int)gClassList.size(); i++)
-                if (gClassList[i].find(gFilter) != std::string::npos) visible.push_back(i);
+                if (gClassList[i].find(sec.filter) != std::string::npos) visible.push_back(i);
         } else {
             for (int i = 0; i < (int)gClassList.size(); i++) visible.push_back(i);
         }
@@ -383,15 +409,15 @@ static void renderClassesTab() {
                     const std::string& n = gClassList[visible[i]];
                     ImGui::PushID(i);
                     if (ImGui::Selectable(n.c_str(), false)) {
+                        sec.selectedClass = n;
+                        sec.fields.clear();
+                        sec.methods.clear();
+                        sec.loading = true;
+                        sec.showDetails = true;
                         {
-                            std::lock_guard<std::mutex> lk2(gClassDetailsMutex);
-                            g_selectedClass = n;
-                            g_selectedFields.clear();
-                            g_selectedMethods.clear();
-                            g_classDetailsLoading = true;
+                            std::lock_guard<std::mutex> lk2(gPendingMutex);
+                            gPendingRequests.push_back({sec.id, n});
                         }
-                        g_pendingClassRequest = n;
-                        g_viewMode = 1;
                     }
                     ImGui::PopID();
                 }
@@ -399,11 +425,38 @@ static void renderClassesTab() {
         }
         ImGui::EndChild();
     }
-
-    ImGui::TextDisabled("Showing %d of %zu", shown, total);
+    ImGui::TextDisabled("Showing %d of %zu", shown, gClassList.size());
 }
 
-// ---------------- Tab: Settings ----------------
+// ---------- FAB ----------
+static void renderFAB() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (g_fabX < 0) g_fabX = io.DisplaySize.x - g_fabSize - 18;
+    if (g_fabY < 0) g_fabY = io.DisplaySize.y - g_fabSize - 36;
+    ImGui::SetNextWindowPos(ImVec2(g_fabX, g_fabY));
+    ImGui::SetNextWindowSize(ImVec2(g_fabSize, g_fabSize));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::Begin("##fab", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoInputs |
+        ImGuiWindowFlags_NoScrollWithMouse);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 center(g_fabX + g_fabSize * 0.5f, g_fabY + g_fabSize * 0.5f);
+    float r = g_fabSize * 0.5f;
+    int alpha = g_fabMoved ? 30 : 15;
+    for (int i = 4; i >= 1; i--) dl->AddCircle(center, r - 1 + i * 1.5f, IM_COL32(255, 200, 87, alpha), 40, 1.2f);
+    dl->AddCircleFilled(center, r - 3, IM_COL32(10, 12, 16, 230), 40);
+    dl->AddCircle(center, r - 3, IM_COL32(255, 200, 87, g_fabMoved ? 255 : 220), 40, 2.5f);
+    drawSigil(dl, center, (r - 6) * 0.85f);
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
+// ---------- Settings ----------
 static void renderSettingsTab() {
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.78f, 0.34f, 1.00f));
@@ -436,72 +489,13 @@ static void renderSettingsTab() {
     ImGui::TextDisabled("github.com/Mrakbrlalhzar");
 }
 
-// ---------------- Class details view ----------------
-static void renderClassDetails() {
-    std::string clsName;
-    std::vector<std::string> fields, methods;
-    bool loading;
-    {
-        std::lock_guard<std::mutex> lk(gClassDetailsMutex);
-        clsName = g_selectedClass;
-        fields = g_selectedFields;
-        methods = g_selectedMethods;
-        loading = g_classDetailsLoading;
-    }
-
-    if (ImGui::Button("< Back", ImVec2(90, 0))) {
-        g_viewMode = 0;
-        return;
-    }
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.78f, 0.34f, 1.00f));
-    ImGui::TextUnformatted(clsName.empty() ? "(no class)" : clsName.c_str());
-    ImGui::PopStyleColor();
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    if (loading) {
-        ImGui::TextDisabled("Loading members...");
-        return;
-    }
-
-    ImGui::BeginChild("##details", ImVec2(0, 0), true);
-
-    if (!fields.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.82f, 0.88f, 1.00f));
-        ImGui::Text("Fields (%zu)", fields.size());
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        for (const auto& f : fields)
-            ImGui::BulletText("%s", f.c_str());
-        ImGui::Spacing();
-    }
-
-    if (!methods.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.82f, 0.88f, 1.00f));
-        ImGui::Text("Methods (%zu)", methods.size());
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        for (const auto& m : methods)
-            ImGui::BulletText("%s", m.c_str());
-    }
-
-    if (fields.empty() && methods.empty())
-        ImGui::TextDisabled("No declared members");
-
-    ImGui::EndChild();
-}
-
-// ---------------- Main window ----------------
+// ---------- Main window ----------
 static void renderMainWindow() {
     ImGuiIO& io = ImGui::GetIO();
     float w = io.DisplaySize.x * 0.92f;
     float h = io.DisplaySize.y * 0.85f;
     ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - w) * 0.5f, io.DisplaySize.y * 0.075f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
-
     ImGui::Begin("DexTool", nullptr, ImGuiWindowFlags_None);
 
     ImVec2 wp = ImGui::GetWindowPos();
@@ -510,74 +504,130 @@ static void renderMainWindow() {
     g_winW = ws.x; g_winH = ws.y;
     g_titleH = ImGui::GetFrameHeight();
 
-    if (g_viewMode == 1) {
-        renderClassDetails();
-    } else {
-        if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_None)) {
-            if (ImGui::BeginTabItem("Classes")) {
-                renderClassesTab();
-                ImGui::EndTabItem();
+    if (ImGui::BeginTabBar("##main_tabs", ImGuiTabBarFlags_None)) {
+        if (ImGui::BeginTabItem("Classes")) {
+            if (ImGui::BeginTabBar("##sections", ImGuiTabBarFlags_AutoSelectNewTabs | ImGuiTabBarFlags_FittingPolicyScroll)) {
+                for (auto& sec : gSections) {
+                    if (sec.detached) continue;
+                    char tabLabel[256];
+                    if (sec.filter[0]) {
+                        snprintf(tabLabel, sizeof(tabLabel), "S%d: %s", sec.id, sec.filter);
+                    } else {
+                        snprintf(tabLabel, sizeof(tabLabel), "Section %d", sec.id);
+                    }
+                    if (ImGui::BeginTabItem(tabLabel)) {
+                        renderSectionContent(sec, false);
+                        ImGui::EndTabItem();
+                    }
+                }
+                if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) {
+                    gRequestAddSection = true;
+                }
+                ImGui::EndTabBar();
             }
-            if (ImGui::BeginTabItem("Settings")) {
-                renderSettingsTab();
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
+            ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Settings")) {
+            renderSettingsTab();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
-
     ImGui::End();
 }
 
-// ---------------- Pending request processor ----------------
-static void processPendingClassRequest() {
-    if (g_pendingClassRequest.empty()) return;
-    std::string className = g_pendingClassRequest;
-    g_pendingClassRequest.clear();
+// ---------- Detached windows ----------
+static void renderDetachedWindows() {
+    for (auto& sec : gSections) {
+        if (!sec.detached) continue;
+        ImGui::SetNextWindowPos(ImVec2(sec.detX, sec.detY), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(sec.detW, sec.detH), ImGuiCond_FirstUseEver);
+        char title[256];
+        if (sec.filter[0]) {
+            snprintf(title, sizeof(title), "S%d: %s##det_%d", sec.id, sec.filter, sec.id);
+        } else {
+            snprintf(title, sizeof(title), "Section %d##det_%d", sec.id, sec.id);
+        }
+        bool open = true;
+        ImGui::Begin(title, &open, ImGuiWindowFlags_None);
+        ImVec2 p = ImGui::GetWindowPos();
+        ImVec2 s = ImGui::GetWindowSize();
+        sec.detX = p.x; sec.detY = p.y;
+        sec.detW = s.x; sec.detH = s.y;
+        renderSectionContent(sec, true);
+        ImGui::End();
+        if (!open) gPendingCloseSections.push_back(sec.id);
+    }
+}
 
+// ---------- Pending ----------
+static void processPendingClassRequests() {
+    if (gPendingRequests.empty() || !gHelperClass || !gVM) return;
+    PendingRequest req;
+    {
+        std::lock_guard<std::mutex> lk(gPendingMutex);
+        if (gPendingRequests.empty()) return;
+        req = gPendingRequests.front();
+        gPendingRequests.erase(gPendingRequests.begin());
+    }
     JNIEnv* env = nullptr;
     bool attached = false;
     if (gVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
         if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
         attached = true;
     }
-    jmethodID reqM = env->GetStaticMethodID(gHelperClass, "requestClassDetails", "(Ljava/lang/String;)V");
+    jmethodID reqM = env->GetStaticMethodID(gHelperClass, "requestClassDetails", "(ILjava/lang/String;)V");
     if (reqM) {
-        jstring js = env->NewStringUTF(className.c_str());
-        env->CallStaticVoidMethod(gHelperClass, reqM, js);
+        jstring js = env->NewStringUTF(req.className.c_str());
+        env->CallStaticVoidMethod(gHelperClass, reqM, (jint)req.sectionId, js);
         env->DeleteLocalRef(js);
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
     if (attached) gVM->DetachCurrentThread();
 }
 
+static void applyPendingChanges() {
+    if (gRequestAddSection) {
+        addSectionImpl();
+        gRequestAddSection = false;
+    }
+    if (!gPendingCloseSections.empty()) {
+        std::vector<int> toClose = gPendingCloseSections;
+        gPendingCloseSections.clear();
+        for (int id : toClose) closeSectionImpl(id);
+    }
+}
+
 static void doRender(JNIEnv*, jclass) {
     if (!gInitialized) return;
     if (!g_firstFrame) { log_step("doRender: first frame"); g_firstFrame = true; }
-
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame();
     ImGuiIO& io = ImGui::GetIO();
     io.FontGlobalScale = g_settingFontScale;
     ImGui::NewFrame();
 
-    if (g_menuVisible) renderMainWindow();
+    if (g_menuVisible) {
+        renderMainWindow();
+        renderDetachedWindows();
+    }
     renderFAB();
-    processPendingClassRequest();
+    processPendingClassRequests();
 
     ImGui::Render();
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    applyPendingChanges();
 }
 
-// ---------------- Touch ----------------
+// ---------- Touch ----------
 static jboolean doTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
     if (!gInitialized) return JNI_FALSE;
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
 
-    // ---- FAB drag/tap always handled first ----
     if (action == 0) {
         bool inFAB = (g_fabX >= 0 && x >= g_fabX && x <= g_fabX + g_fabSize &&
                       g_fabY >= 0 && y >= g_fabY && y <= g_fabY + g_fabSize);
@@ -605,18 +655,13 @@ static jboolean doTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
         }
         if (action == 1 || action == 3) {
             g_fabDown = false;
-            if (!g_fabMoved) {
-                g_menuVisible = !g_menuVisible;
-                if (g_menuVisible) g_viewMode = 0;
-            }
+            if (!g_fabMoved) g_menuVisible = !g_menuVisible;
             return JNI_TRUE;
         }
     }
 
-    // ---- Menu hidden: everything else passes through ----
     if (!g_menuVisible) return JNI_FALSE;
 
-    // ---- Menu visible: damped virtual cursor ----
     if (action == 0) {
         g_virtX = x; g_virtY = y;
         g_realPrevX = x; g_realPrevY = y;
@@ -629,29 +674,24 @@ static jboolean doTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
         float dx = x - g_realPrevX;
         float dy = y - g_realPrevY;
         g_realPrevX = x; g_realPrevY = y;
-
         bool inWindow = (g_virtX >= g_winX && g_virtX <= g_winX + g_winW &&
                          g_virtY >= g_winY && g_virtY <= g_winY + g_winH);
         bool inTitleBar = inWindow && (g_virtY <= g_winY + g_titleH);
-
         float scale = 1.0f;
         if (inTitleBar) scale = g_settingDragSpeed;
         else if (inWindow) scale = g_settingScrollSpeed;
-
         g_virtX += dx * scale;
         g_virtY += dy * scale;
         if (g_virtX < 0) g_virtX = 0;
         if (g_virtY < 0) g_virtY = 0;
         if (g_virtX > io.DisplaySize.x) g_virtX = io.DisplaySize.x;
         if (g_virtY > io.DisplaySize.y) g_virtY = io.DisplaySize.y;
-
         io.AddMousePosEvent(g_virtX, g_virtY);
     }
-
     return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
 }
 
-// ---------------- Native callbacks ----------------
+// ---------- Natives ----------
 static jboolean doWantKeyboard(JNIEnv*, jclass) {
     if (!gInitialized) return JNI_FALSE;
     return ImGui::GetIO().WantTextInput ? JNI_TRUE : JNI_FALSE;
@@ -708,16 +748,15 @@ static std::vector<std::string> jarrToStrs(JNIEnv* env, jobjectArray arr) {
     }
     return out;
 }
-
-static void doSetClassDetails(JNIEnv* env, jclass, jstring className, jobjectArray fields, jobjectArray methods) {
+static void doSetClassDetails(JNIEnv* env, jclass, jint sectionId,
+                              jstring className, jobjectArray fields, jobjectArray methods) {
     std::string name = jstrToStd(env, className);
-    std::vector<std::string> fs = jarrToStrs(env, fields);
-    std::vector<std::string> ms = jarrToStrs(env, methods);
-    std::lock_guard<std::mutex> lk(gClassDetailsMutex);
-    if (name != g_selectedClass) return;
-    g_selectedFields = std::move(fs);
-    g_selectedMethods = std::move(ms);
-    g_classDetailsLoading = false;
+    Section* sec = findSection((int)sectionId);
+    if (!sec) return;
+    if (name != sec->selectedClass) return;
+    sec->fields = jarrToStrs(env, fields);
+    sec->methods = jarrToStrs(env, methods);
+    sec->loading = false;
 }
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
@@ -737,7 +776,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
         {(char*)"nativeWantKeyboard",    (char*)"()Z",                          (void*)doWantKeyboard},
         {(char*)"nativeAddInputChar",    (char*)"(I)V",                         (void*)doAddInputChar},
         {(char*)"nativeAddKeyEvent",     (char*)"(IZ)V",                        (void*)doAddKeyEvent},
-        {(char*)"nativeSetClassDetails", (char*)"(Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetClassDetails},
+        {(char*)"nativeSetClassDetails", (char*)"(ILjava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetClassDetails},
     };
     if (env->RegisterNatives(gHelperClass, methods, 9) != 0) {
         env->ExceptionClear();

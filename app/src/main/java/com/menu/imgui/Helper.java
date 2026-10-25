@@ -159,12 +159,10 @@ public class Helper {
     private static int rd16(byte[] d, int off) {
         return (d[off] & 0xFF) | ((d[off + 1] & 0xFF) << 8);
     }
-
     private static int rd32(byte[] d, int off) {
         return (d[off] & 0xFF) | ((d[off+1] & 0xFF) << 8) |
                ((d[off+2] & 0xFF) << 16) | ((d[off+3] & 0xFF) << 24);
     }
-
     private static int readUleb128(byte[] d, int[] pos) {
         int result = 0;
         int shift = 0;
@@ -176,7 +174,6 @@ public class Helper {
         }
         return result;
     }
-
     private static String readString(byte[] d, int strIdsOff, int strIdx) {
         if (strIdx < 0) return "";
         int strDataOff = rd32(d, strIdsOff + strIdx * 4);
@@ -188,12 +185,10 @@ public class Helper {
         while (p < d.length && d[p] != 0) p++;
         return new String(d, start, p - start, StandardCharsets.UTF_8);
     }
-
     private static String getTypeDesc(byte[] d, int typeIdsOff, int strIdsOff, int typeIdx) {
         int strIdx = rd32(d, typeIdsOff + typeIdx * 4);
         return readString(d, strIdsOff, strIdx);
     }
-
     private static String prettyType(String desc) {
         if (desc == null || desc.isEmpty()) return "?";
         switch (desc.charAt(0)) {
@@ -217,7 +212,6 @@ public class Helper {
     private static void parseDexClasses(byte[] d, List<String> out) {
         if (d.length < 0x70) return;
         if (d[0] != 'd' || d[1] != 'e' || d[2] != 'x' || d[3] != '\n') return;
-        int strIdsSize  = rd32(d, 0x38);
         int strIdsOff   = rd32(d, 0x3C);
         int typeIdsSize = rd32(d, 0x40);
         int typeIdsOff  = rd32(d, 0x44);
@@ -235,8 +229,8 @@ public class Helper {
     }
 
     // ==================== Class details ====================
-    public static void requestClassDetails(String className) {
-        log("requestClassDetails: " + className);
+    public static void requestClassDetails(int sectionId, String className) {
+        log("requestClassDetails: sec=" + sectionId + " " + className);
         new Thread(() -> {
             String[] fields = new String[0];
             String[] methods = new String[0];
@@ -244,11 +238,11 @@ public class Helper {
                 ClassMembers m = parseClassMembers(className);
                 fields = m.fields.toArray(new String[0]);
                 methods = m.methods.toArray(new String[0]);
-                log("classDetails: fields=" + fields.length + " methods=" + methods.length);
+                log("classDetails: sec=" + sectionId + " fields=" + fields.length + " methods=" + methods.length);
             } catch (Throwable t) {
                 log("requestClassDetails failed: " + t);
             }
-            nativeSetClassDetails(className, fields, methods);
+            nativeSetClassDetails(sectionId, className, fields, methods);
         }, "ImGuiClassDetails").start();
     }
 
@@ -392,7 +386,6 @@ public class Helper {
         return sb.toString();
     }
 
-    // ==================== Natives ====================
     static native void nativeInit(android.view.Surface s);
     static native void nativeResize(int w, int h);
     static native void nativeRender();
@@ -401,5 +394,5 @@ public class Helper {
     static native boolean nativeWantKeyboard();
     static native void nativeAddInputChar(int codepoint);
     static native void nativeAddKeyEvent(int keycode, boolean down);
-    static native void nativeSetClassDetails(String className, String[] fields, String[] methods);
+    static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
 }
