@@ -1,0 +1,37 @@
+[
+{
+  "directory": "/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a",
+  "command": "/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -o CMakeFiles/tool.dir/tool/native-lib.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp",
+  "file": "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp"
+},
+{
+  "directory": "/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a",
+  "command": "/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -o CMakeFiles/tool.dir/imgui/imgui.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui.cpp",
+  "file": "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui.cpp"
+},
+{
+  "directory": "/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a",
+  "command": "/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -o CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui_draw.cpp",
+  "file": "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui_draw.cpp"
+},
+{
+  "directory": "/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a",
+  "command": "/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -o CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui_tables.cpp",
+  "file": "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui_tables.cpp"
+},
+{
+  "directory": "/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a",
+  "command": "/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -o CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui_widgets.cpp",
+  "file": "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui_widgets.cpp"
+},
+{
+  "directory": "/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a",
+  "command": "/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -o CMakeFiles/tool.dir/imgui/backends/imgui_impl_android.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends/imgui_impl_android.cpp",
+  "file": "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends/imgui_impl_android.cpp"
+},
+{
+  "directory": "/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a",
+  "command": "/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -o CMakeFiles/tool.dir/imgui/backends/imgui_impl_opengl3.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends/imgui_impl_opengl3.cpp",
+  "file": "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends/imgui_impl_opengl3.cpp"
+}
+]
