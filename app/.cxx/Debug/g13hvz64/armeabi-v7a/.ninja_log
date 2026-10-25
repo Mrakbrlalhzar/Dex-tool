@@ -1,9 +1,0 @@
-# ninja log v5
-0	184	1792916390736247714	CMakeFiles/tool.dir/imgui/backends/imgui_impl_android.cpp.o	a9974f7c235c0b7d
-1	196	1792916390742247640	CMakeFiles/tool.dir/tool/native-lib.cpp.o	937d7a6bce538032
-185	433	1792916390981244725	CMakeFiles/tool.dir/imgui/backends/imgui_impl_opengl3.cpp.o	b20a0433afff731b
-5	1247	1792916391787234893	CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o	88ab8623d2cae7cb
-3	1937	1792916392479226451	CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o	63a4e41812bf5686
-2	2103	1792916392643224451	CMakeFiles/tool.dir/imgui/imgui.cpp.o	40b9a30dbf44007b
-5	2153	1792916392698223780	CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o	955f346b37581802
-2153	2200	1792916392753223109	/home/runner/work/Dex-tool/Dex-tool/app/build/intermediates/cxx/Debug/g13hvz64/obj/armeabi-v7a/libtool.so	18a1bdac0c3b5fb7
