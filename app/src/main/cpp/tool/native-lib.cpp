@@ -14,10 +14,11 @@
 #include <sys/stat.h>
 #include <cstring>
 #include <cstdio>
-#include <cfloat>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <mutex>
+#include <algorithm>
 #include <unwind.h>
 
 #define LOG_TAG "ImGuiTool"
@@ -30,18 +31,21 @@ static ANativeWindow* gWindow = nullptr;
 static bool gInitialized = false;
 static int gWidth = 0, gHeight = 0;
 static int g_log_fd = -1;
-static float gScale = 2.5f;
 
 static std::vector<std::string> gClassList;
 static std::mutex gClassListMutex;
 static char gFilter[128] = {0};
 
-// Cached filtered list (rebuilt only when filter or source changes)
-static std::vector<const std::string*> gFilteredCache;
-static char gLastFilter[128] = {0};
-static bool gCacheDirty = true;
+// Window rect captured each frame for touch region detection
+static float g_winX = 0, g_winY = 0, g_winW = 0, g_winH = 0, g_titleH = 30.0f;
 
-// ---------- Logging ----------
+// Virtual cursor (moves slower in title bar, faster in list)
+static float g_virtX = 0, g_virtY = 0;
+static float g_realPrevX = 0, g_realPrevY = 0;
+
+static bool g_firstFrame = false;
+
+// ---------------- Logging ----------------
 static void get_pkg_name(char* out, size_t outsz) {
     out[0] = 0;
     FILE* f = fopen("/proc/self/cmdline", "r");
@@ -50,11 +54,8 @@ static void get_pkg_name(char* out, size_t outsz) {
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     if (n == 0) return;
-    for (size_t i = 0; i < n; i++) {
-        if (buf[i] == 0 || buf[i] == ':') { buf[i] = 0; break; }
-    }
-    strncpy(out, buf, outsz - 1);
-    out[outsz - 1] = 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] == 0 || buf[i] == ':') { buf[i] = 0; break; }
+    strncpy(out, buf, outsz - 1); out[outsz - 1] = 0;
 }
 
 static int try_open(const char* path) {
@@ -72,23 +73,18 @@ static void init_log() {
         if (fd >= 0) { g_log_fd = fd; return; }
     }
     if (pkg[0]) {
-        char p2[512];
+        char p2[512], p3[512], p4[512];
         snprintf(p2, sizeof(p2), "/sdcard/Android/data/%s", pkg);
         mkdir(p2, 0770);
-        char p3[512];
         snprintf(p3, sizeof(p3), "/sdcard/Android/data/%s/crash.log", pkg);
         int fd = try_open(p3);
         if (fd >= 0) { g_log_fd = fd; return; }
-        char p4[512];
-        snprintf(p4, sizeof(p4), "/data/data/%s", pkg);
+        snprintf(p4, sizeof(p4), "/data/data/%s/files", pkg);
         mkdir(p4, 0770);
         char p5[512];
-        snprintf(p5, sizeof(p5), "/data/data/%s/files", pkg);
-        mkdir(p5, 0770);
-        char p6[512];
-        snprintf(p6, sizeof(p6), "/data/data/%s/files/crash.log", pkg);
-        fd = try_open(p6);
-        if (fd >= 0) g_log_fd = fd;
+        snprintf(p5, sizeof(p5), "/data/data/%s/files/crash.log", pkg);
+        fd = try_open(p5);
+        if (fd >= 0) { g_log_fd = fd; return; }
     }
 }
 
@@ -99,18 +95,14 @@ static void log_step(const char* msg) {
         write(g_log_fd, "\n", 1);
         fsync(g_log_fd);
     }
-    __android_log_write(ANDROID_LOG_INFO, LOG_TAG, msg);
 }
 
-// ---------- Backtrace ----------
+// ---------------- Crash handler ----------------
 struct BtState { void** cur; void** end; };
 static _Unwind_Reason_Code bt_cb(struct _Unwind_Context* ctx, void* arg) {
     BtState* s = (BtState*)arg;
     uintptr_t pc = _Unwind_GetIP(ctx);
-    if (pc) {
-        if (s->cur == s->end) return _URC_END_OF_STACK;
-        *(s->cur++) = (void*)pc;
-    }
+    if (pc) { if (s->cur == s->end) return _URC_END_OF_STACK; *(s->cur++) = (void*)pc; }
     return _URC_NO_REASON;
 }
 static size_t capture_bt(void** buf, size_t max) {
@@ -118,98 +110,77 @@ static size_t capture_bt(void** buf, size_t max) {
     _Unwind_Backtrace(bt_cb, &s);
     return s.cur - buf;
 }
-
 static char g_alt_stack[16384];
 static void crash_handler(int sig, siginfo_t*, void*) {
     if (g_log_fd >= 0) {
         write(g_log_fd, "\n=== NATIVE CRASH ===\nSignal: ", 32);
-        const char* name = "OTHER";
-        switch (sig) {
-            case SIGSEGV: name = "SIGSEGV"; break;
-            case SIGABRT: name = "SIGABRT"; break;
-            case SIGFPE:  name = "SIGFPE";  break;
-            case SIGILL:  name = "SIGILL";  break;
-            case SIGBUS:  name = "SIGBUS";  break;
-            case SIGTRAP: name = "SIGTRAP"; break;
-        }
-        write(g_log_fd, name, strlen(name));
+        const char* nm = (sig == SIGSEGV) ? "SIGSEGV" : (sig == SIGABRT) ? "SIGABRT" :
+                         (sig == SIGFPE) ? "SIGFPE" : (sig == SIGILL) ? "SIGILL" :
+                         (sig == SIGBUS) ? "SIGBUS" : (sig == SIGTRAP) ? "SIGTRAP" : "OTHER";
+        write(g_log_fd, nm, strlen(nm));
         write(g_log_fd, "\n", 1);
-        void* bt[32];
-        size_t n = capture_bt(bt, 32);
-        write(g_log_fd, "Backtrace:\n", 11);
-        const char* H = "0123456789abcdef";
+        void* bt[32]; size_t n = capture_bt(bt, 32);
         for (size_t i = 0; i < n; i++) {
-            uintptr_t addr = (uintptr_t)bt[i];
-            char hx[20];
-            hx[0] = '0'; hx[1] = 'x';
-            for (int j = 0; j < 16; j++) hx[2+j] = H[(addr >> ((15-j)*4)) & 0xF];
-            hx[18] = '\n';
+            uintptr_t a = (uintptr_t)bt[i];
+            char hx[20]; hx[0]='0'; hx[1]='x';
+            const char* H="0123456789abcdef";
+            for (int j=0;j<16;j++) hx[2+j]=H[(a>>((15-j)*4))&0xF];
+            hx[18]='\n';
             write(g_log_fd, hx, 19);
         }
         write(g_log_fd, "=== END ===\n", 12);
         fsync(g_log_fd);
     }
-    signal(sig, SIG_DFL);
-    raise(sig);
+    signal(sig, SIG_DFL); raise(sig);
 }
-
 static void install_crash_handlers() {
-    stack_t ss;
-    ss.ss_sp = g_alt_stack;
-    ss.ss_size = sizeof(g_alt_stack);
-    ss.ss_flags = 0;
+    stack_t ss; ss.ss_sp = g_alt_stack; ss.ss_size = sizeof(g_alt_stack); ss.ss_flags = 0;
     sigaltstack(&ss, nullptr);
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, nullptr);
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGFPE,  &sa, nullptr);
-    sigaction(SIGILL,  &sa, nullptr);
-    sigaction(SIGBUS,  &sa, nullptr);
-    sigaction(SIGTRAP, &sa, nullptr);
+    sigaction(SIGSEGV, &sa, nullptr); sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGFPE, &sa, nullptr);  sigaction(SIGILL, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);  sigaction(SIGTRAP, &sa, nullptr);
 }
 
-// ---------- DEX loading ----------
+// ---------------- DEX loading ----------------
 static bool loadDex(JNIEnv* env) {
-    log_step("loadDex: start");
     jclass clCls = env->FindClass("java/lang/ClassLoader");
+    if (!clCls) return false;
     jmethodID getSys = env->GetStaticMethodID(clCls, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
     jobject parent = env->CallStaticObjectMethod(clCls, getSys);
     jclass imCls = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+    if (!imCls) return false;
     jmethodID ctor = env->GetMethodID(imCls, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
     jobject buf = env->NewDirectByteBuffer((void*)imgui_dex, imgui_dex_len);
     jobject loader = env->NewObject(imCls, ctor, buf, parent);
-    if (env->ExceptionCheck()) { env->ExceptionClear(); log_step("loadDex: ctor threw"); return false; }
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!loader) return false;
     jclass lCls = env->GetObjectClass(loader);
     jmethodID loadM = env->GetMethodID(lCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
     jstring name = env->NewStringUTF("com.menu.imgui.Helper");
     jclass hCls = (jclass)env->CallObjectMethod(loader, loadM, name);
-    if (env->ExceptionCheck()) { env->ExceptionClear(); log_step("loadDex: Helper threw"); return false; }
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
     if (!hCls) return false;
     gHelperClass = (jclass)env->NewGlobalRef(hCls);
-    log_step("loadDex: OK");
     return true;
 }
 
-// ---------- Activity discovery ----------
 static jobject getCurrentActivity(JNIEnv* env) {
     jclass atCls = env->FindClass("android/app/ActivityThread");
     if (!atCls) { env->ExceptionClear(); return nullptr; }
     jmethodID cur = env->GetStaticMethodID(atCls, "currentActivityThread", "()Landroid/app/ActivityThread;");
-    if (!cur) { env->ExceptionClear(); return nullptr; }
+    if (env->ExceptionCheck() || !cur) { env->ExceptionClear(); return nullptr; }
     jobject at = env->CallStaticObjectMethod(atCls, cur);
-    if (!at) { env->ExceptionClear(); return nullptr; }
+    if (env->ExceptionCheck() || !at) { env->ExceptionClear(); return nullptr; }
     jfieldID f = env->GetFieldID(atCls, "mActivities", "Landroid/util/ArrayMap;");
-    if (!f) { env->ExceptionClear(); return nullptr; }
+    if (env->ExceptionCheck() || !f) { env->ExceptionClear(); return nullptr; }
     jobject acts = env->GetObjectField(at, f);
-    if (!acts) return nullptr;
     jclass amCls = env->FindClass("android/util/ArrayMap");
     jmethodID sizeM = env->GetMethodID(amCls, "size", "()I");
     jmethodID valAt = env->GetMethodID(amCls, "valueAt", "(I)Ljava/lang/Object;");
-    if (!sizeM || !valAt) { env->ExceptionClear(); return nullptr; }
     jint n = env->CallIntMethod(acts, sizeM);
     for (jint i = 0; i < n; i++) {
         jobject rec = env->CallObjectMethod(acts, valAt, i);
@@ -225,104 +196,97 @@ static jobject getCurrentActivity(JNIEnv* env) {
 
 static void* pollThread(void*) {
     JNIEnv* env = nullptr;
-    if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
+    if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return nullptr;
     jobject activity = nullptr;
     for (int i = 0; i < 200; i++) {
         activity = getCurrentActivity(env);
         if (activity) break;
         usleep(100000);
     }
-    if (activity && gHelperClass) {
-        jmethodID attach = env->GetStaticMethodID(gHelperClass, "attach", "(Landroid/content/Context;)V");
-        if (attach) {
-            env->CallStaticVoidMethod(gHelperClass, attach, activity);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-        }
-    }
+    if (!activity || !gHelperClass) { gVM->DetachCurrentThread(); return nullptr; }
+    jmethodID attach = env->GetStaticMethodID(gHelperClass, "attach", "(Landroid/content/Context;)V");
+    if (attach) env->CallStaticVoidMethod(gHelperClass, attach, activity);
+    if (env->ExceptionCheck()) env->ExceptionClear();
     gVM->DetachCurrentThread();
     return nullptr;
 }
 
-// ---------- DPI scaling ----------
-static void computeScale(int32_t w, int32_t) {
-    float s = (float)w / 400.0f;
-    if (s < 2.0f) s = 2.0f;
-    if (s > 4.5f) s = 4.5f;
-    gScale = s;
-}
-
-// ---------- Style ----------
+// ---------------- Styling ----------------
 static void setupStyle() {
-    ImGuiStyle& st = ImGui::GetStyle();
-    st.ScaleAllSizes(gScale);
-    st.WindowRounding    = 14.0f;
-    st.ChildRounding     = 10.0f;
-    st.FrameRounding     = 10.0f;
-    st.PopupRounding     = 8.0f;
-    st.ScrollbarRounding = 10.0f;
-    st.GrabRounding      = 6.0f;
-    st.WindowBorderSize  = 1.0f;
-    st.ChildBorderSize   = 0.0f;
-    st.FrameBorderSize   = 0.0f;
-    st.WindowPadding     = ImVec2(16, 16);
-    st.FramePadding      = ImVec2(12, 8);
-    st.ItemSpacing       = ImVec2(10, 8);
-    st.ItemInnerSpacing  = ImVec2(8, 6);
-    st.ScrollbarSize     = 14;
-    st.GrabMinSize       = 12;
-    ImVec4* c = st.Colors;
-    c[ImGuiCol_Text]                 = ImVec4(0.88f, 0.90f, 0.93f, 1.00f);
-    c[ImGuiCol_TextDisabled]         = ImVec4(0.50f, 0.53f, 0.58f, 1.00f);
-    c[ImGuiCol_WindowBg]             = ImVec4(0.04f, 0.05f, 0.07f, 0.98f);
-    c[ImGuiCol_ChildBg]              = ImVec4(0.04f, 0.05f, 0.07f, 1.00f);
-    c[ImGuiCol_PopupBg]              = ImVec4(0.06f, 0.08f, 0.10f, 0.98f);
-    c[ImGuiCol_Border]               = ImVec4(1.00f, 0.78f, 0.34f, 0.30f);
-    c[ImGuiCol_FrameBg]              = ImVec4(0.09f, 0.11f, 0.15f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.14f, 0.17f, 0.22f, 1.00f);
-    c[ImGuiCol_FrameBgActive]        = ImVec4(0.18f, 0.22f, 0.28f, 1.00f);
-    c[ImGuiCol_TitleBg]              = ImVec4(0.06f, 0.08f, 0.10f, 1.00f);
-    c[ImGuiCol_TitleBgActive]        = ImVec4(0.35f, 0.27f, 0.05f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.06f, 0.08f, 0.10f, 1.00f);
-    c[ImGuiCol_MenuBarBg]            = ImVec4(0.06f, 0.08f, 0.10f, 1.00f);
-    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.02f, 0.03f, 0.05f, 0.50f);
-    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.25f, 0.29f, 0.35f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(1.00f, 0.78f, 0.34f, 0.60f);
-    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(1.00f, 0.78f, 0.34f, 0.90f);
-    c[ImGuiCol_CheckMark]            = ImVec4(0.30f, 0.82f, 0.88f, 1.00f);
-    c[ImGuiCol_SliderGrab]           = ImVec4(0.30f, 0.82f, 0.88f, 1.00f);
-    c[ImGuiCol_Button]               = ImVec4(1.00f, 0.78f, 0.34f, 0.25f);
-    c[ImGuiCol_ButtonHovered]        = ImVec4(1.00f, 0.78f, 0.34f, 0.50f);
-    c[ImGuiCol_ButtonActive]         = ImVec4(1.00f, 0.78f, 0.34f, 0.80f);
-    c[ImGuiCol_Header]               = ImVec4(1.00f, 0.78f, 0.34f, 0.20f);
-    c[ImGuiCol_HeaderHovered]        = ImVec4(1.00f, 0.78f, 0.34f, 0.35f);
-    c[ImGuiCol_HeaderActive]         = ImVec4(1.00f, 0.78f, 0.34f, 0.55f);
-    c[ImGuiCol_Separator]            = ImVec4(1.00f, 0.78f, 0.34f, 0.20f);
+    ImGuiStyle& s = ImGui::GetStyle();
+
+    s.WindowRounding    = 16.0f;
+    s.ChildRounding     = 12.0f;
+    s.FrameRounding     = 10.0f;
+    s.GrabRounding      = 10.0f;
+    s.PopupRounding     = 14.0f;
+    s.ScrollbarRounding = 10.0f;
+    s.TabRounding       = 10.0f;
+
+    s.WindowBorderSize  = 1.0f;
+    s.ChildBorderSize   = 1.0f;
+    s.FrameBorderSize   = 0.0f;
+    s.PopupBorderSize   = 1.0f;
+
+    s.WindowPadding     = ImVec2(18, 18);
+    s.FramePadding      = ImVec2(12, 8);
+    s.ItemSpacing       = ImVec2(10, 10);
+    s.ItemInnerSpacing  = ImVec2(8, 8);
+    s.ScrollbarSize     = 16.0f;
+    s.GrabMinSize       = 14.0f;
+
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_Text]                  = ImVec4(0.93f, 0.94f, 0.96f, 1.00f);
+    c[ImGuiCol_TextDisabled]          = ImVec4(0.50f, 0.53f, 0.58f, 1.00f);
+    c[ImGuiCol_WindowBg]              = ImVec4(0.05f, 0.06f, 0.08f, 0.97f);
+    c[ImGuiCol_ChildBg]               = ImVec4(0.07f, 0.08f, 0.11f, 1.00f);
+    c[ImGuiCol_PopupBg]               = ImVec4(0.08f, 0.09f, 0.13f, 0.98f);
+    c[ImGuiCol_Border]                = ImVec4(1.00f, 0.78f, 0.34f, 0.35f);
+    c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    c[ImGuiCol_FrameBg]               = ImVec4(0.13f, 0.15f, 0.19f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.17f, 0.20f, 0.25f, 1.00f);
+    c[ImGuiCol_FrameBgActive]         = ImVec4(0.22f, 0.25f, 0.31f, 1.00f);
+    c[ImGuiCol_TitleBg]               = ImVec4(0.08f, 0.09f, 0.13f, 1.00f);
+    c[ImGuiCol_TitleBgActive]         = ImVec4(0.30f, 0.23f, 0.04f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.08f, 0.09f, 0.13f, 1.00f);
+    c[ImGuiCol_MenuBarBg]             = ImVec4(0.08f, 0.09f, 0.13f, 1.00f);
+    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.05f, 0.06f, 0.08f, 0.60f);
+    c[ImGuiCol_ScrollbarGrab]         = ImVec4(1.00f, 0.78f, 0.34f, 0.35f);
+    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(1.00f, 0.78f, 0.34f, 0.55f);
+    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(1.00f, 0.78f, 0.34f, 0.75f);
+    c[ImGuiCol_CheckMark]             = ImVec4(0.30f, 0.82f, 0.88f, 1.00f);
+    c[ImGuiCol_SliderGrab]            = ImVec4(0.30f, 0.82f, 0.88f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]      = ImVec4(0.40f, 0.92f, 0.98f, 1.00f);
+    c[ImGuiCol_Button]                = ImVec4(1.00f, 0.78f, 0.34f, 0.50f);
+    c[ImGuiCol_ButtonHovered]         = ImVec4(1.00f, 0.78f, 0.34f, 0.75f);
+    c[ImGuiCol_ButtonActive]          = ImVec4(1.00f, 0.78f, 0.34f, 1.00f);
+    c[ImGuiCol_Header]                = ImVec4(1.00f, 0.78f, 0.34f, 0.22f);
+    c[ImGuiCol_HeaderHovered]         = ImVec4(1.00f, 0.78f, 0.34f, 0.42f);
+    c[ImGuiCol_HeaderActive]          = ImVec4(1.00f, 0.78f, 0.34f, 0.60f);
+    c[ImGuiCol_Separator]             = ImVec4(1.00f, 0.78f, 0.34f, 0.25f);
+    c[ImGuiCol_SeparatorHovered]      = ImVec4(1.00f, 0.78f, 0.34f, 0.60f);
+    c[ImGuiCol_SeparatorActive]       = ImVec4(1.00f, 0.78f, 0.34f, 0.90f);
+    c[ImGuiCol_ResizeGrip]            = ImVec4(1.00f, 0.78f, 0.34f, 0.20f);
+    c[ImGuiCol_ResizeGripHovered]     = ImVec4(1.00f, 0.78f, 0.34f, 0.50f);
+    c[ImGuiCol_ResizeGripActive]      = ImVec4(1.00f, 0.78f, 0.34f, 0.80f);
+    c[ImGuiCol_TextSelectedBg]        = ImVec4(1.00f, 0.78f, 0.34f, 0.35f);
+    c[ImGuiCol_NavHighlight]          = ImVec4(1.00f, 0.78f, 0.34f, 0.80f);
 }
 
-// ---------- ImGui backend ----------
+// ---------------- ImGui lifecycle ----------------
 static void doInit(JNIEnv* env, jclass, jobject surface) {
     if (gInitialized) return;
     if (!surface) return;
     gWindow = ANativeWindow_fromSurface(env, surface);
-    if (!gWindow) { log_step("doInit: ANativeWindow null"); return; }
-    int32_t w = ANativeWindow_getWidth(gWindow);
-    int32_t h = ANativeWindow_getHeight(gWindow);
-    computeScale(w, h);
-    LOGI("Scale: %.2f (window %dx%d)", gScale, w, h);
-
+    if (!gWindow) return;
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-
-    ImFontConfig fc;
-    fc.SizePixels = 13.0f * gScale;
-    io.Fonts->AddFontDefault(&fc);
-
+    io.ConfigWindowsMoveFromTitleBarOnly = true;   // only drag from title bar
     setupStyle();
-
-    if (!ImGui_ImplAndroid_Init(gWindow)) { log_step("doInit: Android init fail"); return; }
-    if (!ImGui_ImplOpenGL3_Init("#version 300 es")) { log_step("doInit: GL3 init fail"); return; }
+    if (!ImGui_ImplAndroid_Init(gWindow)) return;
+    if (!ImGui_ImplOpenGL3_Init("#version 300 es")) return;
     gInitialized = true;
     log_step("doInit: complete");
 }
@@ -332,156 +296,152 @@ static void doResize(JNIEnv*, jclass, jint w, jint h) {
     glViewport(0, 0, w, h);
 }
 
-static bool gFirstFrame = false;
-
 static void doRender(JNIEnv*, jclass) {
     if (!gInitialized) return;
-    if (!gFirstFrame) { log_step("doRender: first frame"); gFirstFrame = true; }
-
+    if (!g_firstFrame) { log_step("doRender: first frame"); g_firstFrame = true; }
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
 
-    float screenW = (float)gWidth;
-    float screenH = (float)gHeight;
-    float marginX = screenW * 0.03f;
-    float marginY = screenH * 0.04f;
+    ImGuiIO& io = ImGui::GetIO();
 
-    ImGui::SetNextWindowPos(ImVec2(marginX, marginY), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(screenW - 2 * marginX, screenH - 2 * marginY), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(
-        ImVec2(320 * gScale, 240 * gScale),
-        ImVec2(screenW, screenH)
-    );
+    // Size & position the window on first use
+    float w = io.DisplaySize.x * 0.92f;
+    float h = io.DisplaySize.y * 0.85f;
+    ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - w) * 0.5f, io.DisplaySize.y * 0.075f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_FirstUseEver);
 
-    bool open = ImGui::Begin("  Classes", nullptr,
-        ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::Begin("DexTool", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize);
 
-    if (open) {
-        // -- Header --
-        size_t total = 0;
-        {
-            std::lock_guard<std::mutex> lk(gClassListMutex);
-            total = gClassList.size();
+    // Capture window rect for touch region detection
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+    g_winX = wp.x; g_winY = wp.y;
+    g_winW = ws.x; g_winH = ws.y;
+    g_titleH = ImGui::GetFrameHeight();
+
+    // ----- Header -----
+    size_t total;
+    { std::lock_guard<std::mutex> lk(gClassListMutex); total = gClassList.size(); }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.78f, 0.34f, 1.00f));
+    ImGui::TextUnformatted("Classes");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 10);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.82f, 0.88f, 1.00f));
+    ImGui::Text("%zu", total);
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextDisabled("in target APK");
+
+    // ----- Filter input -----
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##filter", "Search classes...", gFilter, sizeof(gFilter));
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ----- List -----
+    int shown = 0;
+    std::vector<int> visible;
+    {
+        std::lock_guard<std::mutex> lk(gClassListMutex);
+        visible.reserve(gClassList.size());
+        if (gFilter[0]) {
+            for (int i = 0; i < (int)gClassList.size(); i++)
+                if (gClassList[i].find(gFilter) != std::string::npos) visible.push_back(i);
+        } else {
+            for (int i = 0; i < (int)gClassList.size(); i++) visible.push_back(i);
         }
+        shown = (int)visible.size();
 
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.78f, 0.34f, 1.0f));
-        ImGui::SetWindowFontScale(1.35f);
-        ImGui::Text("Classes");
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::PopStyleColor();
-
-        ImGui::SameLine();
-        char cnt[64];
-        snprintf(cnt, sizeof(cnt), "%zu", total);
-        float cntW = ImGui::CalcTextSize(cnt).x + 20 * gScale;
-        ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - cntW + ImGui::GetCursorPosX());
-        ImGui::TextColored(ImVec4(0.30f, 0.82f, 0.88f, 1.0f), "%s", cnt);
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // -- Search bar --
-        float searchH = ImGui::GetFrameHeight() + 4 * gScale;
-        float clearW = (gFilter[0] != 0) ? searchH + 6 * gScale : 0;
-        float searchW = ImGui::GetContentRegionAvail().x - clearW;
-
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12 * gScale, 8 * gScale));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10 * gScale);
-        ImGui::SetNextItemWidth(searchW);
-        ImGui::InputTextWithHint("##filter", "Search classes...", gFilter, sizeof(gFilter));
-        ImGui::PopStyleVar(2);
-
-        if (gFilter[0] != 0) {
-            ImGui::SameLine(0, 6 * gScale);
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.20f, 0.20f, 0.40f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.25f, 0.25f, 0.70f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.90f, 0.30f, 0.30f, 0.90f));
-            if (ImGui::Button("X", ImVec2(searchH, searchH))) gFilter[0] = 0;
-            ImGui::PopStyleColor(3);
-        }
-
-        ImGui::Spacing();
-
-        // -- Filtered cache --
-        if (strcmp(gFilter, gLastFilter) != 0 || gCacheDirty) {
-            std::lock_guard<std::mutex> lk(gClassListMutex);
-            gFilteredCache.clear();
-            gFilteredCache.reserve(gClassList.size());
-            for (const auto& n : gClassList) {
-                if (gFilter[0] == 0 || n.find(gFilter) != std::string::npos)
-                    gFilteredCache.push_back(&n);
-            }
-            strncpy(gLastFilter, gFilter, sizeof(gLastFilter) - 1);
-            gCacheDirty = false;
-        }
-        int visibleCount = (int)gFilteredCache.size();
-
-        // -- List --
-        float footerH = ImGui::GetTextLineHeightWithSpacing() + 4 * gScale;
-        ImGui::BeginChild("##list", ImVec2(0, -footerH), true);
-
-        float rowH = ImGui::GetTextLineHeight() + 14 * gScale;
-
-        ImGuiListClipper clipper;
-        clipper.Begin(visibleCount, rowH);
-        while (clipper.Step()) {
-            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
-                bool isEven = (i % 2 == 0);
-                ImGui::PushStyleColor(ImGuiCol_Header,
-                    isEven ? ImVec4(0.035f, 0.045f, 0.06f, 1.0f)
-                           : ImVec4(0.055f, 0.065f, 0.085f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1.0f, 0.78f, 0.34f, 0.20f));
-                ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(1.0f, 0.78f, 0.34f, 0.35f));
-                ImGui::Selectable(gFilteredCache[i]->c_str(), false, 0, ImVec2(0, rowH));
-                ImGui::PopStyleColor(3);
+        ImGui::BeginChild("##list", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true);
+        if (shown == 0) {
+            ImGui::Spacing();
+            ImGui::TextDisabled("  No matching classes");
+        } else {
+            ImGuiListClipper clipper;
+            clipper.Begin(shown);
+            while (clipper.Step()) {
+                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+                    const std::string& n = gClassList[visible[i]];
+                    ImGui::PushID(i);
+                    if (ImGui::Selectable(n.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick))
+                        LOGI("Selected: %s", n.c_str());
+                    ImGui::PopID();
+                }
             }
         }
-        clipper.End();
-
         ImGui::EndChild();
-
-        // -- Footer --
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 0.53f, 0.58f, 1.0f));
-        ImGui::Text("Showing %d of %zu classes", visibleCount, total);
-        ImGui::PopStyleColor();
     }
-    ImGui::End();
 
+    // ----- Footer -----
+    ImGui::TextDisabled("Showing %d of %zu", shown, total);
+
+    ImGui::End();
     ImGui::Render();
+
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
 
+// ---------------- Touch (damped title bar / accelerated list) ----------------
 static jboolean doTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
     if (!gInitialized) return JNI_FALSE;
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
-    io.AddMousePosEvent(x, y);
-    if (action == 0) io.AddMouseButtonEvent(0, true);
-    else if (action == 1 || action == 3) io.AddMouseButtonEvent(0, false);
+
+    if (action == 0) {                      // DOWN
+        g_virtX = x; g_virtY = y;
+        g_realPrevX = x; g_realPrevY = y;
+        io.AddMousePosEvent(g_virtX, g_virtY);
+        io.AddMouseButtonEvent(0, true);
+    } else if (action == 1 || action == 3) { // UP / CANCEL
+        io.AddMousePosEvent(g_virtX, g_virtY);
+        io.AddMouseButtonEvent(0, false);
+    } else if (action == 2) {                // MOVE
+        float dx = x - g_realPrevX;
+        float dy = y - g_realPrevY;
+        g_realPrevX = x; g_realPrevY = y;
+
+        // Region detection from last frame's window rect
+        bool inWindow   = (g_virtX >= g_winX && g_virtX <= g_winX + g_winW) &&
+                          (g_virtY >= g_winY && g_virtY <= g_winY + g_winH);
+        bool inTitleBar = inWindow && (g_virtY <= g_winY + g_titleH);
+
+        float scale = 1.0f;
+        if (inTitleBar)   scale = 0.55f;   // window drag: SLOWER
+        else if (inWindow) scale = 1.40f;  // list scroll: FASTER
+
+        g_virtX += dx * scale;
+        g_virtY += dy * scale;
+
+        // Clamp to display bounds
+        if (g_virtX < 0) g_virtX = 0;
+        if (g_virtY < 0) g_virtY = 0;
+        if (g_virtX > io.DisplaySize.x) g_virtX = io.DisplaySize.x;
+        if (g_virtY > io.DisplaySize.y) g_virtY = io.DisplaySize.y;
+
+        io.AddMousePosEvent(g_virtX, g_virtY);
+    }
+
     return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
 }
 
 static void doSetClassList(JNIEnv* env, jclass, jobjectArray arr) {
-    {
-        std::lock_guard<std::mutex> lk(gClassListMutex);
-        gClassList.clear();
-        if (!arr) return;
-        jsize n = env->GetArrayLength(arr);
-        gClassList.reserve((size_t)n);
-        for (jsize i = 0; i < n; i++) {
-            jstring js = (jstring)env->GetObjectArrayElement(arr, i);
-            const char* cs = env->GetStringUTFChars(js, nullptr);
-            if (cs) { gClassList.emplace_back(cs); env->ReleaseStringUTFChars(js, cs); }
-            env->DeleteLocalRef(js);
-        }
+    std::lock_guard<std::mutex> lk(gClassListMutex);
+    gClassList.clear();
+    if (!arr) return;
+    jsize n = env->GetArrayLength(arr);
+    gClassList.reserve((size_t)n);
+    for (jsize i = 0; i < n; i++) {
+        js = (jstring)env->GetObjectArrayElement(arr, i);
+        const char* cs = env->GetStringUTFChars(js, nullptr);
+        if (cs) { gClassList.emplace_back(cs); env->ReleaseStringUTFChars(js, cs); }
+        env->DeleteLocalRef(js);
     }
-    gCacheDirty = true;
-    LOGI("Class list stored: %zu", gClassList.size());
 }
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
@@ -489,9 +449,9 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     install_crash_handlers();
     log_step("JNI_OnLoad: started");
     JNIEnv* env = nullptr;
-    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_VERSION_1_6;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return JNI_VERSION_1_6;
     gVM = vm;
-    if (!loadDex(env)) { log_step("loadDex failed"); return JNI_VERSION_1_6; }
+    if (!loadDex(env)) return JNI_VERSION_1_6;
     JNINativeMethod methods[] = {
         {(char*)"nativeInit",         (char*)"(Landroid/view/Surface;)V", (void*)doInit},
         {(char*)"nativeResize",       (char*)"(II)V",                    (void*)doResize},
@@ -501,10 +461,8 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     };
     if (env->RegisterNatives(gHelperClass, methods, 5) != 0) {
         env->ExceptionClear();
-        log_step("RegisterNatives failed");
         return JNI_VERSION_1_6;
     }
-    log_step("Natives registered");
     pthread_t t;
     if (pthread_create(&t, nullptr, pollThread, nullptr) == 0) pthread_detach(t);
     return JNI_VERSION_1_6;

@@ -1,9 +1,24 @@
 ninja: Entering directory `/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a'
 [1/8] Building CXX object CMakeFiles/tool.dir/imgui/backends/imgui_impl_android.cpp.o
 [2/8] Building CXX object CMakeFiles/tool.dir/imgui/backends/imgui_impl_opengl3.cpp.o
-[3/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o
-[4/8] Building CXX object CMakeFiles/tool.dir/tool/native-lib.cpp.o
+[3/8] Building CXX object CMakeFiles/tool.dir/tool/native-lib.cpp.o
+FAILED: CMakeFiles/tool.dir/tool/native-lib.cpp.o 
+/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -MD -MT CMakeFiles/tool.dir/tool/native-lib.cpp.o -MF CMakeFiles/tool.dir/tool/native-lib.cpp.o.d -o CMakeFiles/tool.dir/tool/native-lib.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:440:9: error: use of undeclared identifier 'js'
+        js = (jstring)env->GetObjectArrayElement(arr, i);
+        ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:441:49: error: use of undeclared identifier 'js'
+        const char* cs = env->GetStringUTFChars(js, nullptr);
+                                                ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:442:75: error: use of undeclared identifier 'js'
+        if (cs) { gClassList.emplace_back(cs); env->ReleaseStringUTFChars(js, cs); }
+                                                                          ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:443:29: error: use of undeclared identifier 'js'
+        env->DeleteLocalRef(js);
+                            ^
+4 errors generated.
+[4/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o
 [5/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o
 [6/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o
 [7/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui.cpp.o
-[8/8] Linking CXX shared library /home/runner/work/Dex-tool/Dex-tool/app/build/intermediates/cxx/Debug/g13hvz64/obj/arm64-v8a/libtool.so
+ninja: build stopped: subcommand failed.
