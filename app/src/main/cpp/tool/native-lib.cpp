@@ -45,8 +45,10 @@ struct MethodCallState {
     bool hasResult = false;
     bool calling = false;
     bool runInMain = false;
+    int boolVals[8] = {0};
+    std::vector<std::string> validInstances[8];
     int selectedInstance[8] = {0};
-    std::vector<std::string> availableInstances[8];
+    bool needsFocus = false;
 };
 struct ClassDetail {
     bool loading = false;
@@ -95,7 +97,6 @@ struct PendingInspectorReq { std::string className; };
 struct DetailResult { int sectionId; std::string className; std::vector<std::string> fields; std::vector<std::string> methodRaws; };
 struct MethodResult { int sectionId; std::string className; std::string methodSig; std::string result; };
 struct InspectorResult { std::string className; std::vector<std::string> instances; };
-struct AvailableInstancesResult { std::string className; std::vector<std::string> instances; };
 
 static std::vector<PendingDetailReq> gPendingDetailReqs;
 static std::vector<PendingCallReq> gPendingCallReqs;
@@ -103,7 +104,6 @@ static std::vector<PendingInspectorReq> gPendingInspectorReqs;
 static std::vector<DetailResult> gDetailResults;
 static std::vector<MethodResult> gMethodResults;
 static std::vector<InspectorResult> gInspectorResults;
-static std::vector<AvailableInstancesResult> gAvailableInstancesResults;
 static std::mutex gQueuesMutex;
 
 static float g_settingFontScale = 1.00f;
@@ -269,7 +269,7 @@ static void doResize(JNIEnv*, jclass, jint w, jint h) { gWidth = w; gHeight = h;
 
 static bool isComplexType(const std::string& t) {
     if (t == "int" || t == "long" || t == "short" || t == "byte" || t == "char" || 
-        t == "boolean" || t == "float" || t == "double" || t == "java.lang.String") return false;
+        t == "boolean" || t == "float" || t == "double" || t == "java.lang.String" || t == "byte[]") return false;
     return true;
 }
 
@@ -283,39 +283,60 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
         ImGui::PushID(i);
         ImGui::TextDisabled("arg%d (%s)", i, m.paramTypes[i].c_str());
         
-        if (isComplexType(m.paramTypes[i])) {
-            if (st.availableInstances[i].empty()) {
-                st.availableInstances[i].push_back("null");
-                st.availableInstances[i].push_back("[Current Activity]");
-                st.availableInstances[i].push_back("[Application Context]");
+        if (m.paramTypes[i] == "boolean") {
+            st.boolVals[i] = (strcmp(st.argBufs[i], "true") == 0) ? 1 : 0;
+            if (ImGui::Combo("##bool", &st.boolVals[i], "false\0true\0")) {
+                snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.boolVals[i] ? "true" : "false");
             }
-            if (st.selectedInstance[i] >= (int)st.availableInstances[i].size()) st.selectedInstance[i] = 0;
+        } else if (isComplexType(m.paramTypes[i])) {
+            if (st.validInstances[i].empty()) {
+                st.validInstances[i].push_back("null");
+                // Lazy load valid instances
+                JNIEnv* env = nullptr; bool attached = false;
+                if (gVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) { if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) env = nullptr; else attached = true; }
+                if (env && gHelperClass) {
+                    jmethodID getInst = env->GetStaticMethodID(gHelperClass, "getValidInstances", "(Ljava/lang/String;)[Ljava/lang/String;");
+                    if (getInst) {
+                        jstring jType = env->NewStringUTF(m.paramTypes[i].c_str());
+                        jobjectArray arr = (jobjectArray)env->CallStaticObjectMethod(gHelperClass, getInst, jType);
+                        if (arr) {
+                            jsize n = env->GetArrayLength(arr);
+                            for (jsize j = 0; j < n; j++) {
+                                jstring s = (jstring)env->GetObjectArrayElement(arr, j);
+                                const char* c = env->GetStringUTFChars(s, nullptr);
+                                if (c) st.validInstances[i].push_back(c);
+                                if (c) env->ReleaseStringUTFChars(s, c);
+                                env->DeleteLocalRef(s);
+                            }
+                            env->DeleteLocalRef(arr);
+                        }
+                        env->DeleteLocalRef(jType);
+                    }
+                }
+                if (attached) gVM->DetachCurrentThread();
+            }
             
-            std::string preview = st.availableInstances[i][st.selectedInstance[i]];
+            if (st.selectedInstance[i] >= (int)st.validInstances[i].size()) st.selectedInstance[i] = 0;
+            std::string preview = st.validInstances[i][st.selectedInstance[i]];
             if (ImGui::BeginCombo("##arg_combo", preview.c_str())) {
-                for (int n = 0; n < st.availableInstances[i].size(); n++) {
+                for (int n = 0; n < st.validInstances[i].size(); n++) {
                     bool is_selected = (st.selectedInstance[i] == n);
-                    if (ImGui::Selectable(st.availableInstances[i][n].c_str(), is_selected)) {
+                    if (ImGui::Selectable(st.validInstances[i][n].c_str(), is_selected)) {
                         st.selectedInstance[i] = n;
-                        snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.availableInstances[i][n].c_str());
+                        snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.validInstances[i][n].c_str());
                     }
                     if (is_selected) ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
             }
-        } else if (m.paramTypes[i] == "boolean") {
-            bool val = (st.argBufs[i][0] == '1');
-            if (ImGui::Checkbox("##bool", &val)) {
-                snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%d", val ? 1 : 0);
-            }
         } else {
+            if (st.needsFocus) { ImGui::SetKeyboardFocusHere(); st.needsFocus = false; }
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
         }
         ImGui::PopID();
     }
     ImGui::Checkbox("Call in Main Thread", &st.runInMain);
-    ImGui::TextDisabled("Note: For objects, choose an instance or [Current Activity].");
     
     if (ImGui::Button("Call", ImVec2(100, 0))) {
         PendingCallReq c;
@@ -331,9 +352,7 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
     else if (st.hasResult) {
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
-        ImGui::PushTextWrapPos(0.0f);
         ImGui::TextWrapped("%s", st.result.c_str());
-        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
     ImGui::Unindent(20);
@@ -362,7 +381,6 @@ static void renderClassDetail(Section& sec, const std::string& className) {
     if (!det.methods.empty()) {
         ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "Methods");
         for (auto& m : det.methods) {
-            if (m.name.find("lambda$") == 0) continue; // Hide compiler generated
             bool exp = det.expandedMethods.count(m.raw) > 0;
             ImGui::PushID(m.raw.c_str());
             ImGui::PushTextWrapPos(0.0f);
@@ -372,6 +390,7 @@ static void renderClassDetail(Section& sec, const std::string& className) {
                     auto& st = det.methodStates[m.raw];
                     st.numParams = (int)m.paramTypes.size(); if (st.numParams > 8) st.numParams = 8;
                     for (int i = 0; i < st.numParams; i++) st.argBufs[i][0] = 0;
+                    st.needsFocus = true;
                 }
                 renderMethodPanel(sec, className, m, det.methodStates[m.raw]);
                 ImGui::TreePop();
@@ -685,12 +704,6 @@ static void doSetInspectorInstances(JNIEnv* env, jclass, jstring className, jobj
     if (instances) { jsize n = env->GetArrayLength(instances); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(instances, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.instances.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
     std::lock_guard<std::mutex> lk(gQueuesMutex); gInspectorResults.push_back(std::move(r));
 }
-static void doSetAvailableInstances(JNIEnv* env, jclass, jstring className, jobjectArray instances) {
-    AvailableInstancesResult r;
-    if (className) { const char* c = env->GetStringUTFChars(className, nullptr); r.className = c ? c : ""; if (c) env->ReleaseStringUTFChars(className, c); }
-    if (instances) { jsize n = env->GetArrayLength(instances); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(instances, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.instances.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
-    std::lock_guard<std::mutex> lk(gQueuesMutex); gAvailableInstancesResults.push_back(std::move(r));
-}
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
@@ -708,9 +721,8 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
         {(char*)"nativeSetClassDetails", (char*)"(ILjava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetClassDetails},
         {(char*)"nativeSetMethodResult", (char*)"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", (void*)doSetMethodResult},
         {(char*)"nativeSetInspectorInstances", (char*)"(Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetInspectorInstances},
-        {(char*)"nativeSetAvailableInstances", (char*)"(Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetAvailableInstances},
     };
-    if (env->RegisterNatives(gHelperClass, methods, 12) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
+    if (env->RegisterNatives(gHelperClass, methods, 11) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
     pthread_t t; if (pthread_create(&t, nullptr, pollThread, nullptr) == 0) pthread_detach(t);
     return JNI_VERSION_1_6;
 }

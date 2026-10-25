@@ -17,7 +17,6 @@ import java.io.InputStream;
 import java.io.PrintWriter;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
@@ -35,7 +34,8 @@ public class Helper {
     private static final String TAG = "ImGuiTool";
     private static OverlaySurfaceView overlay;
     private static final Map<String, Object> sInstances = new HashMap<>();
-    private static Context sCurrentContext;
+    private static Object sCurrentActivity = null;
+    private static Object sApplicationContext = null;
 
     static {
         try {
@@ -73,9 +73,10 @@ public class Helper {
     }
 
     public static void attach(Context ctx) {
-        sCurrentContext = ctx;
         if (!(ctx instanceof Activity)) return;
         final Activity activity = (Activity) ctx;
+        sCurrentActivity = activity;
+        sApplicationContext = activity.getApplicationContext();
         activity.runOnUiThread(() -> {
             if (overlay != null) return;
             try {
@@ -105,7 +106,6 @@ public class Helper {
         });
     }
 
-    // DEX Parsing methods remain unchanged (shortened for brevity)
     private static List<String> listAllClasses(Context ctx) {
         List<String> out = new ArrayList<>();
         try (ZipFile zip = new ZipFile(ctx.getPackageCodePath())) {
@@ -118,34 +118,49 @@ public class Helper {
         } catch (Throwable t) { log("listAllClasses error: " + t); }
         Collections.sort(out); return out;
     }
-    private static byte[] readAll(InputStream in) throws IOException { ByteArrayOutputStream o = new ByteArrayOutputStream(); byte[] b = new byte[8192]; int n; while ((n = in.read(b)) > 0) o.write(b, 0, n); return o.toByteArray(); }
+
+    private static byte[] readAll(InputStream in) throws IOException {
+        ByteArrayOutputStream o = new ByteArrayOutputStream(); byte[] b = new byte[8192]; int n;
+        while ((n = in.read(b)) > 0) o.write(b, 0, n); return o.toByteArray();
+    }
     private static int rd16(byte[] d, int off) { return (d[off] & 0xFF) | ((d[off+1] & 0xFF) << 8); }
     private static int rd32(byte[] d, int off) { return (d[off]&0xFF) | ((d[off+1]&0xFF)<<8) | ((d[off+2]&0xFF)<<16) | ((d[off+3]&0xFF)<<24); }
-    private static int readUleb128(byte[] d, int[] pos) { int r = 0, s = 0; while (true) { byte b = d[pos[0]++]; r |= (b & 0x7F) << s; if ((b & 0x80) == 0) break; s += 7; } return r; }
+    private static int readUleb128(byte[] d, int[] pos) {
+        int r = 0, s = 0; while (true) { byte b = d[pos[0]++]; r |= (b & 0x7F) << s; if ((b & 0x80) == 0) break; s += 7; } return r;
+    }
     private static String readString(byte[] d, int strIdsOff, int strIdx) {
-        if (strIdx < 0) return ""; int strDataOff = rd32(d, strIdsOff + strIdx * 4); if (strDataOff <= 0 || strDataOff >= d.length) return "";
-        int p = strDataOff; while (p < d.length && (d[p] & 0x80) != 0) p++; if (p < d.length) p++; int start = p; while (p < d.length && d[p] != 0) p++;
+        if (strIdx < 0) return "";
+        int strDataOff = rd32(d, strIdsOff + strIdx * 4);
+        if (strDataOff <= 0 || strDataOff >= d.length) return "";
+        int p = strDataOff; while (p < d.length && (d[p] & 0x80) != 0) p++; if (p < d.length) p++;
+        int start = p; while (p < d.length && d[p] != 0) p++;
         return new String(d, start, p - start, StandardCharsets.UTF_8);
     }
     private static String getTypeDesc(byte[] d, int typeIdsOff, int strIdsOff, int typeIdx) { return readString(d, strIdsOff, rd32(d, typeIdsOff + typeIdx * 4)); }
     private static String prettyType(String desc) {
         if (desc == null || desc.isEmpty()) return "?";
         switch (desc.charAt(0)) {
-            case 'V': return "void"; case 'Z': return "boolean"; case 'B': return "byte"; case 'S': return "short"; case 'C': return "char"; case 'I': return "int"; case 'J': return "long"; case 'F': return "float"; case 'D': return "double";
+            case 'V': return "void"; case 'Z': return "boolean"; case 'B': return "byte"; case 'S': return "short";
+            case 'C': return "char"; case 'I': return "int"; case 'J': return "long"; case 'F': return "float"; case 'D': return "double";
             case 'L': return desc.endsWith(";") ? desc.substring(1, desc.length() - 1).replace('/', '.') : desc;
-            case '[': return prettyType(desc.substring(1)) + "[]"; default: return desc;
+            case '[': return prettyType(desc.substring(1)) + "[]";
+            default: return desc;
         }
     }
+
     private static void parseDexClasses(byte[] d, List<String> out) {
         if (d.length < 0x70 || d[0] != 'd' || d[1] != 'e' || d[2] != 'x') return;
-        int strIdsOff = rd32(d, 0x3C); int typeIdsSize = rd32(d, 0x40); int typeIdsOff = rd32(d, 0x44); int classDefSize= rd32(d, 0x60); int classDefOff = rd32(d, 0x64);
+        int strIdsOff = rd32(d, 0x3C); int typeIdsSize = rd32(d, 0x40); int typeIdsOff = rd32(d, 0x44);
+        int classDefSize= rd32(d, 0x60); int classDefOff = rd32(d, 0x64);
         if (classDefOff + classDefSize * 32 > d.length) return;
         for (int i = 0; i < classDefSize; i++) {
             int cd = classDefOff + i * 32; int classIdx = rd32(d, cd);
-            if (classIdx < 0 || classIdx >= typeIdsSize) continue; String desc = getTypeDesc(d, typeIdsOff, strIdsOff, classIdx);
+            if (classIdx < 0 || classIdx >= typeIdsSize) continue;
+            String desc = getTypeDesc(d, typeIdsOff, strIdsOff, classIdx);
             if (desc.startsWith("L") && desc.endsWith(";")) out.add(desc.substring(1, desc.length() - 1).replace('/', '.'));
         }
     }
+
     public static void requestClassDetails(int sectionId, String className) {
         new Thread(() -> {
             String[] fields = new String[0]; String[] methods = new String[0];
@@ -154,7 +169,9 @@ public class Helper {
             nativeSetClassDetails(sectionId, className, fields, methods);
         }).start();
     }
+
     private static class ClassMembers { List<String> fields = new ArrayList<>(); List<String> methods = new ArrayList<>(); }
+
     private static ClassMembers parseClassMembers(String className) {
         ClassMembers out = new ClassMembers(); String targetDesc = "L" + className.replace('.', '/') + ";";
         try (ZipFile zip = new ZipFile(getApkPath())) {
@@ -167,23 +184,31 @@ public class Helper {
         } catch (Throwable t) { log("parseClassMembers error: " + t); }
         return out;
     }
+
     private static String cachedApkPath = null;
     private static String getApkPath() {
         if (cachedApkPath != null) return cachedApkPath;
         try { Class<?> at = Class.forName("android.app.ActivityThread"); Object app = at.getMethod("currentApplication").invoke(null); if (app instanceof Context) { cachedApkPath = ((Context) app).getPackageCodePath(); if (cachedApkPath != null) return cachedApkPath; } } catch (Throwable ignored) { }
         return "/system/framework/framework.jar";
     }
+
     private static void parseDexMembers(byte[] d, String targetDesc, ClassMembers out) {
         if (d.length < 0x70 || d[0] != 'd' || d[1] != 'e' || d[2] != 'x') return;
-        int strIdsOff=rd32(d,0x3C); int typeIdsSize=rd32(d,0x40); int typeIdsOff=rd32(d,0x44); int protoIdsOff=rd32(d,0x4C); int fieldIdsOff=rd32(d,0x54); int methodIdsOff=rd32(d,0x5C); int classDefSize=rd32(d,0x60); int classDefOff=rd32(d,0x64);
+        int strIdsOff=rd32(d,0x3C); int typeIdsSize=rd32(d,0x40); int typeIdsOff=rd32(d,0x44);
+        int protoIdsOff=rd32(d,0x4C); int fieldIdsOff=rd32(d,0x54); int methodIdsOff=rd32(d,0x5C);
+        int classDefSize=rd32(d,0x60); int classDefOff=rd32(d,0x64);
         if (classDefOff + classDefSize * 32 > d.length) return;
+
         for (int i = 0; i < classDefSize; i++) {
             int cd = classDefOff + i * 32; int classIdx = rd32(d, cd);
             if (classIdx < 0 || classIdx >= typeIdsSize) continue;
             if (!targetDesc.equals(getTypeDesc(d, typeIdsOff, strIdsOff, classIdx))) continue;
             int classDataOff = rd32(d, cd + 24); if (classDataOff == 0) return;
+
             int[] pos = { classDataOff };
-            int staticFields=readUleb128(d,pos); int instanceFields=readUleb128(d,pos); int directMethods=readUleb128(d,pos); int virtualMethods=readUleb128(d,pos);
+            int staticFields=readUleb128(d,pos); int instanceFields=readUleb128(d,pos);
+            int directMethods=readUleb128(d,pos); int virtualMethods=readUleb128(d,pos);
+
             int fieldIdx = 0;
             for (int j = 0; j < staticFields; j++) { int diff = readUleb128(d, pos); readUleb128(d, pos); fieldIdx += diff; out.fields.add("[static] " + getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx)); }
             fieldIdx = 0;
@@ -195,9 +220,12 @@ public class Helper {
             return;
         }
     }
+
     private static String getFieldSig(byte[] d, int fieldIdsOff, int typeIdsOff, int strIdsOff, int fieldIdx) {
-        int fi = fieldIdsOff + fieldIdx * 8; String name = readString(d, strIdsOff, rd32(d, fi + 4)); String type = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd16(d, fi + 2))); return type + " " + name;
+        int fi = fieldIdsOff + fieldIdx * 8; String name = readString(d, strIdsOff, rd32(d, fi + 4));
+        String type = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd16(d, fi + 2))); return type + " " + name;
     }
+
     private static String getMethodRaw(byte[] d, int methodIdsOff, int protoIdsOff, int typeIdsOff, int strIdsOff, int methodIdx) {
         int mi = methodIdsOff + methodIdx * 8; int protoIdx = rd16(d, mi + 2); String name = readString(d, strIdsOff, rd32(d, mi + 4));
         int pi = protoIdsOff + protoIdx * 12; String returnType = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd32(d, pi + 4)));
@@ -207,6 +235,24 @@ public class Helper {
             for (int j = 0; j < count; j++) { int off = paramsOff + 4 + j * 2; if (off + 2 > d.length) break; if (j > 0) params.append(";"); params.append(prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd16(d, off)))); }
         }
         return name + "|" + returnType + "|" + (name.contains("$") || name.equals("<clinit>") ? "1" : "0") + "|" + ("<init>".equals(name) ? "1" : "0") + "|" + params;
+    }
+
+    public static String[] getValidInstances(String typeName) {
+        List<String> res = new ArrayList<>();
+        res.add("null");
+        try {
+            Class<?> targetClass = classFromString(typeName);
+            for (Map.Entry<String, Object> entry : sInstances.entrySet()) {
+                if (entry.getValue() != null && targetClass.isAssignableFrom(entry.getValue().getClass())) {
+                    res.add(entry.getKey());
+                }
+            }
+            if (targetClass.isAssignableFrom(Activity.class) || targetClass.isAssignableFrom(Context.class)) {
+                res.add("[Current Activity]");
+                res.add("[Application Context]");
+            }
+        } catch (Throwable ignored) { }
+        return res.toArray(new String[0]);
     }
 
     public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName, String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
@@ -233,8 +279,6 @@ public class Helper {
                     if (instance == null) result = "Error: Cannot find or create instance of " + className;
                     else { ret = m.invoke(instance, argValues); result = "Returned: " + (ret == null ? "null" : ret.toString()); }
                 }
-            } catch (InvocationTargetException e) {
-                result = "Error (Method threw exception): " + e.getCause();
             } catch (Throwable t) { result = "Error: " + t.toString(); }
             nativeSetMethodResult(sectionId, className, methodSig, result);
         };
@@ -246,13 +290,18 @@ public class Helper {
             List<String> found = new ArrayList<>();
             try {
                 if (sInstances.containsKey(className)) found.add("Cached: " + sInstances.get(className).toString());
-                Class<?> atClass = Class.forName("android.app.ActivityThread"); Object currentAt = atClass.getMethod("currentActivityThread").invoke(null);
+                Class<?> atClass = Class.forName("android.app.ActivityThread");
+                Object currentAt = atClass.getMethod("currentActivityThread").invoke(null);
                 if (currentAt != null) {
                     java.lang.reflect.Field mActField = atClass.getDeclaredField("mActivities"); mActField.setAccessible(true);
                     android.util.ArrayMap<?, ?> acts = (android.util.ArrayMap<?, ?>) mActField.get(currentAt);
-                    if (acts != null) for (int i = 0; i < acts.size(); i++) {
-                        Object record = acts.valueAt(i); java.lang.reflect.Field actField = record.getClass().getDeclaredField("activity"); actField.setAccessible(true); Object act = actField.get(record);
-                        if (act != null && act.getClass().getName().equals(className)) found.add("Activity: " + act.toString());
+                    if (acts != null) {
+                        for (int i = 0; i < acts.size(); i++) {
+                            Object record = acts.valueAt(i);
+                            java.lang.reflect.Field actField = record.getClass().getDeclaredField("activity"); actField.setAccessible(true);
+                            Object act = actField.get(record);
+                            if (act != null && act.getClass().getName().equals(className)) found.add("Activity: " + act.toString());
+                        }
                     }
                 }
                 Object app = atClass.getMethod("currentApplication").invoke(null);
@@ -267,16 +316,15 @@ public class Helper {
     }
     private static Class<?> classFromString(String s) throws ClassNotFoundException {
         switch (s) {
-            case "int": return int.class; case "long": return long.class; case "short": return short.class; case "byte": return byte.class; case "char": return char.class; case "boolean": return boolean.class; case "float": return float.class; case "double": return double.class; case "void": return void.class;
+            case "int": return int.class; case "long": return long.class; case "short": return short.class;
+            case "byte": return byte.class; case "char": return char.class; case "boolean": return boolean.class;
+            case "float": return float.class; case "double": return double.class; case "void": return void.class;
         }
         if (s.endsWith("[]")) return Array.newInstance(classFromString(s.substring(0, s.length() - 2)), 0).getClass();
         return Class.forName(s);
     }
     private static Object parseArg(Class<?> type, String s) {
         if (s == null || s.equals("null") || s.isEmpty()) return null;
-        if (s.equals("[Current Activity]")) return sCurrentContext;
-        if (s.equals("[Application Context]")) return sCurrentContext != null ? sCurrentContext.getApplicationContext() : null;
-
         if (type == int.class || type == Integer.class) return Integer.parseInt(s);
         if (type == long.class || type == Long.class) return Long.parseLong(s);
         if (type == short.class || type == Short.class) return Short.parseShort(s);
@@ -286,6 +334,10 @@ public class Helper {
         if (type == float.class || type == Float.class) return Float.parseFloat(s);
         if (type == double.class || type == Double.class) return Double.parseDouble(s);
         if (type == String.class) return s;
+        if (type == byte[].class) return s.getBytes(StandardCharsets.UTF_8);
+        
+        if (s.equals("[Current Activity]") && sCurrentActivity != null) return sCurrentActivity;
+        if (s.equals("[Application Context]") && sApplicationContext != null) return sApplicationContext;
         if (sInstances.containsKey(s)) return sInstances.get(s);
         return null;
     }
@@ -301,5 +353,5 @@ public class Helper {
     static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
     static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
     static native void nativeSetInspectorInstances(String className, String[] instances);
-    static native void nativeSetAvailableInstances(String className, String[] instances);
+    static native String[] nativeGetValidInstances(String className);
 }
