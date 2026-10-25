@@ -7,6 +7,10 @@
 #include <GLES3/gl3.h>
 #include "dex_data.h"
 
+#ifndef MY_PI
+#define MY_PI 3.14159265358979323846f
+#endif
+
 #include <pthread.h>
 #include <unistd.h>
 #include <signal.h>
@@ -144,7 +148,7 @@ static void drawSigil(ImDrawList* dl, ImVec2 c, float r) {
     float r2 = r * 0.75f;
     ImVec2 hex[6];
     for (int i = 0; i < 6; i++) {
-        float a = IM_PI * 2.0f * i / 6.0f + IM_PI * 0.5f;
+        float a = MY_PI * 2.0f * i / 6.0f + MY_PI * 0.5f;
         hex[i] = ImVec2(c.x + cosf(a) * r2, c.y + sinf(a) * r2);
     }
     for (int i = 0; i < 6; i++) dl->AddLine(hex[i], hex[(i + 1) % 6], cyan, 1.3f);
@@ -153,12 +157,12 @@ static void drawSigil(ImDrawList* dl, ImVec2 c, float r) {
     float eyeW = r * 0.45f, eyeH = r * 0.22f;
     ImVec2 pts[13];
     for (int i = 0; i <= 12; i++) {
-        float t = (float)i / 12.0f, a = IM_PI * t;
+        float t = (float)i / 12.0f, a = MY_PI * t;
         pts[i] = ImVec2(c.x - eyeW * cosf(a), c.y - eyeH * sinf(a));
     }
     dl->AddPolyline(pts, 13, gold, 0, 1.8f);
     for (int i = 0; i <= 12; i++) {
-        float t = (float)i / 12.0f, a = IM_PI * t;
+        float t = (float)i / 12.0f, a = MY_PI * t;
         pts[i] = ImVec2(c.x - eyeW * cosf(a), c.y + eyeH * sinf(a));
     }
     dl->AddPolyline(pts, 13, gold, 0, 1.8f);
@@ -288,9 +292,6 @@ static void setupStyle() {
     c[ImGuiCol_Separator]            = ImVec4(1.00f, 0.78f, 0.34f, 0.25f);
     c[ImGuiCol_Tab]                  = ImVec4(0.10f, 0.12f, 0.16f, 1.00f);
     c[ImGuiCol_TabHovered]           = ImVec4(1.00f, 0.78f, 0.34f, 0.55f);
-    c[ImGuiCol_TabActive]            = ImVec4(0.35f, 0.27f, 0.05f, 1.00f);
-    c[ImGuiCol_TabUnfocused]         = ImVec4(0.10f, 0.12f, 0.16f, 1.00f);
-    c[ImGuiCol_TabUnfocusedActive]   = ImVec4(0.20f, 0.16f, 0.04f, 1.00f);
 }
 
 // ---------------- ImGui lifecycle ----------------

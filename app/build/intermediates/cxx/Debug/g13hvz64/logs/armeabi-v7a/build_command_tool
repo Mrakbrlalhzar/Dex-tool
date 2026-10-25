@@ -1,0 +1,4 @@
+/usr/local/lib/android/sdk/cmake/3.22.1/bin/ninja \
+  -C \
+  /home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/armeabi-v7a \
+  tool

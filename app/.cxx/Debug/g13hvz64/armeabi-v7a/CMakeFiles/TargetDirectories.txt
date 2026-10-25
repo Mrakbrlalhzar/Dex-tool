@@ -1,0 +1,3 @@
+/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/armeabi-v7a/CMakeFiles/tool.dir
+/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/armeabi-v7a/CMakeFiles/edit_cache.dir
+/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/armeabi-v7a/CMakeFiles/rebuild_cache.dir
