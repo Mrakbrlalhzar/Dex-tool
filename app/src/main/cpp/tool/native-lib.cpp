@@ -33,14 +33,27 @@ static int gWidth = 0, gHeight = 0;
 static std::vector<std::string> gClassList;
 static std::mutex gClassListMutex;
 
-// Widget type codes (must match Java side)
-// 0 = text, 1 = bool, 2 = enum, 3 = auto-context, 4 = instance, 5 = array
+struct FieldInfo {
+    std::string display;
+    std::string name;
+    std::string type;
+    bool isStatic;
+    char editBuf[256] = {0};
+    std::string currentValue;
+    bool hasValue = false;
+    bool updating = false;
+};
 
 struct MethodInfo {
-    std::string raw, name, returnType, display;
-    bool isStatic, isConstructor;
+    std::string display;
+    std::string name;
+    std::string returnType;
     std::vector<std::string> paramTypes;
+    bool isStatic;
+    bool isConstructor;
+    bool isPatched = false; // For future hooking
 };
+
 struct MethodCallState {
     char argBufs[8][256] = {};
     int numParams = 0;
@@ -54,13 +67,16 @@ struct MethodCallState {
     bool needsInit = true;
     bool needsFocus = false;
 };
+
 struct ClassDetail {
     bool loading = false;
-    std::vector<std::string> fields;
+    std::vector<FieldInfo> fields;
     std::vector<MethodInfo> methods;
     std::map<std::string, MethodCallState> methodStates;
     std::set<std::string> expandedMethods;
+    std::set<std::string> expandedFields;
 };
+
 struct Section {
     int id = 0;
     char filter[128] = {0};
@@ -70,16 +86,8 @@ struct Section {
     std::map<std::string, ClassDetail> details;
     std::set<std::string> expandedClasses;
 };
-struct InspectorWin {
-    std::string className;
-    bool isOpen = true;
-    float x = 100, y = 100, w = 400, h = 300;
-    std::vector<std::string> instances;
-    bool searching = false;
-};
 
 static std::vector<Section> gSections;
-static std::vector<InspectorWin> gInspectors;
 static int gNextSectionId = 1;
 static int gActiveSection = 0;
 static bool gRequestAddSection = false;
@@ -97,17 +105,17 @@ static float gWinX = 0, gWinY = 0, gWinW = 0, gWinH = 0;
 
 struct PendingDetailReq { int sectionId; std::string className; };
 struct PendingCallReq { int sectionId; std::string className; std::string methodSig; std::string methodName; std::vector<std::string> paramTypes; std::vector<std::string> args; bool isStatic; bool isConstructor; bool runInMain; };
-struct PendingInspectorReq { std::string className; };
-struct DetailResult { int sectionId; std::string className; std::vector<std::string> fields; std::vector<std::string> methodRaws; };
+struct PendingFieldReq { int sectionId; std::string className; std::string fieldName; std::string instanceName; std::string value; bool isSet; };
+struct DetailResult { int sectionId; std::string className; std::vector<std::string> fields; std::vector<std::string> methods; };
 struct MethodResult { int sectionId; std::string className; std::string methodSig; std::string result; };
-struct InspectorResult { std::string className; std::vector<std::string> instances; };
+struct FieldResult { int sectionId; std::string className; std::string fieldName; std::string value; bool isSet; };
 
 static std::vector<PendingDetailReq> gPendingDetailReqs;
 static std::vector<PendingCallReq> gPendingCallReqs;
-static std::vector<PendingInspectorReq> gPendingInspectorReqs;
+static std::vector<PendingFieldReq> gPendingFieldReqs;
 static std::vector<DetailResult> gDetailResults;
 static std::vector<MethodResult> gMethodResults;
-static std::vector<InspectorResult> gInspectorResults;
+static std::vector<FieldResult> gFieldResults;
 static std::mutex gQueuesMutex;
 
 static float g_settingFontScale = 1.00f;
@@ -131,15 +139,33 @@ static void splitStr(const std::string& s, char d, std::vector<std::string>& out
 static std::string joinStrs(const std::vector<std::string>& v, const char* sep) {
     std::string out; for (size_t i = 0; i < v.size(); i++) { if (i) out += sep; out += v[i]; } return out;
 }
-static MethodInfo parseMethodRaw(const std::string& raw) {
-    MethodInfo m; m.raw = raw; std::vector<std::string> p; splitStr(raw, '|', p);
-    if (p.size() >= 5) {
-        m.name = p[0]; m.returnType = p[1]; m.isStatic = (p[2] == "1"); m.isConstructor = (p[3] == "1");
-        if (!p[4].empty()) splitStr(p[4], ';', m.paramTypes);
+
+// Format: "public int foo(int, java.lang.String)"
+// We parse this dynamically for the UI
+static MethodInfo parseMethodDisplay(const std::string& display) {
+    MethodInfo m;
+    m.display = display;
+    // Very naive parse for the UI. Real logic is in Java.
+    size_t p1 = display.find('(');
+    size_t p2 = display.find(')');
+    if (p1 != std::string::npos) {
+        m.name = display.substr(0, p1);
+        // extract last word as name
+        size_t lastSpace = m.name.rfind(' ');
+        if (lastSpace != std::string::npos) {
+            m.returnType = m.name.substr(0, lastSpace);
+            m.name = m.name.substr(lastSpace + 1);
+        }
+        if (p2 != std::string::npos && p2 > p1) {
+            std::string params = display.substr(p1 + 1, p2 - p1 - 1);
+            if (!params.empty()) splitStr(params, ',', m.paramTypes);
+        }
     }
-    m.display = m.isConstructor ? "<init>(" + joinStrs(m.paramTypes, ", ") + ")" : m.returnType + " " + m.name + "(" + joinStrs(m.paramTypes, ", ") + ")";
+    m.isConstructor = m.name.find("<init>") != std::string::npos;
+    m.isStatic = display.find("static ") != std::string::npos;
     return m;
 }
+
 static Section* findSection(int id) { for (auto& s : gSections) if (s.id == id) return &s; return nullptr; }
 static void addSectionImpl() { Section s; s.id = gNextSectionId++; gSections.push_back(std::move(s)); gActiveSection = gSections.back().id; }
 static void closeSectionImpl(int id) {
@@ -271,7 +297,6 @@ static void doInit(JNIEnv* env, jclass, jobject surface) {
 }
 static void doResize(JNIEnv*, jclass, jint w, jint h) { gWidth = w; gHeight = h; glViewport(0, 0, w, h); }
 
-// ---------- Argument Initialization (The Provider) ----------
 static void initMethodWidgets(MethodCallState& st, const std::vector<std::string>& types) {
     if (!gHelperClass || !gVM) return;
     JNIEnv* env = nullptr; bool attached = false;
@@ -279,21 +304,17 @@ static void initMethodWidgets(MethodCallState& st, const std::vector<std::string
         if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
         attached = true;
     }
-
     jmethodID getType = env->GetStaticMethodID(gHelperClass, "getArgWidgetType", "(Ljava/lang/String;)I");
     jmethodID getSugg = env->GetStaticMethodID(gHelperClass, "getArgSuggestions", "(Ljava/lang/String;)[Ljava/lang/String;");
-
     for (size_t i = 0; i < types.size() && i < 8; i++) {
         jstring js = env->NewStringUTF(types[i].c_str());
         if (!js) continue;
-
         st.widgetType[i] = 0;
         if (getType) {
             jint wt = env->CallStaticIntMethod(gHelperClass, getType, js);
             if (!env->ExceptionCheck()) st.widgetType[i] = (int)wt;
             else env->ExceptionClear();
         }
-
         st.suggestions[i].clear();
         if (getSugg) {
             jobjectArray arr = (jobjectArray)env->CallStaticObjectMethod(gHelperClass, getSugg, js);
@@ -310,7 +331,6 @@ static void initMethodWidgets(MethodCallState& st, const std::vector<std::string
                 env->DeleteLocalRef(arr);
             }
         }
-
         if (!st.suggestions[i].empty()) {
             st.selectedSuggestion[i] = 0;
             snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][0].c_str());
@@ -322,19 +342,41 @@ static void initMethodWidgets(MethodCallState& st, const std::vector<std::string
     if (attached) gVM->DetachCurrentThread();
 }
 
+static void renderField(Section& sec, const std::string& className, FieldInfo& f) {
+    ImGui::PushID(f.name.c_str());
+    if (ImGui::TreeNodeEx(f.display.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth)) {
+        ImGui::Indent(20);
+        if (ImGui::Button("Get")) {
+            PendingFieldReq r; r.sectionId = sec.id; r.className = className; r.fieldName = f.name; r.instanceName = "[Live] Current Activity"; r.isSet = false;
+            { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingFieldReqs.push_back(r); }
+            f.updating = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##edit", f.editBuf, sizeof(f.editBuf));
+        if (ImGui::Button("Set")) {
+            PendingFieldReq r; r.sectionId = sec.id; r.className = className; r.fieldName = f.name; r.instanceName = "[Live] Current Activity"; r.value = f.editBuf; r.isSet = true;
+            { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingFieldReqs.push_back(r); }
+            f.updating = true;
+        }
+        if (f.updating) { ImGui::SameLine(); ImGui::TextDisabled("..."); }
+        else if (f.hasValue) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.3f,0.8f,0.3f,1), "%s", f.currentValue.c_str()); }
+
+        ImGui::Unindent(20);
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
 static void renderMethodPanel(Section& sec, const std::string& className, MethodInfo& m, MethodCallState& st) {
     ImGui::Indent(20);
-
     if (st.needsInit) initMethodWidgets(st, m.paramTypes);
-
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("Return: %s", m.returnType.c_str());
     ImGui::PopTextWrapPos();
-
     for (int i = 0; i < st.numParams; i++) {
         ImGui::PushID(i);
         ImGui::TextDisabled("arg%d (%s)", i, m.paramTypes[i].c_str());
-
         int wt = st.widgetType[i];
         if (wt == 0) {
             if (st.needsFocus && i == 0) { ImGui::SetKeyboardFocusHere(); st.needsFocus = false; }
@@ -342,80 +384,49 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
             ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
         } else if (wt == 1) {
             int bv = (strcmp(st.argBufs[i], "true") == 0) ? 1 : 0;
-            if (ImGui::Combo("##bool", &bv, "false\0true\0")) {
-                snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", bv ? "true" : "false");
-            }
+            if (ImGui::Combo("##bool", &bv, "false\0true\0")) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", bv ? "true" : "false");
         } else if (wt == 2 || wt == 4) {
-            if (st.suggestions[i].empty()) {
-                ImGui::TextDisabled("(no options available)");
-            } else {
-                int sel = st.selectedSuggestion[i];
-                if (sel >= (int)st.suggestions[i].size()) sel = 0;
+            if (st.suggestions[i].empty()) ImGui::TextDisabled("(no options)");
+            else {
+                int sel = st.selectedSuggestion[i]; if (sel >= (int)st.suggestions[i].size()) sel = 0;
                 if (ImGui::BeginCombo("##sugg", st.suggestions[i][sel].c_str())) {
                     for (int n = 0; n < (int)st.suggestions[i].size(); n++) {
                         bool is_sel = (sel == n);
-                        if (ImGui::Selectable(st.suggestions[i][n].c_str(), is_sel)) {
-                            st.selectedSuggestion[i] = n;
-                            snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][n].c_str());
-                        }
+                        if (ImGui::Selectable(st.suggestions[i][n].c_str(), is_sel)) { st.selectedSuggestion[i] = n; snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][n].c_str()); }
                         if (is_sel) ImGui::SetItemDefaultFocus();
                     }
                     ImGui::EndCombo();
                 }
             }
         } else if (wt == 3) {
-            // Auto-Inject Context/Activity
             ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "[Auto-Inject]");
             ImGui::SameLine();
-            if (!st.suggestions[i].empty()) {
-                snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][0].c_str());
-                ImGui::TextDisabled("%s", st.suggestions[i][0].c_str());
-            } else {
-                ImGui::TextDisabled("Pending...");
-            }
+            if (!st.suggestions[i].empty()) { snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][0].c_str()); ImGui::TextDisabled("%s", st.suggestions[i][0].c_str()); }
+            else ImGui::TextDisabled("Pending...");
         } else if (wt == 5) {
-            // Array
             std::string hint = "comma-separated values";
-            if (m.paramTypes[i] == "byte[]") hint = "text -> UTF-8 bytes";
-            else if (m.paramTypes[i] == "char[]") hint = "text -> char array";
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##arr", hint.c_str(), st.argBufs[i], sizeof(st.argBufs[i]));
-        } else {
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
-        }
+            ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##arr", hint.c_str(), st.argBufs[i], sizeof(st.argBufs[i]));
+        } else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }
         ImGui::PopID();
     }
-
     ImGui::Checkbox("Call in Main Thread", &st.runInMain);
-
-    if (ImGui::Button("Refresh args")) {
-        st.needsInit = true;
-        for (int i = 0; i < 8; i++) {
-            st.widgetType[i] = -1;
-            st.suggestions[i].clear();
-            st.selectedSuggestion[i] = 0;
-        }
-    }
+    if (ImGui::Button("Refresh args")) { st.needsInit = true; for (int i = 0; i < 8; i++) { st.widgetType[i] = -1; st.suggestions[i].clear(); st.selectedSuggestion[i] = 0; } }
     ImGui::SameLine();
     if (ImGui::Button("Call", ImVec2(100, 0))) {
-        PendingCallReq c;
-        c.sectionId = sec.id; c.className = className;
-        c.methodSig = m.raw; c.methodName = m.name;
-        c.paramTypes = m.paramTypes; c.args.resize(st.numParams);
+        PendingCallReq c; c.sectionId = sec.id; c.className = className; c.methodSig = m.display; c.methodName = m.name; c.paramTypes = m.paramTypes; c.args.resize(st.numParams);
         for (int i = 0; i < st.numParams; i++) c.args[i] = std::string(st.argBufs[i]);
         c.isStatic = m.isStatic; c.isConstructor = m.isConstructor; c.runInMain = st.runInMain;
         { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); }
         st.calling = true; st.hasResult = false;
     }
-    if (st.calling) { ImGui::SameLine(); ImGui::TextDisabled("Executing..."); }
-    else if (st.hasResult) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextWrapped("%s", st.result.c_str());
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if (ImGui::Button("Patch (Soon)")) {
+        // Future: Hook method here
+        st.result = "Patching will be available in next step.";
+        st.hasResult = true;
     }
+    if (st.calling) { ImGui::SameLine(); ImGui::TextDisabled("Executing..."); }
+    else if (st.hasResult) { ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.8f, 0.3f, 1.0f)); ImGui::PushTextWrapPos(0.0f); ImGui::TextWrapped("%s", st.result.c_str()); ImGui::PopTextWrapPos(); ImGui::PopStyleColor(); }
     ImGui::Unindent(20);
 }
 
@@ -423,41 +434,28 @@ static void renderClassDetail(Section& sec, const std::string& className) {
     auto it = sec.details.find(className); if (it == sec.details.end()) return;
     ClassDetail& det = it->second;
     ImGui::Indent(20);
-
-    if (ImGui::Button("Inspector")) {
-        gInspectors.push_back({className, true, 100, 100, 400, 300, {}, true});
-        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingInspectorReqs.push_back({className}); }
-    }
+    if (ImGui::Button("Inspector")) { /* ... */ }
     ImGui::Separator();
-
     if (det.loading) { ImGui::TextDisabled("Loading..."); ImGui::Unindent(20); return; }
-
     if (!det.fields.empty()) {
         ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "Fields");
-        ImGui::PushTextWrapPos(0.0f);
-        for (auto& f : det.fields) ImGui::BulletText("%s", f.c_str());
-        ImGui::PopTextWrapPos();
+        for (auto& f : det.fields) renderField(sec, className, f);
         ImGui::Spacing();
     }
     if (!det.methods.empty()) {
         ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "Methods");
         for (auto& m : det.methods) {
-            bool exp = det.expandedMethods.count(m.raw) > 0;
-            ImGui::PushID(m.raw.c_str());
+            ImGui::PushID(m.display.c_str());
             ImGui::PushTextWrapPos(0.0f);
             if (ImGui::TreeNodeEx(m.display.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth)) {
-                if (!exp) {
-                    det.expandedMethods.insert(m.raw);
-                    auto& st = det.methodStates[m.raw];
+                auto& st = det.methodStates[m.display];
+                if (st.numParams == 0 && m.paramTypes.size() > 0) {
                     st.numParams = (int)m.paramTypes.size(); if (st.numParams > 8) st.numParams = 8;
                     for (int i = 0; i < st.numParams; i++) st.argBufs[i][0] = 0;
-                    st.needsFocus = true;
-                    st.needsInit = true;
+                    st.needsFocus = true; st.needsInit = true;
                 }
-                renderMethodPanel(sec, className, m, det.methodStates[m.raw]);
+                renderMethodPanel(sec, className, m, st);
                 ImGui::TreePop();
-            } else if (exp) {
-                det.expandedMethods.erase(m.raw);
             }
             ImGui::PopTextWrapPos();
             ImGui::PopID();
@@ -566,9 +564,8 @@ static void renderMainWindow() {
             }
 
             if (!gPressedClassName.empty()) {
-                if (!ImGui::IsMouseDown(0)) {
-                    gPressedClassName.clear(); gClassLongPressed = false;
-                } else if (!gClassLongPressed && ImGui::GetTime() - gPressedClassStart > 0.5) {
+                if (!ImGui::IsMouseDown(0)) { gPressedClassName.clear(); gClassLongPressed = false; }
+                else if (!gClassLongPressed && ImGui::GetTime() - gPressedClassStart > 0.5) {
                     gClassLongPressed = true;
                     Section s; s.id = gNextSectionId++; s.detached = true; s.expandedClasses.insert(gPressedClassName);
                     s.detX = io.DisplaySize.x / 2 - 250; s.detY = io.DisplaySize.y / 2 - 250; s.detW = 500; s.detH = 500;
@@ -607,39 +604,10 @@ static void renderDetachedWindows() {
     }
 }
 
-static void renderInspectors() {
-    for (auto it = gInspectors.begin(); it != gInspectors.end(); ) {
-        ImGui::SetNextWindowPos(ImVec2(it->x, it->y), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(it->w, it->h), ImGuiCond_FirstUseEver);
-        char title[256]; snprintf(title, sizeof(title), "Inspector: %s##%s", it->className.c_str(), it->className.c_str());
-        bool open = it->isOpen;
-        ImGui::Begin(title, &open, ImGuiWindowFlags_None);
-        it->isOpen = open;
-        it->x = ImGui::GetWindowPos().x; it->y = ImGui::GetWindowPos().y;
-        it->w = ImGui::GetWindowSize().x; it->h = ImGui::GetWindowSize().y;
-
-        ImGui::Text("Class: %s", it->className.c_str());
-        if (ImGui::Button("Find Instances")) {
-            it->searching = true; it->instances.clear();
-            { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingInspectorReqs.push_back({it->className}); }
-        }
-        ImGui::Spacing();
-        if (it->searching) ImGui::TextDisabled("Searching...");
-        else if (it->instances.empty()) ImGui::TextDisabled("No instances found.");
-        else {
-            ImGui::PushTextWrapPos(0.0f);
-            for (auto& inst : it->instances) ImGui::BulletText("%s", inst.c_str());
-            ImGui::PopTextWrapPos();
-        }
-        ImGui::End();
-        if (!open) it = gInspectors.erase(it); else ++it;
-    }
-}
-
 static void processPendingCalls() {
-    std::vector<PendingDetailReq> details; std::vector<PendingCallReq> calls; std::vector<PendingInspectorReq> inspectors;
-    { std::lock_guard<std::mutex> lk(gQueuesMutex); details.swap(gPendingDetailReqs); calls.swap(gPendingCallReqs); inspectors.swap(gPendingInspectorReqs); }
-    if (details.empty() && calls.empty() && inspectors.empty()) return; if (!gHelperClass || !gVM) return;
+    std::vector<PendingDetailReq> details; std::vector<PendingCallReq> calls; std::vector<PendingFieldReq> flds;
+    { std::lock_guard<std::mutex> lk(gQueuesMutex); details.swap(gPendingDetailReqs); calls.swap(gPendingCallReqs); flds.swap(gPendingFieldReqs); }
+    if (details.empty() && calls.empty() && flds.empty()) return; if (!gHelperClass || !gVM) return;
     JNIEnv* env = nullptr; bool attached = false;
     if (gVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) { if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return; attached = true; }
 
@@ -660,9 +628,20 @@ static void processPendingCalls() {
             }
         }
     }
-    if (!inspectors.empty()) {
-        jmethodID m = env->GetStaticMethodID(gHelperClass, "requestFindInstances", "(Ljava/lang/String;)V");
-        if (m) for (auto& i : inspectors) { jstring cn = env->NewStringUTF(i.className.c_str()); env->CallStaticVoidMethod(gHelperClass, m, cn); env->DeleteLocalRef(cn); }
+    if (!flds.empty()) {
+        jmethodID mGet = env->GetStaticMethodID(gHelperClass, "requestGetField", "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        jmethodID mSet = env->GetStaticMethodID(gHelperClass, "requestSetField", "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        for (auto& f : flds) {
+            jstring jc = env->NewStringUTF(f.className.c_str()); jstring jf = env->NewStringUTF(f.fieldName.c_str()); jstring ji = env->NewStringUTF(f.instanceName.c_str());
+            if (f.isSet && mSet) {
+                jstring jv = env->NewStringUTF(f.value.c_str());
+                env->CallStaticVoidMethod(gHelperClass, mSet, (jint)f.sectionId, jc, jf, ji, jv);
+                env->DeleteLocalRef(jv);
+            } else if (!f.isSet && mGet) {
+                env->CallStaticVoidMethod(gHelperClass, mGet, (jint)f.sectionId, jc, jf, ji);
+            }
+            env->DeleteLocalRef(jc); env->DeleteLocalRef(jf); env->DeleteLocalRef(ji);
+        }
     }
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
     if (attached) gVM->DetachCurrentThread();
@@ -675,9 +654,9 @@ static void doRender(JNIEnv*, jclass) {
         while (!gDetailResults.empty()) {
             auto r = gDetailResults.front(); gDetailResults.erase(gDetailResults.begin());
             auto* sec = findSection(r.sectionId); if (!sec) continue;
-            auto& det = sec->details[r.className]; det.fields = r.fields; det.methods.clear();
-            for (auto& raw : r.methodRaws) det.methods.push_back(parseMethodRaw(raw));
-            det.loading = false;
+            auto& det = sec->details[r.className]; det.loading = false;
+            det.fields.clear(); for (auto& f : r.fields) { FieldInfo fi; fi.display = f; det.fields.push_back(fi); }
+            det.methods.clear(); for (auto& m : r.methods) det.methods.push_back(parseMethodDisplay(m));
         }
         while (!gMethodResults.empty()) {
             auto r = gMethodResults.front(); gMethodResults.erase(gMethodResults.begin());
@@ -685,16 +664,20 @@ static void doRender(JNIEnv*, jclass) {
             auto& st = sec->details[r.className].methodStates[r.methodSig];
             st.result = r.result; st.hasResult = true; st.calling = false;
         }
-        while (!gInspectorResults.empty()) {
-            auto r = gInspectorResults.front(); gInspectorResults.erase(gInspectorResults.begin());
-            for (auto& insp : gInspectors) { if (insp.className == r.className) { insp.instances = r.instances; insp.searching = false; } }
+        while (!gFieldResults.empty()) {
+            auto r = gFieldResults.front(); gFieldResults.erase(gFieldResults.begin());
+            auto* sec = findSection(r.sectionId); if (!sec) continue;
+            auto& det = sec->details[r.className];
+            for (auto& f : det.fields) {
+                if (f.name == r.fieldName) { f.currentValue = r.value; f.hasValue = true; f.updating = false; snprintf(f.editBuf, sizeof(f.editBuf), "%s", r.value.c_str()); break; }
+            }
         }
     }
 
     ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplAndroid_NewFrame();
     ImGuiIO& io = ImGui::GetIO(); io.FontGlobalScale = g_settingFontScale;
     ImGui::NewFrame();
-    if (g_menuVisible) { renderMainWindow(); renderDetachedWindows(); renderInspectors(); }
+    if (g_menuVisible) { renderMainWindow(); renderDetachedWindows(); }
     renderFAB();
     ImGui::Render();
     glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
@@ -749,7 +732,7 @@ static void doSetClassDetails(JNIEnv* env, jclass, jint sectionId, jstring class
     DetailResult r; r.sectionId = (int)sectionId;
     if (className) { const char* c = env->GetStringUTFChars(className, nullptr); r.className = c ? c : ""; if (c) env->ReleaseStringUTFChars(className, c); }
     if (fields) { jsize n = env->GetArrayLength(fields); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(fields, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.fields.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
-    if (methods) { jsize n = env->GetArrayLength(methods); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(methods, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.methodRaws.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
+    if (methods) { jsize n = env->GetArrayLength(methods); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(methods, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.methods.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
     std::lock_guard<std::mutex> lk(gQueuesMutex); gDetailResults.push_back(std::move(r));
 }
 static void doSetMethodResult(JNIEnv* env, jclass, jint sectionId, jstring className, jstring methodSig, jstring result) {
@@ -759,11 +742,12 @@ static void doSetMethodResult(JNIEnv* env, jclass, jint sectionId, jstring class
     if (result) { const char* c = env->GetStringUTFChars(result, nullptr); r.result = c ? c : ""; if (c) env->ReleaseStringUTFChars(result, c); }
     std::lock_guard<std::mutex> lk(gQueuesMutex); gMethodResults.push_back(std::move(r));
 }
-static void doSetInspectorInstances(JNIEnv* env, jclass, jstring className, jobjectArray instances) {
-    InspectorResult r;
+static void doSetFieldValue(JNIEnv* env, jclass, jint sectionId, jstring className, jstring fieldName, jstring value, jboolean isSet) {
+    FieldResult r; r.sectionId = (int)sectionId; r.isSet = isSet;
     if (className) { const char* c = env->GetStringUTFChars(className, nullptr); r.className = c ? c : ""; if (c) env->ReleaseStringUTFChars(className, c); }
-    if (instances) { jsize n = env->GetArrayLength(instances); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(instances, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.instances.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
-    std::lock_guard<std::mutex> lk(gQueuesMutex); gInspectorResults.push_back(std::move(r));
+    if (fieldName) { const char* c = env->GetStringUTFChars(fieldName, nullptr); r.fieldName = c ? c : ""; if (c) env->ReleaseStringUTFChars(fieldName, c); }
+    if (value) { const char* c = env->GetStringUTFChars(value, nullptr); r.value = c ? c : ""; if (c) env->ReleaseStringUTFChars(value, c); }
+    std::lock_guard<std::mutex> lk(gQueuesMutex); gFieldResults.push_back(std::move(r));
 }
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
@@ -781,7 +765,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
         {(char*)"nativeAddKeyEvent",     (char*)"(IZ)V",                        (void*)doAddKeyEvent},
         {(char*)"nativeSetClassDetails", (char*)"(ILjava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetClassDetails},
         {(char*)"nativeSetMethodResult", (char*)"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", (void*)doSetMethodResult},
-        {(char*)"nativeSetInspectorInstances", (char*)"(Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetInspectorInstances},
+        {(char*)"nativeSetFieldValue",   (char*)"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V", (void*)doSetFieldValue},
     };
     if (env->RegisterNatives(gHelperClass, methods, 11) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
     pthread_t t; if (pthread_create(&t, nullptr, pollThread, nullptr) == 0) pthread_detach(t);

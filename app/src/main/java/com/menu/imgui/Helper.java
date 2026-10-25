@@ -17,7 +17,9 @@ import java.io.InputStream;
 import java.io.PrintWriter;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -36,14 +38,6 @@ public class Helper {
     private static final Map<String, Object> sInstances = new HashMap<>();
     private static Object sCurrentActivity = null;
     private static Object sApplicationContext = null;
-
-    // ========== WIDGET TYPE CODES ==========
-    // 0 = text input (primitives, strings, numbers)
-    // 1 = boolean combo (false/true)
-    // 2 = enum combo (all enum constants)
-    // 3 = auto-inject (Context/Activity)
-    // 4 = instance combo (null, cached, live objects)
-    // 5 = array text input
 
     static {
         try {
@@ -114,7 +108,85 @@ public class Helper {
         });
     }
 
-    // ========== ARGUMENT STRATEGY SYSTEM ==========
+    // ========== DYNAMIC CLASS INSPECTION ==========
+    public static void requestClassDetails(int sectionId, String className) {
+        new Thread(() -> {
+            List<String> fields = new ArrayList<>();
+            List<String> methods = new ArrayList<>();
+            try {
+                Class<?> clazz = Class.forName(className);
+                for (Field f : clazz.getDeclaredFields()) {
+                    f.setAccessible(true);
+                    fields.add((Modifier.isStatic(f.getModifiers()) ? "[static] " : "[instance] ") + 
+                               f.getType().getSimpleName() + " " + f.getName());
+                }
+                for (Method m : clazz.getDeclaredMethods()) {
+                    m.setAccessible(true);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(Modifier.toString(m.getModifiers())).append(" ");
+                    sb.append(m.getReturnType().getSimpleName()).append(" ");
+                    sb.append(m.getName()).append("(");
+                    Class<?>[] params = m.getParameterTypes();
+                    for (int i = 0; i < params.length; i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(params[i].getSimpleName());
+                    }
+                    sb.append(")");
+                    methods.add(sb.toString());
+                }
+            } catch (Throwable t) { log("requestClassDetails failed: " + t); }
+            nativeSetClassDetails(sectionId, className, fields.toArray(new String[0]), methods.toArray(new String[0]));
+        }).start();
+    }
+
+    public static void requestGetField(int sectionId, String className, String fieldName, String instanceName) {
+        new Thread(() -> {
+            String result;
+            try {
+                Class<?> clazz = Class.forName(className);
+                Field f = clazz.getDeclaredField(fieldName);
+                f.setAccessible(true);
+                Object instance = getInstance(className, instanceName);
+                if (instance == null && !Modifier.isStatic(f.getModifiers())) {
+                    result = "Error: Need instance to read instance field.";
+                } else {
+                    Object val = f.get(instance);
+                    result = String.valueOf(val);
+                }
+            } catch (Throwable t) { result = "Error: " + t.toString(); }
+            nativeSetFieldValue(sectionId, className, fieldName, result, false);
+        }).start();
+    }
+
+    public static void requestSetField(int sectionId, String className, String fieldName, String instanceName, String value) {
+        new Thread(() -> {
+            String result;
+            try {
+                Class<?> clazz = Class.forName(className);
+                Field f = clazz.getDeclaredField(fieldName);
+                f.setAccessible(true);
+                Object instance = getInstance(className, instanceName);
+                if (instance == null && !Modifier.isStatic(f.getModifiers())) {
+                    result = "Error: Need instance to set instance field.";
+                } else {
+                    Object parsed = parseArg(f.getType(), value);
+                    f.set(instance, parsed);
+                    result = "Set success: " + f.get(instance);
+                }
+            } catch (Throwable t) { result = "Error: " + t.toString(); }
+            nativeSetFieldValue(sectionId, className, fieldName, result, true);
+        }).start();
+    }
+
+    private static Object getInstance(String className, String instanceName) {
+        if (instanceName == null || instanceName.isEmpty() || instanceName.equals("null")) return null;
+        if (instanceName.equals("[Live] Current Activity")) return sCurrentActivity;
+        if (instanceName.equals("[Live] Application Context")) return sApplicationContext;
+        if (instanceName.startsWith("[Cached] ")) return sInstances.get(instanceName.substring(9));
+        return sInstances.get(instanceName);
+    }
+
+    // ========== METHOD CALL & ARGUMENT PROVIDER ==========
     public static int getArgWidgetType(String typeName) {
         try {
             Class<?> c = classFromString(typeName);
@@ -122,83 +194,47 @@ public class Helper {
             if (c.isEnum()) return 2;
             if (Context.class.isAssignableFrom(c) || Activity.class.isAssignableFrom(c)) return 3;
             if (c.isArray()) return 5;
-            if (c.isPrimitive() || Number.class.isAssignableFrom(c) || 
-                c == String.class || c == CharSequence.class || c == char.class || c == Character.class) return 0;
-            return 4; // Instance Combo
-        } catch (Throwable t) {
-            return 0; // fallback
-        }
+            if (c.isPrimitive() || Number.class.isAssignableFrom(c) || c == String.class || c == CharSequence.class || c == char.class || c == Character.class) return 0;
+            return 4;
+        } catch (Throwable t) { return 0; }
     }
 
     public static String[] getArgSuggestions(String typeName) {
         try {
             Class<?> c = classFromString(typeName);
             List<String> r = new ArrayList<>();
-
             if (c.isEnum()) {
                 for (Object e : c.getEnumConstants()) r.add(((Enum<?>)e).name());
                 return r.toArray(new String[0]);
             }
-
-            if (c.isArray() || c.isPrimitive() || Number.class.isAssignableFrom(c) || 
-                c == String.class || c == CharSequence.class || c == char.class || c == Character.class) {
-                return new String[0];
-            }
-
-            // Instance Combo: null + cache + live
+            if (c.isArray() || c.isPrimitive() || Number.class.isAssignableFrom(c) || c == String.class || c == CharSequence.class) return new String[0];
             r.add("null");
             for (Map.Entry<String, Object> e : sInstances.entrySet()) {
                 if (e.getValue() != null && c.isInstance(e.getValue())) r.add("[Cached] " + e.getKey());
             }
             if (sCurrentActivity != null && c.isInstance(sCurrentActivity)) r.add("[Live] Current Activity");
             if (sApplicationContext != null && c.isInstance(sApplicationContext)) r.add("[Live] Application Context");
-
             return r.toArray(new String[0]);
-        } catch (Throwable t) {
-            return new String[]{"null"};
-        }
+        } catch (Throwable t) { return new String[]{"null"}; }
     }
 
     private static Object resolveArg(Class<?> target, String input) throws Exception {
         if (input == null || input.equals("null") || input.isEmpty()) {
-            if (target.isPrimitive()) throw new IllegalArgumentException("Cannot pass null to primitive " + target.getName());
+            if (target.isPrimitive()) throw new IllegalArgumentException("Cannot pass null to primitive");
             return null;
         }
-
-        // Live objects
-        if (input.equals("[Live] Current Activity")) {
-            if (sCurrentActivity == null) throw new IllegalArgumentException("No Activity");
-            return sCurrentActivity;
-        }
-        if (input.equals("[Live] Application Context")) {
-            if (sApplicationContext == null) throw new IllegalArgumentException("No AppContext");
-            return sApplicationContext;
-        }
-
-        // Cached objects
-        if (input.startsWith("[Cached] ")) {
-            String key = input.substring(9);
-            if (!sInstances.containsKey(key)) throw new IllegalArgumentException("Instance not found: " + key);
-            return sInstances.get(key);
-        }
-
-        // Primitive coercion
+        if (input.equals("[Live] Current Activity")) return sCurrentActivity;
+        if (input.equals("[Live] Application Context")) return sApplicationContext;
+        if (input.startsWith("[Cached] ")) return sInstances.get(input.substring(9));
+        if (sInstances.containsKey(input)) return sInstances.get(input);
+        if (target == String.class || target == CharSequence.class || target == Object.class) return input;
         if (target.isPrimitive() || Number.class.isAssignableFrom(target) || target == Boolean.class || target == Character.class) {
             return coercePrimitive(target, input);
         }
-
-        // String
-        if (target == String.class || target == CharSequence.class || target == Object.class) return input;
-
-        // Enum
         if (target.isEnum()) {
-            for (Object c : target.getEnumConstants()) {
-                if (((Enum<?>)c).name().equalsIgnoreCase(input)) return c;
-            }
-            throw new IllegalArgumentException("No enum constant '" + input + "' in " + target.getName());
+            for (Object c : target.getEnumConstants()) if (((Enum<?>)c).name().equalsIgnoreCase(input)) return c;
+            throw new IllegalArgumentException("No enum constant");
         }
-
-        // Array
         if (target.isArray()) {
             Class<?> comp = target.getComponentType();
             if (comp == byte.class) return input.getBytes(StandardCharsets.UTF_8);
@@ -208,78 +244,49 @@ public class Helper {
             for (int i = 0; i < parts.length; i++) Array.set(arr, i, resolveArg(comp, parts[i].trim()));
             return arr;
         }
-
-        throw new IllegalArgumentException("Cannot convert '" + input + "' to " + target.getName() + ". Create an instance first.");
+        throw new IllegalArgumentException("Cannot convert to " + target.getName());
     }
 
     private static Object coercePrimitive(Class<?> target, String input) {
         String s = input.trim();
-        try {
-            if (target == int.class || target == Integer.class) return Integer.parseInt(s);
-            if (target == long.class || target == Long.class) return Long.parseLong(s);
-            if (target == short.class || target == Short.class) return Short.parseShort(s);
-            if (target == byte.class || target == Byte.class) return Byte.parseByte(s);
-            if (target == float.class || target == Float.class) return Float.parseFloat(s);
-            if (target == double.class || target == Double.class) return Double.parseDouble(s);
-            if (target == boolean.class || target == Boolean.class) {
-                String low = s.toLowerCase();
-                return low.equals("true") || low.equals("1") || low.equals("yes") || low.equals("on");
-            }
-            if (target == char.class || target == Character.class) return s.charAt(0);
-            if (target == java.math.BigInteger.class) return new java.math.BigInteger(s);
-            if (target == java.math.BigDecimal.class) return new java.math.BigDecimal(s);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("Invalid number '" + input + "' for " + target.getSimpleName());
-        }
+        if (target == int.class || target == Integer.class) return Integer.parseInt(s);
+        if (target == long.class || target == Long.class) return Long.parseLong(s);
+        if (target == short.class || target == Short.class) return Short.parseShort(s);
+        if (target == byte.class || target == Byte.class) return Byte.parseByte(s);
+        if (target == float.class || target == Float.class) return Float.parseFloat(s);
+        if (target == double.class || target == Double.class) return Double.parseDouble(s);
+        if (target == boolean.class || target == Boolean.class) return s.equalsIgnoreCase("true") || s.equals("1");
+        if (target == char.class || target == Character.class) return s.charAt(0);
+        if (target == java.math.BigInteger.class) return new java.math.BigInteger(s);
+        if (target == java.math.BigDecimal.class) return new java.math.BigDecimal(s);
         throw new IllegalArgumentException("Unsupported primitive: " + target.getName());
     }
 
-    public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName,
-                                         String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
+    public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName, String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
         Runnable r = () -> {
             String result;
             try {
                 Class<?> cls = Class.forName(className);
                 Class<?>[] paramClasses = new Class<?>[paramTypes.length];
                 for (int i = 0; i < paramTypes.length; i++) paramClasses[i] = classFromString(paramTypes[i]);
-
                 Object[] argValues = new Object[args.length];
-                for (int i = 0; i < args.length; i++) {
-                    argValues[i] = resolveArg(paramClasses[i], args[i]);
-                }
+                for (int i = 0; i < args.length; i++) argValues[i] = resolveArg(paramClasses[i], args[i]);
 
                 Object ret;
                 if (isConstructor) {
-                    Constructor<?> c = cls.getDeclaredConstructor(paramClasses);
-                    c.setAccessible(true);
-                    ret = c.newInstance(argValues);
-                    result = "Created: " + (ret == null ? "null" : ret.toString());
-                    sInstances.put(className, ret);
+                    Constructor<?> c = cls.getDeclaredConstructor(paramClasses); c.setAccessible(true); ret = c.newInstance(argValues);
+                    result = "Created: " + (ret == null ? "null" : ret.toString()); sInstances.put(className, ret);
                 } else if (isStatic) {
-                    Method m = cls.getDeclaredMethod(methodName, paramClasses);
-                    m.setAccessible(true);
-                    ret = m.invoke(null, argValues);
+                    Method m = cls.getDeclaredMethod(methodName, paramClasses); m.setAccessible(true); ret = m.invoke(null, argValues);
                     result = "Returned: " + (ret == null ? "null" : ret.toString());
                 } else {
-                    Method m = cls.getDeclaredMethod(methodName, paramClasses);
-                    m.setAccessible(true);
+                    Method m = cls.getDeclaredMethod(methodName, paramClasses); m.setAccessible(true);
                     Object instance = sInstances.get(className);
-                    if (instance == null) {
-                        instance = tryCreateInstance(cls);
-                        if (instance != null) sInstances.put(className, instance);
-                    }
-                    if (instance == null) {
-                        result = "Error: Cannot find or create instance of " + className;
-                    } else {
-                        ret = m.invoke(instance, argValues);
-                        result = "Returned: " + (ret == null ? "null" : ret.toString());
-                    }
+                    if (instance == null) { instance = tryCreateInstance(cls); if (instance != null) sInstances.put(className, instance); }
+                    if (instance == null) result = "Error: Cannot find or create instance.";
+                    else { ret = m.invoke(instance, argValues); result = "Returned: " + (ret == null ? "null" : ret.toString()); }
                 }
-            } catch (Throwable t) {
-                Throwable inner = t;
-                while (inner.getCause() != null) inner = inner.getCause();
-                result = "Error: " + inner.toString();
-            }
+            } catch (Throwable t) { result = "Error: " + t.toString(); }
             nativeSetMethodResult(sectionId, className, methodSig, result);
         };
         if (runInMain) new Handler(Looper.getMainLooper()).post(r); else new Thread(r).start();
@@ -289,7 +296,6 @@ public class Helper {
         try { Constructor<?> c = cls.getDeclaredConstructor(); c.setAccessible(true); return c.newInstance(); }
         catch (Throwable t) { return null; }
     }
-
     private static Class<?> classFromString(String s) throws ClassNotFoundException {
         switch (s) {
             case "int": return int.class; case "long": return long.class; case "short": return short.class;
@@ -301,7 +307,7 @@ public class Helper {
         return Class.forName(s);
     }
 
-    // ========== Existing code (DEX parsing, class lister, find instances) ==========
+    // ========== STATIC CLASS LIST ==========
     private static List<String> listAllClasses(Context ctx) {
         List<String> out = new ArrayList<>();
         try (ZipFile zip = new ZipFile(ctx.getPackageCodePath())) {
@@ -314,16 +320,12 @@ public class Helper {
         } catch (Throwable t) { log("listAllClasses error: " + t); }
         Collections.sort(out); return out;
     }
-
     private static byte[] readAll(InputStream in) throws IOException {
         ByteArrayOutputStream o = new ByteArrayOutputStream(); byte[] b = new byte[8192]; int n;
         while ((n = in.read(b)) > 0) o.write(b, 0, n); return o.toByteArray();
     }
-    private static int rd16(byte[] d, int off) { return (d[off] & 0xFF) | ((d[off+1] & 0xFF) << 8); }
     private static int rd32(byte[] d, int off) { return (d[off]&0xFF) | ((d[off+1]&0xFF)<<8) | ((d[off+2]&0xFF)<<16) | ((d[off+3]&0xFF)<<24); }
-    private static int readUleb128(byte[] d, int[] pos) {
-        int r = 0, s = 0; while (true) { byte b = d[pos[0]++]; r |= (b & 0x7F) << s; if ((b & 0x80) == 0) break; s += 7; } return r;
-    }
+    private static int readUleb128(byte[] d, int[] pos) { int r = 0, s = 0; while (true) { byte b = d[pos[0]++]; r |= (b & 0x7F) << s; if ((b & 0x80) == 0) break; s += 7; } return r; }
     private static String readString(byte[] d, int strIdsOff, int strIdx) {
         if (strIdx < 0) return "";
         int strDataOff = rd32(d, strIdsOff + strIdx * 4);
@@ -333,17 +335,6 @@ public class Helper {
         return new String(d, start, p - start, StandardCharsets.UTF_8);
     }
     private static String getTypeDesc(byte[] d, int typeIdsOff, int strIdsOff, int typeIdx) { return readString(d, strIdsOff, rd32(d, typeIdsOff + typeIdx * 4)); }
-    private static String prettyType(String desc) {
-        if (desc == null || desc.isEmpty()) return "?";
-        switch (desc.charAt(0)) {
-            case 'V': return "void"; case 'Z': return "boolean"; case 'B': return "byte"; case 'S': return "short";
-            case 'C': return "char"; case 'I': return "int"; case 'J': return "long"; case 'F': return "float"; case 'D': return "double";
-            case 'L': return desc.endsWith(";") ? desc.substring(1, desc.length() - 1).replace('/', '.') : desc;
-            case '[': return prettyType(desc.substring(1)) + "[]";
-            default: return desc;
-        }
-    }
-
     private static void parseDexClasses(byte[] d, List<String> out) {
         if (d.length < 0x70 || d[0] != 'd' || d[1] != 'e' || d[2] != 'x') return;
         int strIdsOff = rd32(d, 0x3C); int typeIdsSize = rd32(d, 0x40); int typeIdsOff = rd32(d, 0x44);
@@ -357,111 +348,6 @@ public class Helper {
         }
     }
 
-    public static void requestClassDetails(int sectionId, String className) {
-        new Thread(() -> {
-            String[] fields = new String[0]; String[] methods = new String[0];
-            try { ClassMembers m = parseClassMembers(className); fields = m.fields.toArray(new String[0]); methods = m.methods.toArray(new String[0]); }
-            catch (Throwable t) { log("requestClassDetails failed: " + t); }
-            nativeSetClassDetails(sectionId, className, fields, methods);
-        }).start();
-    }
-
-    private static class ClassMembers { List<String> fields = new ArrayList<>(); List<String> methods = new ArrayList<>(); }
-
-    private static ClassMembers parseClassMembers(String className) {
-        ClassMembers out = new ClassMembers(); String targetDesc = "L" + className.replace('.', '/') + ";";
-        try (ZipFile zip = new ZipFile(getApkPath())) {
-            for (ZipEntry entry : Collections.list(zip.entries())) {
-                String n = entry.getName();
-                if (n.equals("classes.dex") || n.matches("classes\\d+\\.dex")) {
-                    try (InputStream in = zip.getInputStream(entry)) { parseDexMembers(readAll(in), targetDesc, out); } catch (IOException ignored) { }
-                }
-            }
-        } catch (Throwable t) { log("parseClassMembers error: " + t); }
-        return out;
-    }
-
-    private static String cachedApkPath = null;
-    private static String getApkPath() {
-        if (cachedApkPath != null) return cachedApkPath;
-        try { Class<?> at = Class.forName("android.app.ActivityThread"); Object app = at.getMethod("currentApplication").invoke(null); if (app instanceof Context) { cachedApkPath = ((Context) app).getPackageCodePath(); if (cachedApkPath != null) return cachedApkPath; } } catch (Throwable ignored) { }
-        return "/system/framework/framework.jar";
-    }
-
-    private static void parseDexMembers(byte[] d, String targetDesc, ClassMembers out) {
-        if (d.length < 0x70 || d[0] != 'd' || d[1] != 'e' || d[2] != 'x') return;
-        int strIdsOff=rd32(d,0x3C); int typeIdsSize=rd32(d,0x40); int typeIdsOff=rd32(d,0x44);
-        int protoIdsOff=rd32(d,0x4C); int fieldIdsOff=rd32(d,0x54); int methodIdsOff=rd32(d,0x5C);
-        int classDefSize=rd32(d,0x60); int classDefOff=rd32(d,0x64);
-        if (classDefOff + classDefSize * 32 > d.length) return;
-
-        for (int i = 0; i < classDefSize; i++) {
-            int cd = classDefOff + i * 32; int classIdx = rd32(d, cd);
-            if (classIdx < 0 || classIdx >= typeIdsSize) continue;
-            if (!targetDesc.equals(getTypeDesc(d, typeIdsOff, strIdsOff, classIdx))) continue;
-            int classDataOff = rd32(d, cd + 24); if (classDataOff == 0) return;
-
-            int[] pos = { classDataOff };
-            int staticFields=readUleb128(d,pos); int instanceFields=readUleb128(d,pos);
-            int directMethods=readUleb128(d,pos); int virtualMethods=readUleb128(d,pos);
-
-            int fieldIdx = 0;
-            for (int j = 0; j < staticFields; j++) { int diff = readUleb128(d, pos); readUleb128(d, pos); fieldIdx += diff; out.fields.add("[static] " + getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx)); }
-            fieldIdx = 0;
-            for (int j = 0; j < instanceFields; j++) { int diff = readUleb128(d, pos); readUleb128(d, pos); fieldIdx += diff; out.fields.add("[instance] " + getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx)); }
-            int methodIdx = 0;
-            for (int j = 0; j < directMethods; j++) { int diff = readUleb128(d, pos); readUleb128(d, pos); readUleb128(d, pos); methodIdx += diff; out.methods.add(getMethodRaw(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx)); }
-            methodIdx = 0;
-            for (int j = 0; j < virtualMethods; j++) { int diff = readUleb128(d, pos); readUleb128(d, pos); readUleb128(d, pos); methodIdx += diff; out.methods.add(getMethodRaw(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx)); }
-            return;
-        }
-    }
-
-    private static String getFieldSig(byte[] d, int fieldIdsOff, int typeIdsOff, int strIdsOff, int fieldIdx) {
-        int fi = fieldIdsOff + fieldIdx * 8; String name = readString(d, strIdsOff, rd32(d, fi + 4));
-        String type = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd16(d, fi + 2))); return type + " " + name;
-    }
-
-    private static String getMethodRaw(byte[] d, int methodIdsOff, int protoIdsOff, int typeIdsOff, int strIdsOff, int methodIdx) {
-        int mi = methodIdsOff + methodIdx * 8; int protoIdx = rd16(d, mi + 2); String name = readString(d, strIdsOff, rd32(d, mi + 4));
-        int pi = protoIdsOff + protoIdx * 12; String returnType = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd32(d, pi + 4)));
-        int paramsOff = rd32(d, pi + 8); StringBuilder params = new StringBuilder();
-        if (paramsOff != 0 && paramsOff + 4 <= d.length) {
-            int count = rd32(d, paramsOff);
-            for (int j = 0; j < count; j++) { int off = paramsOff + 4 + j * 2; if (off + 2 > d.length) break; if (j > 0) params.append(";"); params.append(prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd16(d, off)))); }
-        }
-        return name + "|" + returnType + "|" + (name.contains("$") || name.equals("<clinit>") ? "1" : "0") + "|" + ("<init>".equals(name) ? "1" : "0") + "|" + params;
-    }
-
-    public static void requestFindInstances(String className) {
-        new Thread(() -> {
-            List<String> found = new ArrayList<>();
-            try {
-                for (Map.Entry<String, Object> e : sInstances.entrySet()) {
-                    if (e.getValue() != null && e.getKey().equals(className))
-                        found.add("Cached: " + e.getValue().toString());
-                }
-                Class<?> atClass = Class.forName("android.app.ActivityThread");
-                Object currentAt = atClass.getMethod("currentActivityThread").invoke(null);
-                if (currentAt != null) {
-                    java.lang.reflect.Field mActField = atClass.getDeclaredField("mActivities"); mActField.setAccessible(true);
-                    android.util.ArrayMap<?, ?> acts = (android.util.ArrayMap<?, ?>) mActField.get(currentAt);
-                    if (acts != null) {
-                        for (int i = 0; i < acts.size(); i++) {
-                            Object record = acts.valueAt(i);
-                            java.lang.reflect.Field actField = record.getClass().getDeclaredField("activity"); actField.setAccessible(true);
-                            Object act = actField.get(record);
-                            if (act != null && act.getClass().getName().equals(className)) found.add("Activity: " + act.toString());
-                        }
-                    }
-                }
-                Object app = atClass.getMethod("currentApplication").invoke(null);
-                if (app != null && className.equals("android.content.Context")) found.add("Application: " + app.toString());
-            } catch (Throwable ignored) {}
-            nativeSetInspectorInstances(className, found.toArray(new String[0]));
-        }).start();
-    }
-
     static native void nativeInit(android.view.Surface s);
     static native void nativeResize(int w, int h);
     static native void nativeRender();
@@ -472,5 +358,5 @@ public class Helper {
     static native void nativeAddKeyEvent(int keycode, boolean down);
     static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
     static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
-    static native void nativeSetInspectorInstances(String className, String[] instances);
+    static native void nativeSetFieldValue(int sectionId, String className, String fieldName, String value, boolean isSet);
 }
