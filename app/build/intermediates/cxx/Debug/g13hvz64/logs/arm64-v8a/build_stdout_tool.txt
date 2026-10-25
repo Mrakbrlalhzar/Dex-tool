@@ -4,21 +4,34 @@ ninja: Entering directory `/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g1
 [3/8] Building CXX object CMakeFiles/tool.dir/tool/native-lib.cpp.o
 FAILED: CMakeFiles/tool.dir/tool/native-lib.cpp.o 
 /usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -MD -MT CMakeFiles/tool.dir/tool/native-lib.cpp.o -MF CMakeFiles/tool.dir/tool/native-lib.cpp.o.d -o CMakeFiles/tool.dir/tool/native-lib.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp
-/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:440:9: error: use of undeclared identifier 'js'
-        js = (jstring)env->GetObjectArrayElement(arr, i);
-        ^
-/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:441:49: error: use of undeclared identifier 'js'
-        const char* cs = env->GetStringUTFChars(js, nullptr);
-                                                ^
-/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:442:75: error: use of undeclared identifier 'js'
-        if (cs) { gClassList.emplace_back(cs); env->ReleaseStringUTFChars(js, cs); }
-                                                                          ^
-/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:443:29: error: use of undeclared identifier 'js'
-        env->DeleteLocalRef(js);
-                            ^
-4 errors generated.
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:147:19: error: use of undeclared identifier 'IM_PI'
+        float a = IM_PI * 2.0f * i / 6.0f + IM_PI * 0.5f;
+                  ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:147:45: error: use of undeclared identifier 'IM_PI'
+        float a = IM_PI * 2.0f * i / 6.0f + IM_PI * 0.5f;
+                                            ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:156:41: error: use of undeclared identifier 'IM_PI'
+        float t = (float)i / 12.0f, a = IM_PI * t;
+                                        ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:161:41: error: use of undeclared identifier 'IM_PI'
+        float t = (float)i / 12.0f, a = IM_PI * t;
+                                        ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:291:7: error: use of undeclared identifier 'ImGuiCol_TabActive'; did you mean 'ImGuiCol_HeaderActive'?
+    c[ImGuiCol_TabActive]            = ImVec4(0.35f, 0.27f, 0.05f, 1.00f);
+      ^~~~~~~~~~~~~~~~~~
+      ImGuiCol_HeaderActive
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/imgui.h:1807:5: note: 'ImGuiCol_HeaderActive' declared here
+    ImGuiCol_HeaderActive,
+    ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:292:7: error: use of undeclared identifier 'ImGuiCol_TabUnfocused'
+    c[ImGuiCol_TabUnfocused]         = ImVec4(0.10f, 0.12f, 0.16f, 1.00f);
+      ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:293:7: error: use of undeclared identifier 'ImGuiCol_TabUnfocusedActive'
+    c[ImGuiCol_TabUnfocusedActive]   = ImVec4(0.20f, 0.16f, 0.04f, 1.00f);
+      ^
+7 errors generated.
 [4/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o
 [5/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o
-[6/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o
-[7/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui.cpp.o
+[6/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui.cpp.o
+[7/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o
 ninja: build stopped: subcommand failed.
