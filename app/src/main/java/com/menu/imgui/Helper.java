@@ -7,7 +7,6 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.view.ViewGroup;
-
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -38,6 +37,7 @@ public class Helper {
     private static final Map<String, Object> sInstances = new HashMap<>();
     private static Object sCurrentActivity = null;
     private static Object sApplicationContext = null;
+    private static int sPatchCounter = 1;
 
     public static class PatchRecord {
         public int id;
@@ -49,7 +49,6 @@ public class Helper {
         public boolean isActive = true;
     }
     private static final List<PatchRecord> sActivePatches = new ArrayList<>();
-    private static int sPatchCounter = 1;
 
     static {
         try {
@@ -108,8 +107,7 @@ public class Helper {
                     return nativeTouch(action, e.getX(), e.getY());
                 });
                 ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
-                decor.addView(overlay, new ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                decor.addView(overlay, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
                 new Thread(() -> {
                     try {
                         List<String> classes = listAllClasses(activity);
@@ -128,8 +126,7 @@ public class Helper {
                 Class<?> clazz = Class.forName(className);
                 for (Field f : clazz.getDeclaredFields()) {
                     f.setAccessible(true);
-                    fields.add((Modifier.isStatic(f.getModifiers()) ? "[static] " : "[instance] ") + 
-                               f.getType().getSimpleName() + " " + f.getName());
+                    fields.add((Modifier.isStatic(f.getModifiers()) ? "[static] " : "[instance] ") + f.getType().getSimpleName() + " " + f.getName());
                 }
                 for (Method m : clazz.getDeclaredMethods()) {
                     m.setAccessible(true);
@@ -138,10 +135,7 @@ public class Helper {
                     sb.append(m.getReturnType().getSimpleName()).append(" ");
                     sb.append(m.getName()).append("(");
                     Class<?>[] params = m.getParameterTypes();
-                    for (int i = 0; i < params.length; i++) {
-                        if (i > 0) sb.append(", ");
-                        sb.append(params[i].getSimpleName());
-                    }
+                    for (int i = 0; i < params.length; i++) { if (i > 0) sb.append(", "); sb.append(params[i].getSimpleName()); }
                     sb.append(")");
                     methods.add(sb.toString());
                 }
@@ -158,12 +152,8 @@ public class Helper {
                 Field f = clazz.getDeclaredField(fieldName);
                 f.setAccessible(true);
                 Object instance = getInstance(className, instanceName);
-                if (instance == null && !Modifier.isStatic(f.getModifiers())) {
-                    result = "Error: Need instance to read instance field.";
-                } else {
-                    Object val = f.get(instance);
-                    result = String.valueOf(val);
-                }
+                if (instance == null && !Modifier.isStatic(f.getModifiers())) result = "Error: Need instance.";
+                else { Object val = f.get(instance); result = String.valueOf(val); }
             } catch (Throwable t) { result = "Error: " + t.toString(); }
             nativeSetFieldValue(sectionId, className, fieldName, result, false);
         }).start();
@@ -177,13 +167,8 @@ public class Helper {
                 Field f = clazz.getDeclaredField(fieldName);
                 f.setAccessible(true);
                 Object instance = getInstance(className, instanceName);
-                if (instance == null && !Modifier.isStatic(f.getModifiers())) {
-                    result = "Error: Need instance to set instance field.";
-                } else {
-                    Object parsed = parseArg(f.getType(), value);
-                    f.set(instance, parsed);
-                    result = "Set success: " + f.get(instance);
-                }
+                if (instance == null && !Modifier.isStatic(f.getModifiers())) result = "Error: Need instance.";
+                else { Object parsed = parseArg(f.getType(), value); f.set(instance, parsed); result = "Set: " + f.get(instance); }
             } catch (Throwable t) { result = "Error: " + t.toString(); }
             nativeSetFieldValue(sectionId, className, fieldName, result, true);
         }).start();
@@ -199,52 +184,28 @@ public class Helper {
 
     public static void requestPatchMethod(String className, String methodSig, String returnType) {
         PatchRecord p = new PatchRecord();
-        p.id = sPatchCounter++;
-        p.type = "Method";
-        p.className = className;
-        p.targetName = methodSig;
-        p.originalValue = "(original)";
-        p.currentValue = "0";
-        sActivePatches.add(p);
-        syncPatches();
+        p.id = sPatchCounter++; p.type = "Method"; p.className = className; p.targetName = methodSig;
+        p.originalValue = "(original)"; p.currentValue = "0";
+        sActivePatches.add(p); syncPatches();
     }
-
     public static void requestPatchField(String className, String fieldName, String currentValue) {
         PatchRecord p = new PatchRecord();
-        p.id = sPatchCounter++;
-        p.type = "Field";
-        p.className = className;
-        p.targetName = fieldName;
-        p.originalValue = currentValue;
-        p.currentValue = currentValue;
-        sActivePatches.add(p);
-        syncPatches();
+        p.id = sPatchCounter++; p.type = "Field"; p.className = className; p.targetName = fieldName;
+        p.originalValue = currentValue; p.currentValue = currentValue;
+        sActivePatches.add(p); syncPatches();
     }
-
     public static void togglePatch(int id, boolean active) {
-        for (PatchRecord p : sActivePatches) {
-            if (p.id == id) { p.isActive = active; break; }
-        }
+        for (PatchRecord p : sActivePatches) if (p.id == id) { p.isActive = active; break; }
         syncPatches();
     }
-
     public static void updatePatchValue(int id, String newValue) {
-        for (PatchRecord p : sActivePatches) {
-            if (p.id == id) { p.currentValue = newValue; break; }
-        }
+        for (PatchRecord p : sActivePatches) if (p.id == id) { p.currentValue = newValue; break; }
         syncPatches();
     }
-
-    public static void removePatch(int id) {
-        sActivePatches.removeIf(p -> p.id == id);
-        syncPatches();
-    }
-
+    public static void removePatch(int id) { sActivePatches.removeIf(p -> p.id == id); syncPatches(); }
     private static void syncPatches() {
         List<String> serialized = new ArrayList<>();
-        for (PatchRecord p : sActivePatches) {
-            serialized.add(p.id + "|" + p.type + "|" + p.className + "|" + p.targetName + "|" + p.originalValue + "|" + p.currentValue + "|" + p.isActive);
-        }
+        for (PatchRecord p : sActivePatches) serialized.add(p.id + "|" + p.type + "|" + p.className + "|" + p.targetName + "|" + p.originalValue + "|" + p.currentValue + "|" + p.isActive);
         nativeSetPatches(serialized.toArray(new String[0]));
     }
 
@@ -264,15 +225,10 @@ public class Helper {
         try {
             Class<?> c = classFromString(typeName);
             List<String> r = new ArrayList<>();
-            if (c.isEnum()) {
-                for (Object e : c.getEnumConstants()) r.add(((Enum<?>)e).name());
-                return r.toArray(new String[0]);
-            }
+            if (c.isEnum()) { for (Object e : c.getEnumConstants()) r.add(((Enum<?>)e).name()); return r.toArray(new String[0]); }
             if (c.isArray() || c.isPrimitive() || Number.class.isAssignableFrom(c) || c == String.class || c == CharSequence.class) return new String[0];
             r.add("null");
-            for (Map.Entry<String, Object> e : sInstances.entrySet()) {
-                if (e.getValue() != null && c.isInstance(e.getValue())) r.add("[Cached] " + e.getKey());
-            }
+            for (Map.Entry<String, Object> e : sInstances.entrySet()) if (e.getValue() != null && c.isInstance(e.getValue())) r.add("[Cached] " + e.getKey());
             if (sCurrentActivity != null && c.isInstance(sCurrentActivity)) r.add("[Live] Current Activity");
             if (sApplicationContext != null && c.isInstance(sApplicationContext)) r.add("[Live] Application Context");
             return r.toArray(new String[0]);
@@ -289,13 +245,8 @@ public class Helper {
         if (input.startsWith("[Cached] ")) return sInstances.get(input.substring(9));
         if (sInstances.containsKey(input)) return sInstances.get(input);
         if (target == String.class || target == CharSequence.class || target == Object.class) return input;
-        if (target.isPrimitive() || Number.class.isAssignableFrom(target) || target == Boolean.class || target == Character.class) {
-            return coercePrimitive(target, input);
-        }
-        if (target.isEnum()) {
-            for (Object c : target.getEnumConstants()) if (((Enum<?>)c).name().equalsIgnoreCase(input)) return c;
-            throw new IllegalArgumentException("No enum constant");
-        }
+        if (target.isPrimitive() || Number.class.isAssignableFrom(target) || target == Boolean.class || target == Character.class) return coercePrimitive(target, input);
+        if (target.isEnum()) { for (Object c : target.getEnumConstants()) if (((Enum<?>)c).name().equalsIgnoreCase(input)) return c; throw new IllegalArgumentException("No enum constant"); }
         if (target.isArray()) {
             Class<?> comp = target.getComponentType();
             if (comp == byte.class) return input.getBytes(StandardCharsets.UTF_8);
@@ -320,7 +271,7 @@ public class Helper {
         if (target == char.class || target == Character.class) return s.charAt(0);
         if (target == java.math.BigInteger.class) return new java.math.BigInteger(s);
         if (target == java.math.BigDecimal.class) return new java.math.BigDecimal(s);
-        throw new IllegalArgumentException("Unsupported primitive: " + target.getName());
+        throw new IllegalArgumentException("Unsupported primitive");
     }
 
     public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName, String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
@@ -332,7 +283,6 @@ public class Helper {
                 for (int i = 0; i < paramTypes.length; i++) paramClasses[i] = classFromString(paramTypes[i]);
                 Object[] argValues = new Object[args.length];
                 for (int i = 0; i < args.length; i++) argValues[i] = resolveArg(paramClasses[i], args[i]);
-
                 Object ret;
                 if (isConstructor) {
                     Constructor<?> c = cls.getDeclaredConstructor(paramClasses); c.setAccessible(true); ret = c.newInstance(argValues);
@@ -379,10 +329,7 @@ public class Helper {
         if (type == boolean.class || type == Boolean.class) return s.equalsIgnoreCase("true") || s.equals("1");
         if (type == char.class || type == Character.class) return s.charAt(0);
         if (type == String.class) return s;
-        if (type.isEnum()) {
-            for (Object c : type.getEnumConstants()) if (((Enum<?>)c).name().equalsIgnoreCase(s)) return c;
-            return null;
-        }
+        if (type.isEnum()) { for (Object c : type.getEnumConstants()) if (((Enum<?>)c).name().equalsIgnoreCase(s)) return c; return null; }
         return null;
     }
 
@@ -403,7 +350,6 @@ public class Helper {
         while ((n = in.read(b)) > 0) o.write(b, 0, n); return o.toByteArray();
     }
     private static int rd32(byte[] d, int off) { return (d[off]&0xFF) | ((d[off+1]&0xFF)<<8) | ((d[off+2]&0xFF)<<16) | ((d[off+3]&0xFF)<<24); }
-    private static int readUleb128(byte[] d, int[] pos) { int r = 0, s = 0; while (true) { byte b = d[pos[0]++]; r |= (b & 0x7F) << s; if ((b & 0x80) == 0) break; s += 7; } return r; }
     private static String readString(byte[] d, int strIdsOff, int strIdx) {
         if (strIdx < 0) return "";
         int strDataOff = rd32(d, strIdsOff + strIdx * 4);

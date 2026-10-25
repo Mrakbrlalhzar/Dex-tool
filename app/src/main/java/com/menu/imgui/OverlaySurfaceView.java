@@ -10,7 +10,6 @@ import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
-
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
@@ -51,15 +50,9 @@ public class OverlaySurfaceView extends GLSurfaceView {
             Helper.nativeRender();
             final boolean want = Helper.nativeWantKeyboard();
             long now = System.currentTimeMillis();
-            if (want && !keyboardShown) {
-                keyboardShown = true; lastActionMs = now;
-                post(() -> showKeyboard());
-            } else if (!want && keyboardShown) {
-                keyboardShown = false; lastActionMs = now;
-                post(() -> hideKeyboard());
-            } else if (want && keyboardShown && !imm.isAcceptingText() && now - lastActionMs > 400) {
-                lastActionMs = now; post(() -> showKeyboard());
-            }
+            if (want && !keyboardShown) { keyboardShown = true; lastActionMs = now; post(() -> showKeyboard()); }
+            else if (!want && keyboardShown) { keyboardShown = false; lastActionMs = now; post(() -> hideKeyboard()); }
+            else if (want && keyboardShown && !imm.isAcceptingText() && now - lastActionMs > 400) { lastActionMs = now; post(() -> showKeyboard()); }
         }
     }
     @Override public boolean onCheckIsTextEditor() { return true; }
@@ -77,14 +70,8 @@ public class OverlaySurfaceView extends GLSurfaceView {
                 return true;
             }
             @Override public boolean sendKeyEvent(KeyEvent ev) {
-                if (ev.getKeyCode() == KeyEvent.KEYCODE_DEL) {
-                    if (ev.getAction() == KeyEvent.ACTION_DOWN) { Helper.nativeAddKeyEvent(67, true); Helper.nativeAddKeyEvent(67, false); }
-                    return true;
-                }
-                if (ev.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
-                    if (ev.getAction() == KeyEvent.ACTION_DOWN) Helper.nativeAddInputChar('\n');
-                    return true;
-                }
+                if (ev.getKeyCode() == KeyEvent.KEYCODE_DEL) { if (ev.getAction() == KeyEvent.ACTION_DOWN) { Helper.nativeAddKeyEvent(67, true); Helper.nativeAddKeyEvent(67, false); } return true; }
+                if (ev.getKeyCode() == KeyEvent.KEYCODE_ENTER) { if (ev.getAction() == KeyEvent.ACTION_DOWN) Helper.nativeAddInputChar('\n'); return true; }
                 return super.sendKeyEvent(ev);
             }
         };
