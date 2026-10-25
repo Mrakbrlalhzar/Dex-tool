@@ -485,7 +485,9 @@ jobs:
           chmod +x gradlew
 
       - name: Build
-        run: ./gradlew clean :app:assembleDebug --no-build-cache --stacktrace
+        run: |
+          rm -rf app/.cxx app/build .gradle
+          ./gradlew :app:assembleDebug --no-build-cache --stacktrace
 
       - name: Extract libtool.so
         run: |
