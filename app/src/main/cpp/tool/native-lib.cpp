@@ -87,7 +87,7 @@ static bool g_fabDown = false, g_fabMoved = false;
 static float g_fabDownAtX = 0, g_fabDownAtY = 0, g_fabDragStartX = 0, g_fabDragStartY = 0;
 static float g_virtX = 0, g_virtY = 0, g_realPrevX = 0, g_realPrevY = 0, g_titleH = 30.0f;
 
-// ====== FRIDA INIT ======
+// ====== FRIDA INIT (FIXED: 6 args for create_sync) ======
 static GumScript* g_script = nullptr;
 static GumScriptBackend* g_backend = nullptr;
 
@@ -121,7 +121,8 @@ static void on_script_message(const gchar* message, GBytes* data, gpointer user_
 static void init_frida_script() {
     GError* error = nullptr;
     g_backend = gum_script_backend_obtain_qjs();
-    g_script = gum_script_backend_create_sync(g_backend, "patch_agent", PATCH_AGENT_JS, nullptr, &error);
+    // FIXED: 6 arguments: self, name, source, snapshot, cancellable, error
+    g_script = gum_script_backend_create_sync(g_backend, "patch_agent", PATCH_AGENT_JS, nullptr, nullptr, &error);
     if (error || !g_script) {
         LOGI("Frida create error: %s", error ? error->message : "null script");
         if (error) g_error_free(error);
@@ -728,7 +729,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     gVM = vm;
     if (!loadDex(env)) return JNI_VERSION_1_6;
 
-    // Init Frida
+    // Init Frida (FIXED)
     gum_init_embedded();
     LOGI("Frida Gum initialized");
     init_frida_script();
