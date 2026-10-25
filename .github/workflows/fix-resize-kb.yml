@@ -1,0 +1,471 @@
+name: Fix Resize Collapse Keyboard
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Write OverlaySurfaceView.java
+        run: |
+          cat > app/src/main/java/com/menu/imgui/OverlaySurfaceView.java << 'JAVA_EOF'
+          package com.menu.imgui;
+
+          import android.content.Context;
+          import android.graphics.PixelFormat;
+          import android.opengl.GLSurfaceView;
+          import android.text.InputType;
+          import android.view.KeyEvent;
+          import android.view.Surface;
+          import android.view.inputmethod.BaseInputConnection;
+          import android.view.inputmethod.EditorInfo;
+          import android.view.inputmethod.InputConnection;
+          import android.view.inputmethod.InputMethodManager;
+
+          import javax.microedition.khronos.egl.EGLConfig;
+          import javax.microedition.khronos.opengles.GL10;
+
+          public class OverlaySurfaceView extends GLSurfaceView {
+              private volatile boolean ready = false;
+              private volatile boolean keyboardShown = false;
+              private volatile long lastActionMs = 0;
+              private final InputMethodManager imm;
+
+              public OverlaySurfaceView(Context ctx) {
+                  super(ctx);
+                  imm = (InputMethodManager) ctx.getSystemService(Context.INPUT_METHOD_SERVICE);
+                  setEGLContextClientVersion(3);
+                  setEGLConfigChooser(8, 8, 8, 8, 16, 0);
+                  setZOrderOnTop(true);
+                  getHolder().setFormat(PixelFormat.TRANSLUCENT);
+                  setFocusable(true);
+                  setFocusableInTouchMode(true);
+                  setClickable(true);
+                  setRenderer(new MyRenderer());
+                  setRenderMode(RENDERMODE_CONTINUOUSLY);
+              }
+
+              public boolean isReady() { return ready; }
+
+              private void showKeyboard() {
+                  try {
+                      requestFocus();
+                      imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
+                  } catch (Throwable ignored) { }
+              }
+
+              private void hideKeyboard() {
+                  try {
+                      imm.hideSoftInputFromWindow(getWindowToken(), 0);
+                  } catch (Throwable ignored) { }
+              }
+
+              private class MyRenderer implements GLSurfaceView.Renderer {
+                  @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+                      Surface s = getHolder().getSurface();
+                      if (s != null) { Helper.nativeInit(s); ready = true; }
+                  }
+                  @Override public void onSurfaceChanged(GL10 gl, int w, int h) { Helper.nativeResize(w, h); }
+                  @Override public void onDrawFrame(GL10 gl) {
+                      if (!ready) return;
+                      Helper.nativeRender();
+                      final boolean want = Helper.nativeWantKeyboard();
+                      long now = System.currentTimeMillis();
+                      if (want && !keyboardShown) {
+                          keyboardShown = true;
+                          lastActionMs = now;
+                          post(() -> showKeyboard());
+                      } else if (!want && keyboardShown) {
+                          keyboardShown = false;
+                          lastActionMs = now;
+                          post(() -> hideKeyboard());
+                      } else if (want && keyboardShown && !imm.isAcceptingText() && now - lastActionMs > 400) {
+                          lastActionMs = now;
+                          post(() -> showKeyboard());
+                      }
+                  }
+              }
+
+              @Override public boolean onCheckIsTextEditor() { return true; }
+
+              @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+                  outAttrs.inputType = InputType.TYPE_CLASS_TEXT
+                          | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                          | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+                  outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE
+                          | EditorInfo.IME_FLAG_NO_FULLSCREEN
+                          | EditorInfo.IME_FLAG_NO_EXTRACT_UI;
+                  return new BaseInputConnection(this, false) {
+                      @Override public boolean commitText(CharSequence text, int pos) {
+                          if (text != null) for (int i = 0; i < text.length(); i++)
+                              Helper.nativeAddInputChar(text.charAt(i));
+                          return true;
+                      }
+                      @Override public boolean setComposingText(CharSequence text, int pos) {
+                          return commitText(text, pos);
+                      }
+                      @Override public boolean deleteSurroundingText(int before, int after) {
+                          for (int i = 0; i < before; i++) {
+                              Helper.nativeAddKeyEvent(67, true);
+                              Helper.nativeAddKeyEvent(67, false);
+                          }
+                          return true;
+                      }
+                      @Override public boolean sendKeyEvent(KeyEvent ev) {
+                          if (ev.getKeyCode() == KeyEvent.KEYCODE_DEL) {
+                              if (ev.getAction() == KeyEvent.ACTION_DOWN) {
+                                  Helper.nativeAddKeyEvent(67, true);
+                                  Helper.nativeAddKeyEvent(67, false);
+                              }
+                              return true;
+                          }
+                          if (ev.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
+                              if (ev.getAction() == KeyEvent.ACTION_DOWN)
+                                  Helper.nativeAddInputChar('\n');
+                              return true;
+                          }
+                          return super.sendKeyEvent(ev);
+                      }
+                  };
+              }
+          }
+          JAVA_EOF
+
+      - name: Write Helper.java (full rewrite with keyboard hooks)
+        run: |
+          cat > app/src/main/java/com/menu/imgui/Helper.java << 'JAVA_EOF'
+          package com.menu.imgui;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.util.Log;
+          import android.view.MotionEvent;
+          import android.view.ViewGroup;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileWriter;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.PrintWriter;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipFile;
+
+          public class Helper {
+              private static final String TAG = "ImGuiTool";
+              private static OverlaySurfaceView overlay;
+
+              static {
+                  try {
+                      Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+                          try {
+                              File f = new File(getLogDir(), "crash.log");
+                              FileWriter w = new FileWriter(f, true);
+                              PrintWriter pw = new PrintWriter(w);
+                              pw.println("\n=== JAVA CRASH " + now() + " ===");
+                              pw.println("Thread: " + t.getName());
+                              e.printStackTrace(pw);
+                              pw.println("=== END ===");
+                              pw.close();
+                          } catch (Throwable ignored) { }
+                      });
+                  } catch (Throwable ignored) { }
+              }
+
+              private static String now() {
+                  return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
+              }
+
+              private static String getPkgName() {
+                  try (FileInputStream fis = new FileInputStream("/proc/self/cmdline")) {
+                      byte[] buf = new byte[256];
+                      int n = fis.read(buf);
+                      if (n > 0) {
+                          int end = 0;
+                          while (end < n && buf[end] != 0) end++;
+                          String pkg = new String(buf, 0, end, "UTF-8");
+                          int colon = pkg.indexOf(':');
+                          return colon > 0 ? pkg.substring(0, colon) : pkg;
+                      }
+                  } catch (Throwable ignored) { }
+                  return "unknown";
+              }
+
+              private static String getLogDir() {
+                  File downloads = new File("/sdcard/Download");
+                  if (downloads.exists() && downloads.canWrite()) {
+                      File test = new File(downloads, ".wtest");
+                      try { test.createNewFile(); test.delete(); return downloads.getAbsolutePath(); }
+                      catch (Throwable ignored) { }
+                  }
+                  File ext = new File("/sdcard/Android/data/" + getPkgName());
+                  if (ext.exists()) return ext.getAbsolutePath();
+                  try { ext.mkdirs(); } catch (Throwable ignored) { }
+                  if (ext.exists() && ext.canWrite()) return ext.getAbsolutePath();
+                  return "/data/data/" + getPkgName();
+              }
+
+              private static void log(String msg) {
+                  Log.i(TAG, msg);
+                  try {
+                      File f = new File(getLogDir(), "crash.log");
+                      FileWriter w = new FileWriter(f, true);
+                      w.write("[J " + now() + "] " + msg + "\n");
+                      w.close();
+                  } catch (Throwable ignored) { }
+              }
+
+              public static void attach(Context ctx) {
+                  log("Helper.attach entered");
+                  if (!(ctx instanceof Activity)) return;
+                  final Activity activity = (Activity) ctx;
+                  try {
+                      activity.runOnUiThread(() -> attachOnUi(activity));
+                  } catch (Throwable t) {
+                      log("runOnUiThread failed: " + t);
+                  }
+              }
+
+              private static void attachOnUi(Activity activity) {
+                  if (overlay != null) return;
+                  try {
+                      overlay = new OverlaySurfaceView(activity);
+                      overlay.setOnTouchListener((v, e) -> {
+                          if (!overlay.isReady()) return false;
+                          int action;
+                          switch (e.getActionMasked()) {
+                              case MotionEvent.ACTION_DOWN:   action = 0; break;
+                              case MotionEvent.ACTION_UP:     action = 1; break;
+                              case MotionEvent.ACTION_MOVE:   action = 2; break;
+                              case MotionEvent.ACTION_CANCEL: action = 3; break;
+                              default: return false;
+                          }
+                          return nativeTouch(action, e.getX(), e.getY());
+                      });
+                      ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
+                      decor.addView(overlay, new ViewGroup.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT,
+                              ViewGroup.LayoutParams.MATCH_PARENT
+                      ));
+                      log("overlay attached");
+
+                      new Thread(() -> {
+                          try {
+                              List<String> classes = listAllClasses(activity);
+                              log("classLister: found " + classes.size());
+                              nativeSetClassList(classes.toArray(new String[0]));
+                          } catch (Throwable t) {
+                              log("classLister failed: " + t);
+                          }
+                      }, "ImGuiClassLister").start();
+                  } catch (Throwable t) {
+                      log("attachOnUi FAILED: " + t);
+                  }
+              }
+
+              private static List<String> listAllClasses(Context ctx) {
+                  List<String> out = new ArrayList<>();
+                  String apkPath;
+                  try { apkPath = ctx.getPackageCodePath(); }
+                  catch (Throwable t) { return out; }
+                  try (ZipFile zip = new ZipFile(apkPath)) {
+                      for (ZipEntry entry : Collections.list(zip.entries())) {
+                          String n = entry.getName();
+                          if (n.equals("classes.dex") || n.matches("classes\\d+\\.dex")) {
+                              try (InputStream in = zip.getInputStream(entry)) {
+                                  byte[] data = readAll(in);
+                                  parseDex(data, out);
+                              } catch (IOException ignored) { }
+                          }
+                      }
+                  } catch (Throwable t) { log("listAllClasses error: " + t); }
+                  Collections.sort(out);
+                  return out;
+              }
+
+              private static byte[] readAll(InputStream in) throws IOException {
+                  ByteArrayOutputStream o = new ByteArrayOutputStream();
+                  byte[] b = new byte[8192]; int n;
+                  while ((n = in.read(b)) > 0) o.write(b, 0, n);
+                  return o.toByteArray();
+              }
+
+              private static int rd32(byte[] d, int off) {
+                  return (d[off] & 0xFF) | ((d[off+1] & 0xFF) << 8) |
+                         ((d[off+2] & 0xFF) << 16) | ((d[off+3] & 0xFF) << 24);
+              }
+
+              private static void parseDex(byte[] d, List<String> out) {
+                  if (d.length < 0x70) return;
+                  if (d[0] != 'd' || d[1] != 'e' || d[2] != 'x' || d[3] != '\n') return;
+                  int strIdsSize = rd32(d, 0x38);
+                  int strIdsOff  = rd32(d, 0x3C);
+                  int typeIdsSize= rd32(d, 0x40);
+                  int typeIdsOff = rd32(d, 0x44);
+                  int classDefSize=rd32(d, 0x60);
+                  int classDefOff= rd32(d, 0x64);
+                  if (classDefOff + classDefSize * 32 > d.length) return;
+                  for (int i = 0; i < classDefSize; i++) {
+                      int cd = classDefOff + i * 32;
+                      int classIdx = rd32(d, cd);
+                      if (classIdx < 0 || classIdx >= typeIdsSize) continue;
+                      int strIdx = rd32(d, typeIdsOff + classIdx * 4);
+                      if (strIdx < 0 || strIdx >= strIdsSize) continue;
+                      int strDataOff = rd32(d, strIdsOff + strIdx * 4);
+                      if (strDataOff <= 0 || strDataOff >= d.length) continue;
+                      int p = strDataOff;
+                      while (p < d.length && (d[p] & 0x80) != 0) p++;
+                      if (p < d.length) p++;
+                      int start = p;
+                      while (p < d.length && d[p] != 0) p++;
+                      if (p <= start) continue;
+                      String desc = new String(d, start, p - start, java.nio.charset.StandardCharsets.UTF_8);
+                      if (desc.startsWith("L") && desc.endsWith(";"))
+                          out.add(desc.substring(1, desc.length() - 1).replace('/', '.'));
+                      else
+                          out.add(desc);
+                  }
+              }
+
+              static native void nativeInit(android.view.Surface s);
+              static native void nativeResize(int w, int h);
+              static native void nativeRender();
+              static native boolean nativeTouch(int action, float x, float y);
+              static native void nativeSetClassList(String[] classNames);
+              static native boolean nativeWantKeyboard();
+              static native void nativeAddInputChar(int codepoint);
+              static native void nativeAddKeyEvent(int keycode, boolean down);
+          }
+          JAVA_EOF
+
+      - name: Patch native-lib.cpp
+        run: |
+          set -e
+          F=app/src/main/cpp/tool/native-lib.cpp
+
+          # 1) Remove NoCollapse and NoResize flags
+          sed -i 's/ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize/ImGuiWindowFlags_None/g' "$F"
+
+          # 2) Insert keyboard native functions before JNI_OnLoad
+          python3 - << 'PYEOF'
+F = "app/src/main/cpp/tool/native-lib.cpp"
+s = open(F).read()
+add = '''
+// ---------- Keyboard bridge ----------
+static jboolean doWantKeyboard(JNIEnv*, jclass) {
+    if (!gInitialized) return JNI_FALSE;
+    return ImGui::GetIO().WantTextInput ? JNI_TRUE : JNI_FALSE;
+}
+static void doAddInputChar(JNIEnv*, jclass, jint cp) {
+    if (!gInitialized || cp <= 0) return;
+    ImGui::GetIO().AddInputCharacter((unsigned int)cp);
+}
+static void doAddKeyEvent(JNIEnv*, jclass, jint keycode, jboolean down) {
+    if (!gInitialized) return;
+    ImGuiKey k = ImGuiKey_None;
+    switch (keycode) {
+        case 67: k = ImGuiKey_Backspace; break;
+        case 66: k = ImGuiKey_Enter; break;
+        case 65: k = ImGuiKey_Tab; break;
+        default: return;
+    }
+    ImGui::GetIO().AddKeyEvent(k, down ? true : false);
+}
+
+JNIEXPORT jint JNI_OnLoad'''
+s = s.replace("JNIEXPORT jint JNI_OnLoad", add, 1)
+
+# 3) Register the 3 new natives
+old_reg = '{(char*)"nativeSetClassList", (char*)"([Ljava/lang/String;)V",    (void*)doSetClassList},'
+new_reg = (old_reg + '\n'
+           '    {(char*)"nativeWantKeyboard", (char*)"()Z",                     (void*)doWantKeyboard},\n'
+           '    {(char*)"nativeAddInputChar", (char*)"(I)V",                    (void*)doAddInputChar},\n'
+           '    {(char*)"nativeAddKeyEvent",  (char*)"(IZ)V",                   (void*)doAddKeyEvent},')
+if old_reg in s:
+    s = s.replace(old_reg, new_reg, 1)
+    print("registration slot updated")
+else:
+    print("WARN: registration slot not found")
+s = s.replace("env->RegisterNatives(gHelperClass, methods, 5)",
+              "env->RegisterNatives(gHelperClass, methods, 8)")
+open(F, "w").write(s)
+print("native-lib.cpp patched")
+PYEOF
+
+          grep -q "doWantKeyboard" "$F" && echo "✓ keyboard natives added"
+          ! grep -q "ImGuiWindowFlags_NoResize" "$F" && echo "✓ NoResize removed"
+          ! grep -q "ImGuiWindowFlags_NoCollapse" "$F" && echo "✓ NoCollapse removed"
+          grep -q "RegisterNatives(gHelperClass, methods, 8)" "$F" && echo "✓ 8 natives registered"
+
+      - name: Regenerate DEX
+        run: |
+          set -e
+          rm -rf /tmp/dex && mkdir -p /tmp/dex
+          D8=$(find $ANDROID_HOME/build-tools -name d8 | sort -V | tail -1)
+          ANDROID_JAR=$(find $ANDROID_HOME/platforms -name android.jar | sort -V | tail -1)
+          javac -source 8 -target 8 -cp "$ANDROID_JAR" -d /tmp/dex \
+                app/src/main/java/com/menu/imgui/Helper.java \
+                app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
+          test -f "/tmp/dex/com/menu/imgui/Helper\$1.class" && echo "✓ Helper\$1"
+          test -f "/tmp/dex/com/menu/imgui/OverlaySurfaceView.class" && echo "✓ OverlaySurfaceView"
+          test -f "/tmp/dex/com/menu/imgui/OverlaySurfaceView\$MyRenderer.class" && echo "✓ MyRenderer"
+          $D8 --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex \
+              $(find /tmp/dex -name "*.class")
+          xxd -i -n imgui_dex /tmp/dex/classes.dex | sed 's/unsigned char/const unsigned char/' > app/src/main/cpp/tool/dex_data.h
+          grep -q "imgui_dex\[\]" app/src/main/cpp/tool/dex_data.h && echo "✓ dex_data.h ok"
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+
+      - name: Build
+        run: |
+          if [ ! -s gradlew ]; then gradle wrapper --gradle-version 8.5; fi
+          chmod +x gradlew
+          rm -rf app/.cxx app/build .gradle
+          ./gradlew :app:assembleDebug --no-build-cache --stacktrace
+
+      - name: Upload artifacts
+        run: |
+          mkdir -p /tmp/so-out
+          find app/build -name "libtool.so" -exec cp {} /tmp/so-out/ \;
+          ls -la /tmp/so-out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libtool-fix4
+          path: /tmp/so-out/libtool.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imgui-test-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Commit
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "feat: resize/collapse restored + soft keyboard for ImGui inputs [skip ci]"
+          git push
