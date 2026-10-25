@@ -286,7 +286,8 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
         if (isComplexType(m.paramTypes[i])) {
             if (st.availableInstances[i].empty()) {
                 st.availableInstances[i].push_back("null");
-                // In a real scenario, fetch this from Java. Hardcoded null for now.
+                st.availableInstances[i].push_back("[Current Activity]");
+                st.availableInstances[i].push_back("[Application Context]");
             }
             if (st.selectedInstance[i] >= (int)st.availableInstances[i].size()) st.selectedInstance[i] = 0;
             
@@ -302,6 +303,11 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
                 }
                 ImGui::EndCombo();
             }
+        } else if (m.paramTypes[i] == "boolean") {
+            bool val = (st.argBufs[i][0] == '1');
+            if (ImGui::Checkbox("##bool", &val)) {
+                snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%d", val ? 1 : 0);
+            }
         } else {
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
@@ -309,7 +315,7 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
         ImGui::PopID();
     }
     ImGui::Checkbox("Call in Main Thread", &st.runInMain);
-    ImGui::TextDisabled("Note: For complex types, select an existing instance or null.");
+    ImGui::TextDisabled("Note: For objects, choose an instance or [Current Activity].");
     
     if (ImGui::Button("Call", ImVec2(100, 0))) {
         PendingCallReq c;
@@ -325,7 +331,9 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
     else if (st.hasResult) {
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
+        ImGui::PushTextWrapPos(0.0f);
         ImGui::TextWrapped("%s", st.result.c_str());
+        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
     ImGui::Unindent(20);
@@ -354,6 +362,7 @@ static void renderClassDetail(Section& sec, const std::string& className) {
     if (!det.methods.empty()) {
         ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "Methods");
         for (auto& m : det.methods) {
+            if (m.name.find("lambda$") == 0) continue; // Hide compiler generated
             bool exp = det.expandedMethods.count(m.raw) > 0;
             ImGui::PushID(m.raw.c_str());
             ImGui::PushTextWrapPos(0.0f);
