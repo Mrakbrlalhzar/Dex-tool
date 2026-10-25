@@ -5,6 +5,7 @@ import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.util.ArrayMap;
 import android.view.MotionEvent;
 import android.view.ViewGroup;
 
@@ -17,6 +18,7 @@ import java.io.InputStream;
 import java.io.PrintWriter;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
@@ -34,7 +36,7 @@ public class Helper {
     private static final String TAG = "ImGuiTool";
     private static OverlaySurfaceView overlay;
     
-    // Cache for instances so they don't get GC'd during testing
+    // Global cache for created instances
     private static final Map<String, Object> sInstances = new HashMap<>();
 
     static {
@@ -353,6 +355,43 @@ public class Helper {
         else new Thread(r).start();
     }
 
+    public static void requestFindInstances(String className) {
+        new Thread(() -> {
+            List<String> found = new ArrayList<>();
+            try {
+                // 1. Check cache
+                if (sInstances.containsKey(className)) {
+                    found.add("Cached: " + sInstances.get(className).toString());
+                }
+                // 2. Check ActivityThread for activities
+                Class<?> atClass = Class.forName("android.app.ActivityThread");
+                Object currentAt = atClass.getMethod("currentActivityThread").invoke(null);
+                if (currentAt != null) {
+                    Field mActField = atClass.getDeclaredField("mActivities");
+                    mActField.setAccessible(true);
+                    ArrayMap<?, ?> acts = (ArrayMap<?, ?>) mActField.get(currentAt);
+                    if (acts != null) {
+                        for (int i = 0; i < acts.size(); i++) {
+                            Object record = acts.valueAt(i);
+                            Field actField = record.getClass().getDeclaredField("activity");
+                            actField.setAccessible(true);
+                            Object act = actField.get(record);
+                            if (act != null && act.getClass().getName().equals(className)) {
+                                found.add("Activity: " + act.toString());
+                            }
+                        }
+                    }
+                }
+                // 3. Check Application context
+                Object app = atClass.getMethod("currentApplication").invoke(null);
+                if (app != null && className.equals("android.content.Context")) {
+                    found.add("Application: " + app.toString());
+                }
+            } catch (Throwable ignored) {}
+            nativeSetInspectorInstances(className, found.toArray(new String[0]));
+        }).start();
+    }
+
     private static Object tryCreateInstance(Class<?> cls) {
         try {
             Constructor<?> c = cls.getDeclaredConstructor();
@@ -373,15 +412,18 @@ public class Helper {
     }
     private static Object parseArg(Class<?> type, String s) {
         String t = s == null ? "" : s.trim();
-        if (type == int.class) return Integer.parseInt(t);
-        if (type == long.class) return Long.parseLong(t);
-        if (type == short.class) return Short.parseShort(t);
-        if (type == byte.class) return Byte.parseByte(t);
-        if (type == char.class) return t.isEmpty() ? '\0' : t.charAt(0);
-        if (type == boolean.class) return Boolean.parseBoolean(t);
-        if (type == float.class) return Float.parseFloat(t);
-        if (type == double.class) return Double.parseDouble(t);
+        if (type == int.class || type == Integer.class) return Integer.parseInt(t);
+        if (type == long.class || type == Long.class) return Long.parseLong(t);
+        if (type == short.class || type == Short.class) return Short.parseShort(t);
+        if (type == byte.class || type == Byte.class) return Byte.parseByte(t);
+        if (type == char.class || type == Character.class) return t.isEmpty() ? '\0' : t.charAt(0);
+        if (type == boolean.class || type == Boolean.class) return t.equals("1") || t.equalsIgnoreCase("true");
+        if (type == float.class || type == Float.class) return Float.parseFloat(t);
+        if (type == double.class || type == Double.class) return Double.parseDouble(t);
         if (type == String.class) return t;
+        
+        // Complex type: check cache
+        if (sInstances.containsKey(type.getName())) return sInstances.get(type.getName());
         return null;
     }
 
@@ -395,4 +437,5 @@ public class Helper {
     static native void nativeAddKeyEvent(int keycode, boolean down);
     static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
     static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
+    static native void nativeSetInspectorInstances(String className, String[] instances);
 }

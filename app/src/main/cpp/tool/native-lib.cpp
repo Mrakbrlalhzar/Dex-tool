@@ -62,8 +62,16 @@ struct Section {
     std::map<std::string, ClassDetail> details;
     std::set<std::string> expandedClasses;
 };
+struct InspectorWin {
+    std::string className;
+    bool isOpen = true;
+    float x = 100, y = 100, w = 400, h = 300;
+    std::vector<std::string> instances;
+    bool searching = false;
+};
 
 static std::vector<Section> gSections;
+static std::vector<InspectorWin> gInspectors;
 static int gNextSectionId = 1;
 static int gActiveSection = 0;
 static bool gRequestAddSection = false;
@@ -81,13 +89,17 @@ static float gWinX = 0, gWinY = 0, gWinW = 0, gWinH = 0;
 
 struct PendingDetailReq { int sectionId; std::string className; };
 struct PendingCallReq { int sectionId; std::string className; std::string methodSig; std::string methodName; std::vector<std::string> paramTypes; std::vector<std::string> args; bool isStatic; bool isConstructor; bool runInMain; };
+struct PendingInspectorReq { std::string className; };
 struct DetailResult { int sectionId; std::string className; std::vector<std::string> fields; std::vector<std::string> methodRaws; };
 struct MethodResult { int sectionId; std::string className; std::string methodSig; std::string result; };
+struct InspectorResult { std::string className; std::vector<std::string> instances; };
 
 static std::vector<PendingDetailReq> gPendingDetailReqs;
 static std::vector<PendingCallReq> gPendingCallReqs;
+static std::vector<PendingInspectorReq> gPendingInspectorReqs;
 static std::vector<DetailResult> gDetailResults;
 static std::vector<MethodResult> gMethodResults;
+static std::vector<InspectorResult> gInspectorResults;
 static std::mutex gQueuesMutex;
 
 static float g_settingFontScale = 1.00f;
@@ -214,7 +226,6 @@ static void* pollThread(void*) {
     gVM->DetachCurrentThread(); return nullptr;
 }
 
-// Restored Gold Theme
 static void setupStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 16; s.ChildRounding = 12; s.FrameRounding = 10;
@@ -275,6 +286,7 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
         ImGui::PopID();
     }
     ImGui::Checkbox("Call in Main Thread", &st.runInMain);
+    ImGui::TextDisabled("Note: Complex types auto-resolved or null.");
     
     if (ImGui::Button("Call", ImVec2(100, 0))) {
         PendingCallReq c;
@@ -301,6 +313,13 @@ static void renderClassDetail(Section& sec, const std::string& className) {
     auto it = sec.details.find(className); if (it == sec.details.end()) return;
     ClassDetail& det = it->second;
     ImGui::Indent(20);
+    
+    if (ImGui::Button("Inspector")) {
+        gInspectors.push_back({className, true, 100, 100, 400, 300, {}, true});
+        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingInspectorReqs.push_back({className}); }
+    }
+    ImGui::Separator();
+
     if (det.loading) { ImGui::TextDisabled("Loading..."); ImGui::Unindent(20); return; }
 
     if (!det.fields.empty()) {
@@ -345,24 +364,19 @@ static void renderSectionContent(Section& sec) {
     ImGui::TextDisabled("%zu classes", visible.size());
     ImGui::BeginChild("##list", ImVec2(0, 0), true);
     for (auto& name : visible) {
-        bool isExpanded = sec.expandedClasses.count(name) > 0;
         ImGui::PushID(name.c_str());
-        ImGui::SetNextItemOpen(isExpanded, ImGuiCond_Always);
-        if (ImGui::TreeNode(name.c_str())) {
-            if (!isExpanded) {
-                sec.expandedClasses.insert(name);
-                if (sec.details.count(name) == 0) { sec.details[name].loading = true; requestClassDetails(sec.id, name); }
-            }
-            renderClassDetail(sec, name);
-            ImGui::TreePop();
-        } else if (isExpanded) {
-            sec.expandedClasses.erase(name);
-        }
+        // Use native TreeNode toggle to fix close bug
+        bool node_open = ImGui::TreeNodeEx(name.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
         if (ImGui::IsItemClicked()) {
             gPressedClassName = name;
             gPressedClassSectionId = sec.id;
             gPressedClassStart = ImGui::GetTime();
             gClassLongPressed = false;
+        }
+        if (node_open) {
+            if (sec.details.count(name) == 0) { sec.details[name].loading = true; requestClassDetails(sec.id, name); }
+            renderClassDetail(sec, name);
+            ImGui::TreePop();
         }
         ImGui::PopID();
     }
@@ -442,16 +456,11 @@ static void renderMainWindow() {
             if (!gPressedClassName.empty()) {
                 if (!ImGui::IsMouseDown(0)) {
                     if (!gClassLongPressed) {
-                        auto* src = findSection(gPressedClassSectionId);
-                        if (src) {
-                            if (src->expandedClasses.count(gPressedClassName)) src->expandedClasses.erase(gPressedClassName);
-                            else { src->expandedClasses.insert(gPressedClassName); if (src->details.count(gPressedClassName) == 0) { src->details[gPressedClassName].loading = true; requestClassDetails(src->id, gPressedClassName); } }
-                        }
+                        // Just a tap on class name. ImGui handles open/close. No custom logic needed here.
                     }
                     gPressedClassName.clear(); gClassLongPressed = false;
                 } else if (!gClassLongPressed && ImGui::GetTime() - gPressedClassStart > 0.5) {
                     gClassLongPressed = true;
-                    // Create a new detached window specifically for this class
                     Section s; s.id = gNextSectionId++; s.detached = true; s.expandedClasses.insert(gPressedClassName);
                     s.detX = io.DisplaySize.x / 2 - 250; s.detY = io.DisplaySize.y / 2 - 250; s.detW = 500; s.detH = 500;
                     s.filter[0] = 0; snprintf(s.filter, sizeof(s.filter), "%s", gPressedClassName.c_str());
@@ -491,12 +500,41 @@ static void renderDetachedWindows() {
     }
 }
 
+static void renderInspectors() {
+    for (auto it = gInspectors.begin(); it != gInspectors.end(); ) {
+        ImGui::SetNextWindowPos(ImVec2(it->x, it->y), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(it->w, it->h), ImGuiCond_FirstUseEver);
+        char title[256]; snprintf(title, sizeof(title), "Inspector: %s##%s", it->className.c_str(), it->className.c_str());
+        bool open = it->isOpen;
+        ImGui::Begin(title, &open, ImGuiWindowFlags_None);
+        it->isOpen = open;
+        it->x = ImGui::GetWindowPos().x; it->y = ImGui::GetWindowPos().y;
+        it->w = ImGui::GetWindowSize().x; it->h = ImGui::GetWindowSize().y;
+
+        ImGui::Text("Class: %s", it->className.c_str());
+        if (ImGui::Button("Find Instances")) {
+            it->searching = true;
+            it->instances.clear();
+            { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingInspectorReqs.push_back({it->className}); }
+        }
+        ImGui::Spacing();
+        if (it->searching) ImGui::TextDisabled("Searching...");
+        else if (it->instances.empty()) ImGui::TextDisabled("No instances found.");
+        else {
+            for (auto& inst : it->instances) ImGui::BulletText("%s", inst.c_str());
+        }
+        ImGui::End();
+        if (!open) it = gInspectors.erase(it); else ++it;
+    }
+}
+
 static void processPendingCalls() {
-    std::vector<PendingDetailReq> details; std::vector<PendingCallReq> calls;
-    { std::lock_guard<std::mutex> lk(gQueuesMutex); details.swap(gPendingDetailReqs); calls.swap(gPendingCallReqs); }
-    if (details.empty() && calls.empty()) return; if (!gHelperClass || !gVM) return;
+    std::vector<PendingDetailReq> details; std::vector<PendingCallReq> calls; std::vector<PendingInspectorReq> inspectors;
+    { std::lock_guard<std::mutex> lk(gQueuesMutex); details.swap(gPendingDetailReqs); calls.swap(gPendingCallReqs); inspectors.swap(gPendingInspectorReqs); }
+    if (details.empty() && calls.empty() && inspectors.empty()) return; if (!gHelperClass || !gVM) return;
     JNIEnv* env = nullptr; bool attached = false;
     if (gVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) { if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return; attached = true; }
+    
     if (!details.empty()) {
         jmethodID m = env->GetStaticMethodID(gHelperClass, "requestClassDetails", "(ILjava/lang/String;)V");
         if (m) for (auto& d : details) { jstring cn = env->NewStringUTF(d.className.c_str()); env->CallStaticVoidMethod(gHelperClass, m, (jint)d.sectionId, cn); env->DeleteLocalRef(cn); }
@@ -513,6 +551,10 @@ static void processPendingCalls() {
                 env->DeleteLocalRef(jc); env->DeleteLocalRef(js); env->DeleteLocalRef(jn); env->DeleteLocalRef(jpt); env->DeleteLocalRef(ja);
             }
         }
+    }
+    if (!inspectors.empty()) {
+        jmethodID m = env->GetStaticMethodID(gHelperClass, "requestFindInstances", "(Ljava/lang/String;)V");
+        if (m) for (auto& i : inspectors) { jstring cn = env->NewStringUTF(i.className.c_str()); env->CallStaticVoidMethod(gHelperClass, m, cn); env->DeleteLocalRef(cn); }
     }
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
     if (attached) gVM->DetachCurrentThread();
@@ -535,12 +577,18 @@ static void doRender(JNIEnv*, jclass) {
             auto& st = sec->details[r.className].methodStates[r.methodSig];
             st.result = r.result; st.hasResult = true; st.calling = false;
         }
+        while (!gInspectorResults.empty()) {
+            auto r = gInspectorResults.front(); gInspectorResults.erase(gInspectorResults.begin());
+            for (auto& insp : gInspectors) {
+                if (insp.className == r.className) { insp.instances = r.instances; insp.searching = false; }
+            }
+        }
     }
 
     ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplAndroid_NewFrame();
     ImGuiIO& io = ImGui::GetIO(); io.FontGlobalScale = g_settingFontScale;
     ImGui::NewFrame();
-    if (g_menuVisible) { renderMainWindow(); renderDetachedWindows(); }
+    if (g_menuVisible) { renderMainWindow(); renderDetachedWindows(); renderInspectors(); }
     renderFAB();
     ImGui::Render();
     glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
@@ -605,6 +653,12 @@ static void doSetMethodResult(JNIEnv* env, jclass, jint sectionId, jstring class
     if (result) { const char* c = env->GetStringUTFChars(result, nullptr); r.result = c ? c : ""; if (c) env->ReleaseStringUTFChars(result, c); }
     std::lock_guard<std::mutex> lk(gQueuesMutex); gMethodResults.push_back(std::move(r));
 }
+static void doSetInspectorInstances(JNIEnv* env, jclass, jstring className, jobjectArray instances) {
+    InspectorResult r;
+    if (className) { const char* c = env->GetStringUTFChars(className, nullptr); r.className = c ? c : ""; if (c) env->ReleaseStringUTFChars(className, c); }
+    if (instances) { jsize n = env->GetArrayLength(instances); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(instances, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.instances.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
+    std::lock_guard<std::mutex> lk(gQueuesMutex); gInspectorResults.push_back(std::move(r));
+}
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
@@ -621,8 +675,9 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
         {(char*)"nativeAddKeyEvent",     (char*)"(IZ)V",                        (void*)doAddKeyEvent},
         {(char*)"nativeSetClassDetails", (char*)"(ILjava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetClassDetails},
         {(char*)"nativeSetMethodResult", (char*)"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", (void*)doSetMethodResult},
+        {(char*)"nativeSetInspectorInstances", (char*)"(Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetInspectorInstances},
     };
-    if (env->RegisterNatives(gHelperClass, methods, 10) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
+    if (env->RegisterNatives(gHelperClass, methods, 11) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
     pthread_t t; if (pthread_create(&t, nullptr, pollThread, nullptr) == 0) pthread_detach(t);
     return JNI_VERSION_1_6;
 }
