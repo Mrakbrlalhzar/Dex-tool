@@ -1,1 +1,33 @@
 ninja: Entering directory `/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/arm64-v8a'
+[1/8] Building CXX object CMakeFiles/tool.dir/imgui/backends/imgui_impl_android.cpp.o
+[2/8] Building CXX object CMakeFiles/tool.dir/imgui/backends/imgui_impl_opengl3.cpp.o
+[3/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o
+[4/8] Building CXX object CMakeFiles/tool.dir/tool/native-lib.cpp.o
+FAILED: CMakeFiles/tool.dir/tool/native-lib.cpp.o 
+/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtool_EXPORTS -I/tmp/frida-gumjs/arm64-v8a/include -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends -I/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fno-limit-debug-info  -fPIC -MD -MT CMakeFiles/tool.dir/tool/native-lib.cpp.o -MF CMakeFiles/tool.dir/tool/native-lib.cpp.o.d -o CMakeFiles/tool.dir/tool/native-lib.cpp.o -c /home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:48:16: error: no matching function for call to 'gum_script_backend_create'
+    g_script = gum_script_backend_create(backend, "patch_agent", PATCH_AGENT_JS, nullptr, nullptr, &error);
+               ^~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/frida-gumjs/arm64-v8a/include/frida-gumjs.h:86905:14: note: candidate function not viable: requires 7 arguments, but 6 were provided
+GUM_API void gum_script_backend_create (GumScriptBackend * self,
+             ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:48:16: error: assigning to 'GumScript *' (aka '_GumScript *') from incompatible type 'void'
+    g_script = gum_script_backend_create(backend, "patch_agent", PATCH_AGENT_JS, nullptr, nullptr, &error);
+               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:54:5: error: no matching function for call to 'gum_script_set_message_handler'
+    gum_script_set_message_handler(g_script, on_script_message, nullptr, nullptr);
+    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/frida-gumjs/arm64-v8a/include/frida-gumjs.h:86785:14: note: candidate function not viable: no known conversion from 'void (GumScript *, const gchar *, GBytes *, gpointer)' (aka 'void (_GumScript *, const char *, _GBytes *, void *)') to 'GumScriptMessageHandler' (aka 'void (*)(const char *, _GBytes *, void *)') for 2nd argument
+GUM_API void gum_script_set_message_handler (GumScript * self,
+             ^
+/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:55:5: error: no matching function for call to 'gum_script_load'
+    gum_script_load(g_script, nullptr);
+    ^~~~~~~~~~~~~~~
+/tmp/frida-gumjs/arm64-v8a/include/frida-gumjs.h:86774:14: note: candidate function not viable: requires 4 arguments, but 2 were provided
+GUM_API void gum_script_load (GumScript * self, GCancellable * cancellable,
+             ^
+4 errors generated.
+[5/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o
+[6/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui.cpp.o
+[7/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o
+ninja: build stopped: subcommand failed.

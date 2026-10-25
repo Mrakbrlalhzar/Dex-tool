@@ -26,25 +26,25 @@
 			{
 				"command" : 0,
 				"file" : 0,
-				"line" : 26,
+				"line" : 25,
 				"parent" : 0
 			},
 			{
 				"command" : 1,
 				"file" : 0,
-				"line" : 36,
+				"line" : 35,
 				"parent" : 0
 			},
 			{
 				"command" : 2,
 				"file" : 0,
-				"line" : 15,
+				"line" : 13,
 				"parent" : 0
 			},
 			{
 				"command" : 2,
 				"file" : 0,
-				"line" : 20,
+				"line" : 19,
 				"parent" : 0
 			}
 		]
@@ -68,7 +68,7 @@
 			[
 				{
 					"backtrace" : 3,
-					"path" : "/tmp/frida-gumjs/arm64-v8a/include/frida-gum"
+					"path" : "/tmp/frida-gumjs/arm64-v8a/include"
 				},
 				{
 					"backtrace" : 4,
@@ -119,7 +119,7 @@
 			},
 			{
 				"backtrace" : 2,
-				"fragment" : "/tmp/frida-gumjs/arm64-v8a/lib/libfrida-gumjs-1.0.a",
+				"fragment" : "/tmp/frida-gumjs/arm64-v8a/lib/libfrida-gumjs.a",
 				"role" : "libraries"
 			},
 			{

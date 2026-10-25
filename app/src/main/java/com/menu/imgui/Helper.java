@@ -120,7 +120,6 @@ public class Helper {
         });
     }
 
-    // ========== DYNAMIC CLASS INSPECTION ==========
     public static void requestClassDetails(int sectionId, String className) {
         new Thread(() -> {
             List<String> fields = new ArrayList<>();
@@ -198,7 +197,6 @@ public class Helper {
         return sInstances.get(instanceName);
     }
 
-    // ========== PATCH MANAGER ==========
     public static void requestPatchMethod(String className, String methodSig, String returnType) {
         PatchRecord p = new PatchRecord();
         p.id = sPatchCounter++;
@@ -250,7 +248,6 @@ public class Helper {
         nativeSetPatches(serialized.toArray(new String[0]));
     }
 
-    // ========== METHOD CALL & ARGUMENT PROVIDER ==========
     public static int getArgWidgetType(String typeName) {
         try {
             Class<?> c = classFromString(typeName);
@@ -371,7 +368,6 @@ public class Helper {
         return Class.forName(s);
     }
 
-    // Missing parseArg method (was missing)
     private static Object parseArg(Class<?> type, String s) {
         if (s == null || s.equals("null") || s.isEmpty()) return null;
         if (type == int.class || type == Integer.class) return Integer.parseInt(s);
@@ -390,7 +386,6 @@ public class Helper {
         return null;
     }
 
-    // ========== STATIC CLASS LIST ==========
     private static List<String> listAllClasses(Context ctx) {
         List<String> out = new ArrayList<>();
         try (ZipFile zip = new ZipFile(ctx.getPackageCodePath())) {
@@ -431,7 +426,6 @@ public class Helper {
         }
     }
 
-    // Natives
     static native void nativeInit(android.view.Surface s);
     static native void nativeResize(int w, int h);
     static native void nativeRender();
