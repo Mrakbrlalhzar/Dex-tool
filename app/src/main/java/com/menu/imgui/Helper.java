@@ -37,13 +37,13 @@ public class Helper {
     private static Object sCurrentActivity = null;
     private static Object sApplicationContext = null;
 
-    // ========== WIDGET TYPE CODES (returned to C++) ==========
-    // 0 = text input (numbers, string, char, byte, long, short, BigInteger...)
+    // ========== WIDGET TYPE CODES ==========
+    // 0 = text input (primitives, strings, numbers)
     // 1 = boolean combo (false/true)
     // 2 = enum combo (all enum constants)
-    // 3 = instance combo (null + cached instances assignable to type)
-    // 4 = array text input (comma-separated; byte[] uses raw string bytes)
-    // 5 = unsupported (render as text, let user try)
+    // 3 = auto-inject (Context/Activity)
+    // 4 = instance combo (null, cached, live objects)
+    // 5 = array text input
 
     static {
         try {
@@ -114,34 +114,22 @@ public class Helper {
         });
     }
 
-    // ========== UNIVERSAL TYPE RESOLVER ==========
-    // Called by C++ to ask: "what widget should I render for this type?"
+    // ========== ARGUMENT STRATEGY SYSTEM ==========
     public static int getArgWidgetType(String typeName) {
         try {
             Class<?> c = classFromString(typeName);
-            return detectWidgetType(c);
+            if (c == boolean.class || c == Boolean.class) return 1;
+            if (c.isEnum()) return 2;
+            if (Context.class.isAssignableFrom(c) || Activity.class.isAssignableFrom(c)) return 3;
+            if (c.isArray()) return 5;
+            if (c.isPrimitive() || Number.class.isAssignableFrom(c) || 
+                c == String.class || c == CharSequence.class || c == char.class || c == Character.class) return 0;
+            return 4; // Instance Combo
         } catch (Throwable t) {
-            return 5; // unsupported / fallback to text
+            return 0; // fallback
         }
     }
 
-    private static int detectWidgetType(Class<?> c) {
-        // Order matters - check most specific first
-        if (c == boolean.class || c == Boolean.class) return 1;
-        if (c.isEnum()) return 2;
-        if (c.isArray()) return 4;
-        if (c.isPrimitive()) return 0;
-        if (c == String.class || c == CharSequence.class) return 0;
-        if (c == char.class || c == Character.class) return 0;
-        if (Number.class.isAssignableFrom(c)) return 0;
-        if (c == java.math.BigInteger.class || c == java.math.BigDecimal.class) return 0;
-        // If it's the Object type, allow free text (default behavior)
-        if (c == Object.class) return 0;
-        // Otherwise, complex type - try instance combo
-        return 3;
-    }
-
-    // Called by C++ to get combo options
     public static String[] getArgSuggestions(String typeName) {
         try {
             Class<?> c = classFromString(typeName);
@@ -149,76 +137,58 @@ public class Helper {
 
             if (c.isEnum()) {
                 for (Object e : c.getEnumConstants()) r.add(((Enum<?>)e).name());
-                if (r.isEmpty()) r.add("(no constants)");
                 return r.toArray(new String[0]);
             }
 
-            // Instance combo
+            if (c.isArray() || c.isPrimitive() || Number.class.isAssignableFrom(c) || 
+                c == String.class || c == CharSequence.class || c == char.class || c == Character.class) {
+                return new String[0];
+            }
+
+            // Instance Combo: null + cache + live
             r.add("null");
             for (Map.Entry<String, Object> e : sInstances.entrySet()) {
-                if (e.getValue() != null && c.isInstance(e.getValue())) r.add(e.getKey());
+                if (e.getValue() != null && c.isInstance(e.getValue())) r.add("[Cached] " + e.getKey());
             }
-            if (sCurrentActivity != null && c.isInstance(sCurrentActivity)) r.add("[Current Activity]");
-            if (sApplicationContext != null && c.isInstance(sApplicationContext)) r.add("[Application Context]");
+            if (sCurrentActivity != null && c.isInstance(sCurrentActivity)) r.add("[Live] Current Activity");
+            if (sApplicationContext != null && c.isInstance(sApplicationContext)) r.add("[Live] Application Context");
+
             return r.toArray(new String[0]);
         } catch (Throwable t) {
             return new String[]{"null"};
         }
     }
 
-    // Universal converter - called from requestMethodCall
     private static Object resolveArg(Class<?> target, String input) throws Exception {
-        // Handle null
-        if (input == null || input.equals("null")) {
-            if (target.isPrimitive())
-                throw new IllegalArgumentException("Cannot pass null to primitive " + target.getName());
+        if (input == null || input.equals("null") || input.isEmpty()) {
+            if (target.isPrimitive()) throw new IllegalArgumentException("Cannot pass null to primitive " + target.getName());
             return null;
         }
 
-        // Handle empty
-        if (input.isEmpty()) {
-            if (target.isPrimitive())
-                throw new IllegalArgumentException("Cannot pass empty to primitive " + target.getName());
-            if (target == String.class || target == CharSequence.class) return "";
-            if (target.isArray()) {
-                Class<?> comp = target.getComponentType();
-                return Array.newInstance(comp, 0);
-            }
-            return null;
-        }
-
-        // Special markers
-        if (input.equals("[Current Activity]")) {
+        // Live objects
+        if (input.equals("[Live] Current Activity")) {
             if (sCurrentActivity == null) throw new IllegalArgumentException("No Activity");
-            if (!target.isInstance(sCurrentActivity))
-                throw new IllegalArgumentException("Activity not assignable to " + target.getName());
             return sCurrentActivity;
         }
-        if (input.equals("[Application Context]")) {
+        if (input.equals("[Live] Application Context")) {
             if (sApplicationContext == null) throw new IllegalArgumentException("No AppContext");
-            if (!target.isInstance(sApplicationContext))
-                throw new IllegalArgumentException("AppContext not assignable to " + target.getName());
             return sApplicationContext;
         }
 
-        // Exact instance lookup
-        if (sInstances.containsKey(input)) {
-            Object obj = sInstances.get(input);
-            if (!target.isInstance(obj))
-                throw new IllegalArgumentException(input + " not assignable to " + target.getName());
-            return obj;
+        // Cached objects
+        if (input.startsWith("[Cached] ")) {
+            String key = input.substring(9);
+            if (!sInstances.containsKey(key)) throw new IllegalArgumentException("Instance not found: " + key);
+            return sInstances.get(key);
         }
 
-        // Permissive types
-        if (target == String.class || target == CharSequence.class) return input;
-        if (target == Object.class) return input;
-
-        // Primitives + wrappers
-        if (target.isPrimitive() || Number.class.isAssignableFrom(target) ||
-            target == Boolean.class || target == Character.class ||
-            target == java.math.BigInteger.class || target == java.math.BigDecimal.class) {
+        // Primitive coercion
+        if (target.isPrimitive() || Number.class.isAssignableFrom(target) || target == Boolean.class || target == Character.class) {
             return coercePrimitive(target, input);
         }
+
+        // String
+        if (target == String.class || target == CharSequence.class || target == Object.class) return input;
 
         // Enum
         if (target.isEnum()) {
@@ -235,20 +205,11 @@ public class Helper {
             if (comp == char.class) return input.toCharArray();
             String[] parts = input.split(",");
             Object arr = Array.newInstance(comp, parts.length);
-            for (int i = 0; i < parts.length; i++) {
-                Array.set(arr, i, resolveArg(comp, parts[i].trim()));
-            }
+            for (int i = 0; i < parts.length; i++) Array.set(arr, i, resolveArg(comp, parts[i].trim()));
             return arr;
         }
 
-        // Fallback: try any assignable cached instance
-        for (Object obj : sInstances.values()) {
-            if (obj != null && target.isInstance(obj)) return obj;
-        }
-
-        throw new IllegalArgumentException(
-            "Cannot convert '" + input + "' to " + target.getName() +
-            ". Create an instance of " + target.getSimpleName() + " first via <init>.");
+        throw new IllegalArgumentException("Cannot convert '" + input + "' to " + target.getName() + ". Create an instance first.");
     }
 
     private static Object coercePrimitive(Class<?> target, String input) {
@@ -273,7 +234,6 @@ public class Helper {
         throw new IllegalArgumentException("Unsupported primitive: " + target.getName());
     }
 
-    // ========== Method call with universal resolver ==========
     public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName,
                                          String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
         Runnable r = () -> {

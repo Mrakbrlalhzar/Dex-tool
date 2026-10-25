@@ -34,7 +34,7 @@ static std::vector<std::string> gClassList;
 static std::mutex gClassListMutex;
 
 // Widget type codes (must match Java side)
-// 0 = text, 1 = bool, 2 = enum, 3 = instance, 4 = array, 5 = unsupported
+// 0 = text, 1 = bool, 2 = enum, 3 = auto-context, 4 = instance, 5 = array
 
 struct MethodInfo {
     std::string raw, name, returnType, display;
@@ -271,7 +271,7 @@ static void doInit(JNIEnv* env, jclass, jobject surface) {
 }
 static void doResize(JNIEnv*, jclass, jint w, jint h) { gWidth = w; gHeight = h; glViewport(0, 0, w, h); }
 
-// Ask Java: what widget type should this param use?
+// ---------- Argument Initialization (The Provider) ----------
 static void initMethodWidgets(MethodCallState& st, const std::vector<std::string>& types) {
     if (!gHelperClass || !gVM) return;
     JNIEnv* env = nullptr; bool attached = false;
@@ -287,7 +287,7 @@ static void initMethodWidgets(MethodCallState& st, const std::vector<std::string
         jstring js = env->NewStringUTF(types[i].c_str());
         if (!js) continue;
 
-        st.widgetType[i] = 5;
+        st.widgetType[i] = 0;
         if (getType) {
             jint wt = env->CallStaticIntMethod(gHelperClass, getType, js);
             if (!env->ExceptionCheck()) st.widgetType[i] = (int)wt;
@@ -295,7 +295,7 @@ static void initMethodWidgets(MethodCallState& st, const std::vector<std::string
         }
 
         st.suggestions[i].clear();
-        if ((st.widgetType[i] == 2 || st.widgetType[i] == 3) && getSugg) {
+        if (getSugg) {
             jobjectArray arr = (jobjectArray)env->CallStaticObjectMethod(gHelperClass, getSugg, js);
             if (env->ExceptionCheck()) env->ExceptionClear();
             else if (arr) {
@@ -311,8 +311,7 @@ static void initMethodWidgets(MethodCallState& st, const std::vector<std::string
             }
         }
 
-        // Initialize argBufs[i] with first suggestion if combo
-        if ((st.widgetType[i] == 2 || st.widgetType[i] == 3) && !st.suggestions[i].empty()) {
+        if (!st.suggestions[i].empty()) {
             st.selectedSuggestion[i] = 0;
             snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][0].c_str());
         }
@@ -346,9 +345,9 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
             if (ImGui::Combo("##bool", &bv, "false\0true\0")) {
                 snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", bv ? "true" : "false");
             }
-        } else if (wt == 2 || wt == 3) {
+        } else if (wt == 2 || wt == 4) {
             if (st.suggestions[i].empty()) {
-                ImGui::TextDisabled("(no options available - create via <init> first)");
+                ImGui::TextDisabled("(no options available)");
             } else {
                 int sel = st.selectedSuggestion[i];
                 if (sel >= (int)st.suggestions[i].size()) sel = 0;
@@ -364,7 +363,17 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
                     ImGui::EndCombo();
                 }
             }
-        } else if (wt == 4) {
+        } else if (wt == 3) {
+            // Auto-Inject Context/Activity
+            ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "[Auto-Inject]");
+            ImGui::SameLine();
+            if (!st.suggestions[i].empty()) {
+                snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][0].c_str());
+                ImGui::TextDisabled("%s", st.suggestions[i][0].c_str());
+            } else {
+                ImGui::TextDisabled("Pending...");
+            }
+        } else if (wt == 5) {
             // Array
             std::string hint = "comma-separated values";
             if (m.paramTypes[i] == "byte[]") hint = "text -> UTF-8 bytes";
@@ -372,7 +381,6 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
             ImGui::SetNextItemWidth(-1);
             ImGui::InputTextWithHint("##arr", hint.c_str(), st.argBufs[i], sizeof(st.argBufs[i]));
         } else {
-            // Unsupported - fallback text
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
         }
