@@ -45,6 +45,8 @@ struct MethodCallState {
     bool hasResult = false;
     bool calling = false;
     bool runInMain = false;
+    int selectedInstance[8] = {0};
+    std::vector<std::string> availableInstances[8];
 };
 struct ClassDetail {
     bool loading = false;
@@ -93,6 +95,7 @@ struct PendingInspectorReq { std::string className; };
 struct DetailResult { int sectionId; std::string className; std::vector<std::string> fields; std::vector<std::string> methodRaws; };
 struct MethodResult { int sectionId; std::string className; std::string methodSig; std::string result; };
 struct InspectorResult { std::string className; std::vector<std::string> instances; };
+struct AvailableInstancesResult { std::string className; std::vector<std::string> instances; };
 
 static std::vector<PendingDetailReq> gPendingDetailReqs;
 static std::vector<PendingCallReq> gPendingCallReqs;
@@ -100,6 +103,7 @@ static std::vector<PendingInspectorReq> gPendingInspectorReqs;
 static std::vector<DetailResult> gDetailResults;
 static std::vector<MethodResult> gMethodResults;
 static std::vector<InspectorResult> gInspectorResults;
+static std::vector<AvailableInstancesResult> gAvailableInstancesResults;
 static std::mutex gQueuesMutex;
 
 static float g_settingFontScale = 1.00f;
@@ -118,40 +122,28 @@ static float g_titleH = 30.0f;
 
 static void splitStr(const std::string& s, char d, std::vector<std::string>& out) {
     out.clear(); size_t start = 0;
-    for (size_t i = 0; i <= s.size(); i++) {
-        if (i == s.size() || s[i] == d) { out.push_back(s.substr(start, i - start)); start = i + 1; }
-    }
+    for (size_t i = 0; i <= s.size(); i++) { if (i == s.size() || s[i] == d) { out.push_back(s.substr(start, i - start)); start = i + 1; } }
 }
 static std::string joinStrs(const std::vector<std::string>& v, const char* sep) {
-    std::string out;
-    for (size_t i = 0; i < v.size(); i++) { if (i) out += sep; out += v[i]; }
-    return out;
+    std::string out; for (size_t i = 0; i < v.size(); i++) { if (i) out += sep; out += v[i]; } return out;
 }
 static MethodInfo parseMethodRaw(const std::string& raw) {
-    MethodInfo m; m.raw = raw;
-    std::vector<std::string> p; splitStr(raw, '|', p);
+    MethodInfo m; m.raw = raw; std::vector<std::string> p; splitStr(raw, '|', p);
     if (p.size() >= 5) {
-        m.name = p[0]; m.returnType = p[1];
-        m.isStatic = (p[2] == "1"); m.isConstructor = (p[3] == "1");
+        m.name = p[0]; m.returnType = p[1]; m.isStatic = (p[2] == "1"); m.isConstructor = (p[3] == "1");
         if (!p[4].empty()) splitStr(p[4], ';', m.paramTypes);
     }
     m.display = m.isConstructor ? "<init>(" + joinStrs(m.paramTypes, ", ") + ")" : m.returnType + " " + m.name + "(" + joinStrs(m.paramTypes, ", ") + ")";
     return m;
 }
-static Section* findSection(int id) {
-    for (auto& s : gSections) if (s.id == id) return &s;
-    return nullptr;
-}
-static void addSectionImpl() {
-    Section s; s.id = gNextSectionId++; gSections.push_back(std::move(s)); gActiveSection = gSections.back().id;
-}
+static Section* findSection(int id) { for (auto& s : gSections) if (s.id == id) return &s; return nullptr; }
+static void addSectionImpl() { Section s; s.id = gNextSectionId++; gSections.push_back(std::move(s)); gActiveSection = gSections.back().id; }
 static void closeSectionImpl(int id) {
     gSections.erase(std::remove_if(gSections.begin(), gSections.end(), [id](const Section& s) { return s.id == id; }), gSections.end());
     if (gActiveSection == id) { gActiveSection = 0; for (auto& s : gSections) if (!s.detached) { gActiveSection = s.id; break; } }
 }
 static void requestClassDetails(int sectionId, const std::string& className) {
-    std::lock_guard<std::mutex> lk(gQueuesMutex);
-    gPendingDetailReqs.push_back({sectionId, className});
+    std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingDetailReqs.push_back({sectionId, className});
 }
 
 static void drawSigil(ImDrawList* dl, ImVec2 c, float r) {
@@ -275,18 +267,49 @@ static void doInit(JNIEnv* env, jclass, jobject surface) {
 }
 static void doResize(JNIEnv*, jclass, jint w, jint h) { gWidth = w; gHeight = h; glViewport(0, 0, w, h); }
 
+static bool isComplexType(const std::string& t) {
+    if (t == "int" || t == "long" || t == "short" || t == "byte" || t == "char" || 
+        t == "boolean" || t == "float" || t == "double" || t == "java.lang.String") return false;
+    return true;
+}
+
 static void renderMethodPanel(Section& sec, const std::string& className, MethodInfo& m, MethodCallState& st) {
     ImGui::Indent(20);
+    ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("Return: %s", m.returnType.c_str());
+    ImGui::PopTextWrapPos();
+
     for (int i = 0; i < st.numParams; i++) {
         ImGui::PushID(i);
         ImGui::TextDisabled("arg%d (%s)", i, m.paramTypes[i].c_str());
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
+        
+        if (isComplexType(m.paramTypes[i])) {
+            if (st.availableInstances[i].empty()) {
+                st.availableInstances[i].push_back("null");
+                // In a real scenario, fetch this from Java. Hardcoded null for now.
+            }
+            if (st.selectedInstance[i] >= (int)st.availableInstances[i].size()) st.selectedInstance[i] = 0;
+            
+            std::string preview = st.availableInstances[i][st.selectedInstance[i]];
+            if (ImGui::BeginCombo("##arg_combo", preview.c_str())) {
+                for (int n = 0; n < st.availableInstances[i].size(); n++) {
+                    bool is_selected = (st.selectedInstance[i] == n);
+                    if (ImGui::Selectable(st.availableInstances[i][n].c_str(), is_selected)) {
+                        st.selectedInstance[i] = n;
+                        snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.availableInstances[i][n].c_str());
+                    }
+                    if (is_selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        } else {
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
+        }
         ImGui::PopID();
     }
     ImGui::Checkbox("Call in Main Thread", &st.runInMain);
-    ImGui::TextDisabled("Note: Complex types auto-resolved or null.");
+    ImGui::TextDisabled("Note: For complex types, select an existing instance or null.");
     
     if (ImGui::Button("Call", ImVec2(100, 0))) {
         PendingCallReq c;
@@ -294,8 +317,7 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
         c.methodSig = m.raw; c.methodName = m.name;
         c.paramTypes = m.paramTypes; c.args.resize(st.numParams);
         for (int i = 0; i < st.numParams; i++) c.args[i] = std::string(st.argBufs[i]);
-        c.isStatic = m.isStatic; c.isConstructor = m.isConstructor;
-        c.runInMain = st.runInMain;
+        c.isStatic = m.isStatic; c.isConstructor = m.isConstructor; c.runInMain = st.runInMain;
         { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); }
         st.calling = true; st.hasResult = false;
     }
@@ -324,7 +346,9 @@ static void renderClassDetail(Section& sec, const std::string& className) {
 
     if (!det.fields.empty()) {
         ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "Fields");
+        ImGui::PushTextWrapPos(0.0f);
         for (auto& f : det.fields) ImGui::BulletText("%s", f.c_str());
+        ImGui::PopTextWrapPos();
         ImGui::Spacing();
     }
     if (!det.methods.empty()) {
@@ -332,6 +356,7 @@ static void renderClassDetail(Section& sec, const std::string& className) {
         for (auto& m : det.methods) {
             bool exp = det.expandedMethods.count(m.raw) > 0;
             ImGui::PushID(m.raw.c_str());
+            ImGui::PushTextWrapPos(0.0f);
             if (ImGui::TreeNodeEx(m.display.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth)) {
                 if (!exp) {
                     det.expandedMethods.insert(m.raw);
@@ -344,6 +369,7 @@ static void renderClassDetail(Section& sec, const std::string& className) {
             } else if (exp) {
                 det.expandedMethods.erase(m.raw);
             }
+            ImGui::PopTextWrapPos();
             ImGui::PopID();
         }
     }
@@ -365,13 +391,9 @@ static void renderSectionContent(Section& sec) {
     ImGui::BeginChild("##list", ImVec2(0, 0), true);
     for (auto& name : visible) {
         ImGui::PushID(name.c_str());
-        // Use native TreeNode toggle to fix close bug
         bool node_open = ImGui::TreeNodeEx(name.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth);
         if (ImGui::IsItemClicked()) {
-            gPressedClassName = name;
-            gPressedClassSectionId = sec.id;
-            gPressedClassStart = ImGui::GetTime();
-            gClassLongPressed = false;
+            gPressedClassName = name; gPressedClassSectionId = sec.id; gPressedClassStart = ImGui::GetTime(); gClassLongPressed = false;
         }
         if (node_open) {
             if (sec.details.count(name) == 0) { sec.details[name].loading = true; requestClassDetails(sec.id, name); }
@@ -455,18 +477,14 @@ static void renderMainWindow() {
 
             if (!gPressedClassName.empty()) {
                 if (!ImGui::IsMouseDown(0)) {
-                    if (!gClassLongPressed) {
-                        // Just a tap on class name. ImGui handles open/close. No custom logic needed here.
-                    }
+                    if (!gClassLongPressed) { /* Tap */ }
                     gPressedClassName.clear(); gClassLongPressed = false;
                 } else if (!gClassLongPressed && ImGui::GetTime() - gPressedClassStart > 0.5) {
                     gClassLongPressed = true;
                     Section s; s.id = gNextSectionId++; s.detached = true; s.expandedClasses.insert(gPressedClassName);
                     s.detX = io.DisplaySize.x / 2 - 250; s.detY = io.DisplaySize.y / 2 - 250; s.detW = 500; s.detH = 500;
                     s.filter[0] = 0; snprintf(s.filter, sizeof(s.filter), "%s", gPressedClassName.c_str());
-                    gSections.push_back(s);
-                    requestClassDetails(s.id, gPressedClassName);
-                    gPressedClassName.clear();
+                    gSections.push_back(s); requestClassDetails(s.id, gPressedClassName); gPressedClassName.clear();
                 }
             }
 
@@ -513,15 +531,16 @@ static void renderInspectors() {
 
         ImGui::Text("Class: %s", it->className.c_str());
         if (ImGui::Button("Find Instances")) {
-            it->searching = true;
-            it->instances.clear();
+            it->searching = true; it->instances.clear();
             { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingInspectorReqs.push_back({it->className}); }
         }
         ImGui::Spacing();
         if (it->searching) ImGui::TextDisabled("Searching...");
         else if (it->instances.empty()) ImGui::TextDisabled("No instances found.");
         else {
+            ImGui::PushTextWrapPos(0.0f);
             for (auto& inst : it->instances) ImGui::BulletText("%s", inst.c_str());
+            ImGui::PopTextWrapPos();
         }
         ImGui::End();
         if (!open) it = gInspectors.erase(it); else ++it;
@@ -579,9 +598,7 @@ static void doRender(JNIEnv*, jclass) {
         }
         while (!gInspectorResults.empty()) {
             auto r = gInspectorResults.front(); gInspectorResults.erase(gInspectorResults.begin());
-            for (auto& insp : gInspectors) {
-                if (insp.className == r.className) { insp.instances = r.instances; insp.searching = false; }
-            }
+            for (auto& insp : gInspectors) { if (insp.className == r.className) { insp.instances = r.instances; insp.searching = false; } }
         }
     }
 
@@ -659,6 +676,12 @@ static void doSetInspectorInstances(JNIEnv* env, jclass, jstring className, jobj
     if (instances) { jsize n = env->GetArrayLength(instances); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(instances, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.instances.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
     std::lock_guard<std::mutex> lk(gQueuesMutex); gInspectorResults.push_back(std::move(r));
 }
+static void doSetAvailableInstances(JNIEnv* env, jclass, jstring className, jobjectArray instances) {
+    AvailableInstancesResult r;
+    if (className) { const char* c = env->GetStringUTFChars(className, nullptr); r.className = c ? c : ""; if (c) env->ReleaseStringUTFChars(className, c); }
+    if (instances) { jsize n = env->GetArrayLength(instances); for (jsize i = 0; i < n; i++) { jstring s = (jstring)env->GetObjectArrayElement(instances, i); const char* c = env->GetStringUTFChars(s, nullptr); if (c) r.instances.emplace_back(c); if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s); } }
+    std::lock_guard<std::mutex> lk(gQueuesMutex); gAvailableInstancesResults.push_back(std::move(r));
+}
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
@@ -676,8 +699,9 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
         {(char*)"nativeSetClassDetails", (char*)"(ILjava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetClassDetails},
         {(char*)"nativeSetMethodResult", (char*)"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", (void*)doSetMethodResult},
         {(char*)"nativeSetInspectorInstances", (char*)"(Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetInspectorInstances},
+        {(char*)"nativeSetAvailableInstances", (char*)"(Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetAvailableInstances},
     };
-    if (env->RegisterNatives(gHelperClass, methods, 11) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
+    if (env->RegisterNatives(gHelperClass, methods, 12) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
     pthread_t t; if (pthread_create(&t, nullptr, pollThread, nullptr) == 0) pthread_detach(t);
     return JNI_VERSION_1_6;
 }
