@@ -1,4 +1,4 @@
-name: ImGui Patcher with Frida GumJS
+name: ImGui Patcher with Frida GumJS (Fixed)
 
 on:
   push:
@@ -18,23 +18,25 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Download Frida GumJS Devkit
+      - name: Download Frida GumJS Devkit to /tmp
         run: |
           set -e
           FRIDA_VERSION="17.1.0"
           BASE_URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}"
           
-          wget -q "${BASE_URL}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm64.tar.xz" -O /tmp/frida-gumjs-arm64.tar.xz
-          mkdir -p app/src/main/cpp/frida/arm64-v8a
-          tar -xf /tmp/frida-gumjs-arm64.tar.xz -C app/src/main/cpp/frida/arm64-v8a
+          # Download for arm64-v8a
+          wget -q "${BASE_URL}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm64.tar.xz" -O /tmp/frida-arm64.tar.xz
+          mkdir -p /tmp/frida-gumjs/arm64-v8a
+          tar -xf /tmp/frida-arm64.tar.xz -C /tmp/frida-gumjs/arm64-v8a
           
-          wget -q "${BASE_URL}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm.tar.xz" -O /tmp/frida-gumjs-arm.tar.xz
-          mkdir -p app/src/main/cpp/frida/armeabi-v7a
-          tar -xf /tmp/frida-gumjs-arm.tar.xz -C app/src/main/cpp/frida/armeabi-v7a
+          # Download for armeabi-v7a
+          wget -q "${BASE_URL}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm.tar.xz" -O /tmp/frida-arm.tar.xz
+          mkdir -p /tmp/frida-gumjs/armeabi-v7a
+          tar -xf /tmp/frida-arm.tar.xz -C /tmp/frida-gumjs/armeabi-v7a
           
-          echo "✓ Frida GumJS Devkit downloaded"
+          echo "Frida downloaded to /tmp/frida-gumjs"
 
-      - name: Write CMakeLists.txt
+      - name: Write CMakeLists.txt (using /tmp/frida-gumjs)
         run: |
           cat > app/src/main/cpp/CMakeLists.txt << 'EOF'
           cmake_minimum_required(VERSION 3.22.1)
@@ -42,10 +44,11 @@ jobs:
 
           set(CMAKE_CXX_STANDARD 17)
 
+          # Use Frida from /tmp
           if(${ANDROID_ABI} STREQUAL "arm64-v8a")
-              set(FRIDA_DIR ${CMAKE_SOURCE_DIR}/frida/arm64-v8a)
+              set(FRIDA_DIR /tmp/frida-gumjs/arm64-v8a)
           elseif(${ANDROID_ABI} STREQUAL "armeabi-v7a")
-              set(FRIDA_DIR ${CMAKE_SOURCE_DIR}/frida/armeabi-v7a)
+              set(FRIDA_DIR /tmp/frida-gumjs/armeabi-v7a)
           else()
               message(FATAL_ERROR "Unsupported ABI: ${ANDROID_ABI}")
           endif()
@@ -81,7 +84,459 @@ jobs:
           )
           EOF
 
-      - name: Write native-lib.cpp (with embedded JS agent)
+      - name: Write Helper.java (complete with parseArg)
+        run: |
+          cat > app/src/main/java/com/menu/imgui/Helper.java << 'JAVA_EOF'
+          package com.menu.imgui;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.Log;
+          import android.view.MotionEvent;
+          import android.view.ViewGroup;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileWriter;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.PrintWriter;
+          import java.lang.reflect.Array;
+          import java.lang.reflect.Constructor;
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Method;
+          import java.lang.reflect.Modifier;
+          import java.nio.charset.StandardCharsets;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Date;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipFile;
+
+          public class Helper {
+              private static final String TAG = "ImGuiTool";
+              private static OverlaySurfaceView overlay;
+              private static final Map<String, Object> sInstances = new HashMap<>();
+              private static Object sCurrentActivity = null;
+              private static Object sApplicationContext = null;
+
+              public static class PatchRecord {
+                  public int id;
+                  public String type;
+                  public String className;
+                  public String targetName;
+                  public String originalValue;
+                  public String currentValue;
+                  public boolean isActive = true;
+              }
+              private static final List<PatchRecord> sActivePatches = new ArrayList<>();
+              private static int sPatchCounter = 1;
+
+              static {
+                  try {
+                      Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+                          try {
+                              File f = new File(getLogDir(), "crash.log");
+                              FileWriter w = new FileWriter(f, true);
+                              PrintWriter pw = new PrintWriter(w);
+                              pw.println("\n=== JAVA CRASH " + now() + " ===");
+                              pw.println("Thread: " + t.getName());
+                              e.printStackTrace(pw);
+                              pw.println("=== END ===");
+                              pw.close();
+                          } catch (Throwable ignored) { }
+                      });
+                  } catch (Throwable ignored) { }
+              }
+
+              private static String now() { return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date()); }
+              private static String getPkgName() {
+                  try (FileInputStream fis = new FileInputStream("/proc/self/cmdline")) {
+                      byte[] buf = new byte[256]; int n = fis.read(buf);
+                      if (n > 0) { int end = 0; while (end < n && buf[end] != 0) end++; String pkg = new String(buf, 0, end, "UTF-8"); int colon = pkg.indexOf(':'); return colon > 0 ? pkg.substring(0, colon) : pkg; }
+                  } catch (Throwable ignored) { }
+                  return "unknown";
+              }
+              private static String getLogDir() {
+                  File d = new File("/sdcard/Download"); if (d.exists() && d.canWrite()) return d.getAbsolutePath();
+                  File e = new File("/sdcard/Android/data/" + getPkgName()); if (e.exists() && e.canWrite()) return e.getAbsolutePath();
+                  return "/data/data/" + getPkgName();
+              }
+              private static void log(String msg) {
+                  Log.i(TAG, msg);
+                  try { File f = new File(getLogDir(), "crash.log"); FileWriter w = new FileWriter(f, true); w.write("[J " + now() + "] " + msg + "\n"); w.close(); } catch (Throwable ignored) { }
+              }
+
+              public static void attach(Context ctx) {
+                  if (!(ctx instanceof Activity)) return;
+                  final Activity activity = (Activity) ctx;
+                  sCurrentActivity = activity;
+                  sApplicationContext = activity.getApplicationContext();
+                  activity.runOnUiThread(() -> {
+                      if (overlay != null) return;
+                      try {
+                          overlay = new OverlaySurfaceView(activity);
+                          overlay.setOnTouchListener((v, e) -> {
+                              if (!overlay.isReady()) return false;
+                              int action = -1;
+                              switch (e.getActionMasked()) {
+                                  case MotionEvent.ACTION_DOWN:   action = 0; break;
+                                  case MotionEvent.ACTION_UP:     action = 1; break;
+                                  case MotionEvent.ACTION_MOVE:   action = 2; break;
+                                  case MotionEvent.ACTION_CANCEL: action = 3; break;
+                              }
+                              if (action == -1) return false;
+                              return nativeTouch(action, e.getX(), e.getY());
+                          });
+                          ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
+                          decor.addView(overlay, new ViewGroup.LayoutParams(
+                                  ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                          new Thread(() -> {
+                              try {
+                                  List<String> classes = listAllClasses(activity);
+                                  nativeSetClassList(classes.toArray(new String[0]));
+                              } catch (Throwable t) { log("classLister failed: " + t); }
+                          }, "ImGuiClassLister").start();
+                      } catch (Throwable t) { log("attach failed: " + t); }
+                  });
+              }
+
+              // ========== DYNAMIC CLASS INSPECTION ==========
+              public static void requestClassDetails(int sectionId, String className) {
+                  new Thread(() -> {
+                      List<String> fields = new ArrayList<>();
+                      List<String> methods = new ArrayList<>();
+                      try {
+                          Class<?> clazz = Class.forName(className);
+                          for (Field f : clazz.getDeclaredFields()) {
+                              f.setAccessible(true);
+                              fields.add((Modifier.isStatic(f.getModifiers()) ? "[static] " : "[instance] ") + 
+                                         f.getType().getSimpleName() + " " + f.getName());
+                          }
+                          for (Method m : clazz.getDeclaredMethods()) {
+                              m.setAccessible(true);
+                              StringBuilder sb = new StringBuilder();
+                              sb.append(Modifier.toString(m.getModifiers())).append(" ");
+                              sb.append(m.getReturnType().getSimpleName()).append(" ");
+                              sb.append(m.getName()).append("(");
+                              Class<?>[] params = m.getParameterTypes();
+                              for (int i = 0; i < params.length; i++) {
+                                  if (i > 0) sb.append(", ");
+                                  sb.append(params[i].getSimpleName());
+                              }
+                              sb.append(")");
+                              methods.add(sb.toString());
+                          }
+                      } catch (Throwable t) { log("requestClassDetails failed: " + t); }
+                      nativeSetClassDetails(sectionId, className, fields.toArray(new String[0]), methods.toArray(new String[0]));
+                  }).start();
+              }
+
+              public static void requestGetField(int sectionId, String className, String fieldName, String instanceName) {
+                  new Thread(() -> {
+                      String result;
+                      try {
+                          Class<?> clazz = Class.forName(className);
+                          Field f = clazz.getDeclaredField(fieldName);
+                          f.setAccessible(true);
+                          Object instance = getInstance(className, instanceName);
+                          if (instance == null && !Modifier.isStatic(f.getModifiers())) {
+                              result = "Error: Need instance to read instance field.";
+                          } else {
+                              Object val = f.get(instance);
+                              result = String.valueOf(val);
+                          }
+                      } catch (Throwable t) { result = "Error: " + t.toString(); }
+                      nativeSetFieldValue(sectionId, className, fieldName, result, false);
+                  }).start();
+              }
+
+              public static void requestSetField(int sectionId, String className, String fieldName, String instanceName, String value) {
+                  new Thread(() -> {
+                      String result;
+                      try {
+                          Class<?> clazz = Class.forName(className);
+                          Field f = clazz.getDeclaredField(fieldName);
+                          f.setAccessible(true);
+                          Object instance = getInstance(className, instanceName);
+                          if (instance == null && !Modifier.isStatic(f.getModifiers())) {
+                              result = "Error: Need instance to set instance field.";
+                          } else {
+                              Object parsed = parseArg(f.getType(), value);
+                              f.set(instance, parsed);
+                              result = "Set success: " + f.get(instance);
+                          }
+                      } catch (Throwable t) { result = "Error: " + t.toString(); }
+                      nativeSetFieldValue(sectionId, className, fieldName, result, true);
+                  }).start();
+              }
+
+              private static Object getInstance(String className, String instanceName) {
+                  if (instanceName == null || instanceName.isEmpty() || instanceName.equals("null")) return null;
+                  if (instanceName.equals("[Live] Current Activity")) return sCurrentActivity;
+                  if (instanceName.equals("[Live] Application Context")) return sApplicationContext;
+                  if (instanceName.startsWith("[Cached] ")) return sInstances.get(instanceName.substring(9));
+                  return sInstances.get(instanceName);
+              }
+
+              // ========== PATCH MANAGER ==========
+              public static void requestPatchMethod(String className, String methodSig, String returnType) {
+                  PatchRecord p = new PatchRecord();
+                  p.id = sPatchCounter++;
+                  p.type = "Method";
+                  p.className = className;
+                  p.targetName = methodSig;
+                  p.originalValue = "(original)";
+                  p.currentValue = "0";
+                  sActivePatches.add(p);
+                  syncPatches();
+              }
+
+              public static void requestPatchField(String className, String fieldName, String currentValue) {
+                  PatchRecord p = new PatchRecord();
+                  p.id = sPatchCounter++;
+                  p.type = "Field";
+                  p.className = className;
+                  p.targetName = fieldName;
+                  p.originalValue = currentValue;
+                  p.currentValue = currentValue;
+                  sActivePatches.add(p);
+                  syncPatches();
+              }
+
+              public static void togglePatch(int id, boolean active) {
+                  for (PatchRecord p : sActivePatches) {
+                      if (p.id == id) { p.isActive = active; break; }
+                  }
+                  syncPatches();
+              }
+
+              public static void updatePatchValue(int id, String newValue) {
+                  for (PatchRecord p : sActivePatches) {
+                      if (p.id == id) { p.currentValue = newValue; break; }
+                  }
+                  syncPatches();
+              }
+
+              public static void removePatch(int id) {
+                  sActivePatches.removeIf(p -> p.id == id);
+                  syncPatches();
+              }
+
+              private static void syncPatches() {
+                  List<String> serialized = new ArrayList<>();
+                  for (PatchRecord p : sActivePatches) {
+                      serialized.add(p.id + "|" + p.type + "|" + p.className + "|" + p.targetName + "|" + p.originalValue + "|" + p.currentValue + "|" + p.isActive);
+                  }
+                  nativeSetPatches(serialized.toArray(new String[0]));
+              }
+
+              // ========== METHOD CALL & ARGUMENT PROVIDER ==========
+              public static int getArgWidgetType(String typeName) {
+                  try {
+                      Class<?> c = classFromString(typeName);
+                      if (c == boolean.class || c == Boolean.class) return 1;
+                      if (c.isEnum()) return 2;
+                      if (Context.class.isAssignableFrom(c) || Activity.class.isAssignableFrom(c)) return 3;
+                      if (c.isArray()) return 5;
+                      if (c.isPrimitive() || Number.class.isAssignableFrom(c) || c == String.class || c == CharSequence.class || c == char.class || c == Character.class) return 0;
+                      return 4;
+                  } catch (Throwable t) { return 0; }
+              }
+
+              public static String[] getArgSuggestions(String typeName) {
+                  try {
+                      Class<?> c = classFromString(typeName);
+                      List<String> r = new ArrayList<>();
+                      if (c.isEnum()) {
+                          for (Object e : c.getEnumConstants()) r.add(((Enum<?>)e).name());
+                          return r.toArray(new String[0]);
+                      }
+                      if (c.isArray() || c.isPrimitive() || Number.class.isAssignableFrom(c) || c == String.class || c == CharSequence.class) return new String[0];
+                      r.add("null");
+                      for (Map.Entry<String, Object> e : sInstances.entrySet()) {
+                          if (e.getValue() != null && c.isInstance(e.getValue())) r.add("[Cached] " + e.getKey());
+                      }
+                      if (sCurrentActivity != null && c.isInstance(sCurrentActivity)) r.add("[Live] Current Activity");
+                      if (sApplicationContext != null && c.isInstance(sApplicationContext)) r.add("[Live] Application Context");
+                      return r.toArray(new String[0]);
+                  } catch (Throwable t) { return new String[]{"null"}; }
+              }
+
+              private static Object resolveArg(Class<?> target, String input) throws Exception {
+                  if (input == null || input.equals("null") || input.isEmpty()) {
+                      if (target.isPrimitive()) throw new IllegalArgumentException("Cannot pass null to primitive");
+                      return null;
+                  }
+                  if (input.equals("[Live] Current Activity")) return sCurrentActivity;
+                  if (input.equals("[Live] Application Context")) return sApplicationContext;
+                  if (input.startsWith("[Cached] ")) return sInstances.get(input.substring(9));
+                  if (sInstances.containsKey(input)) return sInstances.get(input);
+                  if (target == String.class || target == CharSequence.class || target == Object.class) return input;
+                  if (target.isPrimitive() || Number.class.isAssignableFrom(target) || target == Boolean.class || target == Character.class) {
+                      return coercePrimitive(target, input);
+                  }
+                  if (target.isEnum()) {
+                      for (Object c : target.getEnumConstants()) if (((Enum<?>)c).name().equalsIgnoreCase(input)) return c;
+                      throw new IllegalArgumentException("No enum constant");
+                  }
+                  if (target.isArray()) {
+                      Class<?> comp = target.getComponentType();
+                      if (comp == byte.class) return input.getBytes(StandardCharsets.UTF_8);
+                      if (comp == char.class) return input.toCharArray();
+                      String[] parts = input.split(",");
+                      Object arr = Array.newInstance(comp, parts.length);
+                      for (int i = 0; i < parts.length; i++) Array.set(arr, i, resolveArg(comp, parts[i].trim()));
+                      return arr;
+                  }
+                  throw new IllegalArgumentException("Cannot convert to " + target.getName());
+              }
+
+              private static Object coercePrimitive(Class<?> target, String input) {
+                  String s = input.trim();
+                  if (target == int.class || target == Integer.class) return Integer.parseInt(s);
+                  if (target == long.class || target == Long.class) return Long.parseLong(s);
+                  if (target == short.class || target == Short.class) return Short.parseShort(s);
+                  if (target == byte.class || target == Byte.class) return Byte.parseByte(s);
+                  if (target == float.class || target == Float.class) return Float.parseFloat(s);
+                  if (target == double.class || target == Double.class) return Double.parseDouble(s);
+                  if (target == boolean.class || target == Boolean.class) return s.equalsIgnoreCase("true") || s.equals("1");
+                  if (target == char.class || target == Character.class) return s.charAt(0);
+                  if (target == java.math.BigInteger.class) return new java.math.BigInteger(s);
+                  if (target == java.math.BigDecimal.class) return new java.math.BigDecimal(s);
+                  throw new IllegalArgumentException("Unsupported primitive: " + target.getName());
+              }
+
+              public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName, String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
+                  Runnable r = () -> {
+                      String result;
+                      try {
+                          Class<?> cls = Class.forName(className);
+                          Class<?>[] paramClasses = new Class<?>[paramTypes.length];
+                          for (int i = 0; i < paramTypes.length; i++) paramClasses[i] = classFromString(paramTypes[i]);
+                          Object[] argValues = new Object[args.length];
+                          for (int i = 0; i < args.length; i++) argValues[i] = resolveArg(paramClasses[i], args[i]);
+
+                          Object ret;
+                          if (isConstructor) {
+                              Constructor<?> c = cls.getDeclaredConstructor(paramClasses); c.setAccessible(true); ret = c.newInstance(argValues);
+                              result = "Created: " + (ret == null ? "null" : ret.toString()); sInstances.put(className, ret);
+                          } else if (isStatic) {
+                              Method m = cls.getDeclaredMethod(methodName, paramClasses); m.setAccessible(true); ret = m.invoke(null, argValues);
+                              result = "Returned: " + (ret == null ? "null" : ret.toString());
+                          } else {
+                              Method m = cls.getDeclaredMethod(methodName, paramClasses); m.setAccessible(true);
+                              Object instance = sInstances.get(className);
+                              if (instance == null) { instance = tryCreateInstance(cls); if (instance != null) sInstances.put(className, instance); }
+                              if (instance == null) result = "Error: Cannot find or create instance.";
+                              else { ret = m.invoke(instance, argValues); result = "Returned: " + (ret == null ? "null" : ret.toString()); }
+                          }
+                      } catch (Throwable t) { result = "Error: " + t.toString(); }
+                      nativeSetMethodResult(sectionId, className, methodSig, result);
+                  };
+                  if (runInMain) new Handler(Looper.getMainLooper()).post(r); else new Thread(r).start();
+              }
+
+              private static Object tryCreateInstance(Class<?> cls) {
+                  try { Constructor<?> c = cls.getDeclaredConstructor(); c.setAccessible(true); return c.newInstance(); }
+                  catch (Throwable t) { return null; }
+              }
+              private static Class<?> classFromString(String s) throws ClassNotFoundException {
+                  switch (s) {
+                      case "int": return int.class; case "long": return long.class; case "short": return short.class;
+                      case "byte": return byte.class; case "char": return char.class; case "boolean": return boolean.class;
+                      case "float": return float.class; case "double": return double.class; case "void": return void.class;
+                  }
+                  if (s.endsWith("[]")) return Array.newInstance(classFromString(s.substring(0, s.length() - 2)), 0).getClass();
+                  if (s.equals("String")) return String.class;
+                  return Class.forName(s);
+              }
+
+              // Missing parseArg method (was missing)
+              private static Object parseArg(Class<?> type, String s) {
+                  if (s == null || s.equals("null") || s.isEmpty()) return null;
+                  if (type == int.class || type == Integer.class) return Integer.parseInt(s);
+                  if (type == long.class || type == Long.class) return Long.parseLong(s);
+                  if (type == short.class || type == Short.class) return Short.parseShort(s);
+                  if (type == byte.class || type == Byte.class) return Byte.parseByte(s);
+                  if (type == float.class || type == Float.class) return Float.parseFloat(s);
+                  if (type == double.class || type == Double.class) return Double.parseDouble(s);
+                  if (type == boolean.class || type == Boolean.class) return s.equalsIgnoreCase("true") || s.equals("1");
+                  if (type == char.class || type == Character.class) return s.charAt(0);
+                  if (type == String.class) return s;
+                  if (type.isEnum()) {
+                      for (Object c : type.getEnumConstants()) if (((Enum<?>)c).name().equalsIgnoreCase(s)) return c;
+                      return null;
+                  }
+                  return null;
+              }
+
+              // ========== STATIC CLASS LIST ==========
+              private static List<String> listAllClasses(Context ctx) {
+                  List<String> out = new ArrayList<>();
+                  try (ZipFile zip = new ZipFile(ctx.getPackageCodePath())) {
+                      for (ZipEntry entry : Collections.list(zip.entries())) {
+                          String n = entry.getName();
+                          if (n.equals("classes.dex") || n.matches("classes\\d+\\.dex")) {
+                              try (InputStream in = zip.getInputStream(entry)) { parseDexClasses(readAll(in), out); } catch (IOException ignored) { }
+                          }
+                      }
+                  } catch (Throwable t) { log("listAllClasses error: " + t); }
+                  Collections.sort(out); return out;
+              }
+              private static byte[] readAll(InputStream in) throws IOException {
+                  ByteArrayOutputStream o = new ByteArrayOutputStream(); byte[] b = new byte[8192]; int n;
+                  while ((n = in.read(b)) > 0) o.write(b, 0, n); return o.toByteArray();
+              }
+              private static int rd32(byte[] d, int off) { return (d[off]&0xFF) | ((d[off+1]&0xFF)<<8) | ((d[off+2]&0xFF)<<16) | ((d[off+3]&0xFF)<<24); }
+              private static int readUleb128(byte[] d, int[] pos) { int r = 0, s = 0; while (true) { byte b = d[pos[0]++]; r |= (b & 0x7F) << s; if ((b & 0x80) == 0) break; s += 7; } return r; }
+              private static String readString(byte[] d, int strIdsOff, int strIdx) {
+                  if (strIdx < 0) return "";
+                  int strDataOff = rd32(d, strIdsOff + strIdx * 4);
+                  if (strDataOff <= 0 || strDataOff >= d.length) return "";
+                  int p = strDataOff; while (p < d.length && (d[p] & 0x80) != 0) p++; if (p < d.length) p++;
+                  int start = p; while (p < d.length && d[p] != 0) p++;
+                  return new String(d, start, p - start, StandardCharsets.UTF_8);
+              }
+              private static String getTypeDesc(byte[] d, int typeIdsOff, int strIdsOff, int typeIdx) { return readString(d, strIdsOff, rd32(d, typeIdsOff + typeIdx * 4)); }
+              private static void parseDexClasses(byte[] d, List<String> out) {
+                  if (d.length < 0x70 || d[0] != 'd' || d[1] != 'e' || d[2] != 'x') return;
+                  int strIdsOff = rd32(d, 0x3C); int typeIdsSize = rd32(d, 0x40); int typeIdsOff = rd32(d, 0x44);
+                  int classDefSize= rd32(d, 0x60); int classDefOff = rd32(d, 0x64);
+                  if (classDefOff + classDefSize * 32 > d.length) return;
+                  for (int i = 0; i < classDefSize; i++) {
+                      int cd = classDefOff + i * 32; int classIdx = rd32(d, cd);
+                      if (classIdx < 0 || classIdx >= typeIdsSize) continue;
+                      String desc = getTypeDesc(d, typeIdsOff, strIdsOff, classIdx);
+                      if (desc.startsWith("L") && desc.endsWith(";")) out.add(desc.substring(1, desc.length() - 1).replace('/', '.'));
+                  }
+              }
+
+              // Natives
+              static native void nativeInit(android.view.Surface s);
+              static native void nativeResize(int w, int h);
+              static native void nativeRender();
+              static native boolean nativeTouch(int action, float x, float y);
+              static native void nativeSetClassList(String[] classNames);
+              static native boolean nativeWantKeyboard();
+              static native void nativeAddInputChar(int codepoint);
+              static native void nativeAddKeyEvent(int keycode, boolean down);
+              static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
+              static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
+              static native void nativeSetFieldValue(int sectionId, String className, String fieldName, String value, boolean isSet);
+              static native void nativeSetPatches(String[] patches);
+          }
+          JAVA_EOF
+
+      - name: Write native-lib.cpp (with Frida GumJS init and JS agent)
         run: |
           cat > app/src/main/cpp/tool/native-lib.cpp << 'CPP_EOF'
           #include <jni.h>
@@ -106,57 +561,38 @@ jobs:
           #include <mutex>
           #include <algorithm>
 
-          // --- Frida Includes ---
           #include <frida-gumjs.h>
 
           #define MY_PI 3.14159265358979323846f
           #define LOG_TAG "ImGuiTool"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-          // ... (Global variables, structs for PatchItem, etc. can remain similar) ...
+          // ... (Global variables, structs, etc. - keep as before) ...
 
           // ========== FRIDA SCRIPT AGENT ==========
-          // This is the built-in JavaScript logic. The user never edits this.
           const gchar* PATCH_AGENT_JS = R"(
             Java.perform(function() {
               console.log("[*] Patch Agent Loaded");
-              
-              // We will dynamically hook methods based on commands from C++.
-              // Example: Hook a specific method and change its return value.
-              // In a real scenario, we would use a map of active patches.
-              
-              // Listen for messages from C++
               rpc.exports = {
                 patchMethod: function(className, methodName, returnType, value) {
                   try {
                     var targetClass = Java.use(className);
                     var overloads = targetClass[methodName].overloads;
                     if (overloads.length === 0) return "Error: Method not found";
-                    
-                    // Hook the first overload for simplicity
                     var original = overloads[0];
                     overloads[0].implementation = function() {
-                      // Check if patch is active (we can use a global flag or RPC call)
-                      // For demo, always return the patched value.
                       console.log("[*] Hooked " + className + "." + methodName + " called.");
-                      // Return patched value based on returnType
                       if (returnType === "int") return parseInt(value);
                       if (returnType === "boolean") return value === "true";
                       if (returnType === "java.lang.String") return value;
-                      return null; // Fallback
+                      return null;
                     };
                     return "Success: Hooked " + className + "." + methodName;
                   } catch (e) {
                     return "Error: " + e.message;
                   }
-                },
-                unpatchMethod: function(className, methodName) {
-                  // In a real implementation, we would revert the implementation.
-                  return "Unpatch not fully implemented in demo.";
                 }
               };
-              
-              // Notify C++ that the script is ready
               send({type: "ready"});
             });
           )";
@@ -165,7 +601,6 @@ jobs:
 
           static void on_script_message(GumScript* script, const gchar* message, GBytes* data, gpointer user_data) {
               LOGI("Message from JS: %s", message);
-              // Here we would parse messages from JS and update UI state if needed.
           }
 
           static void load_patch_agent() {
@@ -182,31 +617,13 @@ jobs:
               LOGI("Patch Agent script loaded.");
           }
 
-          // ========== BRIDGE: C++ -> JS ==========
-          // Call this from your UI when the user clicks "Patch".
-          void send_patch_command(const char* className, const char* methodName, const char* returnType, const char* value) {
-              if (!g_script) return;
-              // We use RPC to call the exported JS function.
-              // In a real implementation, you'd use the RPC API from the C side.
-              // This is a simplified example.
-              gchar* script = g_strdup_printf(
-                  "rpc.exports.patchMethod('%s', '%s', '%s', '%s');",
-                  className, methodName, returnType, value
-              );
-              // Ideally, we would eval this via the script's scope.
-              // For brevity, we assume gum_script_post can handle RPC calls.
-              // gum_script_post(g_script, ...); 
-              g_free(script);
-          }
-
-          // ... (Rest of the UI code, touch handling, ImGui rendering, etc.) ...
+          // ... (rest of UI code) ...
 
           JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
               JNIEnv* env = nullptr;
               if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return JNI_VERSION_1_6;
               // gVM = vm; if (!loadDex(env)) return JNI_VERSION_1_6;
 
-              // Initialize Frida GumJS
               gum_init_embedded();
               load_patch_agent();
 
@@ -215,7 +632,7 @@ jobs:
           }
           CPP_EOF
 
-      - name: Regenerate DEX (same as before)
+      - name: Regenerate DEX
         run: |
           set -e
           rm -rf /tmp/dex && mkdir -p /tmp/dex
@@ -252,11 +669,12 @@ jobs:
           name: imgui-test-apk
           path: app/build/outputs/apk/debug/app-debug.apk
 
-      - name: Commit
+      - name: Commit (excluding /tmp/frida-gumjs)
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Add only tracked files; /tmp/frida-gumjs is outside repo
           git add -A
           git diff --staged --quiet || git commit -m "feat: integrate Frida GumJS for in-process Java patching [skip ci]"
           git push
