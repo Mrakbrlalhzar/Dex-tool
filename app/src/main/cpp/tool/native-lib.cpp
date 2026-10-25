@@ -33,6 +33,9 @@ static int gWidth = 0, gHeight = 0;
 static std::vector<std::string> gClassList;
 static std::mutex gClassListMutex;
 
+// Widget type codes (must match Java side)
+// 0 = text, 1 = bool, 2 = enum, 3 = instance, 4 = array, 5 = unsupported
+
 struct MethodInfo {
     std::string raw, name, returnType, display;
     bool isStatic, isConstructor;
@@ -45,9 +48,10 @@ struct MethodCallState {
     bool hasResult = false;
     bool calling = false;
     bool runInMain = false;
-    int boolVals[8] = {0};
-    std::vector<std::string> validInstances[8];
-    int selectedInstance[8] = {0};
+    int widgetType[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
+    std::vector<std::string> suggestions[8];
+    int selectedSuggestion[8] = {0,0,0,0,0,0,0,0};
+    bool needsInit = true;
     bool needsFocus = false;
 };
 struct ClassDetail {
@@ -267,14 +271,63 @@ static void doInit(JNIEnv* env, jclass, jobject surface) {
 }
 static void doResize(JNIEnv*, jclass, jint w, jint h) { gWidth = w; gHeight = h; glViewport(0, 0, w, h); }
 
-static bool isComplexType(const std::string& t) {
-    if (t == "int" || t == "long" || t == "short" || t == "byte" || t == "char" || 
-        t == "boolean" || t == "float" || t == "double" || t == "java.lang.String" || t == "byte[]") return false;
-    return true;
+// Ask Java: what widget type should this param use?
+static void initMethodWidgets(MethodCallState& st, const std::vector<std::string>& types) {
+    if (!gHelperClass || !gVM) return;
+    JNIEnv* env = nullptr; bool attached = false;
+    if (gVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        attached = true;
+    }
+
+    jmethodID getType = env->GetStaticMethodID(gHelperClass, "getArgWidgetType", "(Ljava/lang/String;)I");
+    jmethodID getSugg = env->GetStaticMethodID(gHelperClass, "getArgSuggestions", "(Ljava/lang/String;)[Ljava/lang/String;");
+
+    for (size_t i = 0; i < types.size() && i < 8; i++) {
+        jstring js = env->NewStringUTF(types[i].c_str());
+        if (!js) continue;
+
+        st.widgetType[i] = 5;
+        if (getType) {
+            jint wt = env->CallStaticIntMethod(gHelperClass, getType, js);
+            if (!env->ExceptionCheck()) st.widgetType[i] = (int)wt;
+            else env->ExceptionClear();
+        }
+
+        st.suggestions[i].clear();
+        if ((st.widgetType[i] == 2 || st.widgetType[i] == 3) && getSugg) {
+            jobjectArray arr = (jobjectArray)env->CallStaticObjectMethod(gHelperClass, getSugg, js);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            else if (arr) {
+                jsize n = env->GetArrayLength(arr);
+                for (jsize j = 0; j < n; j++) {
+                    jstring s = (jstring)env->GetObjectArrayElement(arr, j);
+                    const char* c = env->GetStringUTFChars(s, nullptr);
+                    if (c) st.suggestions[i].push_back(c);
+                    if (c) env->ReleaseStringUTFChars(s, c);
+                    env->DeleteLocalRef(s);
+                }
+                env->DeleteLocalRef(arr);
+            }
+        }
+
+        // Initialize argBufs[i] with first suggestion if combo
+        if ((st.widgetType[i] == 2 || st.widgetType[i] == 3) && !st.suggestions[i].empty()) {
+            st.selectedSuggestion[i] = 0;
+            snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][0].c_str());
+        }
+        env->DeleteLocalRef(js);
+    }
+    st.needsInit = false;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached) gVM->DetachCurrentThread();
 }
 
 static void renderMethodPanel(Section& sec, const std::string& className, MethodInfo& m, MethodCallState& st) {
     ImGui::Indent(20);
+
+    if (st.needsInit) initMethodWidgets(st, m.paramTypes);
+
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("Return: %s", m.returnType.c_str());
     ImGui::PopTextWrapPos();
@@ -282,62 +335,61 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
     for (int i = 0; i < st.numParams; i++) {
         ImGui::PushID(i);
         ImGui::TextDisabled("arg%d (%s)", i, m.paramTypes[i].c_str());
-        
-        if (m.paramTypes[i] == "boolean") {
-            st.boolVals[i] = (strcmp(st.argBufs[i], "true") == 0) ? 1 : 0;
-            if (ImGui::Combo("##bool", &st.boolVals[i], "false\0true\0")) {
-                snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.boolVals[i] ? "true" : "false");
+
+        int wt = st.widgetType[i];
+        if (wt == 0) {
+            if (st.needsFocus && i == 0) { ImGui::SetKeyboardFocusHere(); st.needsFocus = false; }
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
+        } else if (wt == 1) {
+            int bv = (strcmp(st.argBufs[i], "true") == 0) ? 1 : 0;
+            if (ImGui::Combo("##bool", &bv, "false\0true\0")) {
+                snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", bv ? "true" : "false");
             }
-        } else if (isComplexType(m.paramTypes[i])) {
-            if (st.validInstances[i].empty()) {
-                st.validInstances[i].push_back("null");
-                // Lazy load valid instances
-                JNIEnv* env = nullptr; bool attached = false;
-                if (gVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) { if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) env = nullptr; else attached = true; }
-                if (env && gHelperClass) {
-                    jmethodID getInst = env->GetStaticMethodID(gHelperClass, "getValidInstances", "(Ljava/lang/String;)[Ljava/lang/String;");
-                    if (getInst) {
-                        jstring jType = env->NewStringUTF(m.paramTypes[i].c_str());
-                        jobjectArray arr = (jobjectArray)env->CallStaticObjectMethod(gHelperClass, getInst, jType);
-                        if (arr) {
-                            jsize n = env->GetArrayLength(arr);
-                            for (jsize j = 0; j < n; j++) {
-                                jstring s = (jstring)env->GetObjectArrayElement(arr, j);
-                                const char* c = env->GetStringUTFChars(s, nullptr);
-                                if (c) st.validInstances[i].push_back(c);
-                                if (c) env->ReleaseStringUTFChars(s, c);
-                                env->DeleteLocalRef(s);
-                            }
-                            env->DeleteLocalRef(arr);
+        } else if (wt == 2 || wt == 3) {
+            if (st.suggestions[i].empty()) {
+                ImGui::TextDisabled("(no options available - create via <init> first)");
+            } else {
+                int sel = st.selectedSuggestion[i];
+                if (sel >= (int)st.suggestions[i].size()) sel = 0;
+                if (ImGui::BeginCombo("##sugg", st.suggestions[i][sel].c_str())) {
+                    for (int n = 0; n < (int)st.suggestions[i].size(); n++) {
+                        bool is_sel = (sel == n);
+                        if (ImGui::Selectable(st.suggestions[i][n].c_str(), is_sel)) {
+                            st.selectedSuggestion[i] = n;
+                            snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][n].c_str());
                         }
-                        env->DeleteLocalRef(jType);
+                        if (is_sel) ImGui::SetItemDefaultFocus();
                     }
+                    ImGui::EndCombo();
                 }
-                if (attached) gVM->DetachCurrentThread();
             }
-            
-            if (st.selectedInstance[i] >= (int)st.validInstances[i].size()) st.selectedInstance[i] = 0;
-            std::string preview = st.validInstances[i][st.selectedInstance[i]];
-            if (ImGui::BeginCombo("##arg_combo", preview.c_str())) {
-                for (int n = 0; n < st.validInstances[i].size(); n++) {
-                    bool is_selected = (st.selectedInstance[i] == n);
-                    if (ImGui::Selectable(st.validInstances[i][n].c_str(), is_selected)) {
-                        st.selectedInstance[i] = n;
-                        snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.validInstances[i][n].c_str());
-                    }
-                    if (is_selected) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
+        } else if (wt == 4) {
+            // Array
+            std::string hint = "comma-separated values";
+            if (m.paramTypes[i] == "byte[]") hint = "text -> UTF-8 bytes";
+            else if (m.paramTypes[i] == "char[]") hint = "text -> char array";
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##arr", hint.c_str(), st.argBufs[i], sizeof(st.argBufs[i]));
         } else {
-            if (st.needsFocus) { ImGui::SetKeyboardFocusHere(); st.needsFocus = false; }
+            // Unsupported - fallback text
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));
         }
         ImGui::PopID();
     }
+
     ImGui::Checkbox("Call in Main Thread", &st.runInMain);
-    
+
+    if (ImGui::Button("Refresh args")) {
+        st.needsInit = true;
+        for (int i = 0; i < 8; i++) {
+            st.widgetType[i] = -1;
+            st.suggestions[i].clear();
+            st.selectedSuggestion[i] = 0;
+        }
+    }
+    ImGui::SameLine();
     if (ImGui::Button("Call", ImVec2(100, 0))) {
         PendingCallReq c;
         c.sectionId = sec.id; c.className = className;
@@ -350,9 +402,10 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
     }
     if (st.calling) { ImGui::SameLine(); ImGui::TextDisabled("Executing..."); }
     else if (st.hasResult) {
-        ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
+        ImGui::PushTextWrapPos(0.0f);
         ImGui::TextWrapped("%s", st.result.c_str());
+        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
     ImGui::Unindent(20);
@@ -362,7 +415,7 @@ static void renderClassDetail(Section& sec, const std::string& className) {
     auto it = sec.details.find(className); if (it == sec.details.end()) return;
     ClassDetail& det = it->second;
     ImGui::Indent(20);
-    
+
     if (ImGui::Button("Inspector")) {
         gInspectors.push_back({className, true, 100, 100, 400, 300, {}, true});
         { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingInspectorReqs.push_back({className}); }
@@ -391,6 +444,7 @@ static void renderClassDetail(Section& sec, const std::string& className) {
                     st.numParams = (int)m.paramTypes.size(); if (st.numParams > 8) st.numParams = 8;
                     for (int i = 0; i < st.numParams; i++) st.argBufs[i][0] = 0;
                     st.needsFocus = true;
+                    st.needsInit = true;
                 }
                 renderMethodPanel(sec, className, m, det.methodStates[m.raw]);
                 ImGui::TreePop();
@@ -505,7 +559,6 @@ static void renderMainWindow() {
 
             if (!gPressedClassName.empty()) {
                 if (!ImGui::IsMouseDown(0)) {
-                    if (!gClassLongPressed) { /* Tap */ }
                     gPressedClassName.clear(); gClassLongPressed = false;
                 } else if (!gClassLongPressed && ImGui::GetTime() - gPressedClassStart > 0.5) {
                     gClassLongPressed = true;
@@ -581,7 +634,7 @@ static void processPendingCalls() {
     if (details.empty() && calls.empty() && inspectors.empty()) return; if (!gHelperClass || !gVM) return;
     JNIEnv* env = nullptr; bool attached = false;
     if (gVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) { if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return; attached = true; }
-    
+
     if (!details.empty()) {
         jmethodID m = env->GetStaticMethodID(gHelperClass, "requestClassDetails", "(ILjava/lang/String;)V");
         if (m) for (auto& d : details) { jstring cn = env->NewStringUTF(d.className.c_str()); env->CallStaticVoidMethod(gHelperClass, m, (jint)d.sectionId, cn); env->DeleteLocalRef(cn); }

@@ -37,6 +37,14 @@ public class Helper {
     private static Object sCurrentActivity = null;
     private static Object sApplicationContext = null;
 
+    // ========== WIDGET TYPE CODES (returned to C++) ==========
+    // 0 = text input (numbers, string, char, byte, long, short, BigInteger...)
+    // 1 = boolean combo (false/true)
+    // 2 = enum combo (all enum constants)
+    // 3 = instance combo (null + cached instances assignable to type)
+    // 4 = array text input (comma-separated; byte[] uses raw string bytes)
+    // 5 = unsupported (render as text, let user try)
+
     static {
         try {
             Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
@@ -106,6 +114,234 @@ public class Helper {
         });
     }
 
+    // ========== UNIVERSAL TYPE RESOLVER ==========
+    // Called by C++ to ask: "what widget should I render for this type?"
+    public static int getArgWidgetType(String typeName) {
+        try {
+            Class<?> c = classFromString(typeName);
+            return detectWidgetType(c);
+        } catch (Throwable t) {
+            return 5; // unsupported / fallback to text
+        }
+    }
+
+    private static int detectWidgetType(Class<?> c) {
+        // Order matters - check most specific first
+        if (c == boolean.class || c == Boolean.class) return 1;
+        if (c.isEnum()) return 2;
+        if (c.isArray()) return 4;
+        if (c.isPrimitive()) return 0;
+        if (c == String.class || c == CharSequence.class) return 0;
+        if (c == char.class || c == Character.class) return 0;
+        if (Number.class.isAssignableFrom(c)) return 0;
+        if (c == java.math.BigInteger.class || c == java.math.BigDecimal.class) return 0;
+        // If it's the Object type, allow free text (default behavior)
+        if (c == Object.class) return 0;
+        // Otherwise, complex type - try instance combo
+        return 3;
+    }
+
+    // Called by C++ to get combo options
+    public static String[] getArgSuggestions(String typeName) {
+        try {
+            Class<?> c = classFromString(typeName);
+            List<String> r = new ArrayList<>();
+
+            if (c.isEnum()) {
+                for (Object e : c.getEnumConstants()) r.add(((Enum<?>)e).name());
+                if (r.isEmpty()) r.add("(no constants)");
+                return r.toArray(new String[0]);
+            }
+
+            // Instance combo
+            r.add("null");
+            for (Map.Entry<String, Object> e : sInstances.entrySet()) {
+                if (e.getValue() != null && c.isInstance(e.getValue())) r.add(e.getKey());
+            }
+            if (sCurrentActivity != null && c.isInstance(sCurrentActivity)) r.add("[Current Activity]");
+            if (sApplicationContext != null && c.isInstance(sApplicationContext)) r.add("[Application Context]");
+            return r.toArray(new String[0]);
+        } catch (Throwable t) {
+            return new String[]{"null"};
+        }
+    }
+
+    // Universal converter - called from requestMethodCall
+    private static Object resolveArg(Class<?> target, String input) throws Exception {
+        // Handle null
+        if (input == null || input.equals("null")) {
+            if (target.isPrimitive())
+                throw new IllegalArgumentException("Cannot pass null to primitive " + target.getName());
+            return null;
+        }
+
+        // Handle empty
+        if (input.isEmpty()) {
+            if (target.isPrimitive())
+                throw new IllegalArgumentException("Cannot pass empty to primitive " + target.getName());
+            if (target == String.class || target == CharSequence.class) return "";
+            if (target.isArray()) {
+                Class<?> comp = target.getComponentType();
+                return Array.newInstance(comp, 0);
+            }
+            return null;
+        }
+
+        // Special markers
+        if (input.equals("[Current Activity]")) {
+            if (sCurrentActivity == null) throw new IllegalArgumentException("No Activity");
+            if (!target.isInstance(sCurrentActivity))
+                throw new IllegalArgumentException("Activity not assignable to " + target.getName());
+            return sCurrentActivity;
+        }
+        if (input.equals("[Application Context]")) {
+            if (sApplicationContext == null) throw new IllegalArgumentException("No AppContext");
+            if (!target.isInstance(sApplicationContext))
+                throw new IllegalArgumentException("AppContext not assignable to " + target.getName());
+            return sApplicationContext;
+        }
+
+        // Exact instance lookup
+        if (sInstances.containsKey(input)) {
+            Object obj = sInstances.get(input);
+            if (!target.isInstance(obj))
+                throw new IllegalArgumentException(input + " not assignable to " + target.getName());
+            return obj;
+        }
+
+        // Permissive types
+        if (target == String.class || target == CharSequence.class) return input;
+        if (target == Object.class) return input;
+
+        // Primitives + wrappers
+        if (target.isPrimitive() || Number.class.isAssignableFrom(target) ||
+            target == Boolean.class || target == Character.class ||
+            target == java.math.BigInteger.class || target == java.math.BigDecimal.class) {
+            return coercePrimitive(target, input);
+        }
+
+        // Enum
+        if (target.isEnum()) {
+            for (Object c : target.getEnumConstants()) {
+                if (((Enum<?>)c).name().equalsIgnoreCase(input)) return c;
+            }
+            throw new IllegalArgumentException("No enum constant '" + input + "' in " + target.getName());
+        }
+
+        // Array
+        if (target.isArray()) {
+            Class<?> comp = target.getComponentType();
+            if (comp == byte.class) return input.getBytes(StandardCharsets.UTF_8);
+            if (comp == char.class) return input.toCharArray();
+            String[] parts = input.split(",");
+            Object arr = Array.newInstance(comp, parts.length);
+            for (int i = 0; i < parts.length; i++) {
+                Array.set(arr, i, resolveArg(comp, parts[i].trim()));
+            }
+            return arr;
+        }
+
+        // Fallback: try any assignable cached instance
+        for (Object obj : sInstances.values()) {
+            if (obj != null && target.isInstance(obj)) return obj;
+        }
+
+        throw new IllegalArgumentException(
+            "Cannot convert '" + input + "' to " + target.getName() +
+            ". Create an instance of " + target.getSimpleName() + " first via <init>.");
+    }
+
+    private static Object coercePrimitive(Class<?> target, String input) {
+        String s = input.trim();
+        try {
+            if (target == int.class || target == Integer.class) return Integer.parseInt(s);
+            if (target == long.class || target == Long.class) return Long.parseLong(s);
+            if (target == short.class || target == Short.class) return Short.parseShort(s);
+            if (target == byte.class || target == Byte.class) return Byte.parseByte(s);
+            if (target == float.class || target == Float.class) return Float.parseFloat(s);
+            if (target == double.class || target == Double.class) return Double.parseDouble(s);
+            if (target == boolean.class || target == Boolean.class) {
+                String low = s.toLowerCase();
+                return low.equals("true") || low.equals("1") || low.equals("yes") || low.equals("on");
+            }
+            if (target == char.class || target == Character.class) return s.charAt(0);
+            if (target == java.math.BigInteger.class) return new java.math.BigInteger(s);
+            if (target == java.math.BigDecimal.class) return new java.math.BigDecimal(s);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid number '" + input + "' for " + target.getSimpleName());
+        }
+        throw new IllegalArgumentException("Unsupported primitive: " + target.getName());
+    }
+
+    // ========== Method call with universal resolver ==========
+    public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName,
+                                         String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
+        Runnable r = () -> {
+            String result;
+            try {
+                Class<?> cls = Class.forName(className);
+                Class<?>[] paramClasses = new Class<?>[paramTypes.length];
+                for (int i = 0; i < paramTypes.length; i++) paramClasses[i] = classFromString(paramTypes[i]);
+
+                Object[] argValues = new Object[args.length];
+                for (int i = 0; i < args.length; i++) {
+                    argValues[i] = resolveArg(paramClasses[i], args[i]);
+                }
+
+                Object ret;
+                if (isConstructor) {
+                    Constructor<?> c = cls.getDeclaredConstructor(paramClasses);
+                    c.setAccessible(true);
+                    ret = c.newInstance(argValues);
+                    result = "Created: " + (ret == null ? "null" : ret.toString());
+                    sInstances.put(className, ret);
+                } else if (isStatic) {
+                    Method m = cls.getDeclaredMethod(methodName, paramClasses);
+                    m.setAccessible(true);
+                    ret = m.invoke(null, argValues);
+                    result = "Returned: " + (ret == null ? "null" : ret.toString());
+                } else {
+                    Method m = cls.getDeclaredMethod(methodName, paramClasses);
+                    m.setAccessible(true);
+                    Object instance = sInstances.get(className);
+                    if (instance == null) {
+                        instance = tryCreateInstance(cls);
+                        if (instance != null) sInstances.put(className, instance);
+                    }
+                    if (instance == null) {
+                        result = "Error: Cannot find or create instance of " + className;
+                    } else {
+                        ret = m.invoke(instance, argValues);
+                        result = "Returned: " + (ret == null ? "null" : ret.toString());
+                    }
+                }
+            } catch (Throwable t) {
+                Throwable inner = t;
+                while (inner.getCause() != null) inner = inner.getCause();
+                result = "Error: " + inner.toString();
+            }
+            nativeSetMethodResult(sectionId, className, methodSig, result);
+        };
+        if (runInMain) new Handler(Looper.getMainLooper()).post(r); else new Thread(r).start();
+    }
+
+    private static Object tryCreateInstance(Class<?> cls) {
+        try { Constructor<?> c = cls.getDeclaredConstructor(); c.setAccessible(true); return c.newInstance(); }
+        catch (Throwable t) { return null; }
+    }
+
+    private static Class<?> classFromString(String s) throws ClassNotFoundException {
+        switch (s) {
+            case "int": return int.class; case "long": return long.class; case "short": return short.class;
+            case "byte": return byte.class; case "char": return char.class; case "boolean": return boolean.class;
+            case "float": return float.class; case "double": return double.class; case "void": return void.class;
+        }
+        if (s.endsWith("[]")) return Array.newInstance(classFromString(s.substring(0, s.length() - 2)), 0).getClass();
+        if (s.equals("String")) return String.class;
+        return Class.forName(s);
+    }
+
+    // ========== Existing code (DEX parsing, class lister, find instances) ==========
     private static List<String> listAllClasses(Context ctx) {
         List<String> out = new ArrayList<>();
         try (ZipFile zip = new ZipFile(ctx.getPackageCodePath())) {
@@ -237,59 +473,14 @@ public class Helper {
         return name + "|" + returnType + "|" + (name.contains("$") || name.equals("<clinit>") ? "1" : "0") + "|" + ("<init>".equals(name) ? "1" : "0") + "|" + params;
     }
 
-    public static String[] getValidInstances(String typeName) {
-        List<String> res = new ArrayList<>();
-        res.add("null");
-        try {
-            Class<?> targetClass = classFromString(typeName);
-            for (Map.Entry<String, Object> entry : sInstances.entrySet()) {
-                if (entry.getValue() != null && targetClass.isAssignableFrom(entry.getValue().getClass())) {
-                    res.add(entry.getKey());
-                }
-            }
-            if (targetClass.isAssignableFrom(Activity.class) || targetClass.isAssignableFrom(Context.class)) {
-                res.add("[Current Activity]");
-                res.add("[Application Context]");
-            }
-        } catch (Throwable ignored) { }
-        return res.toArray(new String[0]);
-    }
-
-    public static void requestMethodCall(int sectionId, String className, String methodSig, String methodName, String[] paramTypes, String[] args, boolean isStatic, boolean isConstructor, boolean runInMain) {
-        Runnable r = () -> {
-            String result;
-            try {
-                Class<?> cls = Class.forName(className);
-                Class<?>[] paramClasses = new Class<?>[paramTypes.length];
-                for (int i = 0; i < paramTypes.length; i++) paramClasses[i] = classFromString(paramTypes[i]);
-                Object[] argValues = new Object[args.length];
-                for (int i = 0; i < args.length; i++) argValues[i] = parseArg(paramClasses[i], args[i]);
-
-                Object ret;
-                if (isConstructor) {
-                    Constructor<?> c = cls.getDeclaredConstructor(paramClasses); c.setAccessible(true); ret = c.newInstance(argValues);
-                    result = "Created: " + (ret == null ? "null" : ret.toString()); sInstances.put(className, ret);
-                } else if (isStatic) {
-                    Method m = cls.getDeclaredMethod(methodName, paramClasses); m.setAccessible(true); ret = m.invoke(null, argValues);
-                    result = "Returned: " + (ret == null ? "null" : ret.toString());
-                } else {
-                    Method m = cls.getDeclaredMethod(methodName, paramClasses); m.setAccessible(true);
-                    Object instance = sInstances.get(className);
-                    if (instance == null) { instance = tryCreateInstance(cls); if (instance != null) sInstances.put(className, instance); }
-                    if (instance == null) result = "Error: Cannot find or create instance of " + className;
-                    else { ret = m.invoke(instance, argValues); result = "Returned: " + (ret == null ? "null" : ret.toString()); }
-                }
-            } catch (Throwable t) { result = "Error: " + t.toString(); }
-            nativeSetMethodResult(sectionId, className, methodSig, result);
-        };
-        if (runInMain) new Handler(Looper.getMainLooper()).post(r); else new Thread(r).start();
-    }
-
     public static void requestFindInstances(String className) {
         new Thread(() -> {
             List<String> found = new ArrayList<>();
             try {
-                if (sInstances.containsKey(className)) found.add("Cached: " + sInstances.get(className).toString());
+                for (Map.Entry<String, Object> e : sInstances.entrySet()) {
+                    if (e.getValue() != null && e.getKey().equals(className))
+                        found.add("Cached: " + e.getValue().toString());
+                }
                 Class<?> atClass = Class.forName("android.app.ActivityThread");
                 Object currentAt = atClass.getMethod("currentActivityThread").invoke(null);
                 if (currentAt != null) {
@@ -311,37 +502,6 @@ public class Helper {
         }).start();
     }
 
-    private static Object tryCreateInstance(Class<?> cls) {
-        try { Constructor<?> c = cls.getDeclaredConstructor(); c.setAccessible(true); return c.newInstance(); } catch (Throwable t) { return null; }
-    }
-    private static Class<?> classFromString(String s) throws ClassNotFoundException {
-        switch (s) {
-            case "int": return int.class; case "long": return long.class; case "short": return short.class;
-            case "byte": return byte.class; case "char": return char.class; case "boolean": return boolean.class;
-            case "float": return float.class; case "double": return double.class; case "void": return void.class;
-        }
-        if (s.endsWith("[]")) return Array.newInstance(classFromString(s.substring(0, s.length() - 2)), 0).getClass();
-        return Class.forName(s);
-    }
-    private static Object parseArg(Class<?> type, String s) {
-        if (s == null || s.equals("null") || s.isEmpty()) return null;
-        if (type == int.class || type == Integer.class) return Integer.parseInt(s);
-        if (type == long.class || type == Long.class) return Long.parseLong(s);
-        if (type == short.class || type == Short.class) return Short.parseShort(s);
-        if (type == byte.class || type == Byte.class) return Byte.parseByte(s);
-        if (type == char.class || type == Character.class) return s.charAt(0);
-        if (type == boolean.class || type == Boolean.class) return s.equals("1") || s.equalsIgnoreCase("true");
-        if (type == float.class || type == Float.class) return Float.parseFloat(s);
-        if (type == double.class || type == Double.class) return Double.parseDouble(s);
-        if (type == String.class) return s;
-        if (type == byte[].class) return s.getBytes(StandardCharsets.UTF_8);
-        
-        if (s.equals("[Current Activity]") && sCurrentActivity != null) return sCurrentActivity;
-        if (s.equals("[Application Context]") && sApplicationContext != null) return sApplicationContext;
-        if (sInstances.containsKey(s)) return sInstances.get(s);
-        return null;
-    }
-
     static native void nativeInit(android.view.Surface s);
     static native void nativeResize(int w, int h);
     static native void nativeRender();
@@ -353,5 +513,4 @@ public class Helper {
     static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
     static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
     static native void nativeSetInspectorInstances(String className, String[] instances);
-    static native String[] nativeGetValidInstances(String className);
 }
