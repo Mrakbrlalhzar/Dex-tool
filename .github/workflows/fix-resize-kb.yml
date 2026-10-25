@@ -110,8 +110,11 @@ jobs:
                           | EditorInfo.IME_FLAG_NO_EXTRACT_UI;
                   return new BaseInputConnection(this, false) {
                       @Override public boolean commitText(CharSequence text, int pos) {
-                          if (text != null) for (int i = 0; i < text.length(); i++)
-                              Helper.nativeAddInputChar(text.charAt(i));
+                          if (text != null) {
+                              for (int i = 0; i < text.length(); i++) {
+                                  Helper.nativeAddInputChar(text.charAt(i));
+                              }
+                          }
                           return true;
                       }
                       @Override public boolean setComposingText(CharSequence text, int pos) {
@@ -133,8 +136,9 @@ jobs:
                               return true;
                           }
                           if (ev.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
-                              if (ev.getAction() == KeyEvent.ACTION_DOWN)
+                              if (ev.getAction() == KeyEvent.ACTION_DOWN) {
                                   Helper.nativeAddInputChar('\n');
+                              }
                               return true;
                           }
                           return super.sendKeyEvent(ev);
@@ -144,7 +148,7 @@ jobs:
           }
           JAVA_EOF
 
-      - name: Write Helper.java (full rewrite with keyboard hooks)
+      - name: Write Helper.java
         run: |
           cat > app/src/main/java/com/menu/imgui/Helper.java << 'JAVA_EOF'
           package com.menu.imgui;
@@ -363,59 +367,54 @@ jobs:
           set -e
           F=app/src/main/cpp/tool/native-lib.cpp
 
-          # 1) Remove NoCollapse and NoResize flags
           sed -i 's/ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize/ImGuiWindowFlags_None/g' "$F"
 
-          # 2) Insert keyboard native functions before JNI_OnLoad
-          python3 - << 'PYEOF'
-F = "app/src/main/cpp/tool/native-lib.cpp"
-s = open(F).read()
-add = '''
-// ---------- Keyboard bridge ----------
-static jboolean doWantKeyboard(JNIEnv*, jclass) {
-    if (!gInitialized) return JNI_FALSE;
-    return ImGui::GetIO().WantTextInput ? JNI_TRUE : JNI_FALSE;
-}
-static void doAddInputChar(JNIEnv*, jclass, jint cp) {
-    if (!gInitialized || cp <= 0) return;
-    ImGui::GetIO().AddInputCharacter((unsigned int)cp);
-}
-static void doAddKeyEvent(JNIEnv*, jclass, jint keycode, jboolean down) {
-    if (!gInitialized) return;
-    ImGuiKey k = ImGuiKey_None;
-    switch (keycode) {
-        case 67: k = ImGuiKey_Backspace; break;
-        case 66: k = ImGuiKey_Enter; break;
-        case 65: k = ImGuiKey_Tab; break;
-        default: return;
-    }
-    ImGui::GetIO().AddKeyEvent(k, down ? true : false);
-}
+          awk '
+          /JNIEXPORT jint JNI_OnLoad/ && !done {
+          print "static jboolean doWantKeyboard(JNIEnv*, jclass) {"
+          print "    if (!gInitialized) return JNI_FALSE;"
+          print "    return ImGui::GetIO().WantTextInput ? JNI_TRUE : JNI_FALSE;"
+          print "}"
+          print "static void doAddInputChar(JNIEnv*, jclass, jint cp) {"
+          print "    if (!gInitialized || cp <= 0) return;"
+          print "    ImGui::GetIO().AddInputCharacter((unsigned int)cp);"
+          print "}"
+          print "static void doAddKeyEvent(JNIEnv*, jclass, jint keycode, jboolean down) {"
+          print "    if (!gInitialized) return;"
+          print "    ImGuiKey k = ImGuiKey_None;"
+          print "    switch (keycode) {"
+          print "        case 67: k = ImGuiKey_Backspace; break;"
+          print "        case 66: k = ImGuiKey_Enter; break;"
+          print "        case 65: k = ImGuiKey_Tab; break;"
+          print "        default: return;"
+          print "    }"
+          print "    ImGui::GetIO().AddKeyEvent(k, down ? true : false);"
+          print "}"
+          print ""
+          done = 1
+          }
+          { print }
+          ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 
-JNIEXPORT jint JNI_OnLoad'''
-s = s.replace("JNIEXPORT jint JNI_OnLoad", add, 1)
+          awk '
+          /nativeSetClassList.*doSetClassList/ && !done {
+          print
+          print "    {(char*)\"nativeWantKeyboard\", (char*)\"()Z\", (void*)doWantKeyboard},"
+          print "    {(char*)\"nativeAddInputChar\", (char*)\"(I)V\", (void*)doAddInputChar},"
+          print "    {(char*)\"nativeAddKeyEvent\", (char*)\"(IZ)V\", (void*)doAddKeyEvent},"
+          done = 1
+          next
+          }
+          { print }
+          ' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 
-# 3) Register the 3 new natives
-old_reg = '{(char*)"nativeSetClassList", (char*)"([Ljava/lang/String;)V",    (void*)doSetClassList},'
-new_reg = (old_reg + '\n'
-           '    {(char*)"nativeWantKeyboard", (char*)"()Z",                     (void*)doWantKeyboard},\n'
-           '    {(char*)"nativeAddInputChar", (char*)"(I)V",                    (void*)doAddInputChar},\n'
-           '    {(char*)"nativeAddKeyEvent",  (char*)"(IZ)V",                   (void*)doAddKeyEvent},')
-if old_reg in s:
-    s = s.replace(old_reg, new_reg, 1)
-    print("registration slot updated")
-else:
-    print("WARN: registration slot not found")
-s = s.replace("env->RegisterNatives(gHelperClass, methods, 5)",
-              "env->RegisterNatives(gHelperClass, methods, 8)")
-open(F, "w").write(s)
-print("native-lib.cpp patched")
-PYEOF
+          sed -i 's/RegisterNatives(gHelperClass, methods, 5)/RegisterNatives(gHelperClass, methods, 8)/' "$F"
 
-          grep -q "doWantKeyboard" "$F" && echo "✓ keyboard natives added"
-          ! grep -q "ImGuiWindowFlags_NoResize" "$F" && echo "✓ NoResize removed"
-          ! grep -q "ImGuiWindowFlags_NoCollapse" "$F" && echo "✓ NoCollapse removed"
-          grep -q "RegisterNatives(gHelperClass, methods, 8)" "$F" && echo "✓ 8 natives registered"
+          ! grep -q "ImGuiWindowFlags_NoResize" "$F" && echo "OK: NoResize removed"
+          ! grep -q "ImGuiWindowFlags_NoCollapse" "$F" && echo "OK: NoCollapse removed"
+          grep -q "doWantKeyboard" "$F" && echo "OK: keyboard functions added"
+          grep -q "nativeWantKeyboard" "$F" && echo "OK: registration added"
+          grep -q "methods, 8)" "$F" && echo "OK: count updated"
 
       - name: Regenerate DEX
         run: |
@@ -426,13 +425,14 @@ PYEOF
           javac -source 8 -target 8 -cp "$ANDROID_JAR" -d /tmp/dex \
                 app/src/main/java/com/menu/imgui/Helper.java \
                 app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
-          test -f "/tmp/dex/com/menu/imgui/Helper\$1.class" && echo "✓ Helper\$1"
-          test -f "/tmp/dex/com/menu/imgui/OverlaySurfaceView.class" && echo "✓ OverlaySurfaceView"
-          test -f "/tmp/dex/com/menu/imgui/OverlaySurfaceView\$MyRenderer.class" && echo "✓ MyRenderer"
+          echo "Compiled classes:"
+          find /tmp/dex -name "*.class"
           $D8 --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex \
               $(find /tmp/dex -name "*.class")
-          xxd -i -n imgui_dex /tmp/dex/classes.dex | sed 's/unsigned char/const unsigned char/' > app/src/main/cpp/tool/dex_data.h
-          grep -q "imgui_dex\[\]" app/src/main/cpp/tool/dex_data.h && echo "✓ dex_data.h ok"
+          xxd -i -n imgui_dex /tmp/dex/classes.dex \
+            | sed 's/unsigned char/const unsigned char/' \
+            > app/src/main/cpp/tool/dex_data.h
+          grep -q "imgui_dex\[\]" app/src/main/cpp/tool/dex_data.h && echo "OK: dex_data.h"
 
       - uses: gradle/actions/setup-gradle@v3
         with:
@@ -467,5 +467,5 @@ PYEOF
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "feat: resize/collapse restored + soft keyboard for ImGui inputs [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: resize/collapse restored + soft keyboard for ImGui inputs [skip ci]"
           git push
