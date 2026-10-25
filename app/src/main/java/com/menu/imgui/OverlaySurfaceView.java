@@ -33,18 +33,13 @@ public class OverlaySurfaceView extends GLSurfaceView {
         setRenderer(new MyRenderer());
         setRenderMode(RENDERMODE_CONTINUOUSLY);
     }
-
     public boolean isReady() { return ready; }
-
     private void showKeyboard() {
-        try { requestFocus(); imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT); }
-        catch (Throwable ignored) { }
+        try { requestFocus(); imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT); } catch (Throwable ignored) { }
     }
     private void hideKeyboard() {
-        try { imm.hideSoftInputFromWindow(getWindowToken(), 0); }
-        catch (Throwable ignored) { }
+        try { imm.hideSoftInputFromWindow(getWindowToken(), 0); } catch (Throwable ignored) { }
     }
-
     private class MyRenderer implements GLSurfaceView.Renderer {
         @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
             Surface s = getHolder().getSurface();
@@ -63,41 +58,27 @@ public class OverlaySurfaceView extends GLSurfaceView {
                 keyboardShown = false; lastActionMs = now;
                 post(() -> hideKeyboard());
             } else if (want && keyboardShown && !imm.isAcceptingText() && now - lastActionMs > 400) {
-                lastActionMs = now;
-                post(() -> showKeyboard());
+                lastActionMs = now; post(() -> showKeyboard());
             }
         }
     }
-
     @Override public boolean onCheckIsTextEditor() { return true; }
-
     @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT
-                | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
-        outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE
-                | EditorInfo.IME_FLAG_NO_FULLSCREEN
-                | EditorInfo.IME_FLAG_NO_EXTRACT_UI;
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+        outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI;
         return new BaseInputConnection(this, false) {
             @Override public boolean commitText(CharSequence text, int pos) {
-                if (text != null) for (int i = 0; i < text.length(); i++)
-                    Helper.nativeAddInputChar(text.charAt(i));
+                if (text != null) for (int i = 0; i < text.length(); i++) Helper.nativeAddInputChar(text.charAt(i));
                 return true;
             }
             @Override public boolean setComposingText(CharSequence text, int pos) { return commitText(text, pos); }
             @Override public boolean deleteSurroundingText(int before, int after) {
-                for (int i = 0; i < before; i++) {
-                    Helper.nativeAddKeyEvent(67, true);
-                    Helper.nativeAddKeyEvent(67, false);
-                }
+                for (int i = 0; i < before; i++) { Helper.nativeAddKeyEvent(67, true); Helper.nativeAddKeyEvent(67, false); }
                 return true;
             }
             @Override public boolean sendKeyEvent(KeyEvent ev) {
                 if (ev.getKeyCode() == KeyEvent.KEYCODE_DEL) {
-                    if (ev.getAction() == KeyEvent.ACTION_DOWN) {
-                        Helper.nativeAddKeyEvent(67, true);
-                        Helper.nativeAddKeyEvent(67, false);
-                    }
+                    if (ev.getAction() == KeyEvent.ACTION_DOWN) { Helper.nativeAddKeyEvent(67, true); Helper.nativeAddKeyEvent(67, false); }
                     return true;
                 }
                 if (ev.getKeyCode() == KeyEvent.KEYCODE_ENTER) {

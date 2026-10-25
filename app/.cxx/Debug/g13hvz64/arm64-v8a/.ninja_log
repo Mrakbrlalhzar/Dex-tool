@@ -1,9 +1,9 @@
 # ninja log v5
-4	168	1792926218722192850	CMakeFiles/tool.dir/imgui/backends/imgui_impl_android.cpp.o	89a26d8cbba8ee58
-168	410	1792926218967197642	CMakeFiles/tool.dir/imgui/backends/imgui_impl_opengl3.cpp.o	e1740efa2b219625
-6	985	1792926219543208908	CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o	102684e87681f26
-4	1285	1792926219828214482	CMakeFiles/tool.dir/tool/native-lib.cpp.o	f49d275d26296545
-5	1552	1792926220094219684	CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o	415fd2fed15cc3ee
-5	1724	1792926220273223185	CMakeFiles/tool.dir/imgui/imgui.cpp.o	af82186b2e7b1c61
-6	1790	1792926220343224554	CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o	d7f6a24ba2ea4fbe
-1790	1826	1792926220386225395	/home/runner/work/Dex-tool/Dex-tool/app/build/intermediates/cxx/Debug/g13hvz64/obj/arm64-v8a/libtool.so	c1709711c609d7ab
+0	120	1792934922912903274	CMakeFiles/tool.dir/imgui/backends/imgui_impl_android.cpp.o	89a26d8cbba8ee58
+120	290	1792934923084903181	CMakeFiles/tool.dir/imgui/backends/imgui_impl_opengl3.cpp.o	e1740efa2b219625
+6	437	1792934923231903102	CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o	102684e87681f26
+2	1076	1792934923866902815	CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o	415fd2fed15cc3ee
+9	1196	1792934923984902766	CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o	d7f6a24ba2ea4fbe
+1	1263	1792934924053902738	CMakeFiles/tool.dir/tool/native-lib.cpp.o	f49d275d26296545
+1	1366	1792934924156902696	CMakeFiles/tool.dir/imgui/imgui.cpp.o	af82186b2e7b1c61
+1367	1409	1792934924204902677	/home/runner/work/Dex-tool/Dex-tool/app/build/intermediates/cxx/Debug/g13hvz64/obj/arm64-v8a/libtool.so	c1709711c609d7ab

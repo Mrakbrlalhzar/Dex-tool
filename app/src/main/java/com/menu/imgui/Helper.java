@@ -13,6 +13,10 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -47,7 +51,6 @@ public class Helper {
     private static String now() {
         return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
     }
-
     private static String getPkgName() {
         try (FileInputStream fis = new FileInputStream("/proc/self/cmdline")) {
             byte[] buf = new byte[256];
@@ -62,21 +65,18 @@ public class Helper {
         } catch (Throwable ignored) { }
         return "unknown";
     }
-
     private static String getLogDir() {
-        File downloads = new File("/sdcard/Download");
-        if (downloads.exists() && downloads.canWrite()) {
-            File test = new File(downloads, ".wtest");
-            try { test.createNewFile(); test.delete(); return downloads.getAbsolutePath(); }
-            catch (Throwable ignored) { }
+        File d = new File("/sdcard/Download");
+        if (d.exists() && d.canWrite()) {
+            File t = new File(d, ".wt");
+            try { t.createNewFile(); t.delete(); return d.getAbsolutePath(); } catch (Throwable ignored) { }
         }
-        File ext = new File("/sdcard/Android/data/" + getPkgName());
-        if (ext.exists()) return ext.getAbsolutePath();
-        try { ext.mkdirs(); } catch (Throwable ignored) { }
-        if (ext.exists() && ext.canWrite()) return ext.getAbsolutePath();
+        File e = new File("/sdcard/Android/data/" + getPkgName());
+        if (e.exists()) return e.getAbsolutePath();
+        try { e.mkdirs(); } catch (Throwable ignored) { }
+        if (e.exists() && e.canWrite()) return e.getAbsolutePath();
         return "/data/data/" + getPkgName();
     }
-
     private static void log(String msg) {
         Log.i(TAG, msg);
         try {
@@ -88,7 +88,6 @@ public class Helper {
     }
 
     public static void attach(Context ctx) {
-        log("Helper.attach entered");
         if (!(ctx instanceof Activity)) return;
         final Activity activity = (Activity) ctx;
         try { activity.runOnUiThread(() -> attachOnUi(activity)); }
@@ -113,27 +112,22 @@ public class Helper {
             });
             ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
             decor.addView(overlay, new ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-            ));
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
             log("overlay attached");
-
             new Thread(() -> {
                 try {
                     List<String> classes = listAllClasses(activity);
-                    log("classLister: found " + classes.size());
+                    log("classLister: " + classes.size());
                     nativeSetClassList(classes.toArray(new String[0]));
                 } catch (Throwable t) { log("classLister failed: " + t); }
             }, "ImGuiClassLister").start();
         } catch (Throwable t) { log("attachOnUi FAILED: " + t); }
     }
 
-    // ==================== Class list ====================
     private static List<String> listAllClasses(Context ctx) {
         List<String> out = new ArrayList<>();
         String apkPath;
-        try { apkPath = ctx.getPackageCodePath(); }
-        catch (Throwable t) { return out; }
+        try { apkPath = ctx.getPackageCodePath(); } catch (Throwable t) { return out; }
         try (ZipFile zip = new ZipFile(apkPath)) {
             for (ZipEntry entry : Collections.list(zip.entries())) {
                 String n = entry.getName();
@@ -155,24 +149,17 @@ public class Helper {
         while ((n = in.read(b)) > 0) o.write(b, 0, n);
         return o.toByteArray();
     }
-
-    private static int rd16(byte[] d, int off) {
-        return (d[off] & 0xFF) | ((d[off + 1] & 0xFF) << 8);
-    }
-    private static int rd32(byte[] d, int off) {
-        return (d[off] & 0xFF) | ((d[off+1] & 0xFF) << 8) |
-               ((d[off+2] & 0xFF) << 16) | ((d[off+3] & 0xFF) << 24);
-    }
+    private static int rd16(byte[] d, int off) { return (d[off] & 0xFF) | ((d[off+1] & 0xFF) << 8); }
+    private static int rd32(byte[] d, int off) { return (d[off]&0xFF) | ((d[off+1]&0xFF)<<8) | ((d[off+2]&0xFF)<<16) | ((d[off+3]&0xFF)<<24); }
     private static int readUleb128(byte[] d, int[] pos) {
-        int result = 0;
-        int shift = 0;
+        int r = 0, s = 0;
         while (true) {
             byte b = d[pos[0]++];
-            result |= (b & 0x7F) << shift;
+            r |= (b & 0x7F) << s;
             if ((b & 0x80) == 0) break;
-            shift += 7;
+            s += 7;
         }
-        return result;
+        return r;
     }
     private static String readString(byte[] d, int strIdsOff, int strIdx) {
         if (strIdx < 0) return "";
@@ -186,8 +173,7 @@ public class Helper {
         return new String(d, start, p - start, StandardCharsets.UTF_8);
     }
     private static String getTypeDesc(byte[] d, int typeIdsOff, int strIdsOff, int typeIdx) {
-        int strIdx = rd32(d, typeIdsOff + typeIdx * 4);
-        return readString(d, strIdsOff, strIdx);
+        return readString(d, strIdsOff, rd32(d, typeIdsOff + typeIdx * 4));
     }
     private static String prettyType(String desc) {
         if (desc == null || desc.isEmpty()) return "?";
@@ -201,9 +187,7 @@ public class Helper {
             case 'J': return "long";
             case 'F': return "float";
             case 'D': return "double";
-            case 'L':
-                if (desc.endsWith(";")) return desc.substring(1, desc.length() - 1).replace('/', '.');
-                return desc;
+            case 'L': return desc.endsWith(";") ? desc.substring(1, desc.length() - 1).replace('/', '.') : desc;
             case '[': return prettyType(desc.substring(1)) + "[]";
             default: return desc;
         }
@@ -228,9 +212,8 @@ public class Helper {
         }
     }
 
-    // ==================== Class details ====================
+    // ============ Class details ============
     public static void requestClassDetails(int sectionId, String className) {
-        log("requestClassDetails: sec=" + sectionId + " " + className);
         new Thread(() -> {
             String[] fields = new String[0];
             String[] methods = new String[0];
@@ -238,10 +221,8 @@ public class Helper {
                 ClassMembers m = parseClassMembers(className);
                 fields = m.fields.toArray(new String[0]);
                 methods = m.methods.toArray(new String[0]);
-                log("classDetails: sec=" + sectionId + " fields=" + fields.length + " methods=" + methods.length);
-            } catch (Throwable t) {
-                log("requestClassDetails failed: " + t);
-            }
+                log("details sec=" + sectionId + " " + className + " f=" + fields.length + " m=" + methods.length);
+            } catch (Throwable t) { log("requestClassDetails failed: " + t); }
             nativeSetClassDetails(sectionId, className, fields, methods);
         }, "ImGuiClassDetails").start();
     }
@@ -254,30 +235,27 @@ public class Helper {
     private static ClassMembers parseClassMembers(String className) {
         ClassMembers out = new ClassMembers();
         String targetDesc = "L" + className.replace('.', '/') + ";";
-
-        File apkFile = new File(getApkPath());
-        try (ZipFile zip = new ZipFile(apkFile)) {
+        File apk = new File(getApkPath());
+        try (ZipFile zip = new ZipFile(apk)) {
             for (ZipEntry entry : Collections.list(zip.entries())) {
                 String n = entry.getName();
                 if (n.equals("classes.dex") || n.matches("classes\\d+\\.dex")) {
                     try (InputStream in = zip.getInputStream(entry)) {
-                        byte[] data = readAll(in);
-                        parseDexMembers(data, targetDesc, out);
+                        parseDexMembers(readAll(in), targetDesc, out);
                     } catch (IOException ignored) { }
                 }
             }
         } catch (Throwable t) { log("parseClassMembers error: " + t); }
         return out;
     }
-
     private static String cachedApkPath = null;
     private static String getApkPath() {
         if (cachedApkPath != null) return cachedApkPath;
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
             Object app = at.getMethod("currentApplication").invoke(null);
-            if (app instanceof android.content.Context) {
-                cachedApkPath = ((android.content.Context) app).getPackageCodePath();
+            if (app instanceof Context) {
+                cachedApkPath = ((Context) app).getPackageCodePath();
                 if (cachedApkPath != null) return cachedApkPath;
             }
         } catch (Throwable ignored) { }
@@ -301,47 +279,37 @@ public class Helper {
             int cd = classDefOff + i * 32;
             int classIdx = rd32(d, cd);
             if (classIdx < 0 || classIdx >= typeIdsSize) continue;
-            String desc = getTypeDesc(d, typeIdsOff, strIdsOff, classIdx);
-            if (!targetDesc.equals(desc)) continue;
-
+            if (!targetDesc.equals(getTypeDesc(d, typeIdsOff, strIdsOff, classIdx))) continue;
             int classDataOff = rd32(d, cd + 24);
             if (classDataOff == 0) return;
-
             int[] pos = { classDataOff };
-            int staticFieldsSize   = readUleb128(d, pos);
-            int instanceFieldsSize = readUleb128(d, pos);
-            int directMethodsSize  = readUleb128(d, pos);
-            int virtualMethodsSize = readUleb128(d, pos);
-
+            int staticFields   = readUleb128(d, pos);
+            int instanceFields = readUleb128(d, pos);
+            int directMethods  = readUleb128(d, pos);
+            int virtualMethods = readUleb128(d, pos);
             int fieldIdx = 0;
-            for (int j = 0; j < staticFieldsSize; j++) {
-                int diff = readUleb128(d, pos);
-                readUleb128(d, pos);
+            for (int j = 0; j < staticFields; j++) {
+                int diff = readUleb128(d, pos); readUleb128(d, pos);
                 fieldIdx += diff;
-                out.fields.add(getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx) + "  [static]");
+                out.fields.add(getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx) + " [static]");
             }
             fieldIdx = 0;
-            for (int j = 0; j < instanceFieldsSize; j++) {
-                int diff = readUleb128(d, pos);
-                readUleb128(d, pos);
+            for (int j = 0; j < instanceFields; j++) {
+                int diff = readUleb128(d, pos); readUleb128(d, pos);
                 fieldIdx += diff;
-                out.fields.add(getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx) + "  [instance]");
+                out.fields.add(getFieldSig(d, fieldIdsOff, typeIdsOff, strIdsOff, fieldIdx) + " [instance]");
             }
             int methodIdx = 0;
-            for (int j = 0; j < directMethodsSize; j++) {
-                int diff = readUleb128(d, pos);
-                readUleb128(d, pos);
-                readUleb128(d, pos);
+            for (int j = 0; j < directMethods; j++) {
+                int diff = readUleb128(d, pos); readUleb128(d, pos); readUleb128(d, pos);
                 methodIdx += diff;
-                out.methods.add(getMethodSig(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx) + "  [direct]");
+                out.methods.add(getMethodRaw(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx, "direct"));
             }
             methodIdx = 0;
-            for (int j = 0; j < virtualMethodsSize; j++) {
-                int diff = readUleb128(d, pos);
-                readUleb128(d, pos);
-                readUleb128(d, pos);
+            for (int j = 0; j < virtualMethods; j++) {
+                int diff = readUleb128(d, pos); readUleb128(d, pos); readUleb128(d, pos);
                 methodIdx += diff;
-                out.methods.add(getMethodSig(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx) + "  [virtual]");
+                out.methods.add(getMethodRaw(d, methodIdsOff, protoIdsOff, typeIdsOff, strIdsOff, methodIdx, "virtual"));
             }
             return;
         }
@@ -349,41 +317,116 @@ public class Helper {
 
     private static String getFieldSig(byte[] d, int fieldIdsOff, int typeIdsOff, int strIdsOff, int fieldIdx) {
         int fi = fieldIdsOff + fieldIdx * 8;
-        int typeIdx = rd16(d, fi + 2);
-        int nameIdx = rd32(d, fi + 4);
-        String name = readString(d, strIdsOff, nameIdx);
-        String type = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, typeIdx));
+        String name = readString(d, strIdsOff, rd32(d, fi + 4));
+        String type = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd16(d, fi + 2)));
         return type + " " + name;
     }
 
-    private static String getMethodSig(byte[] d, int methodIdsOff, int protoIdsOff, int typeIdsOff, int strIdsOff, int methodIdx) {
+    // Format: name|returnType|isStatic(0/1)|isConstructor(0/1)|p1;p2;...
+    private static String getMethodRaw(byte[] d, int methodIdsOff, int protoIdsOff, int typeIdsOff, int strIdsOff, int methodIdx, String kind) {
         int mi = methodIdsOff + methodIdx * 8;
         int protoIdx = rd16(d, mi + 2);
         int nameIdx  = rd32(d, mi + 4);
         String name = readString(d, strIdsOff, nameIdx);
-        if ("<init>".equals(name))   name = "<init> (constructor)";
-        if ("<clinit>".equals(name)) name = "<clinit> (static init)";
-
         int pi = protoIdsOff + protoIdx * 12;
-        int returnTypeIdx = rd32(d, pi + 4);
-        int paramsOff     = rd32(d, pi + 8);
-
-        String returnType = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, returnTypeIdx));
-
-        StringBuilder sb = new StringBuilder();
-        sb.append(returnType).append(" ").append(name).append("(");
+        String returnType = prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd32(d, pi + 4)));
+        int paramsOff = rd32(d, pi + 8);
+        StringBuilder params = new StringBuilder();
         if (paramsOff != 0 && paramsOff + 4 <= d.length) {
             int count = rd32(d, paramsOff);
             for (int j = 0; j < count; j++) {
                 int off = paramsOff + 4 + j * 2;
                 if (off + 2 > d.length) break;
-                int typeIdx = rd16(d, off);
-                if (j > 0) sb.append(", ");
-                sb.append(prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, typeIdx)));
+                if (j > 0) params.append(";");
+                params.append(prettyType(getTypeDesc(d, typeIdsOff, strIdsOff, rd16(d, off))));
             }
         }
-        sb.append(")");
-        return sb.toString();
+        boolean isCtor = "<init>".equals(name);
+        // Static: check access flags — we don't parse them here, use heuristic
+        // For simplicity: mark methods starting with "static" in kind, or check constructor
+        boolean isStatic = name.contains("$") || kind.equals("direct") && (name.startsWith("access$") || name.equals("<clinit>"));
+        return name + "|" + returnType + "|" + (isStatic ? "1" : "0") + "|" + (isCtor ? "1" : "0") + "|" + params;
+    }
+
+    // ============ Method call ============
+    public static void requestMethodCall(int sectionId, String className, String methodSig,
+                                         String methodName, String[] paramTypes, String[] args,
+                                         boolean isStatic, boolean isConstructor) {
+        new Thread(() -> {
+            String result;
+            try {
+                Class<?> cls = Class.forName(className);
+                Class<?>[] paramClasses = new Class<?>[paramTypes.length];
+                for (int i = 0; i < paramTypes.length; i++)
+                    paramClasses[i] = classFromString(paramTypes[i]);
+                Object[] argValues = new Object[args.length];
+                for (int i = 0; i < args.length; i++)
+                    argValues[i] = parseArg(paramClasses[i], args[i]);
+
+                Object ret;
+                if (isConstructor) {
+                    Constructor<?> c = cls.getDeclaredConstructor(paramClasses);
+                    c.setAccessible(true);
+                    ret = c.newInstance(argValues);
+                    result = "Created: " + (ret == null ? "null" : ret.toString());
+                } else if (isStatic) {
+                    Method m = cls.getDeclaredMethod(methodName, paramClasses);
+                    m.setAccessible(true);
+                    ret = m.invoke(null, argValues);
+                    result = "Returned: " + (ret == null ? "null" : ret.toString());
+                } else {
+                    Method m = cls.getDeclaredMethod(methodName, paramClasses);
+                    m.setAccessible(true);
+                    Object instance = tryCreateInstance(cls);
+                    if (instance == null) result = "Error: Cannot create instance";
+                    else {
+                        ret = m.invoke(instance, argValues);
+                        result = "Returned: " + (ret == null ? "null" : ret.toString());
+                    }
+                }
+            } catch (Throwable t) {
+                result = "Error: " + t;
+            }
+            nativeSetMethodResult(sectionId, className, methodSig, result);
+        }, "ImGuiMethodCall").start();
+    }
+
+    private static Object tryCreateInstance(Class<?> cls) {
+        try {
+            Constructor<?> c = cls.getDeclaredConstructor();
+            c.setAccessible(true);
+            return c.newInstance();
+        } catch (Throwable t) { return null; }
+    }
+
+    private static Class<?> classFromString(String s) throws ClassNotFoundException {
+        switch (s) {
+            case "int": return int.class;
+            case "long": return long.class;
+            case "short": return short.class;
+            case "byte": return byte.class;
+            case "char": return char.class;
+            case "boolean": return boolean.class;
+            case "float": return float.class;
+            case "double": return double.class;
+            case "void": return void.class;
+        }
+        if (s.endsWith("[]")) return Array.newInstance(classFromString(s.substring(0, s.length() - 2)), 0).getClass();
+        return Class.forName(s);
+    }
+
+    private static Object parseArg(Class<?> type, String s) {
+        String t = s == null ? "" : s.trim();
+        if (type == int.class || type == Integer.class) return Integer.parseInt(t);
+        if (type == long.class || type == Long.class) return Long.parseLong(t);
+        if (type == short.class || type == Short.class) return Short.parseShort(t);
+        if (type == byte.class || type == Byte.class) return Byte.parseByte(t);
+        if (type == char.class || type == Character.class) return t.isEmpty() ? '\0' : t.charAt(0);
+        if (type == boolean.class || type == Boolean.class) return Boolean.parseBoolean(t);
+        if (type == float.class || type == Float.class) return Float.parseFloat(t);
+        if (type == double.class || type == Double.class) return Double.parseDouble(t);
+        if (type == String.class) return t;
+        return null;
     }
 
     static native void nativeInit(android.view.Surface s);
@@ -395,4 +438,5 @@ public class Helper {
     static native void nativeAddInputChar(int codepoint);
     static native void nativeAddKeyEvent(int keycode, boolean down);
     static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
+    static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
 }
