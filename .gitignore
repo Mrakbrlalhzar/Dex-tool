@@ -1,1 +1,3 @@
 app/src/main/cpp/frida/
+.cxx/
+app/build/
