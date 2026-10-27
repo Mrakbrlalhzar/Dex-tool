@@ -29,10 +29,12 @@ jobs:
           done
           ls -la
 
-      - name: Install dependencies (NDK r25c + Meson + Node.js)
+      - name: Install dependencies (NDK r25c + Meson + Node.js + liblzma)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-pip ninja-build pkg-config libglib2.0-dev unzip curl
+          sudo apt-get install -y -qq \
+            python3-pip ninja-build pkg-config libglib2.0-dev unzip curl \
+            liblzma-dev libzstd-dev zlib1g-dev
           pip3 install --quiet --upgrade pip
           pip3 install --quiet meson
 
@@ -69,7 +71,6 @@ jobs:
       - name: Patch source to declare glib_init
         run: |
           cd /tmp/frida-gum
-          # Add forward declaration of glib_init to gumquickcompile.c
           sed -i '1i void glib_init(void);' bindings/gumjs/gumquickcompile.c
           echo "✓ Patched gumquickcompile.c with glib_init declaration"
 
@@ -381,5 +382,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: add glib_init declaration to gumquickcompile.c [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: add liblzma-dev for libunwind elf64 [skip ci]"
           git push
