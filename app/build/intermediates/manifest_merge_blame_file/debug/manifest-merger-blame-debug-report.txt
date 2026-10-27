@@ -33,7 +33,7 @@
 23        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
 23-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:28:18-86
 24        android:debuggable="true"
-25        android:extractNativeLibs="false"
+25        android:extractNativeLibs="true"
 26        android:label="ImGuiTool"
 26-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:7:9-34
 27        android:requestLegacyExternalStorage="true"

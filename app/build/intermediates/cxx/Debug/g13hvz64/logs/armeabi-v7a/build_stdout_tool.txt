@@ -1,9 +1,0 @@
-ninja: Entering directory `/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Debug/g13hvz64/armeabi-v7a'
-[1/8] Building CXX object CMakeFiles/tool.dir/imgui/backends/imgui_impl_android.cpp.o
-[2/8] Building CXX object CMakeFiles/tool.dir/imgui/backends/imgui_impl_opengl3.cpp.o
-[3/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o
-[4/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o
-[5/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o
-[6/8] Building CXX object CMakeFiles/tool.dir/imgui/imgui.cpp.o
-[7/8] Building CXX object CMakeFiles/tool.dir/tool/native-lib.cpp.o
-[8/8] Linking CXX shared library /home/runner/work/Dex-tool/Dex-tool/app/build/intermediates/cxx/Debug/g13hvz64/obj/armeabi-v7a/libtool.so
