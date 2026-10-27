@@ -114,9 +114,10 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm64 (minsize + diet) ==="
+          echo "=== Meson setup for arm64 (minsize + diet + b_ndebug) ==="
           meson setup build-arm64 --cross-file /tmp/android_arm64.ini \
             --buildtype=minsize \
+            -Db_ndebug=true \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
@@ -154,9 +155,10 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm (minsize + diet) ==="
+          echo "=== Meson setup for arm (minsize + diet + b_ndebug) ==="
           meson setup build-arm --cross-file /tmp/android_arm.ini \
             --buildtype=minsize \
+            -Db_ndebug=true \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
@@ -373,5 +375,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: add subsystem='android' to cross files [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: add b_ndebug=true for diet mode compatibility [skip ci]"
           git push
