@@ -27,13 +27,13 @@
 			{
 				"command" : 0,
 				"file" : 0,
-				"line" : 33,
+				"line" : 34,
 				"parent" : 0
 			},
 			{
 				"command" : 1,
 				"file" : 0,
-				"line" : 42,
+				"line" : 43,
 				"parent" : 0
 			},
 			{
@@ -45,19 +45,13 @@
 			{
 				"command" : 3,
 				"file" : 0,
-				"line" : 24,
+				"line" : 23,
 				"parent" : 0
 			},
 			{
 				"command" : 3,
 				"file" : 0,
-				"line" : 25,
-				"parent" : 0
-			},
-			{
-				"command" : 3,
-				"file" : 0,
-				"line" : 31,
+				"line" : 32,
 				"parent" : 0
 			}
 		]
@@ -85,18 +79,14 @@
 				},
 				{
 					"backtrace" : 5,
-					"path" : "/tmp/frida-built/arm64-v8a/include/gum"
-				},
-				{
-					"backtrace" : 6,
 					"path" : "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui"
 				},
 				{
-					"backtrace" : 6,
+					"backtrace" : 5,
 					"path" : "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/imgui/backends"
 				},
 				{
-					"backtrace" : 6,
+					"backtrace" : 5,
 					"path" : "/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool"
 				}
 			],
@@ -137,11 +127,6 @@
 			{
 				"backtrace" : 2,
 				"fragment" : "-Wl,--gc-sections",
-				"role" : "flags"
-			},
-			{
-				"backtrace" : 2,
-				"fragment" : "-Wl,--exclude-libs,ALL",
 				"role" : "flags"
 			},
 			{

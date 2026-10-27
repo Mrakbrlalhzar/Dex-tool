@@ -10,6 +10,7 @@
 -- Check for working CXX compiler: /usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ - skipped
 -- Detecting CXX compile features
 -- Detecting CXX compile features - done
+-- Frida deps: 
 -- Configuring done
 -- Generating done
 -- Build files have been written to: /home/runner/work/Dex-tool/Dex-tool/app/.cxx/Release/4v2u2d6e/arm64-v8a

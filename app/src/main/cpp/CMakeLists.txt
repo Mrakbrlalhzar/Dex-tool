@@ -17,16 +17,17 @@ else()
 endif()
 
 if(NOT EXISTS "${FRIDA_DIR}/lib/libfrida-gumjs.a")
-    message(FATAL_ERROR "Frida lib not found: ${FRIDA_DIR}/lib/libfrida-gumjs.a")
+    message(FATAL_ERROR "Frida lib missing: ${FRIDA_DIR}/lib/libfrida-gumjs.a")
 endif()
 
-# Include the root + gum subdir for good measure
 include_directories(${FRIDA_DIR}/include)
-include_directories(${FRIDA_DIR}/include/gum)
 
 add_library(frida-gumjs STATIC IMPORTED)
 set_target_properties(frida-gumjs PROPERTIES
     IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
+
+file(GLOB FRIDA_DEPS "${FRIDA_DIR}/deps/*.a")
+message(STATUS "Frida deps: ${FRIDA_DEPS}")
 
 include_directories(imgui imgui/backends tool)
 
@@ -41,7 +42,9 @@ add_library(tool SHARED
 
 target_link_options(tool PRIVATE
     -Wl,--gc-sections
-    -Wl,--exclude-libs,ALL
     -Wl,--strip-all)
 
-target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
+target_link_libraries(tool
+    frida-gumjs
+    ${FRIDA_DEPS}
+    android log EGL GLESv3 dl)
