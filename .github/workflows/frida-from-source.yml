@@ -121,10 +121,11 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm64 (minsize + diet + b_ndebug) ==="
+          echo "=== Meson setup for arm64 (minsize + diet + b_ndebug + minidebuginfo=disabled) ==="
           meson setup build-arm64 --cross-file /tmp/android_arm64.ini \
             --buildtype=minsize \
             -Db_ndebug=true \
+            -Dminidebuginfo=disabled \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
@@ -132,8 +133,7 @@ jobs:
             -Ddatabase=disabled \
             -Dtests=disabled \
             -Ddiet=true \
-            -Ddefault_library=static \
-            -Dlibunwind:lzma=disabled
+            -Ddefault_library=static
           echo "=== Build ==="
           ninja -C build-arm64
           echo "=== .a files ==="
@@ -163,10 +163,11 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm (minsize + diet + b_ndebug) ==="
+          echo "=== Meson setup for arm (minsize + diet + b_ndebug + minidebuginfo=disabled) ==="
           meson setup build-arm --cross-file /tmp/android_arm.ini \
             --buildtype=minsize \
             -Db_ndebug=true \
+            -Dminidebuginfo=disabled \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
@@ -174,8 +175,7 @@ jobs:
             -Ddatabase=disabled \
             -Dtests=disabled \
             -Ddiet=true \
-            -Ddefault_library=static \
-            -Dlibunwind:lzma=disabled
+            -Ddefault_library=static
           echo "=== Build ==="
           ninja -C build-arm
           echo "=== .a files ==="
@@ -384,5 +384,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: disable lzma in libunwind to resolve lzma.h not found [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: use -Dminidebuginfo=disabled to avoid lzma dependency [skip ci]"
           git push
