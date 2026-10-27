@@ -67,7 +67,7 @@ jobs:
           echo "=== frida-gum cloned ==="
           cat meson.options
 
-      - name: Create Meson cross files
+      - name: Create Meson cross files (with subsystem)
         run: |
           set -e
           NDK="$NDK_PATH"
@@ -83,6 +83,8 @@ jobs:
 
           [host_machine]
           system = 'android'
+          subsystem = 'android'
+          kernel = 'linux'
           cpu_family = 'aarch64'
           cpu = 'arm64-v8a'
           endian = 'little'
@@ -98,12 +100,14 @@ jobs:
 
           [host_machine]
           system = 'android'
+          subsystem = 'android'
+          kernel = 'linux'
           cpu_family = 'arm'
           cpu = 'armeabi-v7a'
           endian = 'little'
           EOF
 
-          echo "✓ Cross files created"
+          echo "✓ Cross files created with subsystem"
 
       - name: Build frida-gumjs for android-arm64
         timeout-minutes: 60
@@ -369,5 +373,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: use buildtype=minsize and diet=true for max size reduction [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: add subsystem='android' to cross files [skip ci]"
           git push
