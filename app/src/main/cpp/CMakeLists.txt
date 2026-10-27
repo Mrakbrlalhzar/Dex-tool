@@ -13,19 +13,16 @@ if(${ANDROID_ABI} STREQUAL "arm64-v8a")
 elseif(${ANDROID_ABI} STREQUAL "armeabi-v7a")
     set(FRIDA_DIR /tmp/frida-built/armeabi-v7a)
 else()
-    message(FATAL_ERROR "Unsupported ABI: ${ANDROID_ABI}")
+    message(FATAL_ERROR "Unsupported ABI")
 endif()
 
 if(NOT EXISTS "${FRIDA_DIR}/lib/libfrida-gumjs.a")
-    message(FATAL_ERROR "Frida lib not found: ${FRIDA_DIR}/lib/libfrida-gumjs.a")
+    message(FATAL_ERROR "Frida lib not found")
 endif()
 
-# Include paths for frida + glib + glibconfig
 include_directories(
     ${FRIDA_DIR}/include
     ${FRIDA_DIR}/include/glib-2.0
-    ${FRIDA_DIR}/include/glib-config
-    ${FRIDA_DIR}/include/gum
 )
 
 add_library(frida-gumjs STATIC IMPORTED)
