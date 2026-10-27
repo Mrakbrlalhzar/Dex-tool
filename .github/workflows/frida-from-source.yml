@@ -29,17 +29,19 @@ jobs:
           done
           ls -la
 
-      - name: Install dependencies
+      - name: Install dependencies (NDK r25c + build tools)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-pip ninja-build pkg-config libglib2.0-dev rsync
+          sudo apt-get install -y -qq python3-pip ninja-build pkg-config libglib2.0-dev rsync unzip
           pip3 install --quiet --upgrade pip
           pip3 install --quiet meson
 
-      - name: Detect NDK
-        run: |
-          NDK_DIR=$(ls -d $ANDROID_HOME/ndk/* 2>/dev/null | head -1)
-          echo "NDK_PATH=$NDK_DIR" >> $GITHUB_ENV
+          # Download NDK r25c (required by Frida 17.1.0)
+          wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip -O /tmp/ndk-r25c.zip
+          unzip -q /tmp/ndk-r25c.zip -d /tmp/
+          export NDK_R25C=/tmp/android-ndk-r25c
+          echo "NDK_PATH=$NDK_R25C" >> $GITHUB_ENV
+          echo "✓ NDK r25c installed at $NDK_R25C"
 
       - name: Download Frida devkit (HEADERS ONLY)
         run: |
@@ -68,19 +70,19 @@ jobs:
           EOF
           cat config.mk
 
-      - name: Build Frida core for android-arm64
+      - name: Build Frida devkit for android-arm64
         timeout-minutes: 60
         run: |
           cd /tmp/frida
           export ANDROID_NDK_ROOT="$NDK_PATH"
           export FRIDA_HOST=android-arm64
-          echo "=== Configure android-arm64 ==="
-          ./configure --host=android-arm64 -- -Dfrida-python=disabled 2>&1 | tail -5 || true
-          echo "=== Build core-android-arm64 ==="
-          # Use the specific target to ensure Android cross-compilation
-          make core-android-arm64 -j$(nproc) 2>&1 | tail -30 || echo "make exited non-zero (python failure ignored)"
+          echo "=== Configure android-arm64 with devkits ==="
+          # Crucial: request gum and gumjs devkits, disable python
+          ./configure --host=android-arm64 -- -Ddevkits=gum,gumjs -Dfrida-python=disabled 2>&1 | tail -10
+          echo "=== Build (make) ==="
+          make -j$(nproc) 2>&1 | tail -30 || echo "make exited non-zero (python failure ignored)"
           echo "=== .a files ==="
-          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; 2>/dev/null
+          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; 2>/dev/null || true
 
       - name: Stage arm64
         run: |
@@ -105,18 +107,19 @@ jobs:
           ls -lah "$DEST/lib/"
           test -f "$DEST/include/frida-gumjs.h" && echo "✓ frida-gumjs.h" || (echo "✗ MISSING" && exit 1)
 
-      - name: Build Frida core for android-arm
+      - name: Build Frida devkit for android-arm
         timeout-minutes: 60
         run: |
           cd /tmp/frida
+          # Clean previous build artifacts
           rm -rf build
           export ANDROID_NDK_ROOT="$NDK_PATH"
           export FRIDA_HOST=android-arm
-          echo "=== Configure android-arm ==="
-          ./configure --host=android-arm -- -Dfrida-python=disabled 2>&1 | tail -5 || true
-          echo "=== Build core-android-arm ==="
-          make core-android-arm -j$(nproc) 2>&1 | tail -30 || echo "make exited non-zero (ignored)"
-          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; 2>/dev/null
+          echo "=== Configure android-arm with devkits ==="
+          ./configure --host=android-arm -- -Ddevkits=gum,gumjs -Dfrida-python=disabled 2>&1 | tail -10
+          echo "=== Build (make) ==="
+          make -j$(nproc) 2>&1 | tail -30 || echo "make exited non-zero (ignored)"
+          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; 2>/dev/null || true
 
       - name: Stage armv7
         run: |
@@ -306,5 +309,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: cross-compile frida core-android-arm64 correctly [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: use NDK r25c + devkits=gum,gumjs for cross-compile [skip ci]"
           git push
