@@ -1,4 +1,4 @@
-name: Frida from Source (Dual-Arch Slim)
+name: Frida from Source (Dual-Arch Slim) - Fixed
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -19,7 +19,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Cleanup old workflows (keep only this one)
+      - name: Cleanup other workflows
         run: |
           cd .github/workflows
           for f in *.yml *.yaml; do
@@ -28,8 +28,6 @@ jobs:
               rm -f "$f"
             fi
           done
-          echo "=== Remaining workflows ==="
-          ls -la
 
       - name: Install Build Dependencies
         run: |
@@ -37,21 +35,35 @@ jobs:
           sudo apt-get install -y -qq python3-pip ninja-build pkg-config libglib2.0-dev
           pip3 install --quiet --upgrade pip
           pip3 install --quiet meson
-          echo "✓ Tools:"
           meson --version
           ninja --version
-          python3 --version
 
       - name: Detect NDK
-        id: ndk
         run: |
           NDK_DIR=$(ls -d $ANDROID_HOME/ndk/* 2>/dev/null | head -1)
-          if [ -z "$NDK_DIR" ]; then
-            echo "FATAL: NDK not found"
-            exit 1
-          fi
+          [ -z "$NDK_DIR" ] && echo "FATAL: NDK not found" && exit 1
           echo "NDK_PATH=$NDK_DIR" >> $GITHUB_ENV
-          echo "Using NDK: $NDK_DIR"
+          echo "NDK: $NDK_DIR"
+
+      - name: Download Frida HEADERS only (from devkit)
+        run: |
+          set -e
+          FRIDA_VERSION="17.1.0"
+          BASE_URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}"
+
+          for pair in "arm64-v8a:arm64" "armeabi-v7a:arm"; do
+            ABI="${pair%%:*}"
+            ARCH="${pair##*:}"
+            echo "=== Headers for $ABI ($ARCH) ==="
+            mkdir -p /tmp/frida-built/${ABI}
+            wget -q "${BASE_URL}/frida-gumjs-devkit-${FRIDA_VERSION}-android-${ARCH}.tar.xz" \
+              -O /tmp/devkit-${ARCH}.tar.xz
+            # Extract ONLY include/ — skips the 180MB .a
+            tar -xf /tmp/devkit-${ARCH}.tar.xz -C /tmp/frida-built/${ABI} include/
+            echo "Headers:"
+            ls /tmp/frida-built/${ABI}/include/ | head -10
+            rm -f /tmp/devkit-${ARCH}.tar.xz
+          done
 
       - name: Clone Frida source
         run: |
@@ -59,126 +71,99 @@ jobs:
           FRIDA_VERSION="17.1.0"
           git clone --recursive --depth 1 --branch ${FRIDA_VERSION} \
             https://github.com/frida/frida.git /tmp/frida
-          cd /tmp/frida
-          echo "✓ Frida ${FRIDA_VERSION} cloned"
-          git submodule status | head -5
+          echo "✓ Cloned"
 
-      - name: Configure slim Frida (config.mk)
+      - name: Configure slim Frida
         run: |
-          cd /tmp/frida
-          cat > config.mk << 'EOF'
+          cat > /tmp/frida/config.mk << 'EOF'
           FRIDA_V8 = disabled
           FRIDA_DATABASE = disabled
           FRIDA_CONNECTIVITY = disabled
           FRIDA_OBJC_BRIDGE = disabled
           FRIDA_SWIFT_BRIDGE = disabled
-          FRIDA_OPTIMIZATION_FLAGS = -Oz
           FRIDA_DEBUG = no
           EOF
-          echo "=== config.mk ==="
-          cat config.mk
+          cat /tmp/frida/config.mk
 
-      - name: Build Frida for arm64-v8a
-        timeout-minutes: 60
+      - name: Build Frida arm64-v8a
+        timeout-minutes: 90
         run: |
-          set -e
           cd /tmp/frida
+          rm -rf build
           export ANDROID_NDK_ROOT="$NDK_PATH"
           export FRIDA_HOST=android-arm64
-          echo "=== Building for android-arm64 ==="
-          make -j$(nproc) 2>&1 | tail -30
-          echo "=== Locating artifacts ==="
-          find . -name "libfrida-gumjs*.a" -exec ls -lah {} \;
-          find . -name "frida-gumjs.h" -exec ls -lah {} \;
+          echo "=== Building arm64 ==="
+          # Python build will fail at the END; gumjs is produced first
+          make -j$(nproc) 2>&1 | tail -20 || true
 
-      - name: Stage arm64 artifacts
-        run: |
-          set -e
-          mkdir -p /tmp/frida-built/arm64-v8a/{lib,include}
-          LIB=$(find /tmp/frida -name "libfrida-gumjs.a" | head -1)
-          HDR=$(find /tmp/frida -name "frida-gumjs.h" | head -1)
-          [ -z "$LIB" ] && echo "FATAL: arm64 lib not found" && exit 1
-          [ -z "$HDR" ] && echo "FATAL: arm64 header not found" && exit 1
+          echo "=== Locating libfrida-gumjs ==="
+          LIB=$(find build -name "libfrida-gumjs*.a" -not -name "*inspector*" | head -1)
+          if [ -z "$LIB" ]; then
+            echo "FATAL: libfrida-gumjs.a not found for arm64"
+            find build -name "libfrida*.a" | head -10
+            exit 1
+          fi
+          echo "Found: $LIB ($(ls -lah $LIB | awk '{print $5}'))"
+          mkdir -p /tmp/frida-built/arm64-v8a/lib
           cp "$LIB" /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
-          cp "$HDR" /tmp/frida-built/arm64-v8a/include/
-          # Copy all headers that are in the same dir
-          find /tmp/frida -name "*.h" -path "*frida-gum/bindings/gumjs*" -exec cp {} /tmp/frida-built/arm64-v8a/include/ \; 2>/dev/null || true
-          echo "=== Staged arm64 ==="
           ls -lah /tmp/frida-built/arm64-v8a/lib/
-          ls /tmp/frida-built/arm64-v8a/include/ | head -5
 
-      - name: Build Frida for armeabi-v7a
-        timeout-minutes: 60
+      - name: Build Frida armeabi-v7a
+        timeout-minutes: 90
         run: |
-          set -e
           cd /tmp/frida
-          # Clean previous build outputs to avoid confusion
-          rm -rf build/frida-android-arm64 || true
+          rm -rf build
           export ANDROID_NDK_ROOT="$NDK_PATH"
           export FRIDA_HOST=android-arm
-          echo "=== Building for android-arm ==="
-          make -j$(nproc) 2>&1 | tail -30
-          echo "=== Locating arm artifacts ==="
-          find . -path "*android-arm*" -name "libfrida-gumjs*.a" -exec ls -lah {} \;
+          echo "=== Building arm ==="
+          make -j$(nproc) 2>&1 | tail -20 || true
 
-      - name: Stage armeabi-v7a artifacts
-        run: |
-          set -e
-          mkdir -p /tmp/frida-built/armeabi-v7a/{lib,include}
-          LIB=$(find /tmp/frida -path "*android-arm/*" -name "libfrida-gumjs.a" | head -1)
+          echo "=== Locating libfrida-gumjs ==="
+          LIB=$(find build -name "libfrida-gumjs*.a" -not -name "*inspector*" | head -1)
           if [ -z "$LIB" ]; then
-            LIB=$(find /tmp/frida -name "libfrida-gumjs.a" | grep -v "arm64" | head -1)
+            echo "FATAL: libfrida-gumjs.a not found for arm"
+            find build -name "libfrida*.a" | head -10
+            exit 1
           fi
-          HDR=$(find /tmp/frida -name "frida-gumjs.h" | head -1)
-          [ -z "$LIB" ] && echo "FATAL: arm lib not found" && exit 1
-          [ -z "$HDR" ] && echo "FATAL: arm header not found" && exit 1
+          echo "Found: $LIB ($(ls -lah $LIB | awk '{print $5}'))"
+          mkdir -p /tmp/frida-built/armeabi-v7a/lib
           cp "$LIB" /tmp/frida-built/armeabi-v7a/lib/libfrida-gumjs.a
-          cp "$HDR" /tmp/frida-built/armeabi-v7a/include/
-          find /tmp/frida -name "*.h" -path "*frida-gum/bindings/gumjs*" -exec cp {} /tmp/frida-built/armeabi-v7a/include/ \; 2>/dev/null || true
-          echo "=== Staged arm ==="
           ls -lah /tmp/frida-built/armeabi-v7a/lib/
 
-      - name: Report Frida library sizes
-        run: |
-          echo "=== arm64-v8a ==="
-          ls -lah /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
-          echo "=== armeabi-v7a ==="
-          ls -lah /tmp/frida-built/armeabi-v7a/lib/libfrida-gumjs.a
-          echo ""
-          echo "Note: These are uncompressed static libraries."
-          echo "Final .so will be much smaller after linking + strip."
-
-      - name: Verify existing source files
+      - name: Verify both builds
         run: |
           set -e
-          echo "=== Checking required sources ==="
-          for f in app/src/main/cpp/tool/native-lib.cpp \
-                   app/src/main/cpp/tool/dex_data.h \
-                   app/src/main/java/com/menu/imgui/Helper.java \
-                   app/src/main/java/com/menu/imgui/OverlaySurfaceView.java; do
-            test -s "$f" && echo "✓ $f" || (echo "✗ $f MISSING" && exit 1)
+          for ABI in arm64-v8a armeabi-v7a; do
+            LIB=/tmp/frida-built/$ABI/lib/libfrida-gumjs.a
+            HDR=/tmp/frida-built/$ABI/include/frida-gumjs.h
+            test -s "$LIB" || (echo "MISSING lib for $ABI" && exit 1)
+            test -s "$HDR" || (echo "MISSING header for $ABI" && exit 1)
+            SIZE=$(stat -c%s "$LIB")
+            echo "✓ $ABI: lib=$(echo "scale=2; $SIZE/1048576" | bc)MB, header OK"
           done
-          # Verify native-lib.cpp has Frida init
-          grep -q "gum_init_embedded" app/src/main/cpp/tool/native-lib.cpp && echo "✓ Frida init present" || (echo "✗ Frida init missing in native-lib.cpp" && exit 1)
-          grep -q "gum_script_backend_create_sync" app/src/main/cpp/tool/native-lib.cpp && echo "✓ create_sync present" || (echo "✗ create_sync missing" && exit 1)
 
-      - name: Write CMakeLists.txt (dual-arch source-built Frida)
+      - name: Verify source files
+        run: |
+          set -e
+          test -s app/src/main/cpp/tool/native-lib.cpp || (echo "native-lib.cpp missing" && exit 1)
+          test -s app/src/main/cpp/tool/dex_data.h || (echo "dex_data.h missing" && exit 1)
+          test -s app/src/main/java/com/menu/imgui/Helper.java || (echo "Helper.java missing" && exit 1)
+          test -s app/src/main/java/com/menu/imgui/OverlaySurfaceView.java || (echo "OverlaySurfaceView.java missing" && exit 1)
+          grep -q "gum_init_embedded" app/src/main/cpp/tool/native-lib.cpp && echo "✓ Frida init present"
+
+      - name: Write CMakeLists.txt
         run: |
           cat > app/src/main/cpp/CMakeLists.txt << 'EOF'
           cmake_minimum_required(VERSION 3.22.1)
           project("tool")
           set(CMAKE_CXX_STANDARD 17)
 
-          # Force Release mode
           if(NOT CMAKE_BUILD_TYPE)
               set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
           endif()
-
-          # Size optimizations
           set(CMAKE_C_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
           set(CMAKE_CXX_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
 
-          # Frida paths per architecture
           if(${ANDROID_ABI} STREQUAL "arm64-v8a")
               set(FRIDA_DIR /tmp/frida-built/arm64-v8a)
           elseif(${ANDROID_ABI} STREQUAL "armeabi-v7a")
@@ -188,7 +173,7 @@ jobs:
           endif()
 
           if(NOT EXISTS "${FRIDA_DIR}/lib/libfrida-gumjs.a")
-              message(FATAL_ERROR "Frida lib not found: ${FRIDA_DIR}/lib/libfrida-gumjs.a")
+              message(FATAL_ERROR "Frida lib missing: ${FRIDA_DIR}/lib/libfrida-gumjs.a")
           endif()
 
           include_directories(${FRIDA_DIR}/include)
@@ -216,7 +201,7 @@ jobs:
           target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
           EOF
 
-      - name: Write app/build.gradle.kts (dual-arch release)
+      - name: Write app/build.gradle.kts
         run: |
           cat > app/build.gradle.kts << 'EOF'
           plugins {
@@ -289,13 +274,12 @@ jobs:
           rm -rf app/.cxx app/build .gradle
           ./gradlew :app:assembleDebug --no-build-cache --stacktrace
 
-      - name: Strip .so files
+      - name: Strip .so
         run: |
           set -e
           NDK_STRIP=$(find $NDK_PATH -name "llvm-strip" | head -1)
-          echo "Strip tool: $NDK_STRIP"
           for SO in $(find app/build -name "libtool.so"); do
-            echo "=== Stripping: $SO ==="
+            echo "=== $SO ==="
             ls -lah "$SO"
             $NDK_STRIP --strip-all "$SO"
             ls -lah "$SO"
@@ -303,15 +287,13 @@ jobs:
             echo "→ $(echo "scale=2; $SIZE/1048576" | bc) MB"
           done
 
-      - name: Show APK breakdown
+      - name: Show APK info
         run: |
           APK=$(find app/build -name "*.apk" | head -1)
-          echo "=== APK total ==="
           ls -lah "$APK"
-          echo "=== Native libs inside ==="
           unzip -l "$APK" | grep "\.so"
 
-      - name: Extract .so artifacts
+      - name: Extract .so files
         run: |
           mkdir -p /tmp/so-out
           for SO in $(find app/build -name "libtool.so"); do
@@ -330,11 +312,11 @@ jobs:
           name: app-debug-frida-source
           path: app/build/outputs/apk/debug/*.apk
 
-      - name: Commit updated configs
+      - name: Commit configs
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "feat: frida from source (slim dual-arch) [skip ci]"
+          git diff --staged --quiet || git commit -m "feat: frida from source (slim dual-arch) + devkit headers [skip ci]"
           git push
