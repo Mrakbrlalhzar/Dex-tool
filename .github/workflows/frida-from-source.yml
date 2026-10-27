@@ -42,7 +42,7 @@ jobs:
           echo "NDK_PATH=/tmp/android-ndk-r25c" >> $GITHUB_ENV
           echo "✓ NDK r25c installed"
 
-          # Node.js 20 for frida-compile
+          # Node.js 20
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
           node --version
@@ -65,7 +65,7 @@ jobs:
             https://github.com/frida/frida-gum.git /tmp/frida-gum
           cd /tmp/frida-gum
           echo "=== frida-gum cloned ==="
-          ls meson.options
+          cat meson.options
 
       - name: Create Meson cross files
         run: |
@@ -73,7 +73,6 @@ jobs:
           NDK="$NDK_PATH"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
 
-          # arm64-v8a cross file
           cat > /tmp/android_arm64.ini << EOF
           [binaries]
           c = '$TOOLCHAIN/bin/aarch64-linux-android27-clang'
@@ -89,7 +88,6 @@ jobs:
           endian = 'little'
           EOF
 
-          # armeabi-v7a cross file
           cat > /tmp/android_arm.ini << EOF
           [binaries]
           c = '$TOOLCHAIN/bin/armv7a-linux-androideabi27-clang'
@@ -106,21 +104,19 @@ jobs:
           EOF
 
           echo "✓ Cross files created"
-          cat /tmp/android_arm64.ini
 
       - name: Build frida-gumjs for android-arm64
         timeout-minutes: 60
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm64 ==="
+          echo "=== Meson setup for arm64 (no inspector option) ==="
           meson setup build-arm64 --cross-file /tmp/android_arm64.ini \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
             -Dv8=disabled \
             -Ddatabase=disabled \
-            -Dinspector=disabled \
             -Dtests=disabled \
             -Ddefault_library=static \
             -Doptimization=z \
@@ -154,14 +150,13 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm ==="
+          echo "=== Meson setup for arm (no inspector option) ==="
           meson setup build-arm --cross-file /tmp/android_arm.ini \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
             -Dv8=disabled \
             -Ddatabase=disabled \
-            -Dinspector=disabled \
             -Dtests=disabled \
             -Ddefault_library=static \
             -Doptimization=z \
@@ -374,5 +369,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: build frida-gum directly with cross-file, correct agent.js path [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: remove inspector option, build frida-gum with correct devkits [skip ci]"
           git push
