@@ -110,17 +110,17 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm64 (no inspector option) ==="
+          echo "=== Meson setup for arm64 (minsize + diet) ==="
           meson setup build-arm64 --cross-file /tmp/android_arm64.ini \
+            --buildtype=minsize \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
             -Dv8=disabled \
             -Ddatabase=disabled \
             -Dtests=disabled \
-            -Ddefault_library=static \
-            -Doptimization=z \
-            -Dstrip=true
+            -Ddiet=true \
+            -Ddefault_library=static
           echo "=== Build ==="
           ninja -C build-arm64
           echo "=== .a files ==="
@@ -150,17 +150,17 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm (no inspector option) ==="
+          echo "=== Meson setup for arm (minsize + diet) ==="
           meson setup build-arm --cross-file /tmp/android_arm.ini \
+            --buildtype=minsize \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
             -Dv8=disabled \
             -Ddatabase=disabled \
             -Dtests=disabled \
-            -Ddefault_library=static \
-            -Doptimization=z \
-            -Dstrip=true
+            -Ddiet=true \
+            -Ddefault_library=static
           echo "=== Build ==="
           ninja -C build-arm
           echo "=== .a files ==="
@@ -369,5 +369,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: remove inspector option, build frida-gum with correct devkits [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: use buildtype=minsize and diet=true for max size reduction [skip ci]"
           git push
