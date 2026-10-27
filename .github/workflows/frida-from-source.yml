@@ -29,7 +29,7 @@ jobs:
           done
           ls -la
 
-      - name: Install dependencies (NDK r25c + Meson + Node.js + liblzma)
+      - name: Install dependencies (NDK r25c + Meson + Node.js)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -132,7 +132,8 @@ jobs:
             -Ddatabase=disabled \
             -Dtests=disabled \
             -Ddiet=true \
-            -Ddefault_library=static
+            -Ddefault_library=static \
+            -Dlibunwind:lzma=disabled
           echo "=== Build ==="
           ninja -C build-arm64
           echo "=== .a files ==="
@@ -173,7 +174,8 @@ jobs:
             -Ddatabase=disabled \
             -Dtests=disabled \
             -Ddiet=true \
-            -Ddefault_library=static
+            -Ddefault_library=static \
+            -Dlibunwind:lzma=disabled
           echo "=== Build ==="
           ninja -C build-arm
           echo "=== .a files ==="
@@ -382,5 +384,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: add liblzma-dev for libunwind elf64 [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: disable lzma in libunwind to resolve lzma.h not found [skip ci]"
           git push
