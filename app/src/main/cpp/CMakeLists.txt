@@ -6,7 +6,6 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_C_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
 set(CMAKE_CXX_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
-
 if(${ANDROID_ABI} STREQUAL "arm64-v8a")
     set(FRIDA_DIR /tmp/frida-built/arm64-v8a)
 elseif(${ANDROID_ABI} STREQUAL "armeabi-v7a")
@@ -14,20 +13,10 @@ elseif(${ANDROID_ABI} STREQUAL "armeabi-v7a")
 else()
     message(FATAL_ERROR "Unsupported ABI")
 endif()
-
-include_directories(
-    ${FRIDA_DIR}/include
-    ${FRIDA_DIR}/include/glib-2.0
-    ${FRIDA_DIR}/include/glib-2.0-include
-)
-
-# Import همه کتابخانه‌های استاتیک Frida
-file(GLOB FRIDA_LIBS "${FRIDA_DIR}/lib/*.a")
-add_library(frida-bundle STATIC IMPORTED)
-set_target_properties(frida-bundle PROPERTIES IMPORTED_LOCATION "${FRIDA_DIR}/lib/libfrida-gumjs.a")
-
+include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
+add_library(frida-gumjs STATIC IMPORTED)
+set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
 include_directories(imgui imgui/backends tool)
-
 add_library(tool SHARED
     tool/native-lib.cpp
     imgui/imgui.cpp
@@ -36,12 +25,5 @@ add_library(tool SHARED
     imgui/imgui_widgets.cpp
     imgui/backends/imgui_impl_android.cpp
     imgui/backends/imgui_impl_opengl3.cpp)
-
-# لینک کردن تمام کتابخانه‌های استاتیک همراه با group برای حل وابستگی دایره‌ای
-target_link_libraries(tool
-    -Wl,--start-group
-    ${FRIDA_LIBS}
-    -Wl,--end-group
-    android log EGL GLESv3 dl)
-
 target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
+target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
