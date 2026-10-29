@@ -33,19 +33,15 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            python3-pip ninja-build pkg-config libglib2.0-dev unzip curl \
-            zipalign
+            python3-pip ninja-build pkg-config libglib2.0-dev unzip curl zipalign
           pip3 install --quiet --upgrade pip
           pip3 install --quiet meson
-
           wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip -O /tmp/ndk-r25c.zip
           unzip -q /tmp/ndk-r25c.zip -d /tmp/
           echo "NDK_PATH=/tmp/android-ndk-r25c" >> $GITHUB_ENV
-
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
-          echo "✓ NDK: $NDK_PATH"
-          node --version
+          echo "✓ NDK: $NDK_PATH"; node --version
 
       - name: Download Frida devkit (HEADERS)
         run: |
@@ -62,8 +58,7 @@ jobs:
         run: |
           git clone --recursive --depth 1 --branch 17.1.0 \
             https://github.com/frida/frida-gum.git /tmp/frida-gum
-          cd /tmp/frida-gum
-          echo "✓ cloned"
+          cd /tmp/frida-gum; echo "✓ cloned"
 
       - name: Patch glib_init
         run: |
@@ -78,89 +73,31 @@ jobs:
           set -o pipefail
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-
-          echo "================================================================"
-          echo "STEP 1: rm -rf build"
-          echo "================================================================"
           rm -rf build
-          echo "✓ build dir removed"
-
-          echo "================================================================"
-          echo "STEP 2: ./configure --host=android-arm64"
-          echo "================================================================"
           ./configure --host=android-arm64 -- \
-            -Ddevkits=gum,gumjs \
-            -Dgumjs=enabled \
-            -Dquickjs=enabled \
-            -Dv8=disabled \
-            -Ddatabase=disabled \
-            -Dtests=disabled \
-            -Ddiet=true \
-            -Db_ndebug=true \
-            -Ddefault_library=static \
-            -Dlibunwind:minidebuginfo=disabled \
-            -Dlibdwarf:decompression=false \
-            2>&1 | tee /tmp/arm64-configure.log
-          CFG_EXIT=${PIPESTATUS[0]}
-          echo ">>> CONFIGURE EXIT: $CFG_EXIT <<<"
-          if [ $CFG_EXIT -ne 0 ]; then
-            echo "!!!!! CONFIGURE FAILED !!!!!"
-            tail -60 /tmp/arm64-configure.log
-            exit 1
-          fi
-
-          echo "================================================================"
-          echo "STEP 3: make -j\$(nproc)"
-          echo "================================================================"
+            -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled \
+            -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true \
+            -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled \
+            -Dlibdwarf:decompression=false 2>&1 | tee /tmp/arm64-configure.log
+          [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/arm64-configure.log; exit 1; }
           make -j$(nproc) 2>&1 | tee /tmp/arm64-build.log
-          BLD_EXIT=${PIPESTATUS[0]}
-          echo ">>> BUILD EXIT: $BLD_EXIT <<<"
-
-          echo "================================================================"
-          echo "STEP 3b: generate devkit (arm64)"
-          echo "================================================================"
           python3 releng/devkit.py frida-gumjs android-arm64 2>&1 | tee /tmp/arm64-devkit.log || true
-          DEVKIT_EXIT=${PIPESTATUS[0]}
-          echo ">>> DEVKIT SCRIPT EXIT: $DEVKIT_EXIT <<<"
-
-          echo "================================================================"
-          echo "STEP 3c: list ALL .a files (diagnostic)"
-          echo "================================================================"
           find build -name "*.a" -exec ls -lah {} \; | sort || true
-
-          echo "================================================================"
-          echo "STEP 4: locate self-contained libfrida-gumjs.a"
-          echo "================================================================"
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
-          if [ -z "$LIB" ]; then
-            LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          fi
-          if [ -z "$LIB" ]; then
-            LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          fi
-          echo ">>> Selected library: ${LIB:-<none>}"
-          if [ -z "$LIB" ]; then
-            echo "!!!!! NO SUITABLE libfrida-gumjs.a FOUND !!!!!"
-            tail -80 /tmp/arm64-devkit.log || true
-            tail -80 /tmp/arm64-build.log || true
-            exit 1
-          fi
+          [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          echo ">>> Selected: ${LIB:-<none>}"
+          [ -z "$LIB" ] && { tail -80 /tmp/arm64-devkit.log; exit 1; }
           echo "✓ arm64 library located"
 
       - name: Stage arm64
         run: |
           set -e
-          DEST=/tmp/frida-built/arm64-v8a
-          rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
+          DEST=/tmp/frida-built/arm64-v8a; rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
-          if [ -z "$LIB" ]; then
-            LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          fi
-          if [ -z "$LIB" ]; then
-            LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          fi
-          echo ">>> Staging library: $LIB"
-          [ -z "$LIB" ] && echo "FATAL: no gumjs lib for arm64" && exit 1
+          [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          echo ">>> Staging: $LIB"; [ -z "$LIB" ] && exit 1
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
           GUMJS_H=$(find /tmp/dk64 -name "frida-gumjs.h" | head -1)
           GUM_H=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
@@ -168,7 +105,7 @@ jobs:
           [ -n "$GUM_H" ] && cp -v "$GUM_H" "$DEST/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk64 -type d -name "glib-2.0" | head -1)
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
-          echo ">>> Staged arm64:"; ls -lah "$DEST/lib/"
+          ls -lah "$DEST/lib/"
 
       # ============ ARMv7 BUILD ============
       - name: Build armv7
@@ -178,64 +115,30 @@ jobs:
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
           rm -rf build
-
           ./configure --host=android-arm -- \
-            -Ddevkits=gum,gumjs \
-            -Dgumjs=enabled \
-            -Dquickjs=enabled \
-            -Dv8=disabled \
-            -Ddatabase=disabled \
-            -Dtests=disabled \
-            -Ddiet=true \
-            -Db_ndebug=true \
-            -Ddefault_library=static \
-            -Dlibunwind:minidebuginfo=disabled \
-            -Dlibdwarf:decompression=false \
-            2>&1 | tee /tmp/armv7-configure.log
-          CFG_EXIT=${PIPESTATUS[0]}
-          echo ">>> CONFIGURE EXIT: $CFG_EXIT <<<"
-          if [ $CFG_EXIT -ne 0 ]; then
-            tail -60 /tmp/armv7-configure.log; exit 1
-          fi
-
+            -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled \
+            -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true \
+            -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled \
+            -Dlibdwarf:decompression=false 2>&1 | tee /tmp/armv7-configure.log
+          [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/armv7-configure.log; exit 1; }
           make -j$(nproc) 2>&1 | tee /tmp/armv7-build.log
-          BLD_EXIT=${PIPESTATUS[0]}
-          echo ">>> BUILD EXIT: $BLD_EXIT <<<"
-
           python3 releng/devkit.py frida-gumjs android-arm 2>&1 | tee /tmp/armv7-devkit.log || true
-
           find build -name "*.a" -exec ls -lah {} \; | sort || true
-
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
-          if [ -z "$LIB" ]; then
-            LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          fi
-          if [ -z "$LIB" ]; then
-            LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          fi
-          echo ">>> Selected library: ${LIB:-<none>}"
-          if [ -z "$LIB" ]; then
-            echo "!!!!! NO SUITABLE libfrida-gumjs.a FOUND (armv7) !!!!!"
-            tail -80 /tmp/armv7-devkit.log || true
-            tail -80 /tmp/armv7-build.log || true
-            exit 1
-          fi
+          [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          echo ">>> Selected: ${LIB:-<none>}"
+          [ -z "$LIB" ] && { tail -80 /tmp/armv7-devkit.log; exit 1; }
           echo "✓ armv7 library located"
 
       - name: Stage armv7
         run: |
           set -e
-          DEST=/tmp/frida-built/armeabi-v7a
-          rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
+          DEST=/tmp/frida-built/armeabi-v7a; rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
-          if [ -z "$LIB" ]; then
-            LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          fi
-          if [ -z "$LIB" ]; then
-            LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          fi
-          echo ">>> Staging library: $LIB"
-          [ -z "$LIB" ] && echo "FATAL: no gumjs lib for armv7" && exit 1
+          [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          echo ">>> Staging: $LIB"; [ -z "$LIB" ] && exit 1
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
           GUMJS_H=$(find /tmp/dk32 -name "frida-gumjs.h" | head -1)
           GUM_H=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
@@ -243,135 +146,167 @@ jobs:
           [ -n "$GUM_H" ] && cp -v "$GUM_H" "$DEST/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk32 -type d -name "glib-2.0" | head -1)
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
-          echo ">>> Staged armv7:"; ls -lah "$DEST/lib/"
+          ls -lah "$DEST/lib/"
 
-      # ============ PATCH SOURCES FOR ALL FOUR BUGS ============
-      - name: Patch Helper.java (dedup patches + lifecycle + classloader)
+      # ============ PATCH SOURCES ============
+      - name: Patch Helper.java (attach + dedup + lifecycle)
         run: |
           python3 - << 'PYEOF'
-          import re, pathlib
+          import re, pathlib, sys
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
-          s = p.read_text()
+          s = p.read_text(); orig = s
 
-          # (1) Deduplicate patch records: add before any patch-list insertion.
-          dedup = """
-              private static boolean patchRecordExists(List<PatchRecord> list, String cls, String name, String sig) {
-                  for (PatchRecord r : list) {
-                      if (r.className.equals(cls) && r.methodName.equals(name)
-                              && (sig == null || sig.equals(r.signature))) return true;
-                  }
-                  return false;
-              }
-          """
+          # 1. patchRecordExists
           if "patchRecordExists" not in s:
-              s = s.replace("public class Helper {", "public class Helper {\n" + dedup)
+              marker = "public class Helper {"
+              if marker in s:
+                  s = s.replace(marker, marker + '''
+    private static boolean patchRecordExists(java.util.List<PatchRecord> list, String cls, String name, String sig) {
+        for (PatchRecord r : list) {
+            if (r.className.equals(cls) && r.methodName.equals(name)
+                    && (sig == null || sig.equals(r.signature))) return true;
+        }
+        return false;
+    }
+''', 1)
+                  print("✓ inserted patchRecordExists")
+              else:
+                  print("✗ could not find 'public class Helper {'")
 
-          # (2) Lifecycle callbacks: register in attach(), forward onPause/onResume.
-          lifecycle = """
-              private static void registerLifecycle(Activity activity, OverlaySurfaceView glView) {
-                  activity.getApplication().registerActivityLifecycleCallbacks(
-                      new android.app.Application.ActivityLifecycleCallbacks() {
-                          @Override public void onActivityPaused(Activity a) { if (a == activity) glView.onPause(); }
-                          @Override public void onActivityResumed(Activity a) { if (a == activity) glView.onResume(); }
-                          @Override public void onActivityCreated(Activity a, android.os.Bundle b) {}
-                          @Override public void onActivityStarted(Activity a) {}
-                          @Override public void onActivityStopped(Activity a) {}
-                          @Override public void onActivitySaveInstanceState(Activity a, android.os.Bundle b) {}
-                          @Override public void onActivityDestroyed(Activity a) {}
-                      });
-              }
-          """
+          # 2. registerLifecycle
           if "registerLifecycle" not in s:
-              s = s.replace("public class Helper {", "public class Helper {\n" + lifecycle)
+              marker = "public class Helper {"
+              if marker in s:
+                  s = s.replace(marker, marker + '''
+    private static void registerLifecycle(android.app.Activity activity, OverlaySurfaceView glView) {
+        activity.getApplication().registerActivityLifecycleCallbacks(
+            new android.app.Application.ActivityLifecycleCallbacks() {
+                @Override public void onActivityPaused(android.app.Activity a) { if (a == activity) glView.onPause(); }
+                @Override public void onActivityResumed(android.app.Activity a) { if (a == activity) glView.onResume(); }
+                @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}
+                @Override public void onActivityStarted(android.app.Activity a) {}
+                @Override public void onActivityStopped(android.app.Activity a) {}
+                @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}
+                @Override public void onActivityDestroyed(android.app.Activity a) {}
+            });
+    }
+''', 1)
+                  print("✓ inserted registerLifecycle")
 
-          # (3) attach(): run on main thread, wait for DecorView, set overlay flags.
-          attach_new = """
-              public static void attach(Context context) {
-                  final Activity activity = (Activity) context;
-                  activity.runOnUiThread(() -> {
-                      final ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
-                      if (decor == null) { decor.post(() -> attach(activity)); return; }
-                      OverlaySurfaceView glView = new OverlaySurfaceView(activity);
-                      WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                          WindowManager.LayoutParams.MATCH_PARENT,
-                          WindowManager.LayoutParams.MATCH_PARENT,
-                          WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                              | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                              | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                          PixelFormat.TRANSLUCENT);
-                      lp.alpha = 0.01f; // avoid Android 12 untrusted-touch block
-                      lp.gravity = Gravity.TOP | Gravity.START;
-                      decor.addView(glView, lp);
-                      registerLifecycle(activity, glView);
-                  });
-              }
-          """
-          # Replace the existing attach method body (naive but works for a single method).
+          # 3. replace attach() with brace-counting, accept Context or Activity param
           if "TYPE_APPLICATION_PANEL" not in s:
-              s = re.sub(r"public static void attach\(Context context\)\s*\{.*?\n\s*\}",
-                         attach_new.strip(), s, count=1, flags=re.DOTALL)
+              m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*(?:android\.content\.)?(?:Context|Activity)\s+\w+\s*\)\s*\{', s)
+              if m:
+                  brace_start = s.index('{', m.end() - 1)
+                  depth = 0; end = -1
+                  for i in range(brace_start, len(s)):
+                      if s[i] == '{': depth += 1
+                      elif s[i] == '}':
+                          depth -= 1
+                          if depth == 0: end = i + 1; break
+                  if end > 0:
+                      new_attach = '''public static void attach(Context context) {
+        final android.app.Activity activity = (context instanceof android.app.Activity)
+            ? (android.app.Activity) context
+            : (android.app.Activity) ((android.content.ContextWrapper) context).getBaseContext();
+        activity.runOnUiThread(() -> {
+            final android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
+            if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(context)); return; }
+            OverlaySurfaceView glView = new OverlaySurfaceView(activity);
+            android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                android.graphics.PixelFormat.TRANSLUCENT);
+            lp.alpha = 0.01f;
+            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
+            decor.addView(glView, lp);
+            registerLifecycle(activity, glView);
+        });
+    }'''
+                      s = s[:m.start()] + new_attach + s[end:]
+                      print("✓ replaced attach() method")
+                  else:
+                      print("✗ brace-count failed for attach()")
+              else:
+                  print("✗ attach(Context|Activity) signature not found — PATTERN NEEDS ADJUSTMENT")
+                  sys.exit(2)
 
+          if s == orig:
+              print("⚠ Helper.java unchanged — some patches were no-ops")
           p.write_text(s)
-          print("✓ Helper.java patched")
           PYEOF
 
-      - name: Patch OverlaySurfaceView.java (numeric keyboard + transparency)
+      - name: Patch OverlaySurfaceView.java (numeric IME inside class body)
         run: |
           python3 - << 'PYEOF'
-          import pathlib
+          import re, pathlib, sys
           p = pathlib.Path("app/src/main/java/com/menu/imgui/OverlaySurfaceView.java")
-          s = p.read_text()
+          s = p.read_text(); orig = s
 
-          # Force numeric IME when ImGui wants a numeric widget.
-          numeric_ime = """
-              @Override
-              public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
-                  InputConnection ic = super.onCreateInputConnection(outAttrs);
-                  if (Helper.nativeWantKeyboard()) {
-                      outAttrs.inputType = InputType.TYPE_CLASS_NUMBER
-                          | InputType.TYPE_NUMBER_FLAG_DECIMAL;
-                      outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE;
-                  }
-                  return ic;
-              }
-          """
-          if "TYPE_CLASS_NUMBER" not in s:
-              s = s.replace("public class OverlaySurfaceView",
-                            "public class OverlaySurfaceView\n" + numeric_ime + "\n")
+          if "TYPE_CLASS_NUMBER" in s:
+              print("✓ TYPE_CLASS_NUMBER already present — skipping")
+          else:
+              # find class declaration opening brace
+              m = re.search(r'(public\s+)?class\s+OverlaySurfaceView\b[^{]*\{', s)
+              if not m:
+                  print("✗ class OverlaySurfaceView declaration not found — PATTERN NEEDS ADJUSTMENT")
+                  sys.exit(2)
+              insert_at = m.end()
+              numeric_ime = '''
+    @Override
+    public android.view.inputmethod.InputConnection onCreateInputConnection(android.view.inputmethod.EditorInfo outAttrs) {
+        android.view.inputmethod.InputConnection ic = super.onCreateInputConnection(outAttrs);
+        if (Helper.nativeWantKeyboard()) {
+            outAttrs.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+                | android.text.InputType.TYPE_NUMBER_FLAG_SIGNED;
+            outAttrs.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE;
+        }
+        return ic;
+    }
+'''
+              s = s[:insert_at] + "\n" + numeric_ime + "\n" + s[insert_at:]
+              print("✓ inserted numeric onCreateInputConnection")
 
-          # Make sure the GL surface sits above the dim layer.
-          if "setZOrderOnTop(true)" not in s:
-              s = s.replace("super(context);", "super(context);\n        setZOrderOnTop(true);")
+          # ensure setZOrderOnTop(true) — insert in constructor if missing
+          if "setZOrderOnTop" not in s:
+              # find first constructor: public OverlaySurfaceView(...) {
+              cm = re.search(r'public\s+OverlaySurfaceView\s*\([^)]*\)\s*\{', s)
+              if cm:
+                  s = s[:cm.end()] + "\n        setZOrderOnTop(true);" + s[cm.end():]
+                  print("✓ inserted setZOrderOnTop(true) in constructor")
+              else:
+                  print("⚠ constructor not found — setZOrderOnTop skipped")
 
+          if s == orig:
+              print("⚠ OverlaySurfaceView.java unchanged")
           p.write_text(s)
-          print("✓ OverlaySurfaceView.java patched")
           PYEOF
 
-      - name: Patch native-lib.cpp (dedup + numeric filter + once_flag)
+      - name: Patch native-lib.cpp (once_flag only — CharsDecimal removed)
         run: |
           python3 - << 'PYEOF'
           import pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
-          s = p.read_text()
+          s = p.read_text(); orig = s
 
-          # (1) One-shot Frida init.
           if "std::once_flag frida_once" not in s:
-              s = s.replace('#include <jni.h>',
-                            '#include <jni.h>\n#include <mutex>\nstatic std::once_flag frida_once;')
-              s = s.replace("gum_init_embedded();",
-                            "std::call_once(frida_once, []() { gum_init_embedded(); });")
+              if '#include <mutex>' not in s:
+                  s = s.replace('#include <jni.h>', '#include <jni.h>\n#include <mutex>', 1)
+              if 'gum_init_embedded();' in s:
+                  s = s.replace('gum_init_embedded();',
+                                'static std::once_flag frida_once;\n    std::call_once(frida_once, []() { gum_init_embedded(); });', 1)
+                  print("✓ wrapped gum_init_embedded in call_once")
+              else:
+                  print("⚠ gum_init_embedded() pattern not found verbatim — verify manually")
 
-          # (2) Numeric InputText: add CharsDecimal flag when the Java arg-type is numeric.
-          #     Find the InputText call that renders method-argument widgets and inject a callback.
-          if "ImGuiInputTextFlags_CharsDecimal" not in s:
-              s = s.replace(
-                  "ImGui::InputText(label, buf, sizeof(buf))",
-                  "ImGui::InputText(label, buf, sizeof(buf), ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_CharsScientific)"
-              )
-
+          if s == orig:
+              print("⚠ native-lib.cpp unchanged")
           p.write_text(s)
-          print("✓ native-lib.cpp patched")
           PYEOF
 
       - name: Patch agent.js (classloader-aware + dedup hook)
@@ -381,55 +316,37 @@ jobs:
           npm install frida-java-bridge >/dev/null
           cat > agent.js << 'EOF'
           import Java from "frida-java-bridge";
-
-          const HOOKED = new Set(); // key: className#methodName#sig
-
+          const HOOKED = new Set();
           Java.perform(function () {
             console.log("[*] Patch Agent Loaded");
-
             function findClassLoader(className) {
               let found = null;
-              Java.enumerateClassLoadersSync().forEach(function (loader) {
-                try {
-                  if (loader.findClass(className)) found = loader;
-                } catch (e) {}
-              });
+              try {
+                Java.enumerateClassLoadersSync().forEach(function (loader) {
+                  try { if (loader.findClass(className)) found = loader; } catch (e) {}
+                });
+              } catch (e) {}
               return found;
             }
-
             recv(function (msg) {
               try {
                 const cmd = JSON.parse(msg);
                 if (cmd.action !== "patchMethod") return;
-
                 const key = cmd.className + "#" + cmd.methodName + "#" + (cmd.signature || "");
-                if (HOOKED.has(key)) {
-                  console.log("[*] Already patched: " + key);
-                  return;
-                }
-
+                if (HOOKED.has(key)) { console.log("[*] Already patched: " + key); return; }
                 const loader = findClassLoader(cmd.className) || null;
                 const cls = loader ? Java.use(cmd.className, { classLoader: loader })
                                    : Java.use(cmd.className);
-
                 const overloads = cls[cmd.methodName].overloads;
                 const target = cmd.signature
                   ? overloads.find(o => o.argumentTypes.map(t => t.className).join() === cmd.signature)
                   : overloads[0];
-
                 if (!target) { console.log("[!] Overload not found: " + key); return; }
-
-                target.implementation = function () {
-                  return cmd.returnValue;
-                };
-
+                target.implementation = function () { return cmd.returnValue; };
                 HOOKED.add(key);
                 console.log("[*] Patched " + key);
-              } catch (e) {
-                console.log("[!] " + e.message);
-              }
+              } catch (e) { console.log("[!] " + e.message); }
             });
-
             send({ type: "ready" });
           });
           EOF
@@ -438,19 +355,35 @@ jobs:
           cp agent-compiled.js "$GITHUB_WORKSPACE/app/src/main/assets/agent.js"
           echo "✓ agent.js ready"
 
-      - name: Verify sources
+      - name: Verify sources (verbose per-check)
         run: |
+          FAIL=0
           for f in app/src/main/cpp/tool/native-lib.cpp \
                    app/src/main/cpp/tool/dex_data.h \
                    app/src/main/java/com/menu/imgui/Helper.java \
                    app/src/main/java/com/menu/imgui/OverlaySurfaceView.java \
                    app/src/main/assets/agent.js; do
-            test -s "$f" && echo "✓ $f" || (echo "✗ $f" && exit 1)
+            if [ -s "$f" ]; then echo "✓ exists: $f"; else echo "✗ MISSING: $f"; FAIL=1; fi
           done
-          grep -q "gum_init_embedded" app/src/main/cpp/tool/native-lib.cpp
-          grep -q "TYPE_APPLICATION_PANEL" app/src/main/java/com/menu/imgui/Helper.java
-          grep -q "TYPE_CLASS_NUMBER" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
-          grep -q "CharsDecimal" app/src/main/cpp/tool/native-lib.cpp
+          check() {
+            if grep -q "$2" "$1"; then echo "✓ found '$2' in $1"; else echo "✗ MISSING '$2' in $1"; FAIL=1; fi
+          }
+          check app/src/main/cpp/tool/native-lib.cpp "gum_init_embedded"
+          check app/src/main/java/com/menu/imgui/Helper.java "TYPE_APPLICATION_PANEL"
+          check app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "TYPE_CLASS_NUMBER"
+          if [ $FAIL -ne 0 ]; then
+            echo "===== DIAGNOSTIC: current Helper.java attach area ====="
+            grep -n "attach\|TYPE_APPLICATION_PANEL\|registerLifecycle\|patchRecordExists" \
+              app/src/main/java/com/menu/imgui/Helper.java | head -30 || true
+            echo "===== DIAGNOSTIC: current OverlaySurfaceView class decl ====="
+            grep -n "class OverlaySurfaceView\|onCreateInputConnection\|TYPE_CLASS_NUMBER\|setZOrderOnTop" \
+              app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -20 || true
+            echo "===== DIAGNOSTIC: InputText usages in native-lib.cpp ====="
+            grep -n "InputText\|InputInt\|InputFloat" \
+              app/src/main/cpp/tool/native-lib.cpp | head -20 || true
+            exit 1
+          fi
+          echo "✓ all source checks passed"
 
       - name: Write CMakeLists.txt
         run: |
@@ -547,7 +480,7 @@ jobs:
           rm -rf app/.cxx app/build .gradle
           ./gradlew :app:assembleDebug --no-build-cache --stacktrace
 
-      - name: Zipalign APK (critical for injected .so loading)
+      - name: Zipalign APK
         run: |
           APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
           echo "Original APK: $APK"
@@ -593,5 +526,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: patch dedup, numeric input, overlay touch/lifecycle, zipalign [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: robust source patches + verbose verify [skip ci]"
           git push
