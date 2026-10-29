@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -28,6 +30,26 @@ jobs:
             fi
           done
           ls -la
+
+      - name: Restore OverlaySurfaceView.java from last known-good commit
+        run: |
+          F=app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
+          echo "Git history for $F:"
+          git log --oneline -- "$F" | head -10 || true
+          GOOD=$(git log --oneline -- "$F" | grep -viE "fix:|patch|zipalign|dedup|broken" | head -1 | cut -d' ' -f1)
+          if [ -z "$GOOD" ]; then
+            echo "No pre-fix commit found; using first commit that touched the file"
+            GOOD=$(git log --reverse --oneline -- "$F" | head -1 | cut -d' ' -f1)
+          fi
+          if [ -n "$GOOD" ]; then
+            echo "Restoring $F from $GOOD"
+            git checkout "$GOOD" -- "$F"
+            echo "=== restored file top ==="
+            head -25 "$F"
+          else
+            echo "FATAL: cannot restore $F (no commits found)"
+            exit 1
+          fi
 
       - name: Install dependencies
         run: |
@@ -146,48 +168,42 @@ jobs:
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
           ls -lah "$DEST/lib/"
 
-      - name: Patch Helper.java
+      - name: Patch Helper.java (attach + registerLifecycle + dedup, safe)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, sys
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text(); orig = s
 
-          # 1. registerLifecycle (insert after class opening)
-          register_lifecycle = "\n".join([
-              "private static void registerLifecycle(android.app.Activity activity, OverlaySurfaceView glView) {",
-              "    activity.getApplication().registerActivityLifecycleCallbacks(",
-              "        new android.app.Application.ActivityLifecycleCallbacks() {",
-              "            @Override public void onActivityPaused(android.app.Activity a) { if (a == activity) glView.onPause(); }",
-              "            @Override public void onActivityResumed(android.app.Activity a) { if (a == activity) glView.onResume(); }",
-              "            @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}",
-              "            @Override public void onActivityStarted(android.app.Activity a) {}",
-              "            @Override public void onActivityStopped(android.app.Activity a) {}",
-              "            @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}",
-              "            @Override public void onActivityDestroyed(android.app.Activity a) {}",
-              "        });",
-              "}",
-          ])
+          # 1. registerLifecycle
           if "registerLifecycle" not in s:
+              rl = "\n".join([
+                  "    private static void registerLifecycle(android.app.Activity activity, OverlaySurfaceView glView) {",
+                  "        activity.getApplication().registerActivityLifecycleCallbacks(",
+                  "            new android.app.Application.ActivityLifecycleCallbacks() {",
+                  "                @Override public void onActivityPaused(android.app.Activity a) { if (a == activity) { try { glView.onPause(); } catch (Throwable t) {} } }",
+                  "                @Override public void onActivityResumed(android.app.Activity a) { if (a == activity) { try { glView.onResume(); } catch (Throwable t) {} } }",
+                  "                @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}",
+                  "                @Override public void onActivityStarted(android.app.Activity a) {}",
+                  "                @Override public void onActivityStopped(android.app.Activity a) {}",
+                  "                @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}",
+                  "                @Override public void onActivityDestroyed(android.app.Activity a) {}",
+                  "            });",
+                  "    }",
+              ])
               m = re.search(r'(public\s+class\s+Helper\s*\{)', s)
               if not m:
-                  print("FAIL: could not find 'public class Helper {'")
-                  sys.exit(2)
-              s = s[:m.end()] + "\n" + register_lifecycle + "\n" + s[m.end():]
+                  print("FAIL: could not find 'public class Helper {'"); sys.exit(2)
+              s = s[:m.end()] + "\n" + rl + "\n" + s[m.end():]
               print("PASS: inserted registerLifecycle")
           else:
               print("SKIP: registerLifecycle already present")
 
-          # 2. replace attach (idempotency marker: 'Overlay added to DecorView')
+          # 2. attach replacement (idempotency marker)
           if "Overlay added to DecorView" not in s:
               m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*(?:android\.content\.)?(?:Context|Activity)\s+\w+\s*\)\s*\{', s)
               if not m:
-                  print("FAIL: attach(Context|Activity) signature not found")
-                  print("--- grep of 'attach' ---")
-                  for i, line in enumerate(s.splitlines(), 1):
-                      if "attach" in line:
-                          print(i, line)
-                  sys.exit(2)
+                  print("FAIL: attach(Context|Activity) signature not found"); sys.exit(2)
               brace_start = s.index('{', m.end() - 1)
               depth = 0; end = -1
               for i in range(brace_start, len(s)):
@@ -196,8 +212,7 @@ jobs:
                       depth -= 1
                       if depth == 0: end = i + 1; break
               if end < 0:
-                  print("FAIL: brace-count failed for attach")
-                  sys.exit(2)
+                  print("FAIL: brace-count failed for attach"); sys.exit(2)
               new_attach = "\n".join([
                   "public static void attach(Context context) {",
                   "    final android.app.Activity activity;",
@@ -228,7 +243,7 @@ jobs:
           else:
               print("SKIP: attach already replaced")
 
-          # 3. best-effort dedup in syncPatches
+          # 3. best-effort dedup in syncPatches (only if signature found)
           if "TEMP:DEDUP" not in s:
               sm = re.search(r'void\s+syncPatches\s*\(\s*\)\s*\{', s)
               fm = re.search(r'((?:List|ArrayList|Collection|LinkedList)\s*<\s*PatchRecord\s*>\s*)(\w+)\s*[;=]', s)
@@ -258,7 +273,7 @@ jobs:
                       "",
                   ])
                   s = s[:sm.end()] + dedup + s[sm.end():]
-                  print("PASS: inserted dedup in syncPatches (field '" + field_name + "')")
+                  print("PASS: dedup inserted (field '" + field_name + "')")
               else:
                   print("WARN: syncPatches or patch list field not found; dedup skipped")
           else:
@@ -269,48 +284,12 @@ jobs:
           p.write_text(s)
           PYEOF
 
-      - name: Patch OverlaySurfaceView.java
-        run: |
-          python3 - <<'PYEOF'
-          import re, pathlib, sys
-          p = pathlib.Path("app/src/main/java/com/menu/imgui/OverlaySurfaceView.java")
-          s = p.read_text(); orig = s
-
-          numeric_ime = "\n".join([
-              "@Override",
-              "public android.view.inputmethod.InputConnection onCreateInputConnection(android.view.inputmethod.EditorInfo outAttrs) {",
-              "    android.view.inputmethod.InputConnection ic = super.onCreateInputConnection(outAttrs);",
-              "    if (Helper.nativeWantKeyboard()) {",
-              "        outAttrs.inputType = android.text.InputType.TYPE_CLASS_NUMBER",
-              "            | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL",
-              "            | android.text.InputType.TYPE_NUMBER_FLAG_SIGNED;",
-              "        outAttrs.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE;",
-              "    }",
-              "    return ic;",
-              "}",
-          ])
-          if "TYPE_CLASS_NUMBER" not in s:
-              m = re.search(r'(public\s+)?class\s+OverlaySurfaceView\b[^{]*\{', s)
-              if not m:
-                  print("FAIL: class OverlaySurfaceView declaration not found")
-                  sys.exit(2)
-              s = s[:m.end()] + "\n" + numeric_ime + "\n" + s[m.end():]
-              print("PASS: inserted numeric onCreateInputConnection")
-          else:
-              print("SKIP: TYPE_CLASS_NUMBER already present")
-
-          if s == orig:
-              print("WARN: OverlaySurfaceView.java unchanged")
-          p.write_text(s)
-          PYEOF
-
-      - name: Patch native-lib.cpp
+      - name: Patch native-lib.cpp (once_flag)
         run: |
           python3 - <<'PYEOF'
           import pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text(); orig = s
-
           if "std::once_flag frida_once" not in s:
               if '#include <mutex>' not in s:
                   s = s.replace('#include <jni.h>', '#include <jni.h>\n#include <mutex>', 1)
@@ -322,7 +301,6 @@ jobs:
                   print("WARN: gum_init_embedded() not found verbatim")
           else:
               print("SKIP: once_flag already present")
-
           if s == orig:
               print("WARN: native-lib.cpp unchanged")
           p.write_text(s)
@@ -390,14 +368,17 @@ jobs:
           check app/src/main/cpp/tool/native-lib.cpp "frida_once"
           check app/src/main/java/com/menu/imgui/Helper.java "registerLifecycle"
           check app/src/main/java/com/menu/imgui/Helper.java "Overlay added to DecorView"
-          check app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "onCreateInputConnection"
+          # sanity: class declaration in OverlaySurfaceView must have '{' within 2 lines
+          if grep -A2 "class OverlaySurfaceView" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -3 | grep -q "{"; then
+            echo "OK  OverlaySurfaceView class decl has '{'"
+          else
+            echo "ERR OverlaySurfaceView class decl missing '{' within 2 lines"; FAIL=1
+          fi
           if [ $FAIL -ne 0 ]; then
             echo "===== DIAGNOSTIC: Helper.java attach area ====="
             grep -n "attach\|registerLifecycle\|Overlay added" app/src/main/java/com/menu/imgui/Helper.java | head -30 || true
-            echo "===== DIAGNOSTIC: OverlaySurfaceView class decl ====="
-            grep -n "class OverlaySurfaceView\|onCreateInputConnection\|TYPE_CLASS_NUMBER\|setZOrderOnTop" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -20 || true
-            echo "===== DIAGNOSTIC: native-lib InputText usages ====="
-            grep -n "InputText\|InputInt\|InputFloat" app/src/main/cpp/tool/native-lib.cpp | head -20 || true
+            echo "===== DIAGNOSTIC: OverlaySurfaceView top 25 lines ====="
+            head -25 app/src/main/java/com/menu/imgui/OverlaySurfaceView.java || true
             exit 1
           fi
           echo "all source checks passed"
@@ -543,5 +524,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: YAML syntax + robust java/cpp patches + zipalign [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: restore OverlaySurfaceView from good commit, stop patching it [skip ci]"
           git push
