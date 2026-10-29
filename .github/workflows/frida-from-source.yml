@@ -87,8 +87,6 @@ jobs:
           [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { tail -80 /tmp/arm64-devkit.log; exit 1; }
           echo "arm64 library located: $LIB"
-          echo "=== generated headers in build (arm64) ==="
-          find build -maxdepth 4 -name "frida-*.h" -type f 2>/dev/null | head -20 || true
 
       - name: Stage arm64
         run: |
@@ -102,10 +100,6 @@ jobs:
           if [ -z "$LIB" ]; then echo "FATAL: no libfrida-gumjs.a for arm64"; exit 1; fi
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
 
-          echo "=== devkit files (arm64) ==="
-          find /tmp/dk64 -type f 2>/dev/null | head -40 || true
-
-          # frida-gumjs.h (required)
           GUMJS_H=$(find /tmp/dk64 -name "frida-gumjs.h" 2>/dev/null | head -1)
           if [ -z "$GUMJS_H" ]; then
             echo "FATAL: frida-gumjs.h not found in devkit"
@@ -114,35 +108,21 @@ jobs:
           fi
           cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
 
-          # frida-gum.h (optional; search multiple locations)
           GUM_H=$(find /tmp/dk64 -name "frida-gum.h" 2>/dev/null | head -1)
           [ -z "$GUM_H" ] && GUM_H=$(find /tmp/frida-gum/build -name "frida-gum.h" 2>/dev/null | head -1)
           [ -z "$GUM_H" ] && GUM_H=$(find /tmp/frida-gum -name "frida-gum.h" 2>/dev/null | head -1)
           if [ -n "$GUM_H" ]; then
-            echo "Found frida-gum.h at: $GUM_H"
             cp -v "$GUM_H" "$DEST/include/frida-gum.h"
           else
-            echo "WARN: frida-gum.h not found anywhere"
+            echo "WARN: frida-gum.h not found"
             if grep -q 'frida-gum\.h' /tmp/dk64/frida-gumjs.h 2>/dev/null; then
-              echo "FATAL: frida-gumjs.h includes frida-gum.h but it is missing"
-              exit 1
-            else
-              echo "OK: frida-gumjs.h does not require frida-gum.h (self-contained)"
+              echo "FATAL: frida-gumjs.h requires frida-gum.h but it is missing"; exit 1
             fi
           fi
 
-          # glib-2.0 headers
           GLIB_DIR=$(find /tmp/dk64 -type d -name "glib-2.0" 2>/dev/null | head -1)
-          if [ -n "$GLIB_DIR" ]; then
-            cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
-          else
-            echo "WARN: glib-2.0 directory not found in devkit"
-          fi
-
-          echo "=== Staged arm64 lib ==="
-          ls -lah "$DEST/lib/"
-          echo "=== Staged arm64 include ==="
-          ls -lah "$DEST/include/"
+          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
+          ls -lah "$DEST/lib/" "$DEST/include/"
 
       - name: Build armv7
         timeout-minutes: 60
@@ -164,8 +144,6 @@ jobs:
           [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { tail -80 /tmp/armv7-devkit.log; exit 1; }
           echo "armv7 library located: $LIB"
-          echo "=== generated headers in build (armv7) ==="
-          find build -maxdepth 4 -name "frida-*.h" -type f 2>/dev/null | head -20 || true
 
       - name: Stage armv7
         run: |
@@ -179,9 +157,6 @@ jobs:
           if [ -z "$LIB" ]; then echo "FATAL: no libfrida-gumjs.a for armv7"; exit 1; fi
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
 
-          echo "=== devkit files (armv7) ==="
-          find /tmp/dk32 -type f 2>/dev/null | head -40 || true
-
           GUMJS_H=$(find /tmp/dk32 -name "frida-gumjs.h" 2>/dev/null | head -1)
           if [ -z "$GUMJS_H" ]; then
             echo "FATAL: frida-gumjs.h not found in devkit"
@@ -194,29 +169,17 @@ jobs:
           [ -z "$GUM_H" ] && GUM_H=$(find /tmp/frida-gum/build -name "frida-gum.h" 2>/dev/null | head -1)
           [ -z "$GUM_H" ] && GUM_H=$(find /tmp/frida-gum -name "frida-gum.h" 2>/dev/null | head -1)
           if [ -n "$GUM_H" ]; then
-            echo "Found frida-gum.h at: $GUM_H"
             cp -v "$GUM_H" "$DEST/include/frida-gum.h"
           else
-            echo "WARN: frida-gum.h not found anywhere"
+            echo "WARN: frida-gum.h not found"
             if grep -q 'frida-gum\.h' /tmp/dk32/frida-gumjs.h 2>/dev/null; then
-              echo "FATAL: frida-gumjs.h includes frida-gum.h but it is missing"
-              exit 1
-            else
-              echo "OK: frida-gumjs.h does not require frida-gum.h (self-contained)"
+              echo "FATAL: frida-gumjs.h requires frida-gum.h but it is missing"; exit 1
             fi
           fi
 
           GLIB_DIR=$(find /tmp/dk32 -type d -name "glib-2.0" 2>/dev/null | head -1)
-          if [ -n "$GLIB_DIR" ]; then
-            cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
-          else
-            echo "WARN: glib-2.0 directory not found in devkit"
-          fi
-
-          echo "=== Staged armv7 lib ==="
-          ls -lah "$DEST/lib/"
-          echo "=== Staged armv7 include ==="
-          ls -lah "$DEST/include/"
+          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
+          ls -lah "$DEST/lib/" "$DEST/include/"
 
       # ============ FIX Helper.java ============
       - name: Fix Helper.java (remove dead patchRecordExists + dedup + attach)
@@ -238,15 +201,12 @@ jobs:
                   if end > 0:
                       s = s[:m.start()] + s[end:]
                       print("PASS: removed broken patchRecordExists")
-                  else:
-                      print("WARN: could not brace-count patchRecordExists")
 
           def patch_request(sig_regex, type_str):
               global s
               m = re.search(sig_regex, s)
               if not m:
-                  print("WARN: signature not found: " + sig_regex)
-                  return
+                  print("WARN: signature not found: " + sig_regex); return
               brace = s.index('{', m.end()-1); depth=0; end=-1
               for i in range(brace, len(s)):
                   if s[i]=='{': depth+=1
@@ -281,10 +241,10 @@ jobs:
           patch_request(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', "Method")
           patch_request(r'public\s+static\s+void\s+requestPatchField\s*\([^)]*\)\s*\{', "Field")
 
-          if "WindowManager" not in s or "Overlay added via WindowManager" not in s:
+          if "Overlay added via WindowManager" not in s:
               m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*(?:android\.content\.)?(?:Context|Activity)\s+\w+\s*\)\s*\{', s)
               if not m:
-                  print("FAIL: attach(Context|Activity) not found"); sys.exit(2)
+                  print("FAIL: attach not found"); sys.exit(2)
               brace = s.index('{', m.end()-1); depth=0; end=-1
               for i in range(brace, len(s)):
                   if s[i]=='{': depth+=1
@@ -293,7 +253,6 @@ jobs:
                       if depth==0: end=i+1; break
               if end < 0:
                   print("FAIL: brace-count failed for attach"); sys.exit(2)
-
               new_attach = "\n".join([
                   "public static void attach(Context context) {",
                   "    final android.app.Activity activity;",
@@ -362,7 +321,6 @@ jobs:
           p.write_text(s)
           PYEOF
 
-      # ============ FIX getArgWidgetType (numeric) ============
       - name: Fix getArgWidgetType (numeric types)
         run: |
           python3 - <<'PYEOF'
@@ -414,34 +372,48 @@ jobs:
           s = p.read_text(); orig = s
           if "wt == 6" in s:
               print("SKIP: numeric widgets already present"); raise SystemExit(0)
-          old = 'ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); } else if (wt == 1)'
-          new = "\n".join([
-              'ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));',
-              '} else if (wt == 6) {',
+
+          new_blocks = "\n".join([
+              'else if (wt == 6) {',
               '    int iv = 0; try { iv = std::stoi(st.argBufs[i]); } catch (...) {}',
               '    ImGui::SetNextItemWidth(-1);',
-              '    if (ImGui::InputInt("##int", &iv)) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%d", iv);',
-              '} else if (wt == 7) {',
+              '    if (ImGui::InputInt("##int", &iv)) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%d", iv); }',
+              'else if (wt == 7) {',
               '    float fv = 0.0f; try { fv = std::stof(st.argBufs[i]); } catch (...) {}',
               '    ImGui::SetNextItemWidth(-1);',
-              '    if (ImGui::InputFloat("##float", &fv)) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%.6g", fv);',
-              '} else if (wt == 1)',
+              '    if (ImGui::InputFloat("##float", &fv)) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%.6g", fv); }',
           ])
-          if old in s:
-              s = s.replace(old, new, 1)
-              print("PASS: inserted InputInt/InputFloat for wt==6/7")
-          else:
-              print("WARN: primary pattern not found; trying fallback")
-              fb = '} else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }'
-              if fb in s:
-                  s = s.replace(fb, new + '\n} else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }', 1)
-                  print("PASS: inserted via fallback")
-              else:
-                  print("FATAL: could not locate insertion point — dumping wt-related lines")
-                  for i, line in enumerate(s.splitlines(), 1):
-                      if 'InputText' in line or 'wt ==' in line or 'argBufs' in line:
-                          print(i, line)
-                  raise SystemExit(2)
+
+          # Try three strategies in order
+          inserted = False
+
+          # Strategy 1: exact line 356 (the final else clause)
+          old1 = 'else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }'
+          if old1 in s:
+              s = s.replace(old1, new_blocks + "\n" + old1, 1)
+              print("PASS: inserted before final else (strategy 1)")
+              inserted = True
+
+          # Strategy 2: any InputText("##arg" that is the last occurrence
+          if not inserted:
+              needle = 'ImGui::InputText("##arg"'
+              if needle in s:
+                  idx = s.rfind(needle)
+                  # Find start of the enclosing "else" statement by walking back to "else {"
+                  prefix = s[:idx]
+                  else_idx = prefix.rfind('else {')
+                  if else_idx >= 0:
+                      s = s[:else_idx] + new_blocks + "\n" + s[else_idx:]
+                      print("PASS: inserted before last InputText(\"##arg\") (strategy 2)")
+                      inserted = True
+
+          if not inserted:
+              print("FATAL: could not find insertion point — dumping all InputText(\"##arg\") occurrences:")
+              for i, line in enumerate(s.splitlines(), 1):
+                  if 'InputText("##arg"' in line or 'else {' in line or 'wt ==' in line:
+                      print(i, line)
+              raise SystemExit(2)
+
           if s == orig:
               print("WARN: native-lib.cpp unchanged")
           p.write_text(s)
@@ -453,6 +425,7 @@ jobs:
           check() { if grep -q "$2" "$1"; then echo "OK  '$2' in $1"; else echo "ERR MISSING '$2' in $1"; FAIL=1; fi; }
           check app/src/main/java/com/menu/imgui/Helper.java "TYPE_APPLICATION_PANEL"
           check app/src/main/java/com/menu/imgui/Helper.java "return 6;"
+          check app/src/main/cpp/tool/native-lib.cpp "wt == 6"
           check app/src/main/cpp/tool/native-lib.cpp "InputInt"
           if grep -q "patchRecordExists" app/src/main/java/com/menu/imgui/Helper.java; then
             echo "ERR patchRecordExists still present"; FAIL=1
@@ -460,7 +433,7 @@ jobs:
             echo "OK  patchRecordExists removed"
           fi
           if [ $FAIL -ne 0 ]; then
-            echo "===== Helper.java attach area ====="; grep -n "attach\|WindowManager\|registerLifecycle\|patchRecordExists" app/src/main/java/com/menu/imgui/Helper.java | head -30
+            echo "===== Helper.java attach ====="; grep -n "attach\|WindowManager\|registerLifecycle\|patchRecordExists" app/src/main/java/com/menu/imgui/Helper.java | head -30
             echo "===== native-lib wt handling ====="; grep -n "wt == 6\|wt == 7\|InputInt\|InputFloat" app/src/main/cpp/tool/native-lib.cpp | head -20
             exit 1
           fi
@@ -606,5 +579,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: optional frida-gum.h, robust header staging, dedup + numeric + overlay fixes [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: insert wt==6/7 blocks before final else (line 356) [skip ci]"
           git push
