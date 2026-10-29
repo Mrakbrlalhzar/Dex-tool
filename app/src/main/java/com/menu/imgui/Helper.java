@@ -226,6 +226,7 @@ public static void attach(Context context) {
     sActivePatches.add(p); syncPatches(); nativePatchMethod(className, target, value);
 }
 
+
     public static void requestPatchField(String className, String target, String value) {
     for (PatchRecord __p : sActivePatches) {
         if (__p.type.equals("Field") && __p.className.equals(className) && __p.targetName.equals(target)) {
