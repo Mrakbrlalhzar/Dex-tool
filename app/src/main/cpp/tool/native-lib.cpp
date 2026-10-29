@@ -92,6 +92,26 @@ static float g_virtX = 0, g_virtY = 0, g_realPrevX = 0, g_realPrevY = 0, g_title
 // ====== FRIDA INIT (FIXED: 6 args for create_sync) ======
 static GumScript* g_script = nullptr;
 
+static void notifyMenuOpen(bool open) {
+    if (!g_jvm) return;
+    JNIEnv* env = nullptr;
+    bool detach = false;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        detach = true;
+    }
+    jclass cls = env->FindClass("com/menu/imgui/Helper");
+    if (cls) {
+        jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
+        if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
+        env->DeleteLocalRef(cls);
+    }
+    if (detach) g_jvm->DetachCurrentThread();
+}
+
+static JavaVM* g_jvm = nullptr;
+static bool gMenuOpen = false;
+
 
 
 static std::vector<std::string> gCallLog;
@@ -419,7 +439,7 @@ else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], siz
         PendingCallReq c; c.sectionId = sec.id; c.className = className; c.methodSig = m.display; c.methodName = m.name; c.paramTypes = m.paramTypes; c.args.resize(st.numParams);
         for (int i = 0; i < st.numParams; i++) c.args[i] = std::string(st.argBufs[i]);
         c.isStatic = m.isStatic; c.isConstructor = m.isConstructor; c.runInMain = st.runInMain;
-        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
+        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
         st.calling = true; st.hasResult = false;
     }
     ImGui::SameLine();
@@ -788,7 +808,8 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     if (!loadDex(env)) return JNI_VERSION_1_6;
 
     // Init Frida (FIXED)
-    std::call_once(frida_once, []() { gum_init_embedded(); });
+    std::call_once(frida_once, []() { env->GetJavaVM(&g_jvm);
+    gum_init_embedded(); });
     LOGI("Frida Gum initialized");
     init_frida_script();
 

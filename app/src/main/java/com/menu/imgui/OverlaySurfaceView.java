@@ -24,7 +24,7 @@ public class OverlaySurfaceView extends GLSurfaceView {
         imm = (InputMethodManager) ctx.getSystemService(Context.INPUT_METHOD_SERVICE);
         setEGLContextClientVersion(3);
         setEGLConfigChooser(8, 8, 8, 8, 16, 0);
-        setZOrderOnTop(true);
+        setZOrderOnTop(true); setZOrderMediaOverlay(true);
         getHolder().setFormat(PixelFormat.TRANSLUCENT);
         setFocusable(true);
         setFocusableInTouchMode(true);

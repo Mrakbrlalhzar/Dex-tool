@@ -113,42 +113,44 @@ public class Helper {
 
 public static void attach(Context context) {
     final android.app.Activity activity;
-    if (context instanceof android.app.Activity) {
-        activity = (android.app.Activity) context;
-    } else if (context instanceof android.content.ContextWrapper) {
+    if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
+    else if (context instanceof android.content.ContextWrapper) {
         android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();
         activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
-    } else { activity = null; }
+    } else activity = null;
     if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
     activity.runOnUiThread(() -> {
         OverlaySurfaceView glView = new OverlaySurfaceView(activity);
+        android.view.WindowManager wm = activity.getWindowManager();
+        android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            android.graphics.PixelFormat.TRANSLUCENT);
+        lp.token = activity.getWindow().getDecorView().getWindowToken();
+        lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
         try {
-            android.view.WindowManager wm = activity.getWindowManager();
-            android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
-                android.view.WindowManager.LayoutParams.MATCH_PARENT,
-                android.view.WindowManager.LayoutParams.MATCH_PARENT,
-                android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                    | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                    | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                android.graphics.PixelFormat.TRANSLUCENT);
-            lp.token = activity.getWindow().getDecorView().getWindowToken();
-            lp.alpha = 0.01f;
-            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
-            wm.addView(glView, lp); sOverlayWm = wm; sOverlayLp = lp;
-            registerLifecycle(activity, glView);
-            android.util.Log.i("DexTool", "Overlay added via WindowManager");
-            return;
+            wm.addView(glView, lp);
+            sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
+            android.util.Log.i("DexTool", "Overlay added via WindowManager (alpha=1, touchable=false)");
         } catch (Throwable t) {
             android.util.Log.w("DexTool", "WindowManager failed, fallback to DecorView", t);
+            try {
+                android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
+                sOverlayDecor = decor;
+                decor.addView(glView, new android.view.ViewGroup.LayoutParams(-1, -1));
+                overlay = glView;
+                android.util.Log.i("DexTool", "Overlay added to DecorView (fallback)");
+            } catch (Throwable t2) { android.util.Log.e("DexTool", "all overlay methods failed", t2); }
         }
-        android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
-        if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(activity)); return; }
-        decor.addView(glView, new android.view.ViewGroup.LayoutParams(-1, -1));
         registerLifecycle(activity, glView);
-        android.util.Log.i("DexTool", "Overlay added to DecorView (fallback)");
     });
 }
+
 
     public static void requestClassDetails(int sectionId, String className) {
         new Thread(() -> {
