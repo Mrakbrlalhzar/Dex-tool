@@ -121,50 +121,65 @@ jobs:
           ls -lah "$D/lib/"
 
       # ============================================================
-      # PATCH 1: Helper.java (small window + toggle)
+      # PATCH 1: Helper.java - bulletproof field/method management
       # ============================================================
-      - name: Patch Helper.java
+      - name: Patch Helper.java (clean rewrite)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
 
-          # --- 1. Add fields ---
-          if "sOverlayWm" not in s:
-              anchor = 'private static OverlaySurfaceView overlay;'
-              if anchor in s:
-                  addition = '\n'.join([
-                      anchor,
-                      '    private static android.view.WindowManager sOverlayWm;',
-                      '    private static android.view.WindowManager.LayoutParams sOverlayLp;',
-                      '    private static android.widget.FrameLayout sDecorContainer;',
-                      '    private static int sFabSize = 200;',
-                      '    private static int sFabMargin = 40;',
-                      '    private static android.app.Activity sOverlayActivity;',
-                      '    private static boolean sMenuOpen = false;',
-                  ])
-                  s = s.replace(anchor, addition, 1)
-                  print("PASS: fields added")
-              else:
-                  print("WARN: anchor for fields not found")
+          print("=== BEFORE (first 40 lines) ===")
+          for i, line in enumerate(s.splitlines()[:40], 1):
+              print(i, line)
 
-          # --- 2. Replace attach method ---
-          m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*(?:final\s+)?(?:android\.content\.)?Context\s+\w+\s*\)\s*\{', s)
+          def remove_method(src, pattern):
+              """Remove ALL method bodies matching pattern."""
+              count = 0
+              while True:
+                  m = re.search(pattern, src)
+                  if not m: break
+                  i = src.index('{', m.end()-1)
+                  d = 0; e = -1
+                  for k in range(i, len(src)):
+                      if src[k] == '{': d += 1
+                      elif src[k] == '}':
+                          d -= 1
+                          if d == 0: e = k + 1; break
+                  if e < 0: break
+                  src = src[:m.start()] + src[e:]
+                  count += 1
+              return src, count
+
+          # 1. Remove ALL existing attach/setMenuOpen/doAttach methods
+          s, n1 = remove_method(s, r'public\s+static\s+void\s+attach\s*\(\s*(?:final\s+)?(?:android\.content\.)?Context\s+\w+\s*\)\s*\{')
+          print("Removed attach methods:", n1)
+          s, n2 = remove_method(s, r'public\s+static\s+void\s+setMenuOpen\s*\([^)]*\)\s*\{')
+          print("Removed setMenuOpen methods:", n2)
+          s, n3 = remove_method(s, r'(?:static|private\s+static|public\s+static)\s+void\s+doAttach\s*\([^)]*\)\s*\{')
+          print("Removed doAttach methods:", n3)
+
+          # 2. Add fields right after class opening
+          m = re.search(r'public\s+class\s+Helper\s*\{', s)
           if not m:
-              print("FATAL: attach not found")
+              print("FATAL: class Helper not found")
               raise SystemExit(2)
-          i = s.index('{', m.end()-1); d=0; e=-1
-          for k in range(i, len(s)):
-              if s[k]=='{': d+=1
-              elif s[k]=='}':
-                  d-=1
-                  if d==0: e=k+1; break
-          if e<0:
-              print("FATAL: brace count failed")
-              raise SystemExit(2)
+          fields = "\n".join([
+              "    private static android.view.WindowManager sOverlayWm;",
+              "    private static android.view.WindowManager.LayoutParams sOverlayLp;",
+              "    private static android.widget.FrameLayout sDecorContainer;",
+              "    private static int sFabSize = 200;",
+              "    private static int sFabMargin = 40;",
+              "    private static android.app.Activity sOverlayActivity;",
+              "    private static boolean sMenuOpen = false;",
+              "",
+          ])
+          s = s[:m.end()] + "\n" + fields + s[m.end():]
+          print("PASS: fields added after class opening")
 
-          new_methods = textwrap.dedent(r"""
+          # 3. Insert new methods before registerLifecycle (or after class opening if not found)
+          new_methods = textwrap.dedent("""\
               public static void attach(final Context context) {
                   final android.app.Activity activity;
                   if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
@@ -208,7 +223,6 @@ jobs:
                           android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
                           android.widget.FrameLayout container = new android.widget.FrameLayout(activity);
                           container.setClipChildren(false);
-                          container.setClipToPadding(false);
                           android.widget.FrameLayout.LayoutParams clp = new android.widget.FrameLayout.LayoutParams(fabSize, fabSize);
                           clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
                           clp.rightMargin = margin; clp.topMargin = margin * 4;
@@ -256,10 +270,19 @@ jobs:
                   });
               }
           """).strip()
-          s = s[:m.start()] + new_methods + s[e:]
-          print("PASS: attach + setMenuOpen rewritten")
 
-          # --- 3. registerLifecycle re-attach ---
+          anchor = re.search(r'(?:private\s+static|public\s+static|static)\s+void\s+registerLifecycle\b', s)
+          if anchor:
+              s = s[:anchor.start()] + new_methods + "\n\n" + s[anchor.start():]
+              print("PASS: methods inserted before registerLifecycle")
+          else:
+              # insert after class opening + fields
+              m2 = re.search(r'public\s+class\s+Helper\s*\{', s)
+              if m2:
+                  s = s[:m2.end()] + "\n" + new_methods + "\n" + s[m2.end():]
+                  print("PASS: methods inserted after class opening")
+
+          # 4. registerLifecycle re-attach
           old = "if (a == activity) { glView.onResume(); }"
           new = ("if (a == activity) { try { glView.onResume(); } catch (Throwable t) {} "
                  "try { if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { "
@@ -268,14 +291,14 @@ jobs:
               s = s.replace(old, new, 1)
               print("PASS: registerLifecycle re-attach")
 
-          # --- 4. nativePatchMethod decl ---
+          # 5. nativePatchMethod declaration
           if "nativePatchMethod" not in s:
               m2 = re.search(r'static\s+native\s+void\s+nativeSetPatches\s*\([^)]*\)\s*;', s)
               if m2:
                   s = s[:m2.start()] + "static native void nativePatchMethod(String c, String m, String v); " + s[m2.start():]
                   print("PASS: nativePatchMethod decl")
 
-          # --- 5. requestPatchMethod rewrite ---
+          # 6. requestPatchMethod rewrite
           m = re.search(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', s)
           if m:
               i = s.index('{', m.end()-1); d=0; e=-1
@@ -296,6 +319,9 @@ jobs:
                   print("PASS: requestPatchMethod rewritten")
 
           p.write_text(s)
+          print("=== AFTER (first 50 lines) ===")
+          for i, line in enumerate(s.splitlines()[:50], 1):
+              print(i, line)
           print("Helper.java DONE")
           PYEOF
 
@@ -309,7 +335,6 @@ jobs:
           p = pathlib.Path("app/src/main/java/com/menu/imgui/OverlaySurfaceView.java")
           s = p.read_text()
 
-          # setZOrderOnTop + setZOrderMediaOverlay
           if "setZOrderMediaOverlay" not in s:
               if "setZOrderOnTop(true);" in s:
                   s = s.replace("setZOrderOnTop(true);",
@@ -319,14 +344,12 @@ jobs:
                       "super(context);\n        setZOrderOnTop(true);\n        setZOrderMediaOverlay(true);", 1)
               print("PASS: setZOrderMediaOverlay")
 
-          # setPreserveEGLContextOnPause
           if "setPreserveEGLContextOnPause" not in s:
               if "setRenderMode(RENDERMODE_CONTINUOUSLY);" in s:
                   s = s.replace("setRenderMode(RENDERMODE_CONTINUOUSLY);",
                       "setRenderMode(RENDERMODE_CONTINUOUSLY);\n        setPreserveEGLContextOnPause(true);", 1)
               print("PASS: setPreserveEGLContextOnPause")
 
-          # onTouchEvent + dispatchKeyEvent
           if "onTouchEvent" not in s:
               m = re.search(r'public\s+class\s+OverlaySurfaceView\b[^{]*\{', s)
               if not m:
@@ -357,21 +380,19 @@ jobs:
           PYEOF
 
       # ============================================================
-      # PATCH 3: native-lib.cpp - globals + notifyMenuOpen + agent
+      # PATCH 3: native-lib.cpp - globals + notifyMenuOpen
       # ============================================================
-      - name: Patch native-lib.cpp (globals + agent + native methods)
+      - name: Patch native-lib.cpp (globals + notifyMenuOpen)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
-          # includes
           if "#include <vector>" not in s:
               s = s.replace("#include <mutex>", "#include <mutex>\n#include <vector>\n#include <string>", 1)
               print("PASS: includes")
 
-          # remove old notifyMenuOpen
           if "static void notifyMenuOpen" in s:
               m = re.search(r'static\s+void\s+notifyMenuOpen\s*\([^)]*\)\s*\{', s)
               if m:
@@ -385,7 +406,6 @@ jobs:
                       s = s[:m.start()] + s[e:]
                       print("PASS: removed old notifyMenuOpen")
 
-          # globals
           if "JavaVM* g_jvm" not in s:
               s = s.replace("static GumScript* g_script = nullptr;",
                   "static GumScript* g_script = nullptr;\nstatic JavaVM* g_jvm = nullptr;\nstatic bool gMenuOpen = false;", 1)
@@ -395,15 +415,13 @@ jobs:
               s = s.replace("static JavaVM* g_jvm = nullptr;",
                   "static JavaVM* g_jvm = nullptr;\nstatic std::vector<std::string> gCallLog;\nstatic std::mutex gCallLogMutex;", 1)
 
-          # set g_jvm in JNI_OnLoad
-          if "g_jvm = vm;" not in s and "g_jvm =" not in s:
+          if "g_jvm =" not in s:
               m = re.search(r'JNI_OnLoad\s*\(\s*JavaVM\s*\*\s*(\w+)\s*,\s*void\s*\*\s*\w+\s*\)\s*\{', s)
               if m:
                   var = m.group(1)
                   s = s[:m.end()] + "\n    g_jvm = " + var + ";" + s[m.end():]
                   print("PASS: g_jvm = " + var)
 
-          # add notifyMenuOpen helper
           if "notifyMenuOpen" not in s:
               helper = textwrap.dedent(r"""
                   static void notifyMenuOpen(bool open) {
@@ -427,13 +445,25 @@ jobs:
                             "static GumScript* g_script = nullptr;\n\n" + helper + "\n", 1)
               print("PASS: notifyMenuOpen helper")
 
-          # wire to nativeRender
           if "lastMenuOpen" not in s and "void nativeRender()" in s:
               s = s.replace("void nativeRender() {",
                   "void nativeRender() {\n    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }", 1)
               print("PASS: notifyMenuOpen wired")
 
-          # replace agent
+          p.write_text(s)
+          print("native-lib.cpp globals DONE")
+          PYEOF
+
+      # ============================================================
+      # PATCH 4: native-lib.cpp - agent + JNI methods + Log tab
+      # ============================================================
+      - name: Patch native-lib.cpp (agent + JNI + log)
+        run: |
+          python3 - <<'PYEOF'
+          import re, pathlib, textwrap
+          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
+          s = p.read_text()
+
           new_js = textwrap.dedent(r"""
               Java.perform(function() {
                 function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
@@ -476,20 +506,6 @@ jobs:
               s = re.sub(r'const gchar\* PATCH_AGENT_JS = R"\(.*?\)";',
                   'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
               print("PASS: agent replaced")
-
-          p.write_text(s)
-          print("native-lib.cpp globals DONE")
-          PYEOF
-
-      # ============================================================
-      # PATCH 4: native-lib.cpp - nativePatchMethod / nativeTouch / Log
-      # ============================================================
-      - name: Patch native-lib.cpp (JNI methods + log)
-        run: |
-          python3 - <<'PYEOF'
-          import re, pathlib, textwrap
-          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
-          s = p.read_text()
 
           if "Java_com_menu_imgui_Helper_nativePatchMethod" not in s:
               impl = textwrap.dedent(r"""
@@ -604,11 +620,12 @@ jobs:
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
+          N_SETMENU=$(grep -c "public static void setMenuOpen" app/src/main/java/com/menu/imgui/Helper.java || true)
+          if [ "$N_SETMENU" -ne 1 ]; then echo "ERR setMenuOpen count=$N_SETMENU (expected 1)"; FAIL=1; else echo "OK  exactly one setMenuOpen"; fi
           if grep -q "lp.alpha = 0.01f" app/src/main/java/com/menu/imgui/Helper.java; then echo ERR_alpha; FAIL=1; fi
           if grep -q "if (if (" app/src/main/cpp/tool/native-lib.cpp; then echo ERR_if_if; FAIL=1; fi
           if [ $FAIL -ne 0 ]; then
-            echo "=== Helper attach ==="; grep -n "attach\|sFabSize\|setMenuOpen" app/src/main/java/com/menu/imgui/Helper.java | head -20
-            echo "=== Overlay ==="; grep -n "onTouchEvent\|setZOrderMediaOverlay\|setPreserveEGL" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -10
+            echo "=== Helper head ==="; head -40 app/src/main/java/com/menu/imgui/Helper.java
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -691,5 +708,5 @@ jobs:
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: YAML textwrap.dedent + small window + menu toggle + dex rebuild [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: remove pre-existing setMenuOpen/doAttach, insert fields after class opening, bulletproof patch [skip ci]"
           git push
