@@ -47,13 +47,7 @@ public class Helper {
     }
 
 
-    private static boolean patchRecordExists(List<PatchRecord> list, String cls, String name, String sig) {
-        for (PatchRecord r : list) {
-            if (r.className.equals(cls) && r.methodName.equals(name)
-                    && (sig == null || sig.equals(r.signature))) return true;
-        }
-        return false;
-    }
+    
 
     private static final String TAG = "ImGuiTool";
     private static OverlaySurfaceView overlay;
@@ -115,20 +109,35 @@ public class Helper {
     } else if (context instanceof android.content.ContextWrapper) {
         android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();
         activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
-    } else {
-        activity = null;
-    }
+    } else { activity = null; }
     if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
     activity.runOnUiThread(() -> {
-        final android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
-        if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(activity)); return; }
         OverlaySurfaceView glView = new OverlaySurfaceView(activity);
-        android.view.ViewGroup.LayoutParams lp = new android.view.ViewGroup.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT);
-        decor.addView(glView, lp);
+        try {
+            android.view.WindowManager wm = activity.getWindowManager();
+            android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                android.graphics.PixelFormat.TRANSLUCENT);
+            lp.token = activity.getWindow().getDecorView().getWindowToken();
+            lp.alpha = 0.01f;
+            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
+            wm.addView(glView, lp);
+            registerLifecycle(activity, glView);
+            android.util.Log.i("DexTool", "Overlay added via WindowManager");
+            return;
+        } catch (Throwable t) {
+            android.util.Log.w("DexTool", "WindowManager failed, fallback to DecorView", t);
+        }
+        android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
+        if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(activity)); return; }
+        decor.addView(glView, new android.view.ViewGroup.LayoutParams(-1, -1));
         registerLifecycle(activity, glView);
-        android.util.Log.i("DexTool", "Overlay added to DecorView");
+        android.util.Log.i("DexTool", "Overlay added to DecorView (fallback)");
     });
 }
 
@@ -196,18 +205,42 @@ public class Helper {
         return sInstances.get(instanceName);
     }
 
-    public static void requestPatchMethod(String className, String methodSig, String returnType) {
-        PatchRecord p = new PatchRecord();
-        p.id = sPatchCounter++; p.type = "Method"; p.className = className; p.targetName = methodSig;
-        p.originalValue = "(original)"; p.currentValue = "0";
-        sActivePatches.add(p); syncPatches();
+    public static void requestPatchMethod(String className, String target, String value) {
+    for (PatchRecord __p : sActivePatches) {
+        if (__p.type.equals("Method") && __p.className.equals(className) && __p.targetName.equals(target)) {
+            __p.currentValue = value;
+            syncPatches();
+            return;
+        }
     }
-    public static void requestPatchField(String className, String fieldName, String currentValue) {
-        PatchRecord p = new PatchRecord();
-        p.id = sPatchCounter++; p.type = "Field"; p.className = className; p.targetName = fieldName;
-        p.originalValue = currentValue; p.currentValue = currentValue;
-        sActivePatches.add(p); syncPatches();
+    PatchRecord p = new PatchRecord();
+    p.id = sPatchCounter++;
+    p.type = "Method";
+    p.className = className;
+    p.targetName = target;
+    p.originalValue = "(original)";
+    p.currentValue = value;
+    sActivePatches.add(p);
+    syncPatches();
+}
+    public static void requestPatchField(String className, String target, String value) {
+    for (PatchRecord __p : sActivePatches) {
+        if (__p.type.equals("Field") && __p.className.equals(className) && __p.targetName.equals(target)) {
+            __p.currentValue = value;
+            syncPatches();
+            return;
+        }
     }
+    PatchRecord p = new PatchRecord();
+    p.id = sPatchCounter++;
+    p.type = "Field";
+    p.className = className;
+    p.targetName = target;
+    p.originalValue = "(original)";
+    p.currentValue = value;
+    sActivePatches.add(p);
+    syncPatches();
+}
     public static void togglePatch(int id, boolean active) {
         for (PatchRecord p : sActivePatches) if (p.id == id) { p.isActive = active; break; }
         syncPatches();
@@ -244,16 +277,21 @@ public class Helper {
     }
 
     public static int getArgWidgetType(String typeName) {
-        try {
-            Class<?> c = classFromString(typeName);
-            if (c == boolean.class || c == Boolean.class) return 1;
-            if (c.isEnum()) return 2;
-            if (Context.class.isAssignableFrom(c) || Activity.class.isAssignableFrom(c)) return 3;
-            if (c.isArray()) return 5;
-            if (c.isPrimitive() || Number.class.isAssignableFrom(c) || c == String.class || c == CharSequence.class || c == char.class || c == Character.class) return 0;
-            return 4;
-        } catch (Throwable t) { return 0; }
-    }
+    try {
+        Class<?> c = classFromString(typeName);
+        if (c == boolean.class || c == Boolean.class) return 1;
+        if (c.isEnum()) return 2;
+        if (Context.class.isAssignableFrom(c) || Activity.class.isAssignableFrom(c)) return 3;
+        if (c.isArray()) return 5;
+        if (c == int.class || c == Integer.class || c == long.class || c == Long.class
+                || c == short.class || c == Short.class || c == byte.class || c == Byte.class
+                || c == java.math.BigInteger.class) return 6;
+        if (c == float.class || c == Float.class || c == double.class || c == Double.class
+                || c == java.math.BigDecimal.class) return 7;
+        if (c == String.class || c == CharSequence.class || c == char.class || c == Character.class) return 0;
+        return 4;
+    } catch (Throwable t) { return 0; }
+}
 
     public static String[] getArgSuggestions(String typeName) {
         try {
