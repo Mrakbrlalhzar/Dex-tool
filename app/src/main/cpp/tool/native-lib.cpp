@@ -353,7 +353,15 @@ static void renderMethodPanel(Section& sec, const std::string& className, Method
         }
         else if (wt == 3) { ImGui::TextColored(ImVec4(0.30f,0.82f,0.88f,1), "[Auto-Inject]"); ImGui::SameLine(); if (!st.suggestions[i].empty()) { snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%s", st.suggestions[i][0].c_str()); ImGui::TextDisabled("%s", st.suggestions[i][0].c_str()); } else ImGui::TextDisabled("Pending..."); }
         else if (wt == 5) { std::string hint = "comma-separated"; ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##arr", hint.c_str(), st.argBufs[i], sizeof(st.argBufs[i])); }
-        else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }
+        else if (wt == 6) {
+    int iv = 0; try { iv = std::stoi(st.argBufs[i]); } catch (...) {}
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::InputInt("##int", &iv)) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%d", iv); }
+else if (wt == 7) {
+    float fv = 0.0f; try { fv = std::stof(st.argBufs[i]); } catch (...) {}
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::InputFloat("##float", &fv)) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%.6g", fv); }
+else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }
         ImGui::PopID();
     }
     ImGui::Checkbox("Call in Main Thread", &st.runInMain);
