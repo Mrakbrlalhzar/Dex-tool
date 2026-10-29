@@ -111,7 +111,7 @@ public class Helper {
     } catch (Throwable t) {} });
 }
 
-public static void attach(Context context) {
+public static void attach(final Context context) {
     final android.app.Activity activity;
     if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
     else if (context instanceof android.content.ContextWrapper) {
@@ -119,35 +119,86 @@ public static void attach(Context context) {
         activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
     } else activity = null;
     if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
-    activity.runOnUiThread(() -> {
-        OverlaySurfaceView glView = new OverlaySurfaceView(activity);
-        android.view.WindowManager wm = activity.getWindowManager();
-        android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
-            android.view.WindowManager.LayoutParams.MATCH_PARENT,
-            android.view.WindowManager.LayoutParams.MATCH_PARENT,
-            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            android.graphics.PixelFormat.TRANSLUCENT);
-        lp.token = activity.getWindow().getDecorView().getWindowToken();
-        lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
+    sOverlayActivity = activity;
+    activity.getWindow().getDecorView().post(new Runnable() {
+        @Override public void run() { doAttach(activity); }
+    });
+}
+
+static void doAttach(android.app.Activity activity) {
+    OverlaySurfaceView glView = new OverlaySurfaceView(activity);
+    android.view.WindowManager wm = activity.getWindowManager();
+    android.util.DisplayMetrics dm = activity.getResources().getDisplayMetrics();
+    int fabSize = (int)(80 * dm.density);
+    int margin = (int)(20 * dm.density);
+    sFabSize = fabSize; sFabMargin = margin;
+
+    android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+        fabSize, fabSize,
+        android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+        android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+        android.graphics.PixelFormat.TRANSPARENT);
+    lp.token = activity.getWindow().getDecorView().getWindowToken();
+    lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
+    lp.x = dm.widthPixels - fabSize - margin;
+    lp.y = margin * 4;
+
+    try {
+        wm.addView(glView, lp);
+        sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
+        android.util.Log.i("DexTool", "Overlay added via WM (size=" + fabSize + ")");
+    } catch (Throwable t) {
+        android.util.Log.w("DexTool", "WM failed, decor fallback", t);
         try {
-            wm.addView(glView, lp);
-            sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
-            android.util.Log.i("DexTool", "Overlay added via WindowManager (alpha=1, touchable=false)");
-        } catch (Throwable t) {
-            android.util.Log.w("DexTool", "WindowManager failed, fallback to DecorView", t);
+            android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
+            android.widget.FrameLayout container = new android.widget.FrameLayout(activity);
+            container.setClipChildren(false);
+            container.setClipToPadding(false);
+            android.widget.FrameLayout.LayoutParams clp = new android.widget.FrameLayout.LayoutParams(fabSize, fabSize);
+            clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
+            clp.rightMargin = margin; clp.topMargin = margin * 4;
+            container.addView(glView, clp);
+            sDecorContainer = container; overlay = glView;
+            decor.addView(container, new android.view.ViewGroup.LayoutParams(-1, -1));
+            android.util.Log.i("DexTool", "Overlay added to DecorView (small container)");
+        } catch (Throwable t2) { android.util.Log.e("DexTool", "ALL FAILED", t2); }
+    }
+    registerLifecycle(activity, glView);
+}
+
+public static void setMenuOpen(final boolean open) {
+    sMenuOpen = open;
+    if (overlay == null) return;
+    final int w = sFabSize, m = sFabMargin;
+    overlay.post(new Runnable() {
+        @Override public void run() {
             try {
-                android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
-                sOverlayDecor = decor;
-                decor.addView(glView, new android.view.ViewGroup.LayoutParams(-1, -1));
-                overlay = glView;
-                android.util.Log.i("DexTool", "Overlay added to DecorView (fallback)");
-            } catch (Throwable t2) { android.util.Log.e("DexTool", "all overlay methods failed", t2); }
+                if (sOverlayWm != null && sOverlayLp != null) {
+                    if (open) {
+                        sOverlayLp.width = android.view.WindowManager.LayoutParams.MATCH_PARENT;
+                        sOverlayLp.height = android.view.WindowManager.LayoutParams.MATCH_PARENT;
+                        sOverlayLp.x = 0; sOverlayLp.y = 0;
+                    } else {
+                        sOverlayLp.width = w; sOverlayLp.height = w;
+                        sOverlayLp.x = sOverlayActivity.getResources().getDisplayMetrics().widthPixels - w - m;
+                        sOverlayLp.y = m * 4;
+                    }
+                    sOverlayWm.updateViewLayout(overlay, sOverlayLp);
+                } else if (sDecorContainer != null) {
+                    android.widget.FrameLayout.LayoutParams clp = (android.widget.FrameLayout.LayoutParams) overlay.getLayoutParams();
+                    if (open) {
+                        clp.width = -1; clp.height = -1; clp.gravity = 0;
+                        clp.rightMargin = 0; clp.topMargin = 0;
+                    } else {
+                        clp.width = w; clp.height = w; clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
+                        clp.rightMargin = m; clp.topMargin = m * 4;
+                    }
+                    overlay.setLayoutParams(clp);
+                }
+                android.util.Log.i("DexTool", "setMenuOpen(" + open + ")");
+            } catch (Throwable t) { android.util.Log.w("DexTool", "setMenuOpen err", t); }
         }
-        registerLifecycle(activity, glView);
     });
 }
 
@@ -216,17 +267,7 @@ public static void attach(Context context) {
         return sInstances.get(instanceName);
     }
 
-    public static void requestPatchMethod(String className, String target, String value) {
-    for (PatchRecord __p : sActivePatches) {
-        if ("Method".equals(__p.type) && className.equals(__p.className) && target.equals(__p.targetName)) {
-            __p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return;
-        }
-    }
-    PatchRecord p = new PatchRecord();
-    p.id = sPatchCounter++; p.type = "Method"; p.className = className;
-    p.targetName = target; p.originalValue = "(original)"; p.currentValue = value;
-    sActivePatches.add(p); syncPatches(); nativePatchMethod(className, target, value);
-}
+    public static void requestPatchMethod(String className, String target, String value) { for (PatchRecord __p : sActivePatches) { if ("Method".equals(__p.type) && className.equals(__p.className) && target.equals(__p.targetName)) { __p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return; } } PatchRecord p = new PatchRecord(); p.id = sPatchCounter++; p.type = "Method"; p.className = className; p.targetName = target; p.originalValue = "(original)"; p.currentValue = value; sActivePatches.add(p); syncPatches(); nativePatchMethod(className, target, value); }
 
 
     public static void requestPatchField(String className, String target, String value) {

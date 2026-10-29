@@ -109,6 +109,9 @@ static void notifyMenuOpen(bool open) {
     if (detach) g_jvm->DetachCurrentThread();
 }
 
+
+
+
 static JavaVM* g_jvm = nullptr;
 static bool gMenuOpen = false;
 
@@ -118,8 +121,7 @@ static std::vector<std::string> gCallLog;
 static std::mutex gCallLogMutex;
 static GumScriptBackend* g_backend = nullptr;
 
-const gchar* PATCH_AGENT_JS = R"(
-Java.perform(function() {
+const gchar* PATCH_AGENT_JS = R"(Java.perform(function() {
   function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
   log("agent loaded");
   var HOOKED = {};
@@ -154,8 +156,7 @@ Java.perform(function() {
     } catch(e) { log("ERROR: "+e.message); }
   });
   send({type:"ready"});
-});
-)";
+});)";
 
 static void on_script_message(const gchar* message, GBytes* data, gpointer user_data) {
     LOGI("Frida JS: %s", message); if (message && strstr(message, "\"type\":\"log\"")) { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[JS] ")+message); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }
@@ -439,7 +440,7 @@ else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], siz
         PendingCallReq c; c.sectionId = sec.id; c.className = className; c.methodSig = m.display; c.methodName = m.name; c.paramTypes = m.paramTypes; c.args.resize(st.numParams);
         for (int i = 0; i < st.numParams; i++) c.args[i] = std::string(st.argBufs[i]);
         c.isStatic = m.isStatic; c.isConstructor = m.isConstructor; c.runInMain = st.runInMain;
-        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
+        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
         st.calling = true; st.hasResult = false;
     }
     ImGui::SameLine();
