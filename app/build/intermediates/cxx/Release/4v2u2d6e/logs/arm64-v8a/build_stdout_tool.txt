@@ -9,7 +9,143 @@ ninja: Entering directory `/home/runner/work/Dex-tool/Dex-tool/app/.cxx/Release/
 [8/8] Linking CXX shared library /home/runner/work/Dex-tool/Dex-tool/app/build/intermediates/cxx/Release/4v2u2d6e/obj/arm64-v8a/libtool.so
 FAILED: /home/runner/work/Dex-tool/Dex-tool/app/build/intermediates/cxx/Release/4v2u2d6e/obj/arm64-v8a/libtool.so 
 : && /usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/usr/local/lib/android/sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -fPIC -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden  -static-libstdc++ -Wl,--build-id=sha1 -Wl,--no-rosegment -Wl,--fatal-warnings -Wl,--gc-sections -Wl,--no-undefined -Qunused-arguments    -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all -shared -Wl,-soname,libtool.so -o /home/runner/work/Dex-tool/Dex-tool/app/build/intermediates/cxx/Release/4v2u2d6e/obj/arm64-v8a/libtool.so CMakeFiles/tool.dir/tool/native-lib.cpp.o CMakeFiles/tool.dir/imgui/imgui.cpp.o CMakeFiles/tool.dir/imgui/imgui_draw.cpp.o CMakeFiles/tool.dir/imgui/imgui_tables.cpp.o CMakeFiles/tool.dir/imgui/imgui_widgets.cpp.o CMakeFiles/tool.dir/imgui/backends/imgui_impl_android.cpp.o CMakeFiles/tool.dir/imgui/backends/imgui_impl_opengl3.cpp.o  /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a  -landroid  -llog  -lEGL  -lGLESv3  -ldl  -latomic -lm && :
-ld: error: /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a(gumscript.c.o) is incompatible with aarch64linux
-ld: error: /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a(gumscriptbackend.c.o) is incompatible with aarch64linux
+ld: error: undefined symbol: gum_init_embedded
+>>> referenced by native-lib.cpp:733 (/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:733)
+>>>               CMakeFiles/tool.dir/tool/native-lib.cpp.o:(JNI_OnLoad)
+
+ld: error: undefined symbol: _frida_g_error_free
+>>> referenced by native-lib.cpp:128 (/home/runner/work/Dex-tool/Dex-tool/app/src/main/cpp/tool/native-lib.cpp:128)
+>>>               CMakeFiles/tool.dir/tool/native-lib.cpp.o:(JNI_OnLoad)
+
+ld: error: undefined symbol: g_once_init_enter
+>>> referenced by gumscript.c:9 (../bindings/gumjs/gumscript.c:9)
+>>>               gumscript.c.o:(gum_script_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:44 (../bindings/gumjs/gumscriptbackend.c:44)
+>>>               gumscriptbackend.c.o:(gum_script_backend_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:75 (../bindings/gumjs/gumscriptbackend.c:75)
+>>>               gumscriptbackend.c.o:(gum_script_backend_obtain_qjs) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 18 more times
+
+ld: error: undefined symbol: g_intern_static_string
+>>> referenced by gumscript.c:9 (../bindings/gumjs/gumscript.c:9)
+>>>               gumscript.c.o:(gum_script_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:44 (../bindings/gumjs/gumscriptbackend.c:44)
+>>>               gumscriptbackend.c.o:(gum_script_backend_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptscheduler.c:42 (../bindings/gumjs/gumscriptscheduler.c:42)
+>>>               gumscriptscheduler.c.o:(gum_script_scheduler_get_type_once) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 15 more times
+
+ld: error: undefined symbol: g_type_register_static_simple
+>>> referenced by gumscript.c:9 (../bindings/gumjs/gumscript.c:9)
+>>>               gumscript.c.o:(gum_script_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:44 (../bindings/gumjs/gumscriptbackend.c:44)
+>>>               gumscriptbackend.c.o:(gum_script_backend_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptscheduler.c:42 (../bindings/gumjs/gumscriptscheduler.c:42)
+>>>               gumscriptscheduler.c.o:(gum_script_scheduler_get_type_once) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 14 more times
+
+ld: error: undefined symbol: g_type_interface_add_prerequisite
+>>> referenced by gumscript.c:9 (../bindings/gumjs/gumscript.c:9)
+>>>               gumscript.c.o:(gum_script_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:44 (../bindings/gumjs/gumscriptbackend.c:44)
+>>>               gumscriptbackend.c.o:(gum_script_backend_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: undefined symbol: g_once_init_leave
+>>> referenced by gumscript.c:9 (../bindings/gumjs/gumscript.c:9)
+>>>               gumscript.c.o:(gum_script_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:44 (../bindings/gumjs/gumscriptbackend.c:44)
+>>>               gumscriptbackend.c.o:(gum_script_backend_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:83 (../bindings/gumjs/gumscriptbackend.c:83)
+>>>               gumscriptbackend.c.o:(gum_script_backend_obtain_qjs) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 18 more times
+
+ld: error: undefined symbol: g_type_interface_peek
+>>> referenced by gumscript.h:17 (../bindings/gumjs/gumscript.h:17)
+>>>               gumscript.c.o:(GUM_SCRIPT_GET_IFACE) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.h:18 (../bindings/gumjs/gumscriptbackend.h:18)
+>>>               gumscriptbackend.c.o:(GUM_SCRIPT_BACKEND_GET_IFACE) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: undefined symbol: g_regex_new
+>>> referenced by gumscriptbackend.c:363 (../bindings/gumjs/gumscriptbackend.c:363)
+>>>               gumscriptbackend.c.o:(gum_script_backend_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: undefined symbol: _gum_register_early_destructor
+>>> referenced by gumscriptbackend.c:367 (../bindings/gumjs/gumscriptbackend.c:367)
+>>>               gumscriptbackend.c.o:(gum_script_backend_get_type) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:81 (../bindings/gumjs/gumscriptbackend.c:81)
+>>>               gumscriptbackend.c.o:(gum_script_backend_obtain_qjs) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:299 (../bindings/gumjs/gumscriptbackend.c:299)
+>>>               gumscriptbackend.c.o:(gum_script_backend_get_scheduler) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: undefined symbol: g_object_new
+>>> referenced by gumscriptbackend.c:79 (../bindings/gumjs/gumscriptbackend.c:79)
+>>>               gumscriptbackend.c.o:(gum_script_backend_obtain_qjs) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptscheduler.c:87 (../bindings/gumjs/gumscriptscheduler.c:87)
+>>>               gumscriptscheduler.c.o:(gum_script_scheduler_new) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumquickscriptbackend.c:785 (../bindings/gumjs/gumquickscriptbackend.c:785)
+>>>               gumquickscriptbackend.c.o:(gum_create_script_task_run) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 11 more times
+
+ld: error: undefined symbol: g_object_unref
+>>> referenced by gumscriptbackend.c:92 (../bindings/gumjs/gumscriptbackend.c:92)
+>>>               gumscriptbackend.c.o:(gum_script_backend_deinit_qjs) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:310 (../bindings/gumjs/gumscriptbackend.c:310)
+>>>               gumscriptbackend.c.o:(gum_script_backend_deinit_scheduler) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumquickscriptbackend.c:246 (../bindings/gumjs/gumquickscriptbackend.c:246)
+>>>               gumquickscriptbackend.c.o:(gum_quick_script_backend_dispose) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 89 more times
+
+ld: error: undefined symbol: g_regex_match
+>>> referenced by gumscriptbackend.c:319 (../bindings/gumjs/gumscriptbackend.c:319)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: undefined symbol: g_match_info_matches
+>>> referenced by gumscriptbackend.c:320 (../bindings/gumjs/gumscriptbackend.c:320)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: undefined symbol: g_match_info_fetch
+>>> referenced by gumscriptbackend.c:325 (../bindings/gumjs/gumscriptbackend.c:325)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: undefined symbol: g_base64_decode
+>>> referenced by gumscriptbackend.c:327 (../bindings/gumjs/gumscriptbackend.c:327)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumcmodule-runtime.h:6570 (bindings/gumjs/gumcmodule-runtime.h:6570)
+>>>               gumcmodule.c.o:(gum_cmodule_get_symbols) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumcmodule-runtime.h:6570 (bindings/gumjs/gumcmodule-runtime.h:6570)
+>>>               gumcmodule.c.o:(gum_cmodule_get_symbols) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: undefined symbol: g_utf8_validate
+>>> referenced by gumscriptbackend.c:328 (../bindings/gumjs/gumscriptbackend.c:328)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumquickcore.c:3567 (../bindings/gumjs/gumquickcore.c:3567)
+>>>               gumquickcore.c.o:(gumjs_native_pointer_handle_read) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumquickkernel.c:579 (../bindings/gumjs/gumquickkernel.c:579)
+>>>               gumquickkernel.c.o:(gum_quick_kernel_read) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 3 more times
+
+ld: error: undefined symbol: g_strndup
+>>> referenced by gumscriptbackend.c:330 (../bindings/gumjs/gumscriptbackend.c:330)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumquickscriptbackend.c:347 (../bindings/gumjs/gumquickscriptbackend.c:347)
+>>>               gumquickscriptbackend.c.o:(gum_quick_script_backend_compile_program) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumquickscriptbackend.c:354 (../bindings/gumjs/gumquickscriptbackend.c:354)
+>>>               gumquickscriptbackend.c.o:(gum_quick_script_backend_compile_program) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 4 more times
+
+ld: error: undefined symbol: g_free
+>>> referenced by gumscriptbackend.c:332 (../bindings/gumjs/gumscriptbackend.c:332)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumscriptbackend.c:334 (../bindings/gumjs/gumscriptbackend.c:334)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced by gumquickscriptbackend.c:356 (../bindings/gumjs/gumquickscriptbackend.c:356)
+>>>               gumquickscriptbackend.c.o:(gum_quick_script_backend_compile_program) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+>>> referenced 80 more times
+
+ld: error: undefined symbol: g_match_info_free
+>>> referenced by gumscriptbackend.c:337 (../bindings/gumjs/gumscriptbackend.c:337)
+>>>               gumscriptbackend.c.o:(gum_script_backend_extract_inline_source_map) in archive /tmp/frida-built/arm64-v8a/lib/libfrida-gumjs.a
+
+ld: error: too many errors emitted, stopping now (use -error-limit=0 to see all errors)
 clang++: error: linker command failed with exit code 1 (use -v to see invocation)
 ninja: build stopped: subcommand failed.
