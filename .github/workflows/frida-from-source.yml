@@ -27,12 +27,13 @@ jobs:
               rm -f "$f"
             fi
           done
+          ls -la
 
       - name: Install dependencies (NDK r25c + Meson + Node.js)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            python3-pip ninja-build pkg-config libglib2.0-dev unzip curl gettext
+            python3-pip ninja-build pkg-config libglib2.0-dev unzip curl
           pip3 install --quiet --upgrade pip
           pip3 install --quiet meson
 
@@ -42,142 +43,259 @@ jobs:
 
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
+          echo "✓ NDK: $NDK_PATH"
+          node --version
 
-      - name: Download Frida devkit (HEADERS ONLY)
+      - name: Download Frida devkit (HEADERS)
         run: |
+          set -e
           FRIDA_VERSION="17.1.0"
           BASE="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}"
           wget -q "${BASE}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm64.tar.xz" -O /tmp/dk64.tar.xz
           mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
           wget -q "${BASE}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm.tar.xz" -O /tmp/dk32.tar.xz
           mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
+          echo "✓ devkits ready"
 
       - name: Clone frida-gum source
         run: |
           git clone --recursive --depth 1 --branch 17.1.0 \
             https://github.com/frida/frida-gum.git /tmp/frida-gum
+          cd /tmp/frida-gum
+          echo "✓ cloned"
 
       - name: Patch glib_init
         run: |
           cd /tmp/frida-gum
           sed -i '1i void glib_init(void);' bindings/gumjs/gumquickcompile.c
+          echo "✓ patched"
 
-      - name: Create libintl.h stub (safe isolation)
-        run: |
-          mkdir -p /tmp/intl-stub
-          cat > /tmp/intl-stub/libintl.h << 'EOF'
-          #ifndef LIBINTL_H
-          #define LIBINTL_H
-          static inline char *gettext(const char *msgid) { return (char *)msgid; }
-          static inline char *dgettext(const char *domain, const char *msgid) { return (char *)msgid; }
-          static inline char *ngettext(const char *msgid, const char *msgid_plural, unsigned long n) {
-              return (char *)(n == 1 ? msgid : msgid_plural);
-          }
-          static inline char *bindtextdomain(const char *domainname, const char *dirname) { return (char *)dirname; }
-          static inline char *textdomain(const char *domainname) { return (char *)domainname; }
-          #endif
-          EOF
-
-      # Helper to configure with all slim options
-      - name: Configure helper (defines MESON_OPTS)
-        run: |
-          cat > /tmp/meson_opts.sh << 'EOF'
-          #!/bin/bash
-          # Core slim options
-          OPTS=(
-            --buildtype=minsize
-            -Ddevkits=gum,gumjs
-            -Dgumjs=enabled
-            -Dinspector=disabled
-            -Dquickjs=enabled
-            -Dv8=disabled
-            -Ddatabase=disabled
-            -Dtests=disabled
-            -Ddiet=true
-            -Db_ndebug=true
-            -Ddefault_library=static
-            -Dlibunwind:minidebuginfo=disabled
-            -Dlibdwarf:decompression=false
-          )
-          # Try to disable json-glib subproject entirely
-          OPTS+=(-Djson-glib:enabled=false)
-          # Fallback: pass the stub include only to json-glib if it still builds
-          # OPTS+=(-Djson-glib:c_args=["-I/tmp/intl-stub"])
-          echo "MESON_OPTS: ${OPTS[*]}"
-          export MESON_OPTS
-          EOF
-          chmod +x /tmp/meson_opts.sh
-          source /tmp/meson_opts.sh
-
+      # ============ ARM64 BUILD ============
       - name: Build arm64
         timeout-minutes: 60
         run: |
           set -o pipefail
-          source /tmp/meson_opts.sh
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
+
+          echo "================================================================"
+          echo "STEP 1: rm -rf build"
+          echo "================================================================"
           rm -rf build
+          echo "✓ build dir removed"
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 2: ./configure --host=android-arm64"
+          echo "================================================================"
           ./configure --host=android-arm64 -- \
-            "${OPTS[@]}" \
+            -Ddevkits=gum,gumjs \
+            -Dgumjs=enabled \
+            -Dquickjs=enabled \
+            -Dv8=disabled \
+            -Ddatabase=disabled \
+            -Dtests=disabled \
+            -Ddiet=true \
+            -Db_ndebug=true \
+            -Ddefault_library=static \
+            -Dlibunwind:minidebuginfo=disabled \
+            -Dlibdwarf:decompression=false \
             2>&1 | tee /tmp/arm64-configure.log
           CFG_EXIT=${PIPESTATUS[0]}
-          if [ $CFG_EXIT -ne 0 ]; then tail -80 /tmp/arm64-configure.log; exit 1; fi
+          echo ""
+          echo ">>> CONFIGURE EXIT: $CFG_EXIT <<<"
 
-          # Build the gumjs static library target directly
-          make -j$(nproc) 2>&1 | tee /tmp/arm64-build.log
-          BLD_EXIT=${PIPESTATUS[0]}
-          # Tolerate failure on python/tools bindings if the .a already exists
-          LIB=$(find build -name "libfrida-gumjs-*.a" ! -name "*inspector*" | head -1)
-          if [ -z "$LIB" ]; then
-            echo "::error::No libfrida-gumjs .a found after make"
-            tail -100 /tmp/arm64-build.log
+          if [ $CFG_EXIT -ne 0 ]; then
+            echo "!!!!! CONFIGURE FAILED (exit $CFG_EXIT) !!!!!"
+            tail -60 /tmp/arm64-configure.log
             exit 1
           fi
-          echo "Found library: $LIB"
-          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; || true
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 3: make -j\$(nproc)"
+          echo "================================================================"
+          make -j$(nproc) 2>&1 | tee /tmp/arm64-build.log
+          BLD_EXIT=${PIPESTATUS[0]}
+          echo ">>> BUILD EXIT: $BLD_EXIT <<<"
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 3b: generate devkit (arm64)"
+          echo "================================================================"
+          python3 releng/devkit.py frida-gumjs android-arm64 2>&1 | tee /tmp/arm64-devkit.log || true
+          DEVKIT_EXIT=${PIPESTATUS[0]}
+          echo ">>> DEVKIT SCRIPT EXIT: $DEVKIT_EXIT <<<"
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 3c: list ALL .a files under build (diagnostic)"
+          echo "================================================================"
+          find build -name "*.a" -exec ls -lah {} \; | sort || true
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 4: locate self-contained libfrida-gumjs.a"
+          echo "================================================================"
+          # 1) prefer devkit archive (no version suffix, usually self-contained)
+          LIB=$(find build -name "libfrida-gumjs.a" | head -1)
+          # 2) fallback: any libfrida-gumjs*.a that is NOT inspector and NOT the raw build one
+          if [ -z "$LIB" ]; then
+            LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          fi
+          if [ -z "$LIB" ]; then
+            LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          fi
+
+          echo ">>> Selected library: ${LIB:-<none>}"
+          if [ -z "$LIB" ]; then
+            echo "!!!!! NO SUITABLE libfrida-gumjs.a FOUND !!!!!"
+            echo "=== devkit log tail ==="
+            tail -80 /tmp/arm64-devkit.log || true
+            echo "=== build log tail ==="
+            tail -80 /tmp/arm64-build.log || true
+            exit 1
+          fi
+
+          echo "✓ arm64 library located"
 
       - name: Stage arm64
         run: |
+          set -e
           DEST=/tmp/frida-built/arm64-v8a
-          mkdir -p "$DEST/lib" "$DEST/include"
-          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs-*.a" ! -name "*inspector*" | head -1)
-          if [ -z "$LIB" ]; then echo "No arm64 lib"; exit 1; fi
-          cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
-          cp -v /tmp/dk64/frida-gumjs.h "$DEST/include/"
-          cp -v /tmp/dk64/frida-gum.h "$DEST/include/" 2>/dev/null || true
+          rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
 
+          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
+          if [ -z "$LIB" ]; then
+            LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          fi
+          if [ -z "$LIB" ]; then
+            LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          fi
+          echo ">>> Staging library: $LIB"
+          [ -z "$LIB" ] && echo "FATAL: no gumjs lib for arm64" && exit 1
+          cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
+
+          GUMJS_H=$(find /tmp/dk64 -name "frida-gumjs.h" | head -1)
+          GUM_H=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
+          [ -n "$GUMJS_H" ] && cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
+          [ -n "$GUM_H" ] && cp -v "$GUM_H" "$DEST/include/frida-gum.h"
+          GLIB_DIR=$(find /tmp/dk64 -type d -name "glib-2.0" | head -1)
+          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
+
+          echo ">>> Staged arm64:"
+          ls -lah "$DEST/lib/"
+
+      # ============ ARMv7 BUILD ============
       - name: Build armv7
         timeout-minutes: 60
         run: |
           set -o pipefail
-          source /tmp/meson_opts.sh
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
+
+          echo "================================================================"
+          echo "STEP 1: rm -rf build"
+          echo "================================================================"
           rm -rf build
+          echo "✓ build dir removed"
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 2: ./configure --host=android-arm"
+          echo "================================================================"
           ./configure --host=android-arm -- \
-            "${OPTS[@]}" \
+            -Ddevkits=gum,gumjs \
+            -Dgumjs=enabled \
+            -Dquickjs=enabled \
+            -Dv8=disabled \
+            -Ddatabase=disabled \
+            -Dtests=disabled \
+            -Ddiet=true \
+            -Db_ndebug=true \
+            -Ddefault_library=static \
+            -Dlibunwind:minidebuginfo=disabled \
+            -Dlibdwarf:decompression=false \
             2>&1 | tee /tmp/armv7-configure.log
           CFG_EXIT=${PIPESTATUS[0]}
-          if [ $CFG_EXIT -ne 0 ]; then tail -80 /tmp/armv7-configure.log; exit 1; fi
+          echo ">>> CONFIGURE EXIT: $CFG_EXIT <<<"
 
-          make -j$(nproc) 2>&1 | tee /tmp/armv7-build.log
-          BLD_EXIT=${PIPESTATUS[0]}
-          LIB=$(find build -name "libfrida-gumjs-*.a" ! -name "*inspector*" | head -1)
-          if [ -z "$LIB" ]; then
-            echo "::error::No libfrida-gumjs .a found after make (armv7)"
-            tail -100 /tmp/armv7-build.log
+          if [ $CFG_EXIT -ne 0 ]; then
+            echo "!!!!! CONFIGURE FAILED (exit $CFG_EXIT) !!!!!"
+            tail -60 /tmp/armv7-configure.log
             exit 1
           fi
-          echo "Found armv7 library: $LIB"
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 3: make -j\$(nproc)"
+          echo "================================================================"
+          make -j$(nproc) 2>&1 | tee /tmp/armv7-build.log
+          BLD_EXIT=${PIPESTATUS[0]}
+          echo ">>> BUILD EXIT: $BLD_EXIT <<<"
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 3b: generate devkit (armv7)"
+          echo "================================================================"
+          python3 releng/devkit.py frida-gumjs android-arm 2>&1 | tee /tmp/armv7-devkit.log || true
+          DEVKIT_EXIT=${PIPESTATUS[0]}
+          echo ">>> DEVKIT SCRIPT EXIT: $DEVKIT_EXIT <<<"
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 3c: list ALL .a files under build (diagnostic)"
+          echo "================================================================"
+          find build -name "*.a" -exec ls -lah {} \; | sort || true
+
+          echo ""
+          echo "================================================================"
+          echo "STEP 4: locate self-contained libfrida-gumjs.a (armv7)"
+          echo "================================================================"
+          LIB=$(find build -name "libfrida-gumjs.a" | head -1)
+          if [ -z "$LIB" ]; then
+            LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          fi
+          if [ -z "$LIB" ]; then
+            LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          fi
+
+          echo ">>> Selected library: ${LIB:-<none>}"
+          if [ -z "$LIB" ]; then
+            echo "!!!!! NO SUITABLE libfrida-gumjs.a FOUND (armv7) !!!!!"
+            tail -80 /tmp/armv7-devkit.log || true
+            tail -80 /tmp/armv7-build.log || true
+            exit 1
+          fi
+
+          echo "✓ armv7 library located"
 
       - name: Stage armv7
         run: |
+          set -e
           DEST=/tmp/frida-built/armeabi-v7a
-          mkdir -p "$DEST/lib" "$DEST/include"
-          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs-*.a" ! -name "*inspector*" | head -1)
-          if [ -z "$LIB" ]; then echo "No armv7 lib"; exit 1; fi
+          rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
+
+          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
+          if [ -z "$LIB" ]; then
+            LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          fi
+          if [ -z "$LIB" ]; then
+            LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          fi
+          echo ">>> Staging library: $LIB"
+          [ -z "$LIB" ] && echo "FATAL: no gumjs lib for armv7" && exit 1
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
-          cp -v /tmp/dk32/frida-gumjs.h "$DEST/include/"
+
+          GUMJS_H=$(find /tmp/dk32 -name "frida-gumjs.h" | head -1)
+          GUM_H=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
+          [ -n "$GUMJS_H" ] && cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
+          [ -n "$GUM_H" ] && cp -v "$GUM_H" "$DEST/include/frida-gum.h"
+          GLIB_DIR=$(find /tmp/dk32 -type d -name "glib-2.0" | head -1)
+          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
+
+          echo ">>> Staged armv7:"
+          ls -lah "$DEST/lib/"
 
       - name: Compile agent.js
         run: |
@@ -195,6 +313,7 @@ jobs:
                   var cls = Java.use(cmd.className);
                   var m = cls[cmd.methodName].overloads[0];
                   m.implementation = function() { return cmd.returnValue; };
+                  console.log("[*] Patched " + cmd.className + "." + cmd.methodName);
                 }
               } catch (e) { console.log("[!] " + e.message); }
             });
@@ -204,6 +323,18 @@ jobs:
           npx frida-compile agent.js -o agent-compiled.js -S -c
           mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets"
           cp agent-compiled.js "$GITHUB_WORKSPACE/app/src/main/assets/agent.js"
+          echo "✓ agent.js ready"
+
+      - name: Verify sources
+        run: |
+          for f in app/src/main/cpp/tool/native-lib.cpp \
+                   app/src/main/cpp/tool/dex_data.h \
+                   app/src/main/java/com/menu/imgui/Helper.java \
+                   app/src/main/java/com/menu/imgui/OverlaySurfaceView.java \
+                   app/src/main/assets/agent.js; do
+            test -s "$f" && echo "✓ $f" || (echo "✗ $f" && exit 1)
+          done
+          grep -q "gum_init_embedded" app/src/main/cpp/tool/native-lib.cpp
 
       - name: Write CMakeLists.txt
         run: |
@@ -211,21 +342,30 @@ jobs:
           cmake_minimum_required(VERSION 3.22.1)
           project("tool")
           set(CMAKE_CXX_STANDARD 17)
+          if(NOT CMAKE_BUILD_TYPE)
+              set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+          endif()
           set(CMAKE_C_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
           set(CMAKE_CXX_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
           if(${ANDROID_ABI} STREQUAL "arm64-v8a")
               set(FRIDA_DIR /tmp/frida-built/arm64-v8a)
           elseif(${ANDROID_ABI} STREQUAL "armeabi-v7a")
               set(FRIDA_DIR /tmp/frida-built/armeabi-v7a)
+          else()
+              message(FATAL_ERROR "Unsupported ABI")
           endif()
-          include_directories(${FRIDA_DIR}/include)
+          include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
           add_library(frida-gumjs STATIC IMPORTED)
           set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
           include_directories(imgui imgui/backends tool)
           add_library(tool SHARED
               tool/native-lib.cpp
-              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
-              imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
+              imgui/imgui.cpp
+              imgui/imgui_draw.cpp
+              imgui/imgui_tables.cpp
+              imgui/imgui_widgets.cpp
+              imgui/backends/imgui_impl_android.cpp
+              imgui/backends/imgui_impl_opengl3.cpp)
           target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
           target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
           EOF
@@ -244,21 +384,34 @@ jobs:
                   applicationId = "com.example.tool"
                   minSdk = 27
                   targetSdk = 34
-                  externalNativeBuild { cmake {
-                      cppFlags += "-std=c++17"
-                      arguments += listOf("-DCMAKE_BUILD_TYPE=Release")
-                  } }
+                  versionCode = 1
+                  versionName = "1.0"
+                  externalNativeBuild {
+                      cmake {
+                          cppFlags += "-std=c++17"
+                          arguments += listOf("-DCMAKE_BUILD_TYPE=Release")
+                      }
+                  }
                   ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
               }
-              externalNativeBuild { cmake {
-                  path = file("src/main/cpp/CMakeLists.txt")
-                  version = "3.22.1"
-              } }
+              externalNativeBuild {
+                  cmake {
+                      path = file("src/main/cpp/CMakeLists.txt")
+                      version = "3.22.1"
+                  }
+              }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
               kotlinOptions { jvmTarget = "17" }
+              buildTypes {
+                  getByName("debug") {
+                      externalNativeBuild {
+                          cmake { arguments += listOf("-DCMAKE_BUILD_TYPE=Release") }
+                      }
+                  }
+              }
               packaging { jniLibs { useLegacyPackaging = true } }
           }
           dependencies {
@@ -278,18 +431,48 @@ jobs:
           rm -rf app/.cxx app/build .gradle
           ./gradlew :app:assembleDebug --no-build-cache --stacktrace
 
-      - name: Strip + report
+      - name: Strip + size report
         run: |
           NDK_STRIP=$(find $NDK_PATH -name "llvm-strip" | head -1)
+          for SO in $(find app/build -name "libtool.so"); do
+            ABI=$(echo "$SO" | grep -oE "(arm64-v8a|armeabi-v7a)")
+            echo "=== $ABI ==="
+            echo "Before: $(stat -c%s "$SO" | numfmt --to=iec)"
+            $NDK_STRIP --strip-all "$SO"
+            SIZE=$(stat -c%s "$SO")
+            echo "After: $(awk "BEGIN {printf \"%.2f\", $SIZE/1048576}") MB"
+          done
+
+      - name: Show APK
+        run: |
+          APK=$(find app/build -name "*.apk" | head -1)
+          echo "APK: $(ls -lah "$APK" | awk '{print $5}')"
+          unzip -l "$APK" | grep "\.so"
+
+      - name: Extract artifacts
+        run: |
           mkdir -p /tmp/so-out
           for SO in $(find app/build -name "libtool.so"); do
             ABI=$(echo "$SO" | grep -oE "(arm64-v8a|armeabi-v7a)")
             cp "$SO" "/tmp/so-out/libtool-${ABI}.so"
-            $NDK_STRIP --strip-all "/tmp/so-out/libtool-${ABI}.so"
-            echo "$ABI: $(awk "BEGIN {printf \"%.2f MB\", $(stat -c%s /tmp/so-out/libtool-${ABI}.so)/1048576}")"
           done
+          ls -lah /tmp/so-out/
 
       - uses: actions/upload-artifact@v4
         with:
           name: libtool-slim
           path: /tmp/so-out/*.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-slim
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Commit
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "fix: use devkit archive for self-contained libfrida-gumjs.a [skip ci]"
+          git push
