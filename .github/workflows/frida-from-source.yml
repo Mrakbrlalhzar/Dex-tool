@@ -45,10 +45,7 @@ jobs:
           mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
           wget -q "$B/frida-gumjs-devkit-$V-android-arm.tar.xz" -O /tmp/dk32.tar.xz
           mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
-          echo "=== /tmp/dk64 contents ==="
-          find /tmp/dk64 -maxdepth 2 | head -30
-          echo "=== /tmp/dk32 contents ==="
-          find /tmp/dk32 -maxdepth 2 | head -30
+          echo "devkits ready"
 
       - name: Clone frida-gum
         run: |
@@ -85,32 +82,18 @@ jobs:
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { echo "FATAL: no arm64 lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-
           GUMJS_H=$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)
-          if [ -z "$GUMJS_H" ]; then echo "FATAL: frida-gumjs.h missing"; find /tmp/dk64 -type f | head -40; exit 1; fi
+          [ -z "$GUMJS_H" ] && { echo "FATAL: frida-gumjs.h missing"; find /tmp/dk64 -type f | head -40; exit 1; }
           cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
-
           G=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
           [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
           [ -z "$G" ] && G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1)
-          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN: frida-gum.h not found"; fi
-
-          echo "=== /tmp/dk64 ==="
-          ls -la /tmp/dk64 2>/dev/null || true
-          echo "=== /tmp/frida-gum/build/gum/devkit ==="
-          ls -la /tmp/frida-gum/build/gum/devkit 2>/dev/null || echo "(missing)"
-
+          [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build -type d -name 'glib-2.0' 2>/dev/null | head -1)
-          if [ -n "$GLIB_DIR" ]; then
-              echo "Found glib-2.0 at: $GLIB_DIR"
-              cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
-          else
-              echo "WARN: glib-2.0 headers not found (diet mode should not need them)"
-          fi
-          echo "=== staged include ==="; ls -la "$D/include/"
-          echo "=== staged lib ==="; ls -lah "$D/lib/"
+          if [ -n "$GLIB_DIR" ]; then echo "glib-2.0 at: $GLIB_DIR"; cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN: glib-2.0 headers missing (diet mode - OK)"; fi
+          ls -lah "$D/lib/"
 
       - name: Build armv7
         timeout-minutes: 60
@@ -140,27 +123,40 @@ jobs:
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { echo "FATAL: no armv7 lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-
           GUMJS_H=$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)
-          if [ -z "$GUMJS_H" ]; then echo "FATAL: frida-gumjs.h missing"; find /tmp/dk32 -type f | head -40; exit 1; fi
+          [ -z "$GUMJS_H" ] && { echo "FATAL: frida-gumjs.h missing"; find /tmp/dk32 -type f | head -40; exit 1; }
           cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
-
           G=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
           [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
           [ -z "$G" ] && G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1)
-          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN: frida-gum.h not found"; fi
-
+          [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build -type d -name 'glib-2.0' 2>/dev/null | head -1)
-          if [ -n "$GLIB_DIR" ]; then
-              echo "Found glib-2.0 at: $GLIB_DIR"
-              cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
-          else
-              echo "WARN: glib-2.0 headers not found (diet mode should not need them)"
-          fi
-          echo "=== staged include ==="; ls -la "$D/include/"
-          echo "=== staged lib ==="; ls -lah "$D/lib/"
+          if [ -n "$GLIB_DIR" ]; then echo "glib-2.0 at: $GLIB_DIR"; cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN: glib-2.0 headers missing (diet mode - OK)"; fi
+          ls -lah "$D/lib/"
+
+      # ============================================================
+      # FIX broken `if (if (` from previous iteration (before all patches)
+      # ============================================================
+      - name: Fix broken if-if in native-lib.cpp
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib
+          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
+          s = p.read_text(); orig = s
+          # The broken pattern from previous iteration:
+          # `if (if (ImGui::BeginTabItem("Log")) { ... } if (ImGui::BeginTabItem("Patches"))`
+          # Correct it: remove the extra leading `if (` before `ImGui::BeginTabItem("Log")`.
+          if 'if (if (ImGui::BeginTabItem("Log"))' in s:
+              s = s.replace('if (if (ImGui::BeginTabItem("Log"))',
+                            'if (ImGui::BeginTabItem("Log"))', 1)
+              print("PASS: removed duplicate 'if (' in Log tab")
+          else:
+              print("SKIP: no broken if(if( found")
+          if s != orig:
+              p.write_text(s)
+          PYEOF
 
       # ============================================================
       # PATCH Helper.java
@@ -175,10 +171,12 @@ jobs:
           if "sOverlayWm" not in s:
               s = s.replace("private static OverlaySurfaceView overlay;",
                   "private static OverlaySurfaceView overlay; private static android.view.WindowManager sOverlayWm; private static android.view.WindowManager.LayoutParams sOverlayLp;", 1)
+              print("PASS: overlay fields")
 
           if "sOverlayWm = wm;" not in s:
               s = s.replace("wm.addView(glView, lp);",
                   "wm.addView(glView, lp); sOverlayWm = wm; sOverlayLp = lp;", 1)
+              print("PASS: store wm/lp")
 
           old_resume = "if (a == activity) glView.onResume();"
           new_resume = ("if (a == activity) { glView.onResume(); try { "
@@ -187,10 +185,12 @@ jobs:
               "} } catch (Throwable t) {} }")
           if old_resume in s and "re-attached on resume" not in s:
               s = s.replace(old_resume, new_resume, 1)
+              print("PASS: re-attach on resume")
 
           if "nativePatchMethod" not in s:
               s = s.replace("static native void nativeSetPatches",
                   "static native void nativePatchMethod(String className, String methodName, String returnValue); static native void nativeSetPatches", 1)
+              print("PASS: nativePatchMethod decl")
 
           m = re.search(r'public static void requestPatchMethod\([^)]*\)\s*\{', s)
           if m:
@@ -210,6 +210,7 @@ jobs:
                       'syncPatches(); nativePatchMethod(className, target, value); }')
                   s = s[:m.start()] + body + s[end:]
                   print("PASS: requestPatchMethod with nativePatchMethod")
+
           p.write_text(s)
           PYEOF
 
@@ -226,6 +227,7 @@ jobs:
           if "setPreserveEGLContextOnPause" not in s:
               s = s.replace("setRenderMode(RENDERMODE_CONTINUOUSLY);",
                   "setRenderMode(RENDERMODE_CONTINUOUSLY); setPreserveEGLContextOnPause(true);", 1)
+              print("PASS: EGL preserve")
 
           if "onTouchEvent" not in s:
               methods = textwrap.dedent("""
@@ -247,7 +249,8 @@ jobs:
               """)
               s = s.replace("@Override public boolean onCheckIsTextEditor()",
                   methods + "\n@Override public boolean onCheckIsTextEditor()", 1)
-              print("PASS: onTouchEvent + dispatchKeyEvent inserted")
+              print("PASS: onTouchEvent + dispatchKeyEvent")
+
           p.write_text(s)
           PYEOF
 
@@ -268,6 +271,7 @@ jobs:
           if "gCallLog" not in s:
               s = s.replace("static GumScript* g_script = nullptr;",
                   "static GumScript* g_script = nullptr;\nstatic std::vector<std::string> gCallLog;\nstatic std::mutex gCallLogMutex;", 1)
+              print("PASS: gCallLog")
 
           new_js = textwrap.dedent(r"""
               Java.perform(function() {
@@ -357,10 +361,19 @@ jobs:
                   "gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string(\"[CALL] \")+className+\".\"+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }", 1)
               print("PASS: call log")
 
+          # Log tab - correct pattern (keep leading `if (`)
           if 'BeginTabItem("Log")' not in s:
-              s = s.replace('ImGui::BeginTabItem("Patches")',
-                  'if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); ImGui::BeginChild("##logchild", ImVec2(0,0), true); for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); ImGui::EndChild(); ImGui::EndTabItem(); } if (ImGui::BeginTabItem("Patches")', 1)
-              print("PASS: Log tab")
+              old = 'if (ImGui::BeginTabItem("Patches"))'
+              new = ('if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); '
+                     'ImGui::BeginChild("##logchild", ImVec2(0,0), true); '
+                     'for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); '
+                     'ImGui::EndChild(); ImGui::EndTabItem(); }\n'
+                     '        if (ImGui::BeginTabItem("Patches"))')
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  print("PASS: Log tab (correct pattern)")
+              else:
+                  print("WARN: anchor 'if (ImGui::BeginTabItem(\"Patches\"))' not found")
 
           p.write_text(s)
           PYEOF
@@ -379,9 +392,13 @@ jobs:
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
           chk app/src/main/cpp/tool/native-lib.cpp 'BeginTabItem("Log")'
+          if grep -q "if (if (ImGui::BeginTabItem" app/src/main/cpp/tool/native-lib.cpp; then
+            echo "ERR broken if(if( still present"; FAIL=1
+          else
+            echo "OK  no broken if(if("
+          fi
           if [ $FAIL -ne 0 ]; then
-            echo "===== Helper attach =====" ; grep -n "attach\|nativePatchMethod\|sOverlay" app/src/main/java/com/menu/imgui/Helper.java | head -20
-            echo "===== Overlay =====" ; grep -n "onTouchEvent\|dispatchKeyEvent\|setPreserveEGL" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -20
+            echo "===== native-lib Log tab area =====" ; grep -n "BeginTabItem" app/src/main/cpp/tool/native-lib.cpp | head -20
             exit 1
           fi
           echo "ALL OK"
@@ -464,5 +481,5 @@ jobs:
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: guard glib-2.0 cp (diet mode does not need it) + diagnostics [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: correct Log tab insertion (preserve leading if), repair broken if(if(, glib guard [skip ci]"
           git push
