@@ -32,6 +32,29 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 public class Helper {
+
+    private static void registerLifecycle(Activity activity, OverlaySurfaceView glView) {
+        activity.getApplication().registerActivityLifecycleCallbacks(
+            new android.app.Application.ActivityLifecycleCallbacks() {
+                @Override public void onActivityPaused(Activity a) { if (a == activity) glView.onPause(); }
+                @Override public void onActivityResumed(Activity a) { if (a == activity) glView.onResume(); }
+                @Override public void onActivityCreated(Activity a, android.os.Bundle b) {}
+                @Override public void onActivityStarted(Activity a) {}
+                @Override public void onActivityStopped(Activity a) {}
+                @Override public void onActivitySaveInstanceState(Activity a, android.os.Bundle b) {}
+                @Override public void onActivityDestroyed(Activity a) {}
+            });
+    }
+
+
+    private static boolean patchRecordExists(List<PatchRecord> list, String cls, String name, String sig) {
+        for (PatchRecord r : list) {
+            if (r.className.equals(cls) && r.methodName.equals(name)
+                    && (sig == null || sig.equals(r.signature))) return true;
+        }
+        return false;
+    }
+
     private static final String TAG = "ImGuiTool";
     private static OverlaySurfaceView overlay;
     private static final Map<String, Object> sInstances = new HashMap<>();

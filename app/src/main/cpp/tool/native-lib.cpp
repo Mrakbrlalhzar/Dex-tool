@@ -1,4 +1,6 @@
 #include <jni.h>
+#include <mutex>
+static std::once_flag frida_once;
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include "imgui.h"
@@ -730,7 +732,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     if (!loadDex(env)) return JNI_VERSION_1_6;
 
     // Init Frida (FIXED)
-    gum_init_embedded();
+    std::call_once(frida_once, []() { gum_init_embedded(); });
     LOGI("Frida Gum initialized");
     init_frida_script();
 
