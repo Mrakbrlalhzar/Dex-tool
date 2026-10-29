@@ -29,7 +29,7 @@ jobs:
           done
           ls -la
 
-      - name: Install dependencies (NDK r25c + Meson + Node.js + zipalign)
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -41,9 +41,9 @@ jobs:
           echo "NDK_PATH=/tmp/android-ndk-r25c" >> $GITHUB_ENV
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
-          echo "✓ NDK: $NDK_PATH"; node --version
+          echo "NDK_PATH=$NDK_PATH"; node --version
 
-      - name: Download Frida devkit (HEADERS)
+      - name: Download Frida devkit
         run: |
           set -e
           FRIDA_VERSION="17.1.0"
@@ -52,21 +52,20 @@ jobs:
           mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
           wget -q "${BASE}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm.tar.xz" -O /tmp/dk32.tar.xz
           mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
-          echo "✓ devkits ready"
+          echo "devkits ready"
 
       - name: Clone frida-gum source
         run: |
           git clone --recursive --depth 1 --branch 17.1.0 \
             https://github.com/frida/frida-gum.git /tmp/frida-gum
-          cd /tmp/frida-gum; echo "✓ cloned"
+          cd /tmp/frida-gum; echo "cloned"
 
       - name: Patch glib_init
         run: |
           cd /tmp/frida-gum
           sed -i '1i void glib_init(void);' bindings/gumjs/gumquickcompile.c
-          echo "✓ patched"
+          echo "patched"
 
-      # ============ ARM64 BUILD ============
       - name: Build arm64
         timeout-minutes: 60
         run: |
@@ -86,9 +85,9 @@ jobs:
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          echo ">>> Selected: ${LIB:-<none>}"
+          echo ">>> Selected: ${LIB:-none}"
           [ -z "$LIB" ] && { tail -80 /tmp/arm64-devkit.log; exit 1; }
-          echo "✓ arm64 library located"
+          echo "arm64 library located"
 
       - name: Stage arm64
         run: |
@@ -107,7 +106,6 @@ jobs:
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
           ls -lah "$DEST/lib/"
 
-      # ============ ARMv7 BUILD ============
       - name: Build armv7
         timeout-minutes: 60
         run: |
@@ -127,9 +125,9 @@ jobs:
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          echo ">>> Selected: ${LIB:-<none>}"
+          echo ">>> Selected: ${LIB:-none}"
           [ -z "$LIB" ] && { tail -80 /tmp/armv7-devkit.log; exit 1; }
-          echo "✓ armv7 library located"
+          echo "armv7 library located"
 
       - name: Stage armv7
         run: |
@@ -148,148 +146,167 @@ jobs:
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
           ls -lah "$DEST/lib/"
 
-      # ============ PATCH SOURCES ============
-      - name: Patch Helper.java (attach + dedup + lifecycle)
+      - name: Patch Helper.java
         run: |
-          python3 - << 'PYEOF'
+          python3 - <<'PYEOF'
           import re, pathlib, sys
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text(); orig = s
 
-          # 1. patchRecordExists
-          if "patchRecordExists" not in s:
-              marker = "public class Helper {"
-              if marker in s:
-                  s = s.replace(marker, marker + '''
-    private static boolean patchRecordExists(java.util.List<PatchRecord> list, String cls, String name, String sig) {
-        for (PatchRecord r : list) {
-            if (r.className.equals(cls) && r.methodName.equals(name)
-                    && (sig == null || sig.equals(r.signature))) return true;
-        }
-        return false;
-    }
-''', 1)
-                  print("✓ inserted patchRecordExists")
-              else:
-                  print("✗ could not find 'public class Helper {'")
-
-          # 2. registerLifecycle
+          # 1. registerLifecycle (insert after class opening)
+          register_lifecycle = "\n".join([
+              "private static void registerLifecycle(android.app.Activity activity, OverlaySurfaceView glView) {",
+              "    activity.getApplication().registerActivityLifecycleCallbacks(",
+              "        new android.app.Application.ActivityLifecycleCallbacks() {",
+              "            @Override public void onActivityPaused(android.app.Activity a) { if (a == activity) glView.onPause(); }",
+              "            @Override public void onActivityResumed(android.app.Activity a) { if (a == activity) glView.onResume(); }",
+              "            @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}",
+              "            @Override public void onActivityStarted(android.app.Activity a) {}",
+              "            @Override public void onActivityStopped(android.app.Activity a) {}",
+              "            @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}",
+              "            @Override public void onActivityDestroyed(android.app.Activity a) {}",
+              "        });",
+              "}",
+          ])
           if "registerLifecycle" not in s:
-              marker = "public class Helper {"
-              if marker in s:
-                  s = s.replace(marker, marker + '''
-    private static void registerLifecycle(android.app.Activity activity, OverlaySurfaceView glView) {
-        activity.getApplication().registerActivityLifecycleCallbacks(
-            new android.app.Application.ActivityLifecycleCallbacks() {
-                @Override public void onActivityPaused(android.app.Activity a) { if (a == activity) glView.onPause(); }
-                @Override public void onActivityResumed(android.app.Activity a) { if (a == activity) glView.onResume(); }
-                @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}
-                @Override public void onActivityStarted(android.app.Activity a) {}
-                @Override public void onActivityStopped(android.app.Activity a) {}
-                @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}
-                @Override public void onActivityDestroyed(android.app.Activity a) {}
-            });
-    }
-''', 1)
-                  print("✓ inserted registerLifecycle")
-
-          # 3. replace attach() with brace-counting, accept Context or Activity param
-          if "TYPE_APPLICATION_PANEL" not in s:
-              m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*(?:android\.content\.)?(?:Context|Activity)\s+\w+\s*\)\s*\{', s)
-              if m:
-                  brace_start = s.index('{', m.end() - 1)
-                  depth = 0; end = -1
-                  for i in range(brace_start, len(s)):
-                      if s[i] == '{': depth += 1
-                      elif s[i] == '}':
-                          depth -= 1
-                          if depth == 0: end = i + 1; break
-                  if end > 0:
-                      new_attach = '''public static void attach(Context context) {
-        final android.app.Activity activity = (context instanceof android.app.Activity)
-            ? (android.app.Activity) context
-            : (android.app.Activity) ((android.content.ContextWrapper) context).getBaseContext();
-        activity.runOnUiThread(() -> {
-            final android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
-            if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(context)); return; }
-            OverlaySurfaceView glView = new OverlaySurfaceView(activity);
-            android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
-                android.view.WindowManager.LayoutParams.MATCH_PARENT,
-                android.view.WindowManager.LayoutParams.MATCH_PARENT,
-                android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                    | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                    | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                android.graphics.PixelFormat.TRANSLUCENT);
-            lp.alpha = 0.01f;
-            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
-            decor.addView(glView, lp);
-            registerLifecycle(activity, glView);
-        });
-    }'''
-                      s = s[:m.start()] + new_attach + s[end:]
-                      print("✓ replaced attach() method")
-                  else:
-                      print("✗ brace-count failed for attach()")
-              else:
-                  print("✗ attach(Context|Activity) signature not found — PATTERN NEEDS ADJUSTMENT")
+              m = re.search(r'(public\s+class\s+Helper\s*\{)', s)
+              if not m:
+                  print("FAIL: could not find 'public class Helper {'")
                   sys.exit(2)
+              s = s[:m.end()] + "\n" + register_lifecycle + "\n" + s[m.end():]
+              print("PASS: inserted registerLifecycle")
+          else:
+              print("SKIP: registerLifecycle already present")
+
+          # 2. replace attach (idempotency marker: 'Overlay added to DecorView')
+          if "Overlay added to DecorView" not in s:
+              m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*(?:android\.content\.)?(?:Context|Activity)\s+\w+\s*\)\s*\{', s)
+              if not m:
+                  print("FAIL: attach(Context|Activity) signature not found")
+                  print("--- grep of 'attach' ---")
+                  for i, line in enumerate(s.splitlines(), 1):
+                      if "attach" in line:
+                          print(i, line)
+                  sys.exit(2)
+              brace_start = s.index('{', m.end() - 1)
+              depth = 0; end = -1
+              for i in range(brace_start, len(s)):
+                  if s[i] == '{': depth += 1
+                  elif s[i] == '}':
+                      depth -= 1
+                      if depth == 0: end = i + 1; break
+              if end < 0:
+                  print("FAIL: brace-count failed for attach")
+                  sys.exit(2)
+              new_attach = "\n".join([
+                  "public static void attach(Context context) {",
+                  "    final android.app.Activity activity;",
+                  "    if (context instanceof android.app.Activity) {",
+                  "        activity = (android.app.Activity) context;",
+                  "    } else if (context instanceof android.content.ContextWrapper) {",
+                  "        android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();",
+                  "        activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;",
+                  "    } else {",
+                  "        activity = null;",
+                  "    }",
+                  "    if (activity == null) { android.util.Log.e(\"DexTool\", \"attach: no Activity\"); return; }",
+                  "    activity.runOnUiThread(() -> {",
+                  "        final android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();",
+                  "        if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(activity)); return; }",
+                  "        OverlaySurfaceView glView = new OverlaySurfaceView(activity);",
+                  "        android.view.ViewGroup.LayoutParams lp = new android.view.ViewGroup.LayoutParams(",
+                  "            android.view.ViewGroup.LayoutParams.MATCH_PARENT,",
+                  "            android.view.ViewGroup.LayoutParams.MATCH_PARENT);",
+                  "        decor.addView(glView, lp);",
+                  "        registerLifecycle(activity, glView);",
+                  "        android.util.Log.i(\"DexTool\", \"Overlay added to DecorView\");",
+                  "    });",
+                  "}",
+              ])
+              s = s[:m.start()] + new_attach + s[end:]
+              print("PASS: replaced attach")
+          else:
+              print("SKIP: attach already replaced")
+
+          # 3. best-effort dedup in syncPatches
+          if "TEMP:DEDUP" not in s:
+              sm = re.search(r'void\s+syncPatches\s*\(\s*\)\s*\{', s)
+              fm = re.search(r'((?:List|ArrayList|Collection|LinkedList)\s*<\s*PatchRecord\s*>\s*)(\w+)\s*[;=]', s)
+              if sm and fm:
+                  field_name = fm.group(2)
+                  dedup = "\n".join([
+                      "        // TEMP:DEDUP",
+                      "        try {",
+                      "            java.util.Map<String, PatchRecord> __map = new java.util.LinkedHashMap<>();",
+                      "            java.lang.reflect.Field __fC = null, __fM = null;",
+                      "            for (PatchRecord __r : " + field_name + ") {",
+                      "                if (__fC == null) {",
+                      "                    try { __fC = __r.getClass().getDeclaredField(\"className\"); __fC.setAccessible(true); } catch (Throwable __e) {}",
+                      "                    try { __fM = __r.getClass().getDeclaredField(\"methodName\"); __fM.setAccessible(true); } catch (Throwable __e) {}",
+                      "                }",
+                      "                String __k;",
+                      "                if (__fC != null && __fM != null) {",
+                      "                    __k = String.valueOf(__fC.get(__r)) + \"#\" + String.valueOf(__fM.get(__r));",
+                      "                } else {",
+                      "                    __k = String.valueOf(System.identityHashCode(__r));",
+                      "                }",
+                      "                __map.put(__k, __r);",
+                      "            }",
+                      "            " + field_name + ".clear();",
+                      "            " + field_name + ".addAll(__map.values());",
+                      "        } catch (Throwable __t) { }",
+                      "",
+                  ])
+                  s = s[:sm.end()] + dedup + s[sm.end():]
+                  print("PASS: inserted dedup in syncPatches (field '" + field_name + "')")
+              else:
+                  print("WARN: syncPatches or patch list field not found; dedup skipped")
+          else:
+              print("SKIP: dedup already present")
 
           if s == orig:
-              print("⚠ Helper.java unchanged — some patches were no-ops")
+              print("WARN: Helper.java unchanged")
           p.write_text(s)
           PYEOF
 
-      - name: Patch OverlaySurfaceView.java (numeric IME inside class body)
+      - name: Patch OverlaySurfaceView.java
         run: |
-          python3 - << 'PYEOF'
+          python3 - <<'PYEOF'
           import re, pathlib, sys
           p = pathlib.Path("app/src/main/java/com/menu/imgui/OverlaySurfaceView.java")
           s = p.read_text(); orig = s
 
-          if "TYPE_CLASS_NUMBER" in s:
-              print("✓ TYPE_CLASS_NUMBER already present — skipping")
-          else:
-              # find class declaration opening brace
+          numeric_ime = "\n".join([
+              "@Override",
+              "public android.view.inputmethod.InputConnection onCreateInputConnection(android.view.inputmethod.EditorInfo outAttrs) {",
+              "    android.view.inputmethod.InputConnection ic = super.onCreateInputConnection(outAttrs);",
+              "    if (Helper.nativeWantKeyboard()) {",
+              "        outAttrs.inputType = android.text.InputType.TYPE_CLASS_NUMBER",
+              "            | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL",
+              "            | android.text.InputType.TYPE_NUMBER_FLAG_SIGNED;",
+              "        outAttrs.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE;",
+              "    }",
+              "    return ic;",
+              "}",
+          ])
+          if "TYPE_CLASS_NUMBER" not in s:
               m = re.search(r'(public\s+)?class\s+OverlaySurfaceView\b[^{]*\{', s)
               if not m:
-                  print("✗ class OverlaySurfaceView declaration not found — PATTERN NEEDS ADJUSTMENT")
+                  print("FAIL: class OverlaySurfaceView declaration not found")
                   sys.exit(2)
-              insert_at = m.end()
-              numeric_ime = '''
-    @Override
-    public android.view.inputmethod.InputConnection onCreateInputConnection(android.view.inputmethod.EditorInfo outAttrs) {
-        android.view.inputmethod.InputConnection ic = super.onCreateInputConnection(outAttrs);
-        if (Helper.nativeWantKeyboard()) {
-            outAttrs.inputType = android.text.InputType.TYPE_CLASS_NUMBER
-                | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
-                | android.text.InputType.TYPE_NUMBER_FLAG_SIGNED;
-            outAttrs.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE;
-        }
-        return ic;
-    }
-'''
-              s = s[:insert_at] + "\n" + numeric_ime + "\n" + s[insert_at:]
-              print("✓ inserted numeric onCreateInputConnection")
-
-          # ensure setZOrderOnTop(true) — insert in constructor if missing
-          if "setZOrderOnTop" not in s:
-              # find first constructor: public OverlaySurfaceView(...) {
-              cm = re.search(r'public\s+OverlaySurfaceView\s*\([^)]*\)\s*\{', s)
-              if cm:
-                  s = s[:cm.end()] + "\n        setZOrderOnTop(true);" + s[cm.end():]
-                  print("✓ inserted setZOrderOnTop(true) in constructor")
-              else:
-                  print("⚠ constructor not found — setZOrderOnTop skipped")
+              s = s[:m.end()] + "\n" + numeric_ime + "\n" + s[m.end():]
+              print("PASS: inserted numeric onCreateInputConnection")
+          else:
+              print("SKIP: TYPE_CLASS_NUMBER already present")
 
           if s == orig:
-              print("⚠ OverlaySurfaceView.java unchanged")
+              print("WARN: OverlaySurfaceView.java unchanged")
           p.write_text(s)
           PYEOF
 
-      - name: Patch native-lib.cpp (once_flag only — CharsDecimal removed)
+      - name: Patch native-lib.cpp
         run: |
-          python3 - << 'PYEOF'
+          python3 - <<'PYEOF'
           import pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text(); orig = s
@@ -300,21 +317,23 @@ jobs:
               if 'gum_init_embedded();' in s:
                   s = s.replace('gum_init_embedded();',
                                 'static std::once_flag frida_once;\n    std::call_once(frida_once, []() { gum_init_embedded(); });', 1)
-                  print("✓ wrapped gum_init_embedded in call_once")
+                  print("PASS: wrapped gum_init_embedded")
               else:
-                  print("⚠ gum_init_embedded() pattern not found verbatim — verify manually")
+                  print("WARN: gum_init_embedded() not found verbatim")
+          else:
+              print("SKIP: once_flag already present")
 
           if s == orig:
-              print("⚠ native-lib.cpp unchanged")
+              print("WARN: native-lib.cpp unchanged")
           p.write_text(s)
           PYEOF
 
-      - name: Patch agent.js (classloader-aware + dedup hook)
+      - name: Patch agent.js
         run: |
           mkdir -p /tmp/agent && cd /tmp/agent
           npm init -y >/dev/null
           npm install frida-java-bridge >/dev/null
-          cat > agent.js << 'EOF'
+          cat > agent.js <<'AGENTEOF'
           import Java from "frida-java-bridge";
           const HOOKED = new Set();
           Java.perform(function () {
@@ -349,13 +368,13 @@ jobs:
             });
             send({ type: "ready" });
           });
-          EOF
+          AGENTEOF
           npx frida-compile agent.js -o agent-compiled.js -S -c
           mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets"
           cp agent-compiled.js "$GITHUB_WORKSPACE/app/src/main/assets/agent.js"
-          echo "✓ agent.js ready"
+          echo "agent.js ready"
 
-      - name: Verify sources (verbose per-check)
+      - name: Verify sources
         run: |
           FAIL=0
           for f in app/src/main/cpp/tool/native-lib.cpp \
@@ -363,31 +382,29 @@ jobs:
                    app/src/main/java/com/menu/imgui/Helper.java \
                    app/src/main/java/com/menu/imgui/OverlaySurfaceView.java \
                    app/src/main/assets/agent.js; do
-            if [ -s "$f" ]; then echo "✓ exists: $f"; else echo "✗ MISSING: $f"; FAIL=1; fi
+            if [ -s "$f" ]; then echo "OK  exists: $f"; else echo "ERR MISSING: $f"; FAIL=1; fi
           done
           check() {
-            if grep -q "$2" "$1"; then echo "✓ found '$2' in $1"; else echo "✗ MISSING '$2' in $1"; FAIL=1; fi
+            if grep -q "$2" "$1"; then echo "OK  found '$2' in $1"; else echo "ERR MISSING '$2' in $1"; FAIL=1; fi
           }
-          check app/src/main/cpp/tool/native-lib.cpp "gum_init_embedded"
-          check app/src/main/java/com/menu/imgui/Helper.java "TYPE_APPLICATION_PANEL"
-          check app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "TYPE_CLASS_NUMBER"
+          check app/src/main/cpp/tool/native-lib.cpp "frida_once"
+          check app/src/main/java/com/menu/imgui/Helper.java "registerLifecycle"
+          check app/src/main/java/com/menu/imgui/Helper.java "Overlay added to DecorView"
+          check app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "onCreateInputConnection"
           if [ $FAIL -ne 0 ]; then
-            echo "===== DIAGNOSTIC: current Helper.java attach area ====="
-            grep -n "attach\|TYPE_APPLICATION_PANEL\|registerLifecycle\|patchRecordExists" \
-              app/src/main/java/com/menu/imgui/Helper.java | head -30 || true
-            echo "===== DIAGNOSTIC: current OverlaySurfaceView class decl ====="
-            grep -n "class OverlaySurfaceView\|onCreateInputConnection\|TYPE_CLASS_NUMBER\|setZOrderOnTop" \
-              app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -20 || true
-            echo "===== DIAGNOSTIC: InputText usages in native-lib.cpp ====="
-            grep -n "InputText\|InputInt\|InputFloat" \
-              app/src/main/cpp/tool/native-lib.cpp | head -20 || true
+            echo "===== DIAGNOSTIC: Helper.java attach area ====="
+            grep -n "attach\|registerLifecycle\|Overlay added" app/src/main/java/com/menu/imgui/Helper.java | head -30 || true
+            echo "===== DIAGNOSTIC: OverlaySurfaceView class decl ====="
+            grep -n "class OverlaySurfaceView\|onCreateInputConnection\|TYPE_CLASS_NUMBER\|setZOrderOnTop" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -20 || true
+            echo "===== DIAGNOSTIC: native-lib InputText usages ====="
+            grep -n "InputText\|InputInt\|InputFloat" app/src/main/cpp/tool/native-lib.cpp | head -20 || true
             exit 1
           fi
-          echo "✓ all source checks passed"
+          echo "all source checks passed"
 
       - name: Write CMakeLists.txt
         run: |
-          cat > app/src/main/cpp/CMakeLists.txt << 'EOF'
+          cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
           cmake_minimum_required(VERSION 3.22.1)
           project("tool")
           set(CMAKE_CXX_STANDARD 17)
@@ -417,11 +434,11 @@ jobs:
               imgui/backends/imgui_impl_opengl3.cpp)
           target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
           target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
-          EOF
+          CMEOF
 
       - name: Write build.gradle.kts
         run: |
-          cat > app/build.gradle.kts << 'EOF'
+          cat > app/build.gradle.kts <<'GRADLEEOF'
           plugins {
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
@@ -467,7 +484,7 @@ jobs:
               implementation("androidx.core:core-ktx:1.12.0")
               implementation("androidx.appcompat:appcompat:1.6.1")
           }
-          EOF
+          GRADLEEOF
 
       - uses: gradle/actions/setup-gradle@v3
         with:
@@ -486,10 +503,10 @@ jobs:
           echo "Original APK: $APK"
           cp "$APK" /tmp/app-unaligned.apk
           zipalign -p -f 4 /tmp/app-unaligned.apk "$APK"
-          echo "✓ zipaligned with -p 4"
+          echo "zipaligned with -p 4"
           unzip -l "$APK" | grep "\.so"
 
-      - name: Strip + size report
+      - name: Strip and size report
         run: |
           NDK_STRIP=$(find $NDK_PATH -name "llvm-strip" | head -1)
           for SO in $(find app/build -name "libtool.so"); do
@@ -526,5 +543,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: robust source patches + verbose verify [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: YAML syntax + robust java/cpp patches + zipalign [skip ci]"
           git push
