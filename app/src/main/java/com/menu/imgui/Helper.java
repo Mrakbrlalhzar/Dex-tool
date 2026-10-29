@@ -37,7 +37,7 @@ public class Helper {
         activity.getApplication().registerActivityLifecycleCallbacks(
             new android.app.Application.ActivityLifecycleCallbacks() {
                 @Override public void onActivityPaused(Activity a) { if (a == activity) glView.onPause(); }
-                @Override public void onActivityResumed(Activity a) { if (a == activity) glView.onResume(); }
+                @Override public void onActivityResumed(Activity a) { if (a == activity) { glView.onResume(); try { if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { sOverlayWm.addView(glView, sOverlayLp); android.util.Log.i("DexTool", "re-attached on resume"); } } catch (Throwable t) {} } }
                 @Override public void onActivityCreated(Activity a, android.os.Bundle b) {}
                 @Override public void onActivityStarted(Activity a) {}
                 @Override public void onActivityStopped(Activity a) {}
@@ -50,7 +50,7 @@ public class Helper {
     
 
     private static final String TAG = "ImGuiTool";
-    private static OverlaySurfaceView overlay;
+    private static OverlaySurfaceView overlay; private static android.view.WindowManager sOverlayWm; private static android.view.WindowManager.LayoutParams sOverlayLp;
     private static final Map<String, Object> sInstances = new HashMap<>();
     private static Object sCurrentActivity = null;
     private static Object sApplicationContext = null;
@@ -126,7 +126,7 @@ public class Helper {
             lp.token = activity.getWindow().getDecorView().getWindowToken();
             lp.alpha = 0.01f;
             lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
-            wm.addView(glView, lp);
+            wm.addView(glView, lp); sOverlayWm = wm; sOverlayLp = lp;
             registerLifecycle(activity, glView);
             android.util.Log.i("DexTool", "Overlay added via WindowManager");
             return;
@@ -205,24 +205,7 @@ public class Helper {
         return sInstances.get(instanceName);
     }
 
-    public static void requestPatchMethod(String className, String target, String value) {
-    for (PatchRecord __p : sActivePatches) {
-        if (__p.type.equals("Method") && __p.className.equals(className) && __p.targetName.equals(target)) {
-            __p.currentValue = value;
-            syncPatches();
-            return;
-        }
-    }
-    PatchRecord p = new PatchRecord();
-    p.id = sPatchCounter++;
-    p.type = "Method";
-    p.className = className;
-    p.targetName = target;
-    p.originalValue = "(original)";
-    p.currentValue = value;
-    sActivePatches.add(p);
-    syncPatches();
-}
+    public static void requestPatchMethod(String className, String target, String value) { for (PatchRecord __p : sActivePatches) { if (__p.type.equals("Method") && __p.className.equals(className) && __p.targetName.equals(target)) { __p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return; } } PatchRecord p = new PatchRecord(); p.id = sPatchCounter++; p.type = "Method"; p.className = className; p.targetName = target; p.originalValue = "(original)"; p.currentValue = value; sActivePatches.add(p); syncPatches(); nativePatchMethod(className, target, value); }
     public static void requestPatchField(String className, String target, String value) {
     for (PatchRecord __p : sActivePatches) {
         if (__p.type.equals("Field") && __p.className.equals(className) && __p.targetName.equals(target)) {
@@ -455,5 +438,5 @@ public class Helper {
     static native void nativeSetClassDetails(int sectionId, String className, String[] fields, String[] methods);
     static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
     static native void nativeSetFieldValue(int sectionId, String className, String fieldName, String value, boolean isSet);
-    static native void nativeSetPatches(String[] patches);
+    static native void nativePatchMethod(String className, String methodName, String returnValue); static native void nativeSetPatches(String[] patches);
 }

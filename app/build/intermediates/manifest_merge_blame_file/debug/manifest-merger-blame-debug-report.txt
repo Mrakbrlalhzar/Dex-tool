@@ -57,28 +57,6 @@
 35-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:15:27-74
 36            </intent-filter>
 37        </activity>
-38
-39        <provider
-39-->[androidx.emoji2:emoji2:1.2.0] /home/runner/.gradle/caches/transforms-3/0ddb9c379c67fcbab722e7078f3a6911/transformed/emoji2-1.2.0/AndroidManifest.xml:24:9-32:20
-40            android:name="androidx.startup.InitializationProvider"
-40-->[androidx.emoji2:emoji2:1.2.0] /home/runner/.gradle/caches/transforms-3/0ddb9c379c67fcbab722e7078f3a6911/transformed/emoji2-1.2.0/AndroidManifest.xml:25:13-67
-41            android:authorities="com.example.tool.androidx-startup"
-41-->[androidx.emoji2:emoji2:1.2.0] /home/runner/.gradle/caches/transforms-3/0ddb9c379c67fcbab722e7078f3a6911/transformed/emoji2-1.2.0/AndroidManifest.xml:26:13-68
-42            android:exported="false" >
-42-->[androidx.emoji2:emoji2:1.2.0] /home/runner/.gradle/caches/transforms-3/0ddb9c379c67fcbab722e7078f3a6911/transformed/emoji2-1.2.0/AndroidManifest.xml:27:13-37
-43            <meta-data
-43-->[androidx.emoji2:emoji2:1.2.0] /home/runner/.gradle/caches/transforms-3/0ddb9c379c67fcbab722e7078f3a6911/transformed/emoji2-1.2.0/AndroidManifest.xml:29:13-31:52
-44                android:name="androidx.emoji2.text.EmojiCompatInitializer"
-44-->[androidx.emoji2:emoji2:1.2.0] /home/runner/.gradle/caches/transforms-3/0ddb9c379c67fcbab722e7078f3a6911/transformed/emoji2-1.2.0/AndroidManifest.xml:30:17-75
-45                android:value="androidx.startup" />
-45-->[androidx.emoji2:emoji2:1.2.0] /home/runner/.gradle/caches/transforms-3/0ddb9c379c67fcbab722e7078f3a6911/transformed/emoji2-1.2.0/AndroidManifest.xml:31:17-49
-46            <meta-data
-46-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/runner/.gradle/caches/transforms-3/76233322e366847b47ab88198fef879e/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:31:13-33:52
-47                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
-47-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/runner/.gradle/caches/transforms-3/76233322e366847b47ab88198fef879e/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:32:17-78
-48                android:value="androidx.startup" />
-48-->[androidx.lifecycle:lifecycle-process:2.4.1] /home/runner/.gradle/caches/transforms-3/76233322e366847b47ab88198fef879e/transformed/lifecycle-process-2.4.1/AndroidManifest.xml:33:17-49
-49        </provider>
-50    </application>
-51
-52</manifest>
+38    </application>
+39
+40</manifest>

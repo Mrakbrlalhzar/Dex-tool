@@ -30,7 +30,7 @@ public class OverlaySurfaceView extends GLSurfaceView {
         setFocusableInTouchMode(true);
         setClickable(true);
         setRenderer(new MyRenderer());
-        setRenderMode(RENDERMODE_CONTINUOUSLY);
+        setRenderMode(RENDERMODE_CONTINUOUSLY); setPreserveEGLContextOnPause(true);
     }
     public boolean isReady() { return ready; }
     private void showKeyboard() {
@@ -55,7 +55,24 @@ public class OverlaySurfaceView extends GLSurfaceView {
             else if (want && keyboardShown && !imm.isAcceptingText() && now - lastActionMs > 400) { lastActionMs = now; post(() -> showKeyboard()); }
         }
     }
-    @Override public boolean onCheckIsTextEditor() { return true; }
+    
+@Override public boolean onTouchEvent(android.view.MotionEvent e) {
+    int action = e.getActionMasked();
+    boolean handled = Helper.nativeTouch(action, e.getX(), e.getY());
+    if (action == android.view.MotionEvent.ACTION_DOWN) return handled;
+    return super.onTouchEvent(e);
+}
+@Override public boolean dispatchKeyEvent(android.view.KeyEvent e) {
+    int c = e.getKeyCode();
+    if (e.getAction() == android.view.KeyEvent.ACTION_DOWN) {
+        if (c >= android.view.KeyEvent.KEYCODE_0 && c <= android.view.KeyEvent.KEYCODE_9) { Helper.nativeAddInputChar((char)('0'+(c-android.view.KeyEvent.KEYCODE_0))); return true; }
+        if (c == android.view.KeyEvent.KEYCODE_PERIOD || c == android.view.KeyEvent.KEYCODE_NUMPAD_DOT) { Helper.nativeAddInputChar('.'); return true; }
+        if (c == android.view.KeyEvent.KEYCODE_MINUS || c == android.view.KeyEvent.KEYCODE_NUMPAD_SUBTRACT) { Helper.nativeAddInputChar('-'); return true; }
+    }
+    return super.dispatchKeyEvent(e);
+}
+
+@Override public boolean onCheckIsTextEditor() { return true; }
     @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
         outAttrs.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
         outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI;

@@ -91,33 +91,51 @@ static float g_virtX = 0, g_virtY = 0, g_realPrevX = 0, g_realPrevY = 0, g_title
 
 // ====== FRIDA INIT (FIXED: 6 args for create_sync) ======
 static GumScript* g_script = nullptr;
+static std::vector<std::string> gCallLog;
+static std::mutex gCallLogMutex;
 static GumScriptBackend* g_backend = nullptr;
 
 const gchar* PATCH_AGENT_JS = R"(
-  Java.perform(function() {
-    console.log("[*] Patch Agent Loaded from native-lib");
-    recv(function(msg) {
-      console.log("[C++] -> [JS]: " + msg);
-      try {
-        var cmd = JSON.parse(msg);
-        if (cmd.action === "patchMethod") {
-          var cls = Java.use(cmd.className);
-          var m = cls[cmd.methodName].overloads[0];
-          m.implementation = function() {
-            return cmd.returnValue;
-          };
-          console.log("[*] Patched " + cmd.className + "." + cmd.methodName);
-        }
-      } catch (e) {
-        console.log("[!] " + e.message);
-      }
-    });
-    send({type: "ready"});
+Java.perform(function() {
+  function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
+  log("agent loaded");
+  var HOOKED = {};
+  recv(function(raw) {
+    try {
+      var cmd = JSON.parse(raw);
+      log("recv: "+raw);
+      if (cmd.action !== "patchMethod") return;
+      var key = cmd.className+"#"+cmd.methodName;
+      if (HOOKED[key]) { log("already patched: "+key); return; }
+      var loaders = Java.enumerateClassLoadersSync();
+      var loader = null;
+      for (var i=0;i<loaders.length;i++){ try{ if(loaders[i].findClass(cmd.className)){ loader=loaders[i]; break; } }catch(e){} }
+      if (loader) Java.classFactory.loader = loader;
+      var cls = Java.use(cmd.className);
+      var ovs = cls[cmd.methodName].overloads;
+      var target = null;
+      for (var i=0;i<ovs.length;i++){ if(target===null && ovs[i].argumentTypes.length===0) target=ovs[i]; }
+      if (!target) target = ovs[0];
+      var rt = target.returnType.className;
+      var rv = cmd.returnValue;
+      target.implementation = function() {
+        log("HOOK HIT: "+cmd.methodName);
+        if (rt==="int"||rt==="long"||rt==="short"||rt==="byte") return parseInt(rv,10);
+        if (rt==="float"||rt==="double") return parseFloat(rv);
+        if (rt==="boolean") return rv==="true"||rv==="1";
+        if (rt==="void") return undefined;
+        return rv;
+      };
+      HOOKED[key] = true;
+      log("PATCHED: "+key);
+    } catch(e) { log("ERROR: "+e.message); }
   });
+  send({type:"ready"});
+});
 )";
 
 static void on_script_message(const gchar* message, GBytes* data, gpointer user_data) {
-    LOGI("Frida JS: %s", message);
+    LOGI("Frida JS: %s", message); if (message && strstr(message, "\"type\":\"log\"")) { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[JS] ")+message); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }
 }
 
 static void init_frida_script() {
@@ -140,6 +158,33 @@ static void send_to_js(const char* json) {
 }
 
 // ====== SIGIL ======
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
+    if (!g_script) return;
+    const char* c = env->GetStringUTFChars(jc, nullptr);
+    const char* m = env->GetStringUTFChars(jm, nullptr);
+    const char* v = env->GetStringUTFChars(jv, nullptr);
+    std::string json = "{\"action\":\"patchMethod\",\"className\":\"";
+    json += c; json += "\",\"methodName\":\""; json += m;
+    json += "\",\"returnValue\":\""; json += v; json += "\"}";
+    send_to_js(json.c_str());
+    env->ReleaseStringUTFChars(jc, c);
+    env->ReleaseStringUTFChars(jm, m);
+    env->ReleaseStringUTFChars(jv, v);
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(x, y);
+    if (action == 0) io.AddMouseButtonEvent(0, true);
+    else if (action == 1) io.AddMouseButtonEvent(0, false);
+    else if (action == 3) io.AddMouseButtonEvent(0, false);
+    return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
+}
+
 static void drawSigil(ImDrawList* dl, ImVec2 c, float r) {
     const ImU32 gold = IM_COL32(255, 200, 87, 255), cyan = IM_COL32(77, 208, 225, 220);
     const ImU32 dark = IM_COL32(10, 12, 16, 255), red = IM_COL32(255, 80, 80, 210);
@@ -371,7 +416,7 @@ else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], siz
         PendingCallReq c; c.sectionId = sec.id; c.className = className; c.methodSig = m.display; c.methodName = m.name; c.paramTypes = m.paramTypes; c.args.resize(st.numParams);
         for (int i = 0; i < st.numParams; i++) c.args[i] = std::string(st.argBufs[i]);
         c.isStatic = m.isStatic; c.isConstructor = m.isConstructor; c.runInMain = st.runInMain;
-        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); }
+        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
         st.calling = true; st.hasResult = false;
     }
     ImGui::SameLine();
@@ -554,7 +599,7 @@ static void renderMainWindow() {
             if (active) renderSectionContent(*active); else ImGui::TextDisabled("No sections.");
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Patches")) { renderPatchesTab(); ImGui::EndTabItem(); }
+        if (if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); ImGui::BeginChild("##logchild", ImVec2(0,0), true); for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); ImGui::EndChild(); ImGui::EndTabItem(); } if (ImGui::BeginTabItem("Patches")) { renderPatchesTab(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Settings")) { renderSettingsTab(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
