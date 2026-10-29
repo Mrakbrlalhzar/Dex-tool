@@ -45,7 +45,10 @@ jobs:
           mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
           wget -q "$B/frida-gumjs-devkit-$V-android-arm.tar.xz" -O /tmp/dk32.tar.xz
           mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
-          echo "devkits ready"
+          echo "=== /tmp/dk64 contents ==="
+          find /tmp/dk64 -maxdepth 2 | head -30
+          echo "=== /tmp/dk32 contents ==="
+          find /tmp/dk32 -maxdepth 2 | head -30
 
       - name: Clone frida-gum
         run: |
@@ -80,12 +83,34 @@ jobs:
           D=/tmp/frida-built/arm64-v8a; rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          [ -z "$LIB" ] && { echo "FATAL: no arm64 lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-          cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
-          G=$(find /tmp/dk64 -name "frida-gum.h" | head -1); [ -z "$G" ] && G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1)
-          [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
-          cp -rv "$(find /tmp/dk64 -type d -name 'glib-2.0' | head -1)" "$D/include/glib-2.0"
-          ls -lah "$D/lib/"
+
+          GUMJS_H=$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)
+          if [ -z "$GUMJS_H" ]; then echo "FATAL: frida-gumjs.h missing"; find /tmp/dk64 -type f | head -40; exit 1; fi
+          cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
+
+          G=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
+          [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
+          [ -z "$G" ] && G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1)
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN: frida-gum.h not found"; fi
+
+          echo "=== /tmp/dk64 ==="
+          ls -la /tmp/dk64 2>/dev/null || true
+          echo "=== /tmp/frida-gum/build/gum/devkit ==="
+          ls -la /tmp/frida-gum/build/gum/devkit 2>/dev/null || echo "(missing)"
+
+          GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1)
+          [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
+          [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build -type d -name 'glib-2.0' 2>/dev/null | head -1)
+          if [ -n "$GLIB_DIR" ]; then
+              echo "Found glib-2.0 at: $GLIB_DIR"
+              cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
+          else
+              echo "WARN: glib-2.0 headers not found (diet mode should not need them)"
+          fi
+          echo "=== staged include ==="; ls -la "$D/include/"
+          echo "=== staged lib ==="; ls -lah "$D/lib/"
 
       - name: Build armv7
         timeout-minutes: 60
@@ -113,12 +138,29 @@ jobs:
           D=/tmp/frida-built/armeabi-v7a; rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          [ -z "$LIB" ] && { echo "FATAL: no armv7 lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-          cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
-          G=$(find /tmp/dk32 -name "frida-gum.h" | head -1); [ -z "$G" ] && G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1)
-          [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
-          cp -rv "$(find /tmp/dk32 -type d -name 'glib-2.0' | head -1)" "$D/include/glib-2.0"
-          ls -lah "$D/lib/"
+
+          GUMJS_H=$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)
+          if [ -z "$GUMJS_H" ]; then echo "FATAL: frida-gumjs.h missing"; find /tmp/dk32 -type f | head -40; exit 1; fi
+          cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
+
+          G=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
+          [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
+          [ -z "$G" ] && G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1)
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN: frida-gum.h not found"; fi
+
+          GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1)
+          [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
+          [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build -type d -name 'glib-2.0' 2>/dev/null | head -1)
+          if [ -n "$GLIB_DIR" ]; then
+              echo "Found glib-2.0 at: $GLIB_DIR"
+              cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
+          else
+              echo "WARN: glib-2.0 headers not found (diet mode should not need them)"
+          fi
+          echo "=== staged include ==="; ls -la "$D/include/"
+          echo "=== staged lib ==="; ls -lah "$D/lib/"
 
       # ============================================================
       # PATCH Helper.java
@@ -227,7 +269,6 @@ jobs:
               s = s.replace("static GumScript* g_script = nullptr;",
                   "static GumScript* g_script = nullptr;\nstatic std::vector<std::string> gCallLog;\nstatic std::mutex gCallLogMutex;", 1)
 
-          # --- replace PATCH_AGENT_JS with robust version ---
           new_js = textwrap.dedent(r"""
               Java.perform(function() {
                 function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
@@ -271,7 +312,6 @@ jobs:
                   'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
               print("PASS: PATCH_AGENT_JS replaced")
 
-          # --- nativePatchMethod impl ---
           if "Java_com_menu_imgui_Helper_nativePatchMethod" not in s:
               impl = textwrap.dedent(r'''
                   extern "C" JNIEXPORT void JNICALL
@@ -292,7 +332,6 @@ jobs:
               s = s.replace("static void drawSigil", impl + "\nstatic void drawSigil", 1)
               print("PASS: nativePatchMethod impl")
 
-          # --- nativeTouch impl ---
           if "Java_com_menu_imgui_Helper_nativeTouch" not in s:
               touch = textwrap.dedent(r'''
                   extern "C" JNIEXPORT jboolean JNICALL
@@ -308,19 +347,16 @@ jobs:
               s = s.replace("static void drawSigil", touch + "\nstatic void drawSigil", 1)
               print("PASS: nativeTouch impl")
 
-          # --- log JS messages ---
           if 'type\\":\\"log' not in s:
               s = s.replace('LOGI("Frida JS: %s", message);',
                   'LOGI("Frida JS: %s", message); if (message && strstr(message, "\\"type\\":\\"log\\"")) { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[JS] ")+message); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }', 1)
               print("PASS: log handler")
 
-          # --- log Call button ---
           if 'push_back("[CALL]' not in s:
               s = s.replace("gPendingCallReqs.push_back(c);",
                   "gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string(\"[CALL] \")+className+\".\"+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }", 1)
               print("PASS: call log")
 
-          # --- Log tab ---
           if 'BeginTabItem("Log")' not in s:
               s = s.replace('ImGui::BeginTabItem("Patches")',
                   'if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); ImGui::BeginChild("##logchild", ImVec2(0,0), true); for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); ImGui::EndChild(); ImGui::EndTabItem(); } if (ImGui::BeginTabItem("Patches")', 1)
@@ -428,5 +464,5 @@ jobs:
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: YAML syntax with textwrap.dedent, patch bridge, touch, EGL, digits, log [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: guard glib-2.0 cp (diet mode does not need it) + diagnostics [skip ci]"
           git push
