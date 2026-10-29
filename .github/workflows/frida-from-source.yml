@@ -123,7 +123,7 @@ jobs:
       # ============================================================
       # PATCH Helper.java
       # ============================================================
-      - name: Patch Helper.java (nativePatchMethod + re-attach + EGL fields)
+      - name: Patch Helper.java (nativePatchMethod + re-attach)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib
@@ -177,7 +177,7 @@ jobs:
       - name: Patch OverlaySurfaceView.java (EGL + touch + digit keys)
         run: |
           python3 - <<'PYEOF'
-          import pathlib
+          import pathlib, textwrap
           p = pathlib.Path("app/src/main/java/com/menu/imgui/OverlaySurfaceView.java")
           s = p.read_text()
 
@@ -186,23 +186,23 @@ jobs:
                   "setRenderMode(RENDERMODE_CONTINUOUSLY); setPreserveEGLContextOnPause(true);", 1)
 
           if "onTouchEvent" not in s:
-              methods = '''
-@Override public boolean onTouchEvent(android.view.MotionEvent e) {
-    int action = e.getActionMasked();
-    boolean handled = Helper.nativeTouch(action, e.getX(), e.getY());
-    if (action == android.view.MotionEvent.ACTION_DOWN) return handled;
-    return super.onTouchEvent(e);
-}
-@Override public boolean dispatchKeyEvent(android.view.KeyEvent e) {
-    int c = e.getKeyCode();
-    if (e.getAction() == android.view.KeyEvent.ACTION_DOWN) {
-        if (c >= android.view.KeyEvent.KEYCODE_0 && c <= android.view.KeyEvent.KEYCODE_9) { Helper.nativeAddInputChar((char)('0'+(c-android.view.KeyEvent.KEYCODE_0))); return true; }
-        if (c == android.view.KeyEvent.KEYCODE_PERIOD || c == android.view.KeyEvent.KEYCODE_NUMPAD_DOT) { Helper.nativeAddInputChar('.'); return true; }
-        if (c == android.view.KeyEvent.KEYCODE_MINUS || c == android.view.KeyEvent.KEYCODE_NUMPAD_SUBTRACT) { Helper.nativeAddInputChar('-'); return true; }
-    }
-    return super.dispatchKeyEvent(e);
-}
-'''
+              methods = textwrap.dedent("""
+                  @Override public boolean onTouchEvent(android.view.MotionEvent e) {
+                      int action = e.getActionMasked();
+                      boolean handled = Helper.nativeTouch(action, e.getX(), e.getY());
+                      if (action == android.view.MotionEvent.ACTION_DOWN) return handled;
+                      return super.onTouchEvent(e);
+                  }
+                  @Override public boolean dispatchKeyEvent(android.view.KeyEvent e) {
+                      int c = e.getKeyCode();
+                      if (e.getAction() == android.view.KeyEvent.ACTION_DOWN) {
+                          if (c >= android.view.KeyEvent.KEYCODE_0 && c <= android.view.KeyEvent.KEYCODE_9) { Helper.nativeAddInputChar((char)('0'+(c-android.view.KeyEvent.KEYCODE_0))); return true; }
+                          if (c == android.view.KeyEvent.KEYCODE_PERIOD || c == android.view.KeyEvent.KEYCODE_NUMPAD_DOT) { Helper.nativeAddInputChar('.'); return true; }
+                          if (c == android.view.KeyEvent.KEYCODE_MINUS || c == android.view.KeyEvent.KEYCODE_NUMPAD_SUBTRACT) { Helper.nativeAddInputChar('-'); return true; }
+                      }
+                      return super.dispatchKeyEvent(e);
+                  }
+              """)
               s = s.replace("@Override public boolean onCheckIsTextEditor()",
                   methods + "\n@Override public boolean onCheckIsTextEditor()", 1)
               print("PASS: onTouchEvent + dispatchKeyEvent inserted")
@@ -215,7 +215,7 @@ jobs:
       - name: Patch native-lib.cpp (agent + nativePatchMethod + nativeTouch + Log)
         run: |
           python3 - <<'PYEOF'
-          import re, pathlib
+          import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
@@ -227,84 +227,84 @@ jobs:
               s = s.replace("static GumScript* g_script = nullptr;",
                   "static GumScript* g_script = nullptr;\nstatic std::vector<std::string> gCallLog;\nstatic std::mutex gCallLogMutex;", 1)
 
-          # --- replace PATCH_AGENT_JS ---
-          new_js = r'''
-Java.perform(function() {
-  function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
-  log("agent loaded");
-  var HOOKED = {};
-  recv(function(raw) {
-    try {
-      var cmd = JSON.parse(raw);
-      log("recv: "+raw);
-      if (cmd.action !== "patchMethod") return;
-      var key = cmd.className+"#"+cmd.methodName;
-      if (HOOKED[key]) { log("already patched: "+key); return; }
-      var loaders = Java.enumerateClassLoadersSync();
-      var loader = null;
-      for (var i=0;i<loaders.length;i++){ try{ if(loaders[i].findClass(cmd.className)){ loader=loaders[i]; break; } }catch(e){} }
-      if (loader) Java.classFactory.loader = loader;
-      var cls = Java.use(cmd.className);
-      var ovs = cls[cmd.methodName].overloads;
-      var target = null;
-      for (var i=0;i<ovs.length;i++){ if(target===null && ovs[i].argumentTypes.length===0) target=ovs[i]; }
-      if (!target) target = ovs[0];
-      var rt = target.returnType.className;
-      var rv = cmd.returnValue;
-      target.implementation = function() {
-        log("HOOK HIT: "+cmd.methodName);
-        if (rt==="int"||rt==="long"||rt==="short"||rt==="byte") return parseInt(rv,10);
-        if (rt==="float"||rt==="double") return parseFloat(rv);
-        if (rt==="boolean") return rv==="true"||rv==="1";
-        if (rt==="void") return undefined;
-        return rv;
-      };
-      HOOKED[key] = true;
-      log("PATCHED: "+key);
-    } catch(e) { log("ERROR: "+e.message); }
-  });
-  send({type:"ready"});
-});
-'''
+          # --- replace PATCH_AGENT_JS with robust version ---
+          new_js = textwrap.dedent(r"""
+              Java.perform(function() {
+                function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
+                log("agent loaded");
+                var HOOKED = {};
+                recv(function(raw) {
+                  try {
+                    var cmd = JSON.parse(raw);
+                    log("recv: "+raw);
+                    if (cmd.action !== "patchMethod") return;
+                    var key = cmd.className+"#"+cmd.methodName;
+                    if (HOOKED[key]) { log("already patched: "+key); return; }
+                    var loaders = Java.enumerateClassLoadersSync();
+                    var loader = null;
+                    for (var i=0;i<loaders.length;i++){ try{ if(loaders[i].findClass(cmd.className)){ loader=loaders[i]; break; } }catch(e){} }
+                    if (loader) Java.classFactory.loader = loader;
+                    var cls = Java.use(cmd.className);
+                    var ovs = cls[cmd.methodName].overloads;
+                    var target = null;
+                    for (var i=0;i<ovs.length;i++){ if(target===null && ovs[i].argumentTypes.length===0) target=ovs[i]; }
+                    if (!target) target = ovs[0];
+                    var rt = target.returnType.className;
+                    var rv = cmd.returnValue;
+                    target.implementation = function() {
+                      log("HOOK HIT: "+cmd.methodName);
+                      if (rt==="int"||rt==="long"||rt==="short"||rt==="byte") return parseInt(rv,10);
+                      if (rt==="float"||rt==="double") return parseFloat(rv);
+                      if (rt==="boolean") return rv==="true"||rv==="1";
+                      if (rt==="void") return undefined;
+                      return rv;
+                    };
+                    HOOKED[key] = true;
+                    log("PATCHED: "+key);
+                  } catch(e) { log("ERROR: "+e.message); }
+                });
+                send({type:"ready"});
+              });
+          """)
           if 'PATCH_AGENT_JS' in s:
               s = re.sub(r'const gchar\* PATCH_AGENT_JS = R"\(.*?\)";',
                   'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
               print("PASS: PATCH_AGENT_JS replaced")
 
-          # --- nativePatchMethod ---
+          # --- nativePatchMethod impl ---
           if "Java_com_menu_imgui_Helper_nativePatchMethod" not in s:
-              impl = '''
-extern "C" JNIEXPORT void JNICALL
-Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
-    if (!g_script) return;
-    const char* c = env->GetStringUTFChars(jc, nullptr);
-    const char* m = env->GetStringUTFChars(jm, nullptr);
-    const char* v = env->GetStringUTFChars(jv, nullptr);
-    std::string json = "{\\"action\\":\\"patchMethod\\",\\"className\\":\\"";
-    json += c; json += "\\",\\"methodName\\":\\""; json += m;
-    json += "\\",\\"returnValue\\":\\""; json += v; json += "\\"}";
-    send_to_js(json.c_str());
-    env->ReleaseStringUTFChars(jc, c);
-    env->ReleaseStringUTFChars(jm, m);
-    env->ReleaseStringUTFChars(jv, v);
-}
-'''
+              impl = textwrap.dedent(r'''
+                  extern "C" JNIEXPORT void JNICALL
+                  Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
+                      if (!g_script) return;
+                      const char* c = env->GetStringUTFChars(jc, nullptr);
+                      const char* m = env->GetStringUTFChars(jm, nullptr);
+                      const char* v = env->GetStringUTFChars(jv, nullptr);
+                      std::string json = "{\"action\":\"patchMethod\",\"className\":\"";
+                      json += c; json += "\",\"methodName\":\""; json += m;
+                      json += "\",\"returnValue\":\""; json += v; json += "\"}";
+                      send_to_js(json.c_str());
+                      env->ReleaseStringUTFChars(jc, c);
+                      env->ReleaseStringUTFChars(jm, m);
+                      env->ReleaseStringUTFChars(jv, v);
+                  }
+              ''')
               s = s.replace("static void drawSigil", impl + "\nstatic void drawSigil", 1)
               print("PASS: nativePatchMethod impl")
 
-          # --- nativeTouch ---
+          # --- nativeTouch impl ---
           if "Java_com_menu_imgui_Helper_nativeTouch" not in s:
-              touch = '''
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
-    ImGuiIO& io = ImGui::GetIO();
-    io.AddMousePosEvent(x, y);
-    if (action == 0) io.AddMouseButtonEvent(0, true);
-    else if (action == 1) io.AddMouseButtonEvent(0, false);
-    else if (action == 3) io.AddMouseButtonEvent(0, false);
-    return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
-}
-'''
+              touch = textwrap.dedent(r'''
+                  extern "C" JNIEXPORT jboolean JNICALL
+                  Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
+                      ImGuiIO& io = ImGui::GetIO();
+                      io.AddMousePosEvent(x, y);
+                      if (action == 0) io.AddMouseButtonEvent(0, true);
+                      else if (action == 1) io.AddMouseButtonEvent(0, false);
+                      else if (action == 3) io.AddMouseButtonEvent(0, false);
+                      return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
+                  }
+              ''')
               s = s.replace("static void drawSigil", touch + "\nstatic void drawSigil", 1)
               print("PASS: nativeTouch impl")
 
@@ -342,7 +342,7 @@ Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, j
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "dispatchKeyEvent"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
-          chk app/src/main/cpp/tool/native-lib.cpp "BeginTabItem(\"Log\")"
+          chk app/src/main/cpp/tool/native-lib.cpp 'BeginTabItem("Log")'
           if [ $FAIL -ne 0 ]; then
             echo "===== Helper attach =====" ; grep -n "attach\|nativePatchMethod\|sOverlay" app/src/main/java/com/menu/imgui/Helper.java | head -20
             echo "===== Overlay =====" ; grep -n "onTouchEvent\|dispatchKeyEvent\|setPreserveEGL" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -20
@@ -428,5 +428,5 @@ Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, j
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: patch bridge to Frida, touch pass-through, EGL preserve, digit keys, call log [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: YAML syntax with textwrap.dedent, patch bridge, touch, EGL, digits, log [skip ci]"
           git push
