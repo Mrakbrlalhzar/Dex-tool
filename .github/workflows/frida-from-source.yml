@@ -35,7 +35,9 @@ jobs:
           echo "NDK_PATH=/tmp/android-ndk-r25c" >> $GITHUB_ENV
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
-          node --version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/build-tools/" 2>/dev/null || true
+          ls "$ANDROID_HOME/platforms/" 2>/dev/null || true
 
       - name: Download Frida devkit
         run: |
@@ -83,7 +85,7 @@ jobs:
           [ -z "$LIB" ] && { echo "FATAL: no arm64 lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
           GUMJS_H=$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)
-          [ -z "$GUMJS_H" ] && { echo "FATAL: frida-gumjs.h missing"; find /tmp/dk64 -type f | head -40; exit 1; }
+          [ -z "$GUMJS_H" ] && { echo "FATAL: frida-gumjs.h missing"; exit 1; }
           cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
           G=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
           [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
@@ -92,7 +94,7 @@ jobs:
           GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build -type d -name 'glib-2.0' 2>/dev/null | head -1)
-          if [ -n "$GLIB_DIR" ]; then echo "glib-2.0 at: $GLIB_DIR"; cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN: glib-2.0 headers missing (diet mode - OK)"; fi
+          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
           ls -lah "$D/lib/"
 
       - name: Build armv7
@@ -124,7 +126,7 @@ jobs:
           [ -z "$LIB" ] && { echo "FATAL: no armv7 lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
           GUMJS_H=$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)
-          [ -z "$GUMJS_H" ] && { echo "FATAL: frida-gumjs.h missing"; find /tmp/dk32 -type f | head -40; exit 1; }
+          [ -z "$GUMJS_H" ] && { echo "FATAL: frida-gumjs.h missing"; exit 1; }
           cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
           G=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
           [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
@@ -133,65 +135,44 @@ jobs:
           GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build -type d -name 'glib-2.0' 2>/dev/null | head -1)
-          if [ -n "$GLIB_DIR" ]; then echo "glib-2.0 at: $GLIB_DIR"; cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN: glib-2.0 headers missing (diet mode - OK)"; fi
+          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
           ls -lah "$D/lib/"
 
       # ============================================================
-      # FIX broken `if (if (` from previous iteration (before all patches)
+      # PATCH 1: Helper.java
       # ============================================================
-      - name: Fix broken if-if in native-lib.cpp
+      - name: Patch Helper.java
         run: |
           python3 - <<'PYEOF'
-          import pathlib
-          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
-          s = p.read_text(); orig = s
-          # The broken pattern from previous iteration:
-          # `if (if (ImGui::BeginTabItem("Log")) { ... } if (ImGui::BeginTabItem("Patches"))`
-          # Correct it: remove the extra leading `if (` before `ImGui::BeginTabItem("Log")`.
-          if 'if (if (ImGui::BeginTabItem("Log"))' in s:
-              s = s.replace('if (if (ImGui::BeginTabItem("Log"))',
-                            'if (ImGui::BeginTabItem("Log"))', 1)
-              print("PASS: removed duplicate 'if (' in Log tab")
-          else:
-              print("SKIP: no broken if(if( found")
-          if s != orig:
-              p.write_text(s)
-          PYEOF
-
-      # ============================================================
-      # PATCH Helper.java
-      # ============================================================
-      - name: Patch Helper.java (nativePatchMethod + re-attach)
-        run: |
-          python3 - <<'PYEOF'
-          import re, pathlib
+          import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
 
+          # add sOverlayWm/sOverlayLp fields
           if "sOverlayWm" not in s:
               s = s.replace("private static OverlaySurfaceView overlay;",
                   "private static OverlaySurfaceView overlay; private static android.view.WindowManager sOverlayWm; private static android.view.WindowManager.LayoutParams sOverlayLp;", 1)
-              print("PASS: overlay fields")
 
+          # store wm/lp after addView
           if "sOverlayWm = wm;" not in s:
               s = s.replace("wm.addView(glView, lp);",
                   "wm.addView(glView, lp); sOverlayWm = wm; sOverlayLp = lp;", 1)
-              print("PASS: store wm/lp")
 
-          old_resume = "if (a == activity) glView.onResume();"
-          new_resume = ("if (a == activity) { glView.onResume(); try { "
-              "if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { "
-              "sOverlayWm.addView(glView, sOverlayLp); android.util.Log.i(\"DexTool\", \"re-attached on resume\"); "
-              "} } catch (Throwable t) {} }")
-          if old_resume in s and "re-attached on resume" not in s:
-              s = s.replace(old_resume, new_resume, 1)
-              print("PASS: re-attach on resume")
+          # re-attach on resume
+          old = "if (a == activity) glView.onResume();"
+          new = ("if (a == activity) { glView.onResume(); try { "
+                 "if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { "
+                 "sOverlayWm.addView(glView, sOverlayLp); android.util.Log.i(\"DexTool\", \"re-attached\"); "
+                 "} } catch (Throwable t) {} }")
+          if old in s and "re-attached" not in s:
+              s = s.replace(old, new, 1)
 
+          # declare nativePatchMethod
           if "nativePatchMethod" not in s:
               s = s.replace("static native void nativeSetPatches",
-                  "static native void nativePatchMethod(String className, String methodName, String returnValue); static native void nativeSetPatches", 1)
-              print("PASS: nativePatchMethod decl")
+                  "static native void nativePatchMethod(String c, String m, String v); static native void nativeSetPatches", 1)
 
+          # rewrite requestPatchMethod
           m = re.search(r'public static void requestPatchMethod\([^)]*\)\s*\{', s)
           if m:
               i = s.index('{', m.end()-1); d=0; end=-1
@@ -201,23 +182,44 @@ jobs:
                       d-=1
                       if d==0: end=k+1; break
               if end>0:
-                  body = ('public static void requestPatchMethod(String className, String target, String value) { '
-                      'for (PatchRecord __p : sActivePatches) { '
-                      'if (__p.type.equals("Method") && __p.className.equals(className) && __p.targetName.equals(target)) { '
-                      '__p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return; } } '
-                      'PatchRecord p = new PatchRecord(); p.id = sPatchCounter++; p.type = "Method"; p.className = className; '
-                      'p.targetName = target; p.originalValue = "(original)"; p.currentValue = value; sActivePatches.add(p); '
-                      'syncPatches(); nativePatchMethod(className, target, value); }')
+                  body = textwrap.dedent("""\
+                      public static void requestPatchMethod(String className, String target, String value) {
+                          for (PatchRecord __p : sActivePatches) {
+                              if ("Method".equals(__p.type) && className.equals(__p.className) && target.equals(__p.targetName)) {
+                                  __p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return;
+                              }
+                          }
+                          PatchRecord p = new PatchRecord();
+                          p.id = sPatchCounter++; p.type = "Method"; p.className = className;
+                          p.targetName = target; p.originalValue = "(original)"; p.currentValue = value;
+                          sActivePatches.add(p); syncPatches(); nativePatchMethod(className, target, value);
+                      }
+                  """)
                   s = s[:m.start()] + body + s[end:]
-                  print("PASS: requestPatchMethod with nativePatchMethod")
+
+          # setMenuOpen
+          if "setMenuOpen" not in s:
+              menu = textwrap.dedent("""\
+                  public static void setMenuOpen(final boolean open) {
+                      if (sOverlayWm == null || sOverlayLp == null || overlay == null) return;
+                      overlay.post(() -> { try {
+                          if (open) { sOverlayLp.width = -1; sOverlayLp.height = -1; sOverlayLp.flags &= ~android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE; }
+                          else { sOverlayLp.width = 240; sOverlayLp.height = 240; sOverlayLp.flags |= android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE; }
+                          sOverlayWm.updateViewLayout(overlay, sOverlayLp);
+                      } catch (Throwable t) {} });
+                  }
+              """)
+              s = s.replace("public static void attach(Context context) {",
+                            menu + "\npublic static void attach(Context context) {", 1)
 
           p.write_text(s)
+          print("Helper.java patched")
           PYEOF
 
       # ============================================================
-      # PATCH OverlaySurfaceView.java
+      # PATCH 2: OverlaySurfaceView.java
       # ============================================================
-      - name: Patch OverlaySurfaceView.java (EGL + touch + digit keys)
+      - name: Patch OverlaySurfaceView.java
         run: |
           python3 - <<'PYEOF'
           import pathlib, textwrap
@@ -227,7 +229,6 @@ jobs:
           if "setPreserveEGLContextOnPause" not in s:
               s = s.replace("setRenderMode(RENDERMODE_CONTINUOUSLY);",
                   "setRenderMode(RENDERMODE_CONTINUOUSLY); setPreserveEGLContextOnPause(true);", 1)
-              print("PASS: EGL preserve")
 
           if "onTouchEvent" not in s:
               methods = textwrap.dedent("""
@@ -249,15 +250,14 @@ jobs:
               """)
               s = s.replace("@Override public boolean onCheckIsTextEditor()",
                   methods + "\n@Override public boolean onCheckIsTextEditor()", 1)
-              print("PASS: onTouchEvent + dispatchKeyEvent")
-
           p.write_text(s)
+          print("OverlaySurfaceView.java patched")
           PYEOF
 
       # ============================================================
-      # PATCH native-lib.cpp
+      # PATCH 3: native-lib.cpp
       # ============================================================
-      - name: Patch native-lib.cpp (agent + nativePatchMethod + nativeTouch + Log)
+      - name: Patch native-lib.cpp
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -266,13 +266,12 @@ jobs:
 
           if "#include <vector>" not in s:
               s = s.replace("#include <mutex>", "#include <mutex>\n#include <vector>\n#include <string>", 1)
-              print("PASS: includes")
 
           if "gCallLog" not in s:
               s = s.replace("static GumScript* g_script = nullptr;",
                   "static GumScript* g_script = nullptr;\nstatic std::vector<std::string> gCallLog;\nstatic std::mutex gCallLogMutex;", 1)
-              print("PASS: gCallLog")
 
+          # robust agent
           new_js = textwrap.dedent(r"""
               Java.perform(function() {
                 function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
@@ -314,8 +313,8 @@ jobs:
           if 'PATCH_AGENT_JS' in s:
               s = re.sub(r'const gchar\* PATCH_AGENT_JS = R"\(.*?\)";',
                   'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
-              print("PASS: PATCH_AGENT_JS replaced")
 
+          # nativePatchMethod impl
           if "Java_com_menu_imgui_Helper_nativePatchMethod" not in s:
               impl = textwrap.dedent(r'''
                   extern "C" JNIEXPORT void JNICALL
@@ -334,8 +333,8 @@ jobs:
                   }
               ''')
               s = s.replace("static void drawSigil", impl + "\nstatic void drawSigil", 1)
-              print("PASS: nativePatchMethod impl")
 
+          # nativeTouch impl
           if "Java_com_menu_imgui_Helper_nativeTouch" not in s:
               touch = textwrap.dedent(r'''
                   extern "C" JNIEXPORT jboolean JNICALL
@@ -349,34 +348,80 @@ jobs:
                   }
               ''')
               s = s.replace("static void drawSigil", touch + "\nstatic void drawSigil", 1)
-              print("PASS: nativeTouch impl")
 
+          # log JS messages
           if 'type\\":\\"log' not in s:
               s = s.replace('LOGI("Frida JS: %s", message);',
                   'LOGI("Frida JS: %s", message); if (message && strstr(message, "\\"type\\":\\"log\\"")) { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[JS] ")+message); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }', 1)
-              print("PASS: log handler")
 
+          # log Call button
           if 'push_back("[CALL]' not in s:
               s = s.replace("gPendingCallReqs.push_back(c);",
                   "gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string(\"[CALL] \")+className+\".\"+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }", 1)
-              print("PASS: call log")
 
-          # Log tab - correct pattern (keep leading `if (`)
+          # Log tab
           if 'BeginTabItem("Log")' not in s:
-              old = 'if (ImGui::BeginTabItem("Patches"))'
-              new = ('if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); '
-                     'ImGui::BeginChild("##logchild", ImVec2(0,0), true); '
-                     'for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); '
-                     'ImGui::EndChild(); ImGui::EndTabItem(); }\n'
-                     '        if (ImGui::BeginTabItem("Patches"))')
-              if old in s:
-                  s = s.replace(old, new, 1)
-                  print("PASS: Log tab (correct pattern)")
-              else:
-                  print("WARN: anchor 'if (ImGui::BeginTabItem(\"Patches\"))' not found")
+              s = s.replace('if (ImGui::BeginTabItem("Patches"))',
+                  'if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); ImGui::BeginChild("##logchild", ImVec2(0,0), true); for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); ImGui::EndChild(); ImGui::EndTabItem(); }\n        if (ImGui::BeginTabItem("Patches"))', 1)
+
+          # notifyMenuOpen
+          if "notifyMenuOpen" not in s:
+              helper = textwrap.dedent(r'''
+                  static void notifyMenuOpen(bool open) {
+                      JNIEnv* env = nullptr;
+                      if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return;
+                      jclass cls = env->FindClass("com/menu/imgui/Helper");
+                      if (!cls) return;
+                      jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
+                      if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
+                      env->DeleteLocalRef(cls);
+                  }
+              ''')
+              s = s.replace("static GumScript* g_script = nullptr;",
+                            "static GumScript* g_script = nullptr;\n" + helper, 1)
+
+          if "notifyMenuOpen(" in s and "lastMenuOpen" not in s:
+              s = s.replace("void nativeRender() {",
+                  "void nativeRender() {\n    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }", 1)
 
           p.write_text(s)
+          print("native-lib.cpp patched")
           PYEOF
+
+      # ============================================================
+      # REBUILD dex_data.h (THE KEY FIX)
+      # ============================================================
+      - name: Rebuild dex_data.h from patched Java
+        run: |
+          set -e
+          ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -1)
+          echo "android.jar: $ANDROID_JAR"
+          D8=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -1)
+          echo "d8: $D8"
+
+          mkdir -p /tmp/dex_build
+          rm -rf /tmp/dex_build/*
+
+          # 1. compile all Java files in com/menu/imgui
+          javac -source 8 -target 8 -cp "$ANDROID_JAR" \
+            -d /tmp/dex_build \
+            app/src/main/java/com/menu/imgui/*.java 2>&1 | tee /tmp/javac.log
+          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC FAILED"; cat /tmp/javac.log; exit 1; }
+          echo "javac OK"
+          find /tmp/dex_build -name "*.class" | head -20
+
+          # 2. dex
+          "$D8" --min-api 26 --output /tmp/dex_build \
+            $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
+          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8 FAILED"; cat /tmp/d8.log; exit 1; }
+          echo "d8 OK"
+          ls -lah /tmp/dex_build/classes.dex
+
+          # 3. header
+          xxd -i /tmp/dex_build/classes.dex > app/src/main/cpp/tool/dex_data.h
+          echo "dex_data.h rebuilt:"
+          head -5 app/src/main/cpp/tool/dex_data.h
+          wc -l app/src/main/cpp/tool/dex_data.h
 
       # ============================================================
       # VERIFY
@@ -386,19 +431,17 @@ jobs:
           FAIL=0
           chk() { if grep -q "$2" "$1"; then echo "OK  $2"; else echo "ERR $2"; FAIL=1; fi; }
           chk app/src/main/java/com/menu/imgui/Helper.java "nativePatchMethod"
+          chk app/src/main/java/com/menu/imgui/Helper.java "setMenuOpen"
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "setPreserveEGLContextOnPause"
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "onTouchEvent"
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "dispatchKeyEvent"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
           chk app/src/main/cpp/tool/native-lib.cpp 'BeginTabItem("Log")'
-          if grep -q "if (if (ImGui::BeginTabItem" app/src/main/cpp/tool/native-lib.cpp; then
-            echo "ERR broken if(if( still present"; FAIL=1
-          else
-            echo "OK  no broken if(if("
-          fi
           if [ $FAIL -ne 0 ]; then
-            echo "===== native-lib Log tab area =====" ; grep -n "BeginTabItem" app/src/main/cpp/tool/native-lib.cpp | head -20
+            echo "===== diagnostics ====="
+            grep -n "onTouchEvent\|dispatchKeyEvent\|setPreserveEGL" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -10
+            grep -n "nativePatchMethod\|setMenuOpen" app/src/main/java/com/menu/imgui/Helper.java | head -10
             exit 1
           fi
           echo "ALL OK"
@@ -481,5 +524,5 @@ jobs:
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: correct Log tab insertion (preserve leading if), repair broken if(if(, glib guard [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: rebuild dex_data.h from patched Java (root cause), robust patch agent, touch, EGL, digits, log [skip ci]"
           git push
