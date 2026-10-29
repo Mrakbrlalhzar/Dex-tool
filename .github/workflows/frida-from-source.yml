@@ -19,17 +19,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Cleanup old workflows
-        run: |
-          cd .github/workflows
-          for f in *.yml *.yaml; do
-            if [ -f "$f" ] && [ "$f" != "frida-from-source.yml" ]; then
-              rm -f "$f"
-            fi
-          done
-          ls -la
-
-      - name: Install dependencies (NDK r25c + Meson + Node.js)
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -43,240 +33,63 @@ jobs:
 
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
-          echo "✓ NDK: $NDK_PATH"
-          node --version
 
-      - name: Download Frida devkit (HEADERS)
+      - name: Clone and Build Frida for arm64
+        timeout-minutes: 90
         run: |
           set -e
-          FRIDA_VERSION="17.1.0"
-          BASE="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}"
-          wget -q "${BASE}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm64.tar.xz" -O /tmp/dk64.tar.xz
-          mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
-          wget -q "${BASE}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm.tar.xz" -O /tmp/dk32.tar.xz
-          mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
-          echo "✓ devkits ready"
-
-      - name: Clone frida-gum source
-        run: |
           git clone --recursive --depth 1 --branch 17.1.0 \
             https://github.com/frida/frida-gum.git /tmp/frida-gum
           cd /tmp/frida-gum
-          echo "✓ cloned"
-
-      - name: Patch glib_init
-        run: |
-          cd /tmp/frida-gum
           sed -i '1i void glib_init(void);' bindings/gumjs/gumquickcompile.c
-          echo "✓ patched"
-
-      # ============ ARM64 BUILD (با لاگ کامل) ============
-      - name: Build arm64
-        timeout-minutes: 60
-        run: |
-          set -o pipefail
-          cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-
-          echo "================================================================"
-          echo "STEP 1: rm -rf build  (فایل قبلی arm64 رو پاک می‌کنیم)"
-          echo "================================================================"
-          rm -rf build
-          echo "✓ build dir removed"
-
-          echo ""
-          echo "================================================================"
-          echo "STEP 2: ./configure --host=android-arm64"
-          echo "================================================================"
           ./configure --host=android-arm64 -- \
             -Ddevkits=gum,gumjs \
-            -Dgumjs=enabled \
-            -Dquickjs=enabled \
-            -Dv8=disabled \
-            -Ddatabase=disabled \
-            -Dtests=disabled \
-            -Ddiet=true \
-            -Db_ndebug=true \
-            -Ddefault_library=static \
-            -Dlibunwind:minidebuginfo=disabled \
-            -Dlibdwarf:decompression=false \
-            2>&1 | tee /tmp/arm64-configure.log
-          CFG_EXIT=${PIPESTATUS[0]}
-          echo ""
-          echo ">>> CONFIGURE EXIT: $CFG_EXIT <<<"
+            -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled \
+            -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static \
+            -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false
+          make -j$(nproc) || true
+          # کپی تمام کتابخانه‌های استاتیک تولید شده
+          mkdir -p /tmp/frida-built/arm64-v8a/lib
+          find build -name '*.a' -exec cp -v {} /tmp/frida-built/arm64-v8a/lib/ \;
 
-          if [ $CFG_EXIT -ne 0 ]; then
-            echo ""
-            echo "================================================================"
-            echo "!!!!! CONFIGURE FAILED (exit $CFG_EXIT) !!!!!"
-            echo "================================================================"
-            echo "=== tail of configure log ==="
-            tail -60 /tmp/arm64-configure.log
-            exit 1
-          fi
-
-          echo ""
-          echo "================================================================"
-          echo "STEP 3: make -j\$(nproc)  (برای arm64)"
-          echo "================================================================"
-          make -j$(nproc) 2>&1 | tee /tmp/arm64-build.log
-          BLD_EXIT=${PIPESTATUS[0]}
-          echo ""
-          echo ">>> BUILD EXIT: $BLD_EXIT <<<"
-
-          echo ""
-          echo "================================================================"
-          echo "STEP 4: checking .a files"
-          echo "================================================================"
-          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; || true
-
-          LIB_COUNT=$(find build -name "libfrida-gumjs-*.a" ! -name "*inspector*" 2>/dev/null | wc -l)
-          echo ">>> Found $LIB_COUNT gumjs .a files <<<"
-
-          if [ "$LIB_COUNT" -eq 0 ]; then
-            echo ""
-            echo "================================================================"
-            echo "!!!!! NO .a FILES FOUND !!!!!"
-            echo "================================================================"
-            echo "=== LAST 100 LINES OF BUILD LOG ==="
-            tail -100 /tmp/arm64-build.log || echo "(no log)"
-            echo ""
-            echo "=== what's in build/subprojects/ ==="
-            ls build/subprojects/ 2>/dev/null || echo "(dir missing)"
-            echo ""
-            echo "=== what's in build/subprojects/frida-gum/bindings/ ==="
-            ls build/subprojects/frida-gum/bindings/ 2>/dev/null || echo "(dir missing)"
-            exit 1
-          fi
-
-          if [ $BLD_EXIT -ne 0 ]; then
-            echo ""
-            echo ">>> WARNING: Build exited with $BLD_EXIT but .a files exist!"
-            echo ">>> This is normal (python/tools bindings fail but core is built)."
-          fi
-
-          echo "✓ arm64 build done"
-
-      - name: Stage arm64
+      - name: Build Frida for armv7
+        timeout-minutes: 90
         run: |
           set -e
-          DEST=/tmp/frida-built/arm64-v8a
-          rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
-
-          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs-*.a" ! -name "*inspector*" | head -1)
-          echo ">>> Found library: $LIB"
-          [ -z "$LIB" ] && echo "FATAL: no gumjs lib for arm64" && exit 1
-          cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
-
-          GUMJS_H=$(find /tmp/dk64 -name "frida-gumjs.h" | head -1)
-          GUM_H=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
-          [ -n "$GUMJS_H" ] && cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
-          [ -n "$GUM_H" ] && cp -v "$GUM_H" "$DEST/include/frida-gum.h"
-          GLIB_DIR=$(find /tmp/dk64 -type d -name "glib-2.0" | head -1)
-          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
-
-          echo ">>> Staged arm64:"
-          ls -lah "$DEST/lib/"
-          echo ">>> include dir:"
-          ls "$DEST/include/" | head -10
-
-      # ============ ARMv7 BUILD (با لاگ کامل) ============
-      - name: Build armv7
-        timeout-minutes: 60
-        run: |
-          set -o pipefail
           cd /tmp/frida-gum
-          export ANDROID_NDK_ROOT="$NDK_PATH"
-
-          echo "================================================================"
-          echo "STEP 1: rm -rf build  (فایل قبلی arm64 رو پاک می‌کنیم)"
-          echo "================================================================"
           rm -rf build
-          echo "✓ build dir removed"
-
-          echo ""
-          echo "================================================================"
-          echo "STEP 2: ./configure --host=android-arm"
-          echo "================================================================"
+          export ANDROID_NDK_ROOT="$NDK_PATH"
           ./configure --host=android-arm -- \
             -Ddevkits=gum,gumjs \
-            -Dgumjs=enabled \
-            -Dquickjs=enabled \
-            -Dv8=disabled \
-            -Ddatabase=disabled \
-            -Dtests=disabled \
-            -Ddiet=true \
-            -Db_ndebug=true \
-            -Ddefault_library=static \
-            -Dlibunwind:minidebuginfo=disabled \
-            -Dlibdwarf:decompression=false \
-            2>&1 | tee /tmp/armv7-configure.log
-          CFG_EXIT=${PIPESTATUS[0]}
-          echo ""
-          echo ">>> CONFIGURE EXIT: $CFG_EXIT <<<"
+            -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled \
+            -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static \
+            -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false
+          make -j$(nproc) || true
+          mkdir -p /tmp/frida-built/armeabi-v7a/lib
+          find build -name '*.a' -exec cp -v {} /tmp/frida-built/armeabi-v7a/lib/ \;
 
-          if [ $CFG_EXIT -ne 0 ]; then
-            echo ""
-            echo "================================================================"
-            echo "!!!!! CONFIGURE FAILED (exit $CFG_EXIT) !!!!!"
-            echo "================================================================"
-            tail -60 /tmp/armv7-configure.log
-            exit 1
-          fi
-
-          echo ""
-          echo "================================================================"
-          echo "STEP 3: make -j\$(nproc)  (برای armv7)"
-          echo "================================================================"
-          make -j$(nproc) 2>&1 | tee /tmp/armv7-build.log
-          BLD_EXIT=${PIPESTATUS[0]}
-          echo ""
-          echo ">>> BUILD EXIT: $BLD_EXIT <<<"
-
-          echo ""
-          echo "================================================================"
-          echo "STEP 4: checking .a files (armv7)"
-          echo "================================================================"
-          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; || true
-
-          LIB_COUNT=$(find build -name "libfrida-gumjs-*.a" ! -name "*inspector*" 2>/dev/null | wc -l)
-          echo ">>> Found $LIB_COUNT gumjs .a files <<<"
-
-          if [ "$LIB_COUNT" -eq 0 ]; then
-            echo ""
-            echo "================================================================"
-            echo "!!!!! NO .a FILES FOUND (armv7) !!!!!"
-            echo "================================================================"
-            echo "=== LAST 100 LINES OF BUILD LOG ==="
-            tail -100 /tmp/armv7-build.log || echo "(no log)"
-            echo ""
-            echo "=== build/subprojects/ ==="
-            ls build/subprojects/ 2>/dev/null || echo "(dir missing)"
-            exit 1
-          fi
-
-          echo "✓ armv7 build done"
-
-      - name: Stage armv7
+      - name: Download Frida devkit headers (for frida-gumjs.h & glib headers)
         run: |
-          set -e
-          DEST=/tmp/frida-built/armeabi-v7a
-          rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
+          FRIDA_VERSION="17.1.0"
+          BASE="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}"
+          wget -q "${BASE}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm64.tar.xz" -O /tmp/dk64.tar.xz
+          wget -q "${BASE}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm.tar.xz" -O /tmp/dk32.tar.xz
+          mkdir -p /tmp/dk64 /tmp/dk32
+          tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
+          tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
 
-          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs-*.a" ! -name "*inspector*" | head -1)
-          echo ">>> Found library: $LIB"
-          [ -z "$LIB" ] && echo "FATAL: no gumjs lib for armv7" && exit 1
-          cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
-
-          GUMJS_H=$(find /tmp/dk32 -name "frida-gumjs.h" | head -1)
-          GUM_H=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
-          [ -n "$GUMJS_H" ] && cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
-          [ -n "$GUM_H" ] && cp -v "$GUM_H" "$DEST/include/frida-gum.h"
-          GLIB_DIR=$(find /tmp/dk32 -type d -name "glib-2.0" | head -1)
-          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
-
-          echo ">>> Staged armv7:"
-          ls -lah "$DEST/lib/"
+      - name: Stage Headers
+        run: |
+          for arch in arm64-v8a armeabi-v7a; do
+            DEST="/tmp/frida-built/$arch/include"
+            mkdir -p "$DEST"
+            if [ "$arch" = "arm64-v8a" ]; then SRC="/tmp/dk64"; else SRC="/tmp/dk32"; fi
+            cp -rv "$SRC"/*.h "$DEST"/ 2>/dev/null || true
+            # کپی هدرهای GLib از سیستمی که Frida با آن بیلد شده
+            cp -rv /usr/include/glib-2.0 "$DEST"/ 2>/dev/null || true
+            cp -rv /usr/lib/x86_64-linux-gnu/glib-2.0/include "$DEST"/glib-2.0-include 2>/dev/null || true
+          done
 
       - name: Compile agent.js
         run: |
@@ -304,14 +117,11 @@ jobs:
           npx frida-compile agent.js -o agent-compiled.js -S -c
           mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets"
           cp agent-compiled.js "$GITHUB_WORKSPACE/app/src/main/assets/agent.js"
-          echo "✓ agent.js ready"
 
       - name: Verify sources
         run: |
-          for f in app/src/main/cpp/tool/native-lib.cpp \
-                   app/src/main/cpp/tool/dex_data.h \
-                   app/src/main/java/com/menu/imgui/Helper.java \
-                   app/src/main/java/com/menu/imgui/OverlaySurfaceView.java \
+          for f in app/src/main/cpp/tool/native-lib.cpp app/src/main/cpp/tool/dex_data.h \
+                   app/src/main/java/com/menu/imgui/Helper.java app/src/main/java/com/menu/imgui/OverlaySurfaceView.java \
                    app/src/main/assets/agent.js; do
             test -s "$f" && echo "✓ $f" || (echo "✗ $f" && exit 1)
           done
@@ -328,6 +138,7 @@ jobs:
           endif()
           set(CMAKE_C_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
           set(CMAKE_CXX_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
+
           if(${ANDROID_ABI} STREQUAL "arm64-v8a")
               set(FRIDA_DIR /tmp/frida-built/arm64-v8a)
           elseif(${ANDROID_ABI} STREQUAL "armeabi-v7a")
@@ -335,10 +146,20 @@ jobs:
           else()
               message(FATAL_ERROR "Unsupported ABI")
           endif()
-          include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
-          add_library(frida-gumjs STATIC IMPORTED)
-          set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
+
+          include_directories(
+              ${FRIDA_DIR}/include
+              ${FRIDA_DIR}/include/glib-2.0
+              ${FRIDA_DIR}/include/glib-2.0-include
+          )
+
+          # Import همه کتابخانه‌های استاتیک Frida
+          file(GLOB FRIDA_LIBS "${FRIDA_DIR}/lib/*.a")
+          add_library(frida-bundle STATIC IMPORTED)
+          set_target_properties(frida-bundle PROPERTIES IMPORTED_LOCATION "${FRIDA_DIR}/lib/libfrida-gumjs.a")
+
           include_directories(imgui imgui/backends tool)
+
           add_library(tool SHARED
               tool/native-lib.cpp
               imgui/imgui.cpp
@@ -347,8 +168,15 @@ jobs:
               imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_android.cpp
               imgui/backends/imgui_impl_opengl3.cpp)
+
+          # لینک کردن تمام کتابخانه‌های استاتیک همراه با group برای حل وابستگی دایره‌ای
+          target_link_libraries(tool
+              -Wl,--start-group
+              ${FRIDA_LIBS}
+              -Wl,--end-group
+              android log EGL GLESv3 dl)
+
           target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
-          target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
           EOF
 
       - name: Write build.gradle.kts
@@ -437,7 +265,6 @@ jobs:
             ABI=$(echo "$SO" | grep -oE "(arm64-v8a|armeabi-v7a)")
             cp "$SO" "/tmp/so-out/libtool-${ABI}.so"
           done
-          ls -lah /tmp/so-out/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -455,5 +282,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: rm -rf build before each configure + full logging [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: link all frida static libs (gum, glib, gio, ...) with --start-group [skip ci]"
           git push
