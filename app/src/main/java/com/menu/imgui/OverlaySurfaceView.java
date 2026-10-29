@@ -13,20 +13,7 @@ import android.view.inputmethod.InputMethodManager;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
-public class OverlaySurfaceView
-
-    @Override
-    public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
-        InputConnection ic = super.onCreateInputConnection(outAttrs);
-        if (Helper.nativeWantKeyboard()) {
-            outAttrs.inputType = InputType.TYPE_CLASS_NUMBER
-                | InputType.TYPE_NUMBER_FLAG_DECIMAL;
-            outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE;
-        }
-        return ic;
-    }
-
- extends GLSurfaceView {
+public class OverlaySurfaceView extends GLSurfaceView {
     private volatile boolean ready = false;
     private volatile boolean keyboardShown = false;
     private volatile long lastActionMs = 0;
