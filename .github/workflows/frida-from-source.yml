@@ -33,8 +33,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            python3-pip ninja-build pkg-config libglib2.0-dev unzip curl \
-            liblzma-dev libzstd-dev zlib1g-dev
+            python3-pip ninja-build pkg-config libglib2.0-dev unzip curl
           pip3 install --quiet --upgrade pip
           pip3 install --quiet meson
 
@@ -74,59 +73,14 @@ jobs:
           sed -i '1i void glib_init(void);' bindings/gumjs/gumquickcompile.c
           echo "✓ Patched gumquickcompile.c with glib_init declaration"
 
-      - name: Create Meson cross files (with subsystem)
-        run: |
-          set -e
-          NDK="$NDK_PATH"
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-
-          cat > /tmp/android_arm64.ini << EOF
-          [binaries]
-          c = '$TOOLCHAIN/bin/aarch64-linux-android27-clang'
-          cpp = '$TOOLCHAIN/bin/aarch64-linux-android27-clang++'
-          ar = '$TOOLCHAIN/bin/llvm-ar'
-          strip = '$TOOLCHAIN/bin/llvm-strip'
-          pkgconfig = 'pkg-config'
-
-          [host_machine]
-          system = 'android'
-          subsystem = 'android'
-          kernel = 'linux'
-          cpu_family = 'aarch64'
-          cpu = 'arm64-v8a'
-          endian = 'little'
-          EOF
-
-          cat > /tmp/android_arm.ini << EOF
-          [binaries]
-          c = '$TOOLCHAIN/bin/armv7a-linux-androideabi27-clang'
-          cpp = '$TOOLCHAIN/bin/armv7a-linux-androideabi27-clang++'
-          ar = '$TOOLCHAIN/bin/llvm-ar'
-          strip = '$TOOLCHAIN/bin/llvm-strip'
-          pkgconfig = 'pkg-config'
-
-          [host_machine]
-          system = 'android'
-          subsystem = 'android'
-          kernel = 'linux'
-          cpu_family = 'arm'
-          cpu = 'armeabi-v7a'
-          endian = 'little'
-          EOF
-
-          echo "✓ Cross files created with subsystem"
-
       - name: Build frida-gumjs for android-arm64
         timeout-minutes: 60
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm64 (minsize + diet + b_ndebug + libunwind:minidebuginfo=disabled + libdwarf:decompression=false) ==="
-          meson setup build-arm64 --cross-file /tmp/android_arm64.ini \
-            --buildtype=minsize \
-            -Db_ndebug=true \
-            -Dlibunwind:minidebuginfo=disabled \
-            -Dlibdwarf:decompression=false \
+          echo "=== Configure using Frida's own script for arm64 ==="
+          # Use Frida's configure script to generate proper cross files
+          ./configure --host=android-arm64 -- \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
@@ -134,11 +88,14 @@ jobs:
             -Ddatabase=disabled \
             -Dtests=disabled \
             -Ddiet=true \
-            -Ddefault_library=static
+            -Db_ndebug=true \
+            -Ddefault_library=static \
+            -Dlibunwind:minidebuginfo=disabled \
+            -Dlibdwarf:decompression=false
           echo "=== Build ==="
-          ninja -C build-arm64
+          make -j$(nproc) 2>&1 | tail -40
           echo "=== .a files ==="
-          find build-arm64 -name "libfrida-gumjs*.a" -exec ls -lah {} \; 2>/dev/null
+          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; 2>/dev/null
 
       - name: Stage arm64
         run: |
@@ -146,7 +103,7 @@ jobs:
           DEST=/tmp/frida-built/arm64-v8a
           rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
 
-          LIB=$(find /tmp/frida-gum/build-arm64 -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && echo "FATAL: no gumjs lib for arm64" && exit 1
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
 
@@ -164,12 +121,8 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm (minsize + diet + b_ndebug + libunwind:minidebuginfo=disabled + libdwarf:decompression=false) ==="
-          meson setup build-arm --cross-file /tmp/android_arm.ini \
-            --buildtype=minsize \
-            -Db_ndebug=true \
-            -Dlibunwind:minidebuginfo=disabled \
-            -Dlibdwarf:decompression=false \
+          echo "=== Configure using Frida's own script for arm ==="
+          ./configure --host=android-arm -- \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
@@ -177,11 +130,14 @@ jobs:
             -Ddatabase=disabled \
             -Dtests=disabled \
             -Ddiet=true \
-            -Ddefault_library=static
+            -Db_ndebug=true \
+            -Ddefault_library=static \
+            -Dlibunwind:minidebuginfo=disabled \
+            -Dlibdwarf:decompression=false
           echo "=== Build ==="
-          ninja -C build-arm
+          make -j$(nproc) 2>&1 | tail -40
           echo "=== .a files ==="
-          find build-arm -name "libfrida-gumjs*.a" -exec ls -lah {} \; 2>/dev/null
+          find build -name "libfrida-gumjs*.a" -exec ls -lah {} \; 2>/dev/null
 
       - name: Stage armv7
         run: |
@@ -189,7 +145,7 @@ jobs:
           DEST=/tmp/frida-built/armeabi-v7a
           rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
 
-          LIB=$(find /tmp/frida-gum/build-arm -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
+          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && echo "FATAL: no gumjs lib for armv7" && exit 1
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
 
@@ -386,5 +342,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: disable libdwarf decompression to avoid zstd.h dependency [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: use Frida's configure script for correct cross-compilation sysroot [skip ci]"
           git push
