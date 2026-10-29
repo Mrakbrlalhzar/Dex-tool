@@ -121,11 +121,12 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm64 (minsize + diet + b_ndebug + libunwind:minidebuginfo=disabled) ==="
+          echo "=== Meson setup for arm64 (minsize + diet + b_ndebug + libunwind:minidebuginfo=disabled + libdwarf:decompression=false) ==="
           meson setup build-arm64 --cross-file /tmp/android_arm64.ini \
             --buildtype=minsize \
             -Db_ndebug=true \
             -Dlibunwind:minidebuginfo=disabled \
+            -Dlibdwarf:decompression=false \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
@@ -163,11 +164,12 @@ jobs:
         run: |
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
-          echo "=== Meson setup for arm (minsize + diet + b_ndebug + libunwind:minidebuginfo=disabled) ==="
+          echo "=== Meson setup for arm (minsize + diet + b_ndebug + libunwind:minidebuginfo=disabled + libdwarf:decompression=false) ==="
           meson setup build-arm --cross-file /tmp/android_arm.ini \
             --buildtype=minsize \
             -Db_ndebug=true \
             -Dlibunwind:minidebuginfo=disabled \
+            -Dlibdwarf:decompression=false \
             -Ddevkits=gum,gumjs \
             -Dgumjs=enabled \
             -Dquickjs=enabled \
@@ -384,5 +386,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: use -Dlibunwind:minidebuginfo=disabled to avoid lzma dependency [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: disable libdwarf decompression to avoid zstd.h dependency [skip ci]"
           git push
