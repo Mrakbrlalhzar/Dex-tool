@@ -102,7 +102,16 @@ public class Helper {
         try { File f = new File(getLogDir(), "crash.log"); FileWriter w = new FileWriter(f, true); w.write("[J " + now() + "] " + msg + "\n"); w.close(); } catch (Throwable ignored) { }
     }
 
-    public static void attach(Context context) {
+    public static void setMenuOpen(final boolean open) {
+    if (sOverlayWm == null || sOverlayLp == null || overlay == null) return;
+    overlay.post(() -> { try {
+        if (open) { sOverlayLp.width = -1; sOverlayLp.height = -1; sOverlayLp.flags &= ~android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE; }
+        else { sOverlayLp.width = 240; sOverlayLp.height = 240; sOverlayLp.flags |= android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE; }
+        sOverlayWm.updateViewLayout(overlay, sOverlayLp);
+    } catch (Throwable t) {} });
+}
+
+public static void attach(Context context) {
     final android.app.Activity activity;
     if (context instanceof android.app.Activity) {
         activity = (android.app.Activity) context;
@@ -205,7 +214,18 @@ public class Helper {
         return sInstances.get(instanceName);
     }
 
-    public static void requestPatchMethod(String className, String target, String value) { for (PatchRecord __p : sActivePatches) { if (__p.type.equals("Method") && __p.className.equals(className) && __p.targetName.equals(target)) { __p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return; } } PatchRecord p = new PatchRecord(); p.id = sPatchCounter++; p.type = "Method"; p.className = className; p.targetName = target; p.originalValue = "(original)"; p.currentValue = value; sActivePatches.add(p); syncPatches(); nativePatchMethod(className, target, value); }
+    public static void requestPatchMethod(String className, String target, String value) {
+    for (PatchRecord __p : sActivePatches) {
+        if ("Method".equals(__p.type) && className.equals(__p.className) && target.equals(__p.targetName)) {
+            __p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return;
+        }
+    }
+    PatchRecord p = new PatchRecord();
+    p.id = sPatchCounter++; p.type = "Method"; p.className = className;
+    p.targetName = target; p.originalValue = "(original)"; p.currentValue = value;
+    sActivePatches.add(p); syncPatches(); nativePatchMethod(className, target, value);
+}
+
     public static void requestPatchField(String className, String target, String value) {
     for (PatchRecord __p : sActivePatches) {
         if (__p.type.equals("Field") && __p.className.equals(className) && __p.targetName.equals(target)) {
