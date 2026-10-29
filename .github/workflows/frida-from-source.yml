@@ -82,12 +82,8 @@ jobs:
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { echo "FATAL: no arm64 lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-          GUMJS_H=$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)
-          [ -z "$GUMJS_H" ] && { echo "FATAL: frida-gumjs.h missing"; exit 1; }
-          cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
-          G=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
-          [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
-          [ -z "$G" ] && G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1)
+          cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
+          G=$(find /tmp/dk64 -name "frida-gum.h" | head -1); [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
           [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
@@ -122,12 +118,8 @@ jobs:
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { echo "FATAL: no armv7 lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-          GUMJS_H=$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)
-          [ -z "$GUMJS_H" ] && { echo "FATAL: frida-gumjs.h missing"; exit 1; }
-          cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
-          G=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
-          [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
-          [ -z "$G" ] && G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1)
+          cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
+          G=$(find /tmp/dk32 -name "frida-gum.h" | head -1); [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
           [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
@@ -135,102 +127,120 @@ jobs:
           ls -lah "$D/lib/"
 
       # ============================================================
-      # PATCH 1: Clean up broken notifyMenuOpen from previous iteration
+      # PATCH Helper.java: remove alpha=0.01, add FLAG_NOT_TOUCHABLE toggle, fallback
       # ============================================================
-      - name: Remove broken notifyMenuOpen from native-lib.cpp
-        run: |
-          python3 - <<'PYEOF'
-          import re, pathlib
-          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
-          if not p.exists():
-              print("no file"); raise SystemExit(0)
-          s = p.read_text(); orig = s
-
-          # Remove helper function body
-          if "static void notifyMenuOpen" in s:
-              m = re.search(r'static void notifyMenuOpen\(bool open\)\s*\{', s)
-              if m:
-                  i = s.index('{', m.end()-1); d=0; e=-1
-                  for k in range(i, len(s)):
-                      if s[k]=='{': d+=1
-                      elif s[k]=='}':
-                          d-=1
-                          if d==0: e=k+1; break
-                  if e>0:
-                      s = s[:m.start()] + s[e:]
-                      print("PASS: removed notifyMenuOpen helper")
-
-          # Remove call in nativeRender (with or without leading blank line)
-          s = s.replace("    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }\n", "")
-          s = s.replace("    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }\n", "")
-          s = s.replace("    static bool lastMenuOpen = false;\n", "")
-
-          if s != orig:
-              p.write_text(s)
-          else:
-              print("nothing to remove")
-          PYEOF
-
-      # ============================================================
-      # PATCH 2: Helper.java
-      # ============================================================
-      - name: Patch Helper.java
+      - name: Patch Helper.java (overlay alpha + touch toggle + fallback)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
 
+          # 1. Add fields
           if "sOverlayWm" not in s:
               s = s.replace("private static OverlaySurfaceView overlay;",
-                  "private static OverlaySurfaceView overlay; private static android.view.WindowManager sOverlayWm; private static android.view.WindowManager.LayoutParams sOverlayLp;", 1)
+                  "private static OverlaySurfaceView overlay; private static android.view.WindowManager sOverlayWm; private static android.view.WindowManager.LayoutParams sOverlayLp; private static android.view.ViewGroup sOverlayDecor;", 1)
 
-          if "sOverlayWm = wm;" not in s:
-              s = s.replace("wm.addView(glView, lp);",
-                  "wm.addView(glView, lp); sOverlayWm = wm; sOverlayLp = lp;", 1)
+          # 2. Rewrite attach: alpha=1.0, FLAG_NOT_TOUCHABLE initially, fallback to decor
+          # First remove the existing attach method body via brace counting.
+          m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*Context\s+\w+\s*\)\s*\{', s)
+          if not m:
+              print("FAIL: attach(Context) not found"); raise SystemExit(2)
+          i = s.index('{', m.end()-1); d=0; e=-1
+          for k in range(i, len(s)):
+              if s[k]=='{': d+=1
+              elif s[k]=='}':
+                  d-=1
+                  if d==0: e=k+1; break
+          if e < 0:
+              print("FAIL: brace count for attach"); raise SystemExit(2)
 
+          new_attach = textwrap.dedent("""\
+              public static void attach(Context context) {
+                  final android.app.Activity activity;
+                  if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
+                  else if (context instanceof android.content.ContextWrapper) {
+                      android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();
+                      activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
+                  } else activity = null;
+                  if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
+                  activity.runOnUiThread(() -> {
+                      OverlaySurfaceView glView = new OverlaySurfaceView(activity);
+                      android.view.WindowManager wm = activity.getWindowManager();
+                      android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+                          android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                          android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                          android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                          android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                              | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                              | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                              | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                          android.graphics.PixelFormat.TRANSLUCENT);
+                      lp.token = activity.getWindow().getDecorView().getWindowToken();
+                      lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
+                      try {
+                          wm.addView(glView, lp);
+                          sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
+                          android.util.Log.i("DexTool", "Overlay added via WindowManager (alpha=1, touchable=false)");
+                      } catch (Throwable t) {
+                          android.util.Log.w("DexTool", "WindowManager failed, fallback to DecorView", t);
+                          try {
+                              android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
+                              sOverlayDecor = decor;
+                              decor.addView(glView, new android.view.ViewGroup.LayoutParams(-1, -1));
+                              overlay = glView;
+                              android.util.Log.i("DexTool", "Overlay added to DecorView (fallback)");
+                          } catch (Throwable t2) { android.util.Log.e("DexTool", "all overlay methods failed", t2); }
+                      }
+                      registerLifecycle(activity, glView);
+                  });
+              }
+          """)
+          s = s[:m.start()] + new_attach + s[e:]
+
+          # 3. setMenuOpen: toggle FLAG_NOT_TOUCHABLE, no alpha change
+          if "setMenuOpen" not in s:
+              menu = textwrap.dedent("""\
+                  public static void setMenuOpen(final boolean open) {
+                      if (sOverlayLp == null || overlay == null) return;
+                      overlay.post(() -> {
+                          try {
+                              if (open) {
+                                  sOverlayLp.flags &= ~android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                                  sOverlayLp.flags &= ~android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                              } else {
+                                  sOverlayLp.flags |= android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+                                  sOverlayLp.flags |= android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                              }
+                              if (sOverlayWm != null) sOverlayWm.updateViewLayout(overlay, sOverlayLp);
+                              else if (sOverlayDecor != null) sOverlayDecor.requestLayout();
+                              android.util.Log.i("DexTool", "setMenuOpen(" + open + ")");
+                          } catch (Throwable t) { android.util.Log.w("DexTool", "setMenuOpen failed", t); }
+                      });
+                  }
+              """)
+              s = s.replace("public static void attach(Context context) {",
+                            menu + "\npublic static void attach(Context context) {", 1)
+
+          # 4. re-attach on resume
           old = "if (a == activity) glView.onResume();"
-          new = ("if (a == activity) { glView.onResume(); try { "
-                 "if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { "
-                 "sOverlayWm.addView(glView, sOverlayLp); android.util.Log.i(\"DexTool\", \"re-attached\"); "
-                 "} } catch (Throwable t) {} }")
+          new = ("if (a == activity) { try { glView.onResume(); } catch (Throwable t) {} "
+                 "try { if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { "
+                 "sOverlayWm.addView(glView, sOverlayLp); android.util.Log.i(\"DexTool\", \"re-attached\"); } } catch (Throwable t) {} }")
           if old in s and "re-attached" not in s:
               s = s.replace(old, new, 1)
 
+          # 5. nativePatchMethod declaration
           if "nativePatchMethod" not in s:
               s = s.replace("static native void nativeSetPatches",
                   "static native void nativePatchMethod(String c, String m, String v); static native void nativeSetPatches", 1)
 
-          m = re.search(r'public static void requestPatchMethod\([^)]*\)\s*\{', s)
-          if m:
-              i = s.index('{', m.end()-1); d=0; end=-1
-              for k in range(i, len(s)):
-                  if s[k]=='{': d+=1
-                  elif s[k]=='}':
-                      d-=1
-                      if d==0: end=k+1; break
-              if end>0:
-                  body = textwrap.dedent("""\
-                      public static void requestPatchMethod(String className, String target, String value) {
-                          for (PatchRecord __p : sActivePatches) {
-                              if ("Method".equals(__p.type) && className.equals(__p.className) && target.equals(__p.targetName)) {
-                                  __p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return;
-                              }
-                          }
-                          PatchRecord p = new PatchRecord();
-                          p.id = sPatchCounter++; p.type = "Method"; p.className = className;
-                          p.targetName = target; p.originalValue = "(original)"; p.currentValue = value;
-                          sActivePatches.add(p); syncPatches(); nativePatchMethod(className, target, value);
-                      }
-                  """)
-                  s = s[:m.start()] + body + s[end:]
-
           p.write_text(s)
-          print("Helper.java patched")
+          print("PASS: Helper.java rewritten (alpha removed, touch toggle, fallback)")
           PYEOF
 
       # ============================================================
-      # PATCH 3: OverlaySurfaceView.java
+      # PATCH OverlaySurfaceView.java: setZOrderMediaOverlay + touch + EGL
       # ============================================================
       - name: Patch OverlaySurfaceView.java
         run: |
@@ -239,10 +249,15 @@ jobs:
           p = pathlib.Path("app/src/main/java/com/menu/imgui/OverlaySurfaceView.java")
           s = p.read_text()
 
+          # setZOrderMediaOverlay + setPreserveEGLContextOnPause
+          if "setZOrderMediaOverlay" not in s:
+              s = s.replace("setZOrderOnTop(true);",
+                  "setZOrderOnTop(true); setZOrderMediaOverlay(true);", 1)
           if "setPreserveEGLContextOnPause" not in s:
               s = s.replace("setRenderMode(RENDERMODE_CONTINUOUSLY);",
                   "setRenderMode(RENDERMODE_CONTINUOUSLY); setPreserveEGLContextOnPause(true);", 1)
 
+          # onTouchEvent + dispatchKeyEvent
           if "onTouchEvent" not in s:
               methods = textwrap.dedent("""
                   @Override public boolean onTouchEvent(android.view.MotionEvent e) {
@@ -264,26 +279,74 @@ jobs:
               s = s.replace("@Override public boolean onCheckIsTextEditor()",
                   methods + "\n@Override public boolean onCheckIsTextEditor()", 1)
           p.write_text(s)
-          print("OverlaySurfaceView.java patched")
+          print("PASS: OverlaySurfaceView.java patched")
           PYEOF
 
       # ============================================================
-      # PATCH 4: native-lib.cpp
+      # PATCH native-lib.cpp: g_jvm, gMenuOpen, notifyMenuOpen, nativeTouch, agent
       # ============================================================
-      - name: Patch native-lib.cpp
+      - name: Patch native-lib.cpp (g_jvm + gMenuOpen + notifyMenuOpen)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
+          # 1. g_jvm global
+          if "JavaVM* g_jvm" not in s:
+              s = s.replace("static GumScript* g_script = nullptr;",
+                  "static GumScript* g_script = nullptr;\nstatic JavaVM* g_jvm = nullptr;\nstatic bool gMenuOpen = false;", 1)
+              # store in JNI_OnLoad
+              s = s.replace("gum_init_embedded();",
+                  "env->GetJavaVM(&g_jvm);\n    gum_init_embedded();", 1)
+
+          # 2. includes
           if "#include <vector>" not in s:
               s = s.replace("#include <mutex>", "#include <mutex>\n#include <vector>\n#include <string>", 1)
-
           if "gCallLog" not in s:
-              s = s.replace("static GumScript* g_script = nullptr;",
-                  "static GumScript* g_script = nullptr;\nstatic std::vector<std::string> gCallLog;\nstatic std::mutex gCallLogMutex;", 1)
+              s = s.replace("static JavaVM* g_jvm = nullptr;",
+                  "static JavaVM* g_jvm = nullptr;\nstatic std::vector<std::string> gCallLog;\nstatic std::mutex gCallLogMutex;", 1)
 
+          # 3. notifyMenuOpen helper (now g_jvm is defined)
+          if "notifyMenuOpen" not in s:
+              helper = textwrap.dedent(r'''
+                  static void notifyMenuOpen(bool open) {
+                      if (!g_jvm) return;
+                      JNIEnv* env = nullptr;
+                      bool detach = false;
+                      if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+                          if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+                          detach = true;
+                      }
+                      jclass cls = env->FindClass("com/menu/imgui/Helper");
+                      if (cls) {
+                          jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
+                          if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
+                          env->DeleteLocalRef(cls);
+                      }
+                      if (detach) g_jvm->DetachCurrentThread();
+                  }
+              ''')
+              s = s.replace("static GumScript* g_script = nullptr;",
+                            "static GumScript* g_script = nullptr;\n" + helper, 1)
+
+          # 4. call notifyMenuOpen when gMenuOpen changes
+          if "notifyMenuOpen(" in s and "lastMenuOpen" not in s:
+              s = s.replace("void nativeRender() {",
+                  "void nativeRender() {\n    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }", 1)
+
+          p.write_text(s)
+          print("PASS: g_jvm + gMenuOpen + notifyMenuOpen")
+          PYEOF
+
+      - name: Patch native-lib.cpp (agent, nativePatchMethod, nativeTouch, Log)
+        run: |
+          python3 - <<'PYEOF'
+          import re, pathlib, textwrap
+          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
+          s = p.read_text()
+
+          # robust agent
           new_js = textwrap.dedent(r"""
               Java.perform(function() {
                 function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
@@ -372,44 +435,30 @@ jobs:
                   'if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); ImGui::BeginChild("##logchild", ImVec2(0,0), true); for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); ImGui::EndChild(); ImGui::EndTabItem(); }\n        if (ImGui::BeginTabItem("Patches"))', 1)
 
           p.write_text(s)
-          print("native-lib.cpp patched")
+          print("PASS: native-lib.cpp fully patched")
           PYEOF
 
       # ============================================================
-      # REBUILD dex_data.h WITH CORRECT VARIABLE NAME
+      # REBUILD dex_data.h
       # ============================================================
-      - name: Rebuild dex_data.h (correct imgui_dex naming)
+      - name: Rebuild dex_data.h
         run: |
           set -e
           ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -1)
-          echo "android.jar: $ANDROID_JAR"
           D8=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -1)
-          echo "d8: $D8"
-
           rm -rf /tmp/dex_build /tmp/dex_out
           mkdir -p /tmp/dex_build /tmp/dex_out
-
           echo "=== javac ==="
           javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build \
             $(find app/src/main/java/com/menu/imgui -name "*.java") 2>&1 | tee /tmp/javac.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC FAILED"; cat /tmp/javac.log; exit 1; }
-          echo "javac OK"
-          find /tmp/dex_build -name "*.class" | sort
-
           echo "=== d8 ==="
           "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out \
             $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8 FAILED"; cat /tmp/d8.log; exit 1; }
-          echo "d8 OK"
-          ls -lah /tmp/dex_out/classes.dex
-
-          echo "=== xxd (with -n imgui_dex) ==="
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
-          echo "dex_data.h head:"
-          head -5 app/src/main/cpp/tool/dex_data.h
-          echo "dex_data.h tail (check variable name):"
-          tail -3 app/src/main/cpp/tool/dex_data.h
-          wc -l app/src/main/cpp/tool/dex_data.h
+          echo "dex_data.h head:"; head -3 app/src/main/cpp/tool/dex_data.h
+          echo "dex_data.h tail:"; tail -2 app/src/main/cpp/tool/dex_data.h
 
       # ============================================================
       # VERIFY
@@ -418,23 +467,24 @@ jobs:
         run: |
           FAIL=0
           chk() { if grep -q "$2" "$1"; then echo "OK  $2"; else echo "ERR $2"; FAIL=1; fi; }
-          chk app/src/main/java/com/menu/imgui/Helper.java "nativePatchMethod"
+          chk app/src/main/java/com/menu/imgui/Helper.java "FLAG_NOT_TOUCHABLE"
+          chk app/src/main/java/com/menu/imgui/Helper.java "setMenuOpen"
+          chk app/src/main/java/com/menu/imgui/Helper.java "setOverlayDecor"
+          chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "setZOrderMediaOverlay"
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "setPreserveEGLContextOnPause"
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "onTouchEvent"
-          chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "dispatchKeyEvent"
+          chk app/src/main/cpp/tool/native-lib.cpp "g_jvm"
+          chk app/src/main/cpp/tool/native-lib.cpp "notifyMenuOpen"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
-          chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
-          chk app/src/main/cpp/tool/native-lib.cpp 'BeginTabItem("Log")'
           chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
-          if grep -q "notifyMenuOpen" app/src/main/cpp/tool/native-lib.cpp; then
-            echo "ERR notifyMenuOpen still present"; FAIL=1
+          if grep -q "lp.alpha = 0.01f" app/src/main/java/com/menu/imgui/Helper.java; then
+            echo "ERR alpha=0.01 still present"; FAIL=1
           else
-            echo "OK  notifyMenuOpen removed"
+            echo "OK  alpha=0.01 removed"
           fi
           if [ $FAIL -ne 0 ]; then
             echo "===== diagnostics ====="
-            grep -n "notifyMenuOpen\|g_jvm" app/src/main/cpp/tool/native-lib.cpp | head -10
-            tail -3 app/src/main/cpp/tool/dex_data.h
+            grep -n "alpha\|FLAG_NOT_TOUCHABLE\|setMenuOpen\|setOverlayDecor" app/src/main/java/com/menu/imgui/Helper.java | head -20
             exit 1
           fi
           echo "ALL OK"
@@ -517,5 +567,5 @@ jobs:
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: xxd -n imgui_dex + remove broken notifyMenuOpen + rebuild dex [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: remove alpha=0.01 (invisible menu), FLAG_NOT_TOUCHABLE toggle, decor fallback, setZOrderMediaOverlay [skip ci]"
           git push
