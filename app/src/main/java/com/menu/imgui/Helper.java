@@ -108,38 +108,29 @@ public class Helper {
         try { File f = new File(getLogDir(), "crash.log"); FileWriter w = new FileWriter(f, true); w.write("[J " + now() + "] " + msg + "\n"); w.close(); } catch (Throwable ignored) { }
     }
 
-    public static void attach(Context ctx) {
-        if (!(ctx instanceof Activity)) return;
-        final Activity activity = (Activity) ctx;
-        sCurrentActivity = activity;
-        sApplicationContext = activity.getApplicationContext();
-        activity.runOnUiThread(() -> {
-            if (overlay != null) return;
-            try {
-                overlay = new OverlaySurfaceView(activity);
-                overlay.setOnTouchListener((v, e) -> {
-                    if (!overlay.isReady()) return false;
-                    int action = -1;
-                    switch (e.getActionMasked()) {
-                        case MotionEvent.ACTION_DOWN:   action = 0; break;
-                        case MotionEvent.ACTION_UP:     action = 1; break;
-                        case MotionEvent.ACTION_MOVE:   action = 2; break;
-                        case MotionEvent.ACTION_CANCEL: action = 3; break;
-                    }
-                    if (action == -1) return false;
-                    return nativeTouch(action, e.getX(), e.getY());
-                });
-                ViewGroup decor = (ViewGroup) activity.getWindow().getDecorView();
-                decor.addView(overlay, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                new Thread(() -> {
-                    try {
-                        List<String> classes = listAllClasses(activity);
-                        nativeSetClassList(classes.toArray(new String[0]));
-                    } catch (Throwable t) { log("classLister failed: " + t); }
-                }, "ImGuiClassLister").start();
-            } catch (Throwable t) { log("attach failed: " + t); }
-        });
+    public static void attach(Context context) {
+    final android.app.Activity activity;
+    if (context instanceof android.app.Activity) {
+        activity = (android.app.Activity) context;
+    } else if (context instanceof android.content.ContextWrapper) {
+        android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();
+        activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
+    } else {
+        activity = null;
     }
+    if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
+    activity.runOnUiThread(() -> {
+        final android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
+        if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(activity)); return; }
+        OverlaySurfaceView glView = new OverlaySurfaceView(activity);
+        android.view.ViewGroup.LayoutParams lp = new android.view.ViewGroup.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT);
+        decor.addView(glView, lp);
+        registerLifecycle(activity, glView);
+        android.util.Log.i("DexTool", "Overlay added to DecorView");
+    });
+}
 
     public static void requestClassDetails(int sectionId, String className) {
         new Thread(() -> {
@@ -226,7 +217,27 @@ public class Helper {
         syncPatches();
     }
     public static void removePatch(int id) { sActivePatches.removeIf(p -> p.id == id); syncPatches(); }
-    private static void syncPatches() {
+    private static void syncPatches() {        // TEMP:DEDUP
+        try {
+            java.util.Map<String, PatchRecord> __map = new java.util.LinkedHashMap<>();
+            java.lang.reflect.Field __fC = null, __fM = null;
+            for (PatchRecord __r : sActivePatches) {
+                if (__fC == null) {
+                    try { __fC = __r.getClass().getDeclaredField("className"); __fC.setAccessible(true); } catch (Throwable __e) {}
+                    try { __fM = __r.getClass().getDeclaredField("methodName"); __fM.setAccessible(true); } catch (Throwable __e) {}
+                }
+                String __k;
+                if (__fC != null && __fM != null) {
+                    __k = String.valueOf(__fC.get(__r)) + "#" + String.valueOf(__fM.get(__r));
+                } else {
+                    __k = String.valueOf(System.identityHashCode(__r));
+                }
+                __map.put(__k, __r);
+            }
+            sActivePatches.clear();
+            sActivePatches.addAll(__map.values());
+        } catch (Throwable __t) { }
+
         List<String> serialized = new ArrayList<>();
         for (PatchRecord p : sActivePatches) serialized.add(p.id + "|" + p.type + "|" + p.className + "|" + p.targetName + "|" + p.originalValue + "|" + p.currentValue + "|" + p.isActive);
         nativeSetPatches(serialized.toArray(new String[0]));
