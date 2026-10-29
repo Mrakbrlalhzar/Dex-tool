@@ -416,7 +416,7 @@ else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], siz
         PendingCallReq c; c.sectionId = sec.id; c.className = className; c.methodSig = m.display; c.methodName = m.name; c.paramTypes = m.paramTypes; c.args.resize(st.numParams);
         for (int i = 0; i < st.numParams; i++) c.args[i] = std::string(st.argBufs[i]);
         c.isStatic = m.isStatic; c.isConstructor = m.isConstructor; c.runInMain = st.runInMain;
-        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
+        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
         st.calling = true; st.hasResult = false;
     }
     ImGui::SameLine();
@@ -599,7 +599,7 @@ static void renderMainWindow() {
             if (active) renderSectionContent(*active); else ImGui::TextDisabled("No sections.");
             ImGui::EndTabItem();
         }
-        if (if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); ImGui::BeginChild("##logchild", ImVec2(0,0), true); for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); ImGui::EndChild(); ImGui::EndTabItem(); } if (ImGui::BeginTabItem("Patches")) { renderPatchesTab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); ImGui::BeginChild("##logchild", ImVec2(0,0), true); for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); ImGui::EndChild(); ImGui::EndTabItem(); } if (ImGui::BeginTabItem("Patches")) { renderPatchesTab(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Settings")) { renderSettingsTab(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
