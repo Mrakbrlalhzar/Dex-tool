@@ -51,7 +51,10 @@ jobs:
           mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
           wget -q "${BASE}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm.tar.xz" -O /tmp/dk32.tar.xz
           mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
-          echo "devkits ready"
+          echo "=== arm64 devkit contents ==="
+          find /tmp/dk64 -type f | head -40
+          echo "=== arm devkit contents ==="
+          find /tmp/dk32 -type f | head -40
 
       - name: Clone frida-gum source
         run: |
@@ -84,20 +87,62 @@ jobs:
           [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { tail -80 /tmp/arm64-devkit.log; exit 1; }
           echo "arm64 library located: $LIB"
+          echo "=== generated headers in build (arm64) ==="
+          find build -maxdepth 4 -name "frida-*.h" -type f 2>/dev/null | head -20 || true
 
       - name: Stage arm64
         run: |
           set -e
-          DEST=/tmp/frida-built/arm64-v8a; rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
+          DEST=/tmp/frida-built/arm64-v8a
+          rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
+
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && exit 1
+          if [ -z "$LIB" ]; then echo "FATAL: no libfrida-gumjs.a for arm64"; exit 1; fi
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
-          cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$DEST/include/frida-gumjs.h"
-          cp -v "$(find /tmp/dk64 -name 'frida-gum.h' | head -1)" "$DEST/include/frida-gum.h"
-          cp -rv "$(find /tmp/dk64 -type d -name 'glib-2.0' | head -1)" "$DEST/include/glib-2.0"
+
+          echo "=== devkit files (arm64) ==="
+          find /tmp/dk64 -type f 2>/dev/null | head -40 || true
+
+          # frida-gumjs.h (required)
+          GUMJS_H=$(find /tmp/dk64 -name "frida-gumjs.h" 2>/dev/null | head -1)
+          if [ -z "$GUMJS_H" ]; then
+            echo "FATAL: frida-gumjs.h not found in devkit"
+            find /tmp/dk64 -type f 2>/dev/null | head -40
+            exit 1
+          fi
+          cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
+
+          # frida-gum.h (optional; search multiple locations)
+          GUM_H=$(find /tmp/dk64 -name "frida-gum.h" 2>/dev/null | head -1)
+          [ -z "$GUM_H" ] && GUM_H=$(find /tmp/frida-gum/build -name "frida-gum.h" 2>/dev/null | head -1)
+          [ -z "$GUM_H" ] && GUM_H=$(find /tmp/frida-gum -name "frida-gum.h" 2>/dev/null | head -1)
+          if [ -n "$GUM_H" ]; then
+            echo "Found frida-gum.h at: $GUM_H"
+            cp -v "$GUM_H" "$DEST/include/frida-gum.h"
+          else
+            echo "WARN: frida-gum.h not found anywhere"
+            if grep -q 'frida-gum\.h' /tmp/dk64/frida-gumjs.h 2>/dev/null; then
+              echo "FATAL: frida-gumjs.h includes frida-gum.h but it is missing"
+              exit 1
+            else
+              echo "OK: frida-gumjs.h does not require frida-gum.h (self-contained)"
+            fi
+          fi
+
+          # glib-2.0 headers
+          GLIB_DIR=$(find /tmp/dk64 -type d -name "glib-2.0" 2>/dev/null | head -1)
+          if [ -n "$GLIB_DIR" ]; then
+            cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
+          else
+            echo "WARN: glib-2.0 directory not found in devkit"
+          fi
+
+          echo "=== Staged arm64 lib ==="
           ls -lah "$DEST/lib/"
+          echo "=== Staged arm64 include ==="
+          ls -lah "$DEST/include/"
 
       - name: Build armv7
         timeout-minutes: 60
@@ -119,20 +164,59 @@ jobs:
           [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { tail -80 /tmp/armv7-devkit.log; exit 1; }
           echo "armv7 library located: $LIB"
+          echo "=== generated headers in build (armv7) ==="
+          find build -maxdepth 4 -name "frida-*.h" -type f 2>/dev/null | head -20 || true
 
       - name: Stage armv7
         run: |
           set -e
-          DEST=/tmp/frida-built/armeabi-v7a; rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
+          DEST=/tmp/frida-built/armeabi-v7a
+          rm -rf "$DEST"; mkdir -p "$DEST/lib" "$DEST/include"
+
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && exit 1
+          if [ -z "$LIB" ]; then echo "FATAL: no libfrida-gumjs.a for armv7"; exit 1; fi
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
-          cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$DEST/include/frida-gumjs.h"
-          cp -v "$(find /tmp/dk32 -name 'frida-gum.h' | head -1)" "$DEST/include/frida-gum.h"
-          cp -rv "$(find /tmp/dk32 -type d -name 'glib-2.0' | head -1)" "$DEST/include/glib-2.0"
+
+          echo "=== devkit files (armv7) ==="
+          find /tmp/dk32 -type f 2>/dev/null | head -40 || true
+
+          GUMJS_H=$(find /tmp/dk32 -name "frida-gumjs.h" 2>/dev/null | head -1)
+          if [ -z "$GUMJS_H" ]; then
+            echo "FATAL: frida-gumjs.h not found in devkit"
+            find /tmp/dk32 -type f 2>/dev/null | head -40
+            exit 1
+          fi
+          cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
+
+          GUM_H=$(find /tmp/dk32 -name "frida-gum.h" 2>/dev/null | head -1)
+          [ -z "$GUM_H" ] && GUM_H=$(find /tmp/frida-gum/build -name "frida-gum.h" 2>/dev/null | head -1)
+          [ -z "$GUM_H" ] && GUM_H=$(find /tmp/frida-gum -name "frida-gum.h" 2>/dev/null | head -1)
+          if [ -n "$GUM_H" ]; then
+            echo "Found frida-gum.h at: $GUM_H"
+            cp -v "$GUM_H" "$DEST/include/frida-gum.h"
+          else
+            echo "WARN: frida-gum.h not found anywhere"
+            if grep -q 'frida-gum\.h' /tmp/dk32/frida-gumjs.h 2>/dev/null; then
+              echo "FATAL: frida-gumjs.h includes frida-gum.h but it is missing"
+              exit 1
+            else
+              echo "OK: frida-gumjs.h does not require frida-gum.h (self-contained)"
+            fi
+          fi
+
+          GLIB_DIR=$(find /tmp/dk32 -type d -name "glib-2.0" 2>/dev/null | head -1)
+          if [ -n "$GLIB_DIR" ]; then
+            cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
+          else
+            echo "WARN: glib-2.0 directory not found in devkit"
+          fi
+
+          echo "=== Staged armv7 lib ==="
           ls -lah "$DEST/lib/"
+          echo "=== Staged armv7 include ==="
+          ls -lah "$DEST/include/"
 
       # ============ FIX Helper.java ============
       - name: Fix Helper.java (remove dead patchRecordExists + dedup + attach)
@@ -142,7 +226,6 @@ jobs:
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text(); orig = s
 
-          # 1. Remove broken patchRecordExists (dead code)
           if "patchRecordExists" in s:
               m = re.search(r'private\s+static\s+boolean\s+patchRecordExists\s*\([^)]*\)\s*\{', s)
               if m:
@@ -157,11 +240,8 @@ jobs:
                       print("PASS: removed broken patchRecordExists")
                   else:
                       print("WARN: could not brace-count patchRecordExists")
-              else:
-                  print("WARN: patchRecordExists mentioned but signature not matched")
 
-          # 2. Dedup in requestPatchMethod / requestPatchField
-          def patch_request(sig_regex, type_str, target_var):
+          def patch_request(sig_regex, type_str):
               global s
               m = re.search(sig_regex, s)
               if not m:
@@ -174,8 +254,7 @@ jobs:
                       depth-=1
                       if depth==0: end=i+1; break
               if end < 0:
-                  print("WARN: brace-count failed for " + type_str)
-                  return
+                  print("WARN: brace-count failed for " + type_str); return
               body = "\n".join([
                   "public static void requestPatch" + type_str + "(String className, String target, String value) {",
                   "    for (PatchRecord __p : sActivePatches) {",
@@ -199,11 +278,10 @@ jobs:
               s = s[:m.start()] + body + s[end:]
               print("PASS: dedup added to requestPatch" + type_str)
 
-          patch_request(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', "Method", "methodSig")
-          patch_request(r'public\s+static\s+void\s+requestPatchField\s*\([^)]*\)\s*\{', "Field", "fieldName")
+          patch_request(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', "Method")
+          patch_request(r'public\s+static\s+void\s+requestPatchField\s*\([^)]*\)\s*\{', "Field")
 
-          # 3. attach: WindowManager with fallback to decor.addView
-          if "Overlay added to DecorView" not in s or "TYPE_APPLICATION_PANEL" not in s:
+          if "WindowManager" not in s or "Overlay added via WindowManager" not in s:
               m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*(?:android\.content\.)?(?:Context|Activity)\s+\w+\s*\)\s*\{', s)
               if not m:
                   print("FAIL: attach(Context|Activity) not found"); sys.exit(2)
@@ -259,21 +337,40 @@ jobs:
               s = s[:m.start()] + new_attach + s[end:]
               print("PASS: attach replaced with WindowManager + fallback")
 
+          if "registerLifecycle" not in s:
+              rl = "\n".join([
+                  "    private static void registerLifecycle(android.app.Activity activity, OverlaySurfaceView glView) {",
+                  "        activity.getApplication().registerActivityLifecycleCallbacks(",
+                  "            new android.app.Application.ActivityLifecycleCallbacks() {",
+                  "                @Override public void onActivityPaused(android.app.Activity a) { if (a == activity) { try { glView.onPause(); } catch (Throwable t) {} } }",
+                  "                @Override public void onActivityResumed(android.app.Activity a) { if (a == activity) { try { glView.onResume(); } catch (Throwable t) {} } }",
+                  "                @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}",
+                  "                @Override public void onActivityStarted(android.app.Activity a) {}",
+                  "                @Override public void onActivityStopped(android.app.Activity a) {}",
+                  "                @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}",
+                  "                @Override public void onActivityDestroyed(android.app.Activity a) {}",
+                  "            });",
+                  "    }",
+              ])
+              m2 = re.search(r'(public\s+class\s+Helper\s*\{)', s)
+              if m2:
+                  s = s[:m2.end()] + "\n" + rl + "\n" + s[m2.end():]
+                  print("PASS: inserted registerLifecycle")
+
           if s == orig:
               print("WARN: Helper.java unchanged")
           p.write_text(s)
           PYEOF
 
-      # ============ FIX widget types (Helper) ============
+      # ============ FIX getArgWidgetType (numeric) ============
       - name: Fix getArgWidgetType (numeric types)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
-          if "return 6;" in s or "return 7;" in s:
-              print("SKIP: numeric widget types already present")
-              raise SystemExit(0)
+          if "return 6;" in s and "return 7;" in s:
+              print("SKIP: numeric widget types already present"); raise SystemExit(0)
           m = re.search(r'public\s+static\s+int\s+getArgWidgetType\s*\([^)]*\)\s*\{', s)
           if not m:
               print("FAIL: getArgWidgetType not found"); raise SystemExit(2)
@@ -312,13 +409,11 @@ jobs:
       - name: Fix native-lib.cpp (numeric widgets)
         run: |
           python3 - <<'PYEOF'
-          import pathlib, re
+          import pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text(); orig = s
           if "wt == 6" in s:
-              print("SKIP: numeric widgets already present")
-              raise SystemExit(0)
-          # Insert wt==6 / wt==7 handling right after the InputText for wt==0
+              print("SKIP: numeric widgets already present"); raise SystemExit(0)
           old = 'ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); } else if (wt == 1)'
           new = "\n".join([
               'ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));',
@@ -336,14 +431,17 @@ jobs:
               s = s.replace(old, new, 1)
               print("PASS: inserted InputInt/InputFloat for wt==6/7")
           else:
-              print("FAIL: pattern for wt==0 InputText not found")
-              # fallback: insert before the final else InputText
+              print("WARN: primary pattern not found; trying fallback")
               fb = '} else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }'
               if fb in s:
                   s = s.replace(fb, new + '\n} else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }', 1)
                   print("PASS: inserted via fallback")
               else:
-                  print("FATAL: could not locate insertion point"); raise SystemExit(2)
+                  print("FATAL: could not locate insertion point — dumping wt-related lines")
+                  for i, line in enumerate(s.splitlines(), 1):
+                      if 'InputText' in line or 'wt ==' in line or 'argBufs' in line:
+                          print(i, line)
+                  raise SystemExit(2)
           if s == orig:
               print("WARN: native-lib.cpp unchanged")
           p.write_text(s)
@@ -508,5 +606,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: dedup patches, numeric InputInt/Float, WindowManager overlay [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: optional frida-gum.h, robust header staging, dedup + numeric + overlay fixes [skip ci]"
           git push
