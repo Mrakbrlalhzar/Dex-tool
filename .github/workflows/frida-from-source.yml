@@ -35,9 +35,7 @@ jobs:
           echo "NDK_PATH=/tmp/android-ndk-r25c" >> $GITHUB_ENV
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/build-tools/" 2>/dev/null || true
-          ls "$ANDROID_HOME/platforms/" 2>/dev/null || true
+          node --version
 
       - name: Download Frida devkit
         run: |
@@ -93,7 +91,6 @@ jobs:
           [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
-          [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
           ls -lah "$D/lib/"
 
@@ -134,12 +131,48 @@ jobs:
           [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1)
-          [ -z "$GLIB_DIR" ] && GLIB_DIR=$(find /tmp/frida-gum/build -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
           ls -lah "$D/lib/"
 
       # ============================================================
-      # PATCH 1: Helper.java
+      # PATCH 1: Clean up broken notifyMenuOpen from previous iteration
+      # ============================================================
+      - name: Remove broken notifyMenuOpen from native-lib.cpp
+        run: |
+          python3 - <<'PYEOF'
+          import re, pathlib
+          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
+          if not p.exists():
+              print("no file"); raise SystemExit(0)
+          s = p.read_text(); orig = s
+
+          # Remove helper function body
+          if "static void notifyMenuOpen" in s:
+              m = re.search(r'static void notifyMenuOpen\(bool open\)\s*\{', s)
+              if m:
+                  i = s.index('{', m.end()-1); d=0; e=-1
+                  for k in range(i, len(s)):
+                      if s[k]=='{': d+=1
+                      elif s[k]=='}':
+                          d-=1
+                          if d==0: e=k+1; break
+                  if e>0:
+                      s = s[:m.start()] + s[e:]
+                      print("PASS: removed notifyMenuOpen helper")
+
+          # Remove call in nativeRender (with or without leading blank line)
+          s = s.replace("    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }\n", "")
+          s = s.replace("    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }\n", "")
+          s = s.replace("    static bool lastMenuOpen = false;\n", "")
+
+          if s != orig:
+              p.write_text(s)
+          else:
+              print("nothing to remove")
+          PYEOF
+
+      # ============================================================
+      # PATCH 2: Helper.java
       # ============================================================
       - name: Patch Helper.java
         run: |
@@ -148,17 +181,14 @@ jobs:
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
 
-          # add sOverlayWm/sOverlayLp fields
           if "sOverlayWm" not in s:
               s = s.replace("private static OverlaySurfaceView overlay;",
                   "private static OverlaySurfaceView overlay; private static android.view.WindowManager sOverlayWm; private static android.view.WindowManager.LayoutParams sOverlayLp;", 1)
 
-          # store wm/lp after addView
           if "sOverlayWm = wm;" not in s:
               s = s.replace("wm.addView(glView, lp);",
                   "wm.addView(glView, lp); sOverlayWm = wm; sOverlayLp = lp;", 1)
 
-          # re-attach on resume
           old = "if (a == activity) glView.onResume();"
           new = ("if (a == activity) { glView.onResume(); try { "
                  "if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { "
@@ -167,12 +197,10 @@ jobs:
           if old in s and "re-attached" not in s:
               s = s.replace(old, new, 1)
 
-          # declare nativePatchMethod
           if "nativePatchMethod" not in s:
               s = s.replace("static native void nativeSetPatches",
                   "static native void nativePatchMethod(String c, String m, String v); static native void nativeSetPatches", 1)
 
-          # rewrite requestPatchMethod
           m = re.search(r'public static void requestPatchMethod\([^)]*\)\s*\{', s)
           if m:
               i = s.index('{', m.end()-1); d=0; end=-1
@@ -197,27 +225,12 @@ jobs:
                   """)
                   s = s[:m.start()] + body + s[end:]
 
-          # setMenuOpen
-          if "setMenuOpen" not in s:
-              menu = textwrap.dedent("""\
-                  public static void setMenuOpen(final boolean open) {
-                      if (sOverlayWm == null || sOverlayLp == null || overlay == null) return;
-                      overlay.post(() -> { try {
-                          if (open) { sOverlayLp.width = -1; sOverlayLp.height = -1; sOverlayLp.flags &= ~android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE; }
-                          else { sOverlayLp.width = 240; sOverlayLp.height = 240; sOverlayLp.flags |= android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE; }
-                          sOverlayWm.updateViewLayout(overlay, sOverlayLp);
-                      } catch (Throwable t) {} });
-                  }
-              """)
-              s = s.replace("public static void attach(Context context) {",
-                            menu + "\npublic static void attach(Context context) {", 1)
-
           p.write_text(s)
           print("Helper.java patched")
           PYEOF
 
       # ============================================================
-      # PATCH 2: OverlaySurfaceView.java
+      # PATCH 3: OverlaySurfaceView.java
       # ============================================================
       - name: Patch OverlaySurfaceView.java
         run: |
@@ -255,7 +268,7 @@ jobs:
           PYEOF
 
       # ============================================================
-      # PATCH 3: native-lib.cpp
+      # PATCH 4: native-lib.cpp
       # ============================================================
       - name: Patch native-lib.cpp
         run: |
@@ -271,7 +284,6 @@ jobs:
               s = s.replace("static GumScript* g_script = nullptr;",
                   "static GumScript* g_script = nullptr;\nstatic std::vector<std::string> gCallLog;\nstatic std::mutex gCallLogMutex;", 1)
 
-          # robust agent
           new_js = textwrap.dedent(r"""
               Java.perform(function() {
                 function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
@@ -314,7 +326,6 @@ jobs:
               s = re.sub(r'const gchar\* PATCH_AGENT_JS = R"\(.*?\)";',
                   'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
 
-          # nativePatchMethod impl
           if "Java_com_menu_imgui_Helper_nativePatchMethod" not in s:
               impl = textwrap.dedent(r'''
                   extern "C" JNIEXPORT void JNICALL
@@ -334,7 +345,6 @@ jobs:
               ''')
               s = s.replace("static void drawSigil", impl + "\nstatic void drawSigil", 1)
 
-          # nativeTouch impl
           if "Java_com_menu_imgui_Helper_nativeTouch" not in s:
               touch = textwrap.dedent(r'''
                   extern "C" JNIEXPORT jboolean JNICALL
@@ -349,49 +359,26 @@ jobs:
               ''')
               s = s.replace("static void drawSigil", touch + "\nstatic void drawSigil", 1)
 
-          # log JS messages
           if 'type\\":\\"log' not in s:
               s = s.replace('LOGI("Frida JS: %s", message);',
                   'LOGI("Frida JS: %s", message); if (message && strstr(message, "\\"type\\":\\"log\\"")) { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[JS] ")+message); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }', 1)
 
-          # log Call button
           if 'push_back("[CALL]' not in s:
               s = s.replace("gPendingCallReqs.push_back(c);",
                   "gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string(\"[CALL] \")+className+\".\"+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }", 1)
 
-          # Log tab
           if 'BeginTabItem("Log")' not in s:
               s = s.replace('if (ImGui::BeginTabItem("Patches"))',
                   'if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); ImGui::BeginChild("##logchild", ImVec2(0,0), true); for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); ImGui::EndChild(); ImGui::EndTabItem(); }\n        if (ImGui::BeginTabItem("Patches"))', 1)
-
-          # notifyMenuOpen
-          if "notifyMenuOpen" not in s:
-              helper = textwrap.dedent(r'''
-                  static void notifyMenuOpen(bool open) {
-                      JNIEnv* env = nullptr;
-                      if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return;
-                      jclass cls = env->FindClass("com/menu/imgui/Helper");
-                      if (!cls) return;
-                      jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
-                      if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
-                      env->DeleteLocalRef(cls);
-                  }
-              ''')
-              s = s.replace("static GumScript* g_script = nullptr;",
-                            "static GumScript* g_script = nullptr;\n" + helper, 1)
-
-          if "notifyMenuOpen(" in s and "lastMenuOpen" not in s:
-              s = s.replace("void nativeRender() {",
-                  "void nativeRender() {\n    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }", 1)
 
           p.write_text(s)
           print("native-lib.cpp patched")
           PYEOF
 
       # ============================================================
-      # REBUILD dex_data.h (THE KEY FIX)
+      # REBUILD dex_data.h WITH CORRECT VARIABLE NAME
       # ============================================================
-      - name: Rebuild dex_data.h from patched Java
+      - name: Rebuild dex_data.h (correct imgui_dex naming)
         run: |
           set -e
           ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -1)
@@ -399,28 +386,29 @@ jobs:
           D8=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -1)
           echo "d8: $D8"
 
-          mkdir -p /tmp/dex_build
-          rm -rf /tmp/dex_build/*
+          rm -rf /tmp/dex_build /tmp/dex_out
+          mkdir -p /tmp/dex_build /tmp/dex_out
 
-          # 1. compile all Java files in com/menu/imgui
-          javac -source 8 -target 8 -cp "$ANDROID_JAR" \
-            -d /tmp/dex_build \
-            app/src/main/java/com/menu/imgui/*.java 2>&1 | tee /tmp/javac.log
+          echo "=== javac ==="
+          javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build \
+            $(find app/src/main/java/com/menu/imgui -name "*.java") 2>&1 | tee /tmp/javac.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC FAILED"; cat /tmp/javac.log; exit 1; }
           echo "javac OK"
-          find /tmp/dex_build -name "*.class" | head -20
+          find /tmp/dex_build -name "*.class" | sort
 
-          # 2. dex
-          "$D8" --min-api 26 --output /tmp/dex_build \
+          echo "=== d8 ==="
+          "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out \
             $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8 FAILED"; cat /tmp/d8.log; exit 1; }
           echo "d8 OK"
-          ls -lah /tmp/dex_build/classes.dex
+          ls -lah /tmp/dex_out/classes.dex
 
-          # 3. header
-          xxd -i /tmp/dex_build/classes.dex > app/src/main/cpp/tool/dex_data.h
-          echo "dex_data.h rebuilt:"
+          echo "=== xxd (with -n imgui_dex) ==="
+          xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
+          echo "dex_data.h head:"
           head -5 app/src/main/cpp/tool/dex_data.h
+          echo "dex_data.h tail (check variable name):"
+          tail -3 app/src/main/cpp/tool/dex_data.h
           wc -l app/src/main/cpp/tool/dex_data.h
 
       # ============================================================
@@ -431,17 +419,22 @@ jobs:
           FAIL=0
           chk() { if grep -q "$2" "$1"; then echo "OK  $2"; else echo "ERR $2"; FAIL=1; fi; }
           chk app/src/main/java/com/menu/imgui/Helper.java "nativePatchMethod"
-          chk app/src/main/java/com/menu/imgui/Helper.java "setMenuOpen"
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "setPreserveEGLContextOnPause"
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "onTouchEvent"
           chk app/src/main/java/com/menu/imgui/OverlaySurfaceView.java "dispatchKeyEvent"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
           chk app/src/main/cpp/tool/native-lib.cpp 'BeginTabItem("Log")'
+          chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
+          if grep -q "notifyMenuOpen" app/src/main/cpp/tool/native-lib.cpp; then
+            echo "ERR notifyMenuOpen still present"; FAIL=1
+          else
+            echo "OK  notifyMenuOpen removed"
+          fi
           if [ $FAIL -ne 0 ]; then
             echo "===== diagnostics ====="
-            grep -n "onTouchEvent\|dispatchKeyEvent\|setPreserveEGL" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -10
-            grep -n "nativePatchMethod\|setMenuOpen" app/src/main/java/com/menu/imgui/Helper.java | head -10
+            grep -n "notifyMenuOpen\|g_jvm" app/src/main/cpp/tool/native-lib.cpp | head -10
+            tail -3 app/src/main/cpp/tool/dex_data.h
             exit 1
           fi
           echo "ALL OK"
@@ -524,5 +517,5 @@ jobs:
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: rebuild dex_data.h from patched Java (root cause), robust patch agent, touch, EGL, digits, log [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: xxd -n imgui_dex + remove broken notifyMenuOpen + rebuild dex [skip ci]"
           git push
