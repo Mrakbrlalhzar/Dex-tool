@@ -25,37 +25,14 @@ jobs:
         run: |
           cd .github/workflows
           for f in *.yml *.yaml; do
-            if [ -f "$f" ] && [ "$f" != "frida-from-source.yml" ]; then
-              rm -f "$f"
-            fi
+            if [ -f "$f" ] && [ "$f" != "frida-from-source.yml" ]; then rm -f "$f"; fi
           done
           ls -la
-
-      - name: Restore OverlaySurfaceView.java from last known-good commit
-        run: |
-          F=app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
-          echo "Git history for $F:"
-          git log --oneline -- "$F" | head -10 || true
-          GOOD=$(git log --oneline -- "$F" | grep -viE "fix:|patch|zipalign|dedup|broken" | head -1 | cut -d' ' -f1)
-          if [ -z "$GOOD" ]; then
-            echo "No pre-fix commit found; using first commit that touched the file"
-            GOOD=$(git log --reverse --oneline -- "$F" | head -1 | cut -d' ' -f1)
-          fi
-          if [ -n "$GOOD" ]; then
-            echo "Restoring $F from $GOOD"
-            git checkout "$GOOD" -- "$F"
-            echo "=== restored file top ==="
-            head -25 "$F"
-          else
-            echo "FATAL: cannot restore $F (no commits found)"
-            exit 1
-          fi
 
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            python3-pip ninja-build pkg-config libglib2.0-dev unzip curl zipalign
+          sudo apt-get install -y -qq python3-pip ninja-build pkg-config libglib2.0-dev unzip curl zipalign
           pip3 install --quiet --upgrade pip
           pip3 install --quiet meson
           wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip -O /tmp/ndk-r25c.zip
@@ -78,8 +55,7 @@ jobs:
 
       - name: Clone frida-gum source
         run: |
-          git clone --recursive --depth 1 --branch 17.1.0 \
-            https://github.com/frida/frida-gum.git /tmp/frida-gum
+          git clone --recursive --depth 1 --branch 17.1.0 https://github.com/frida/frida-gum.git /tmp/frida-gum
           cd /tmp/frida-gum; echo "cloned"
 
       - name: Patch glib_init
@@ -103,13 +79,11 @@ jobs:
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/arm64-configure.log; exit 1; }
           make -j$(nproc) 2>&1 | tee /tmp/arm64-build.log
           python3 releng/devkit.py frida-gumjs android-arm64 2>&1 | tee /tmp/arm64-devkit.log || true
-          find build -name "*.a" -exec ls -lah {} \; | sort || true
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          echo ">>> Selected: ${LIB:-none}"
           [ -z "$LIB" ] && { tail -80 /tmp/arm64-devkit.log; exit 1; }
-          echo "arm64 library located"
+          echo "arm64 library located: $LIB"
 
       - name: Stage arm64
         run: |
@@ -118,14 +92,11 @@ jobs:
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          echo ">>> Staging: $LIB"; [ -z "$LIB" ] && exit 1
+          [ -z "$LIB" ] && exit 1
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
-          GUMJS_H=$(find /tmp/dk64 -name "frida-gumjs.h" | head -1)
-          GUM_H=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
-          [ -n "$GUMJS_H" ] && cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
-          [ -n "$GUM_H" ] && cp -v "$GUM_H" "$DEST/include/frida-gum.h"
-          GLIB_DIR=$(find /tmp/dk64 -type d -name "glib-2.0" | head -1)
-          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
+          cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$DEST/include/frida-gumjs.h"
+          cp -v "$(find /tmp/dk64 -name 'frida-gum.h' | head -1)" "$DEST/include/frida-gum.h"
+          cp -rv "$(find /tmp/dk64 -type d -name 'glib-2.0' | head -1)" "$DEST/include/glib-2.0"
           ls -lah "$DEST/lib/"
 
       - name: Build armv7
@@ -143,13 +114,11 @@ jobs:
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/armv7-configure.log; exit 1; }
           make -j$(nproc) 2>&1 | tee /tmp/armv7-build.log
           python3 releng/devkit.py frida-gumjs android-arm 2>&1 | tee /tmp/armv7-devkit.log || true
-          find build -name "*.a" -exec ls -lah {} \; | sort || true
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          echo ">>> Selected: ${LIB:-none}"
           [ -z "$LIB" ] && { tail -80 /tmp/armv7-devkit.log; exit 1; }
-          echo "armv7 library located"
+          echo "armv7 library located: $LIB"
 
       - name: Stage armv7
         run: |
@@ -158,61 +127,95 @@ jobs:
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          echo ">>> Staging: $LIB"; [ -z "$LIB" ] && exit 1
+          [ -z "$LIB" ] && exit 1
           cp -v "$LIB" "$DEST/lib/libfrida-gumjs.a"
-          GUMJS_H=$(find /tmp/dk32 -name "frida-gumjs.h" | head -1)
-          GUM_H=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
-          [ -n "$GUMJS_H" ] && cp -v "$GUMJS_H" "$DEST/include/frida-gumjs.h"
-          [ -n "$GUM_H" ] && cp -v "$GUM_H" "$DEST/include/frida-gum.h"
-          GLIB_DIR=$(find /tmp/dk32 -type d -name "glib-2.0" | head -1)
-          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$DEST/include/glib-2.0"
+          cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$DEST/include/frida-gumjs.h"
+          cp -v "$(find /tmp/dk32 -name 'frida-gum.h' | head -1)" "$DEST/include/frida-gum.h"
+          cp -rv "$(find /tmp/dk32 -type d -name 'glib-2.0' | head -1)" "$DEST/include/glib-2.0"
           ls -lah "$DEST/lib/"
 
-      - name: Patch Helper.java (attach + registerLifecycle + dedup, safe)
+      # ============ FIX Helper.java ============
+      - name: Fix Helper.java (remove dead patchRecordExists + dedup + attach)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, sys
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text(); orig = s
 
-          # 1. registerLifecycle
-          if "registerLifecycle" not in s:
-              rl = "\n".join([
-                  "    private static void registerLifecycle(android.app.Activity activity, OverlaySurfaceView glView) {",
-                  "        activity.getApplication().registerActivityLifecycleCallbacks(",
-                  "            new android.app.Application.ActivityLifecycleCallbacks() {",
-                  "                @Override public void onActivityPaused(android.app.Activity a) { if (a == activity) { try { glView.onPause(); } catch (Throwable t) {} } }",
-                  "                @Override public void onActivityResumed(android.app.Activity a) { if (a == activity) { try { glView.onResume(); } catch (Throwable t) {} } }",
-                  "                @Override public void onActivityCreated(android.app.Activity a, android.os.Bundle b) {}",
-                  "                @Override public void onActivityStarted(android.app.Activity a) {}",
-                  "                @Override public void onActivityStopped(android.app.Activity a) {}",
-                  "                @Override public void onActivitySaveInstanceState(android.app.Activity a, android.os.Bundle b) {}",
-                  "                @Override public void onActivityDestroyed(android.app.Activity a) {}",
-                  "            });",
-                  "    }",
-              ])
-              m = re.search(r'(public\s+class\s+Helper\s*\{)', s)
-              if not m:
-                  print("FAIL: could not find 'public class Helper {'"); sys.exit(2)
-              s = s[:m.end()] + "\n" + rl + "\n" + s[m.end():]
-              print("PASS: inserted registerLifecycle")
-          else:
-              print("SKIP: registerLifecycle already present")
+          # 1. Remove broken patchRecordExists (dead code)
+          if "patchRecordExists" in s:
+              m = re.search(r'private\s+static\s+boolean\s+patchRecordExists\s*\([^)]*\)\s*\{', s)
+              if m:
+                  brace = s.index('{', m.end()-1); depth = 0; end = -1
+                  for i in range(brace, len(s)):
+                      if s[i]=='{': depth+=1
+                      elif s[i]=='}':
+                          depth-=1
+                          if depth==0: end=i+1; break
+                  if end > 0:
+                      s = s[:m.start()] + s[end:]
+                      print("PASS: removed broken patchRecordExists")
+                  else:
+                      print("WARN: could not brace-count patchRecordExists")
+              else:
+                  print("WARN: patchRecordExists mentioned but signature not matched")
 
-          # 2. attach replacement (idempotency marker)
-          if "Overlay added to DecorView" not in s:
+          # 2. Dedup in requestPatchMethod / requestPatchField
+          def patch_request(sig_regex, type_str, target_var):
+              global s
+              m = re.search(sig_regex, s)
+              if not m:
+                  print("WARN: signature not found: " + sig_regex)
+                  return
+              brace = s.index('{', m.end()-1); depth=0; end=-1
+              for i in range(brace, len(s)):
+                  if s[i]=='{': depth+=1
+                  elif s[i]=='}':
+                      depth-=1
+                      if depth==0: end=i+1; break
+              if end < 0:
+                  print("WARN: brace-count failed for " + type_str)
+                  return
+              body = "\n".join([
+                  "public static void requestPatch" + type_str + "(String className, String target, String value) {",
+                  "    for (PatchRecord __p : sActivePatches) {",
+                  "        if (__p.type.equals(\"" + type_str + "\") && __p.className.equals(className) && __p.targetName.equals(target)) {",
+                  "            __p.currentValue = value;",
+                  "            syncPatches();",
+                  "            return;",
+                  "        }",
+                  "    }",
+                  "    PatchRecord p = new PatchRecord();",
+                  "    p.id = sPatchCounter++;",
+                  "    p.type = \"" + type_str + "\";",
+                  "    p.className = className;",
+                  "    p.targetName = target;",
+                  "    p.originalValue = \"(original)\";",
+                  "    p.currentValue = value;",
+                  "    sActivePatches.add(p);",
+                  "    syncPatches();",
+                  "}",
+              ])
+              s = s[:m.start()] + body + s[end:]
+              print("PASS: dedup added to requestPatch" + type_str)
+
+          patch_request(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', "Method", "methodSig")
+          patch_request(r'public\s+static\s+void\s+requestPatchField\s*\([^)]*\)\s*\{', "Field", "fieldName")
+
+          # 3. attach: WindowManager with fallback to decor.addView
+          if "Overlay added to DecorView" not in s or "TYPE_APPLICATION_PANEL" not in s:
               m = re.search(r'public\s+static\s+void\s+attach\s*\(\s*(?:android\.content\.)?(?:Context|Activity)\s+\w+\s*\)\s*\{', s)
               if not m:
-                  print("FAIL: attach(Context|Activity) signature not found"); sys.exit(2)
-              brace_start = s.index('{', m.end() - 1)
-              depth = 0; end = -1
-              for i in range(brace_start, len(s)):
-                  if s[i] == '{': depth += 1
-                  elif s[i] == '}':
-                      depth -= 1
-                      if depth == 0: end = i + 1; break
+                  print("FAIL: attach(Context|Activity) not found"); sys.exit(2)
+              brace = s.index('{', m.end()-1); depth=0; end=-1
+              for i in range(brace, len(s)):
+                  if s[i]=='{': depth+=1
+                  elif s[i]=='}':
+                      depth-=1
+                      if depth==0: end=i+1; break
               if end < 0:
                   print("FAIL: brace-count failed for attach"); sys.exit(2)
+
               new_attach = "\n".join([
                   "public static void attach(Context context) {",
                   "    final android.app.Activity activity;",
@@ -221,167 +224,149 @@ jobs:
                   "    } else if (context instanceof android.content.ContextWrapper) {",
                   "        android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();",
                   "        activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;",
-                  "    } else {",
-                  "        activity = null;",
-                  "    }",
+                  "    } else { activity = null; }",
                   "    if (activity == null) { android.util.Log.e(\"DexTool\", \"attach: no Activity\"); return; }",
                   "    activity.runOnUiThread(() -> {",
-                  "        final android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();",
-                  "        if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(activity)); return; }",
                   "        OverlaySurfaceView glView = new OverlaySurfaceView(activity);",
-                  "        android.view.ViewGroup.LayoutParams lp = new android.view.ViewGroup.LayoutParams(",
-                  "            android.view.ViewGroup.LayoutParams.MATCH_PARENT,",
-                  "            android.view.ViewGroup.LayoutParams.MATCH_PARENT);",
-                  "        decor.addView(glView, lp);",
+                  "        try {",
+                  "            android.view.WindowManager wm = activity.getWindowManager();",
+                  "            android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(",
+                  "                android.view.WindowManager.LayoutParams.MATCH_PARENT,",
+                  "                android.view.WindowManager.LayoutParams.MATCH_PARENT,",
+                  "                android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,",
+                  "                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE",
+                  "                    | android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL",
+                  "                    | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,",
+                  "                android.graphics.PixelFormat.TRANSLUCENT);",
+                  "            lp.token = activity.getWindow().getDecorView().getWindowToken();",
+                  "            lp.alpha = 0.01f;",
+                  "            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;",
+                  "            wm.addView(glView, lp);",
+                  "            registerLifecycle(activity, glView);",
+                  "            android.util.Log.i(\"DexTool\", \"Overlay added via WindowManager\");",
+                  "            return;",
+                  "        } catch (Throwable t) {",
+                  "            android.util.Log.w(\"DexTool\", \"WindowManager failed, fallback to DecorView\", t);",
+                  "        }",
+                  "        android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();",
+                  "        if (decor == null) { activity.getWindow().getDecorView().post(() -> attach(activity)); return; }",
+                  "        decor.addView(glView, new android.view.ViewGroup.LayoutParams(-1, -1));",
                   "        registerLifecycle(activity, glView);",
-                  "        android.util.Log.i(\"DexTool\", \"Overlay added to DecorView\");",
+                  "        android.util.Log.i(\"DexTool\", \"Overlay added to DecorView (fallback)\");",
                   "    });",
                   "}",
               ])
               s = s[:m.start()] + new_attach + s[end:]
-              print("PASS: replaced attach")
-          else:
-              print("SKIP: attach already replaced")
-
-          # 3. best-effort dedup in syncPatches (only if signature found)
-          if "TEMP:DEDUP" not in s:
-              sm = re.search(r'void\s+syncPatches\s*\(\s*\)\s*\{', s)
-              fm = re.search(r'((?:List|ArrayList|Collection|LinkedList)\s*<\s*PatchRecord\s*>\s*)(\w+)\s*[;=]', s)
-              if sm and fm:
-                  field_name = fm.group(2)
-                  dedup = "\n".join([
-                      "        // TEMP:DEDUP",
-                      "        try {",
-                      "            java.util.Map<String, PatchRecord> __map = new java.util.LinkedHashMap<>();",
-                      "            java.lang.reflect.Field __fC = null, __fM = null;",
-                      "            for (PatchRecord __r : " + field_name + ") {",
-                      "                if (__fC == null) {",
-                      "                    try { __fC = __r.getClass().getDeclaredField(\"className\"); __fC.setAccessible(true); } catch (Throwable __e) {}",
-                      "                    try { __fM = __r.getClass().getDeclaredField(\"methodName\"); __fM.setAccessible(true); } catch (Throwable __e) {}",
-                      "                }",
-                      "                String __k;",
-                      "                if (__fC != null && __fM != null) {",
-                      "                    __k = String.valueOf(__fC.get(__r)) + \"#\" + String.valueOf(__fM.get(__r));",
-                      "                } else {",
-                      "                    __k = String.valueOf(System.identityHashCode(__r));",
-                      "                }",
-                      "                __map.put(__k, __r);",
-                      "            }",
-                      "            " + field_name + ".clear();",
-                      "            " + field_name + ".addAll(__map.values());",
-                      "        } catch (Throwable __t) { }",
-                      "",
-                  ])
-                  s = s[:sm.end()] + dedup + s[sm.end():]
-                  print("PASS: dedup inserted (field '" + field_name + "')")
-              else:
-                  print("WARN: syncPatches or patch list field not found; dedup skipped")
-          else:
-              print("SKIP: dedup already present")
+              print("PASS: attach replaced with WindowManager + fallback")
 
           if s == orig:
               print("WARN: Helper.java unchanged")
           p.write_text(s)
           PYEOF
 
-      - name: Patch native-lib.cpp (once_flag)
+      # ============ FIX widget types (Helper) ============
+      - name: Fix getArgWidgetType (numeric types)
         run: |
           python3 - <<'PYEOF'
-          import pathlib
+          import re, pathlib
+          p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
+          s = p.read_text()
+          if "return 6;" in s or "return 7;" in s:
+              print("SKIP: numeric widget types already present")
+              raise SystemExit(0)
+          m = re.search(r'public\s+static\s+int\s+getArgWidgetType\s*\([^)]*\)\s*\{', s)
+          if not m:
+              print("FAIL: getArgWidgetType not found"); raise SystemExit(2)
+          brace = s.index('{', m.end()-1); depth=0; end=-1
+          for i in range(brace, len(s)):
+              if s[i]=='{': depth+=1
+              elif s[i]=='}':
+                  depth-=1
+                  if depth==0: end=i+1; break
+          if end < 0:
+              print("FAIL: brace-count failed"); raise SystemExit(2)
+          new_fn = "\n".join([
+              "public static int getArgWidgetType(String typeName) {",
+              "    try {",
+              "        Class<?> c = classFromString(typeName);",
+              "        if (c == boolean.class || c == Boolean.class) return 1;",
+              "        if (c.isEnum()) return 2;",
+              "        if (Context.class.isAssignableFrom(c) || Activity.class.isAssignableFrom(c)) return 3;",
+              "        if (c.isArray()) return 5;",
+              "        if (c == int.class || c == Integer.class || c == long.class || c == Long.class",
+              "                || c == short.class || c == Short.class || c == byte.class || c == Byte.class",
+              "                || c == java.math.BigInteger.class) return 6;",
+              "        if (c == float.class || c == Float.class || c == double.class || c == Double.class",
+              "                || c == java.math.BigDecimal.class) return 7;",
+              "        if (c == String.class || c == CharSequence.class || c == char.class || c == Character.class) return 0;",
+              "        return 4;",
+              "    } catch (Throwable t) { return 0; }",
+              "}",
+          ])
+          s = s[:m.start()] + new_fn + s[end:]
+          p.write_text(s)
+          print("PASS: getArgWidgetType updated (6=integer, 7=float)")
+          PYEOF
+
+      # ============ FIX native-lib.cpp (InputInt / InputFloat) ============
+      - name: Fix native-lib.cpp (numeric widgets)
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text(); orig = s
-          if "std::once_flag frida_once" not in s:
-              if '#include <mutex>' not in s:
-                  s = s.replace('#include <jni.h>', '#include <jni.h>\n#include <mutex>', 1)
-              if 'gum_init_embedded();' in s:
-                  s = s.replace('gum_init_embedded();',
-                                'static std::once_flag frida_once;\n    std::call_once(frida_once, []() { gum_init_embedded(); });', 1)
-                  print("PASS: wrapped gum_init_embedded")
-              else:
-                  print("WARN: gum_init_embedded() not found verbatim")
+          if "wt == 6" in s:
+              print("SKIP: numeric widgets already present")
+              raise SystemExit(0)
+          # Insert wt==6 / wt==7 handling right after the InputText for wt==0
+          old = 'ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); } else if (wt == 1)'
+          new = "\n".join([
+              'ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i]));',
+              '} else if (wt == 6) {',
+              '    int iv = 0; try { iv = std::stoi(st.argBufs[i]); } catch (...) {}',
+              '    ImGui::SetNextItemWidth(-1);',
+              '    if (ImGui::InputInt("##int", &iv)) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%d", iv);',
+              '} else if (wt == 7) {',
+              '    float fv = 0.0f; try { fv = std::stof(st.argBufs[i]); } catch (...) {}',
+              '    ImGui::SetNextItemWidth(-1);',
+              '    if (ImGui::InputFloat("##float", &fv)) snprintf(st.argBufs[i], sizeof(st.argBufs[i]), "%.6g", fv);',
+              '} else if (wt == 1)',
+          ])
+          if old in s:
+              s = s.replace(old, new, 1)
+              print("PASS: inserted InputInt/InputFloat for wt==6/7")
           else:
-              print("SKIP: once_flag already present")
+              print("FAIL: pattern for wt==0 InputText not found")
+              # fallback: insert before the final else InputText
+              fb = '} else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }'
+              if fb in s:
+                  s = s.replace(fb, new + '\n} else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], sizeof(st.argBufs[i])); }', 1)
+                  print("PASS: inserted via fallback")
+              else:
+                  print("FATAL: could not locate insertion point"); raise SystemExit(2)
           if s == orig:
               print("WARN: native-lib.cpp unchanged")
           p.write_text(s)
           PYEOF
 
-      - name: Patch agent.js
-        run: |
-          mkdir -p /tmp/agent && cd /tmp/agent
-          npm init -y >/dev/null
-          npm install frida-java-bridge >/dev/null
-          cat > agent.js <<'AGENTEOF'
-          import Java from "frida-java-bridge";
-          const HOOKED = new Set();
-          Java.perform(function () {
-            console.log("[*] Patch Agent Loaded");
-            function findClassLoader(className) {
-              let found = null;
-              try {
-                Java.enumerateClassLoadersSync().forEach(function (loader) {
-                  try { if (loader.findClass(className)) found = loader; } catch (e) {}
-                });
-              } catch (e) {}
-              return found;
-            }
-            recv(function (msg) {
-              try {
-                const cmd = JSON.parse(msg);
-                if (cmd.action !== "patchMethod") return;
-                const key = cmd.className + "#" + cmd.methodName + "#" + (cmd.signature || "");
-                if (HOOKED.has(key)) { console.log("[*] Already patched: " + key); return; }
-                const loader = findClassLoader(cmd.className) || null;
-                const cls = loader ? Java.use(cmd.className, { classLoader: loader })
-                                   : Java.use(cmd.className);
-                const overloads = cls[cmd.methodName].overloads;
-                const target = cmd.signature
-                  ? overloads.find(o => o.argumentTypes.map(t => t.className).join() === cmd.signature)
-                  : overloads[0];
-                if (!target) { console.log("[!] Overload not found: " + key); return; }
-                target.implementation = function () { return cmd.returnValue; };
-                HOOKED.add(key);
-                console.log("[*] Patched " + key);
-              } catch (e) { console.log("[!] " + e.message); }
-            });
-            send({ type: "ready" });
-          });
-          AGENTEOF
-          npx frida-compile agent.js -o agent-compiled.js -S -c
-          mkdir -p "$GITHUB_WORKSPACE/app/src/main/assets"
-          cp agent-compiled.js "$GITHUB_WORKSPACE/app/src/main/assets/agent.js"
-          echo "agent.js ready"
-
       - name: Verify sources
         run: |
           FAIL=0
-          for f in app/src/main/cpp/tool/native-lib.cpp \
-                   app/src/main/cpp/tool/dex_data.h \
-                   app/src/main/java/com/menu/imgui/Helper.java \
-                   app/src/main/java/com/menu/imgui/OverlaySurfaceView.java \
-                   app/src/main/assets/agent.js; do
-            if [ -s "$f" ]; then echo "OK  exists: $f"; else echo "ERR MISSING: $f"; FAIL=1; fi
-          done
-          check() {
-            if grep -q "$2" "$1"; then echo "OK  found '$2' in $1"; else echo "ERR MISSING '$2' in $1"; FAIL=1; fi
-          }
-          check app/src/main/cpp/tool/native-lib.cpp "frida_once"
-          check app/src/main/java/com/menu/imgui/Helper.java "registerLifecycle"
-          check app/src/main/java/com/menu/imgui/Helper.java "Overlay added to DecorView"
-          # sanity: class declaration in OverlaySurfaceView must have '{' within 2 lines
-          if grep -A2 "class OverlaySurfaceView" app/src/main/java/com/menu/imgui/OverlaySurfaceView.java | head -3 | grep -q "{"; then
-            echo "OK  OverlaySurfaceView class decl has '{'"
+          check() { if grep -q "$2" "$1"; then echo "OK  '$2' in $1"; else echo "ERR MISSING '$2' in $1"; FAIL=1; fi; }
+          check app/src/main/java/com/menu/imgui/Helper.java "TYPE_APPLICATION_PANEL"
+          check app/src/main/java/com/menu/imgui/Helper.java "return 6;"
+          check app/src/main/cpp/tool/native-lib.cpp "InputInt"
+          if grep -q "patchRecordExists" app/src/main/java/com/menu/imgui/Helper.java; then
+            echo "ERR patchRecordExists still present"; FAIL=1
           else
-            echo "ERR OverlaySurfaceView class decl missing '{' within 2 lines"; FAIL=1
+            echo "OK  patchRecordExists removed"
           fi
           if [ $FAIL -ne 0 ]; then
-            echo "===== DIAGNOSTIC: Helper.java attach area ====="
-            grep -n "attach\|registerLifecycle\|Overlay added" app/src/main/java/com/menu/imgui/Helper.java | head -30 || true
-            echo "===== DIAGNOSTIC: OverlaySurfaceView top 25 lines ====="
-            head -25 app/src/main/java/com/menu/imgui/OverlaySurfaceView.java || true
+            echo "===== Helper.java attach area ====="; grep -n "attach\|WindowManager\|registerLifecycle\|patchRecordExists" app/src/main/java/com/menu/imgui/Helper.java | head -30
+            echo "===== native-lib wt handling ====="; grep -n "wt == 6\|wt == 7\|InputInt\|InputFloat" app/src/main/cpp/tool/native-lib.cpp | head -20
             exit 1
           fi
-          echo "all source checks passed"
+          echo "all checks passed"
 
       - name: Write CMakeLists.txt
         run: |
@@ -481,7 +466,6 @@ jobs:
       - name: Zipalign APK
         run: |
           APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
-          echo "Original APK: $APK"
           cp "$APK" /tmp/app-unaligned.apk
           zipalign -p -f 4 /tmp/app-unaligned.apk "$APK"
           echo "zipaligned with -p 4"
@@ -524,5 +508,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: restore OverlaySurfaceView from good commit, stop patching it [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: dedup patches, numeric InputInt/Float, WindowManager overlay [skip ci]"
           git push
