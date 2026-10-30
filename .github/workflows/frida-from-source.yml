@@ -123,49 +123,56 @@ jobs:
       # ============================================================
       # PATCH 1: Helper.java - bulletproof field/method management
       # ============================================================
-      - name: Patch Helper.java (clean rewrite)
+      - name: Patch Helper.java
         run: |
           python3 - <<'PYEOF'
-          import re, pathlib, textwrap
+          import re, pathlib
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
 
-          print("=== BEFORE (first 40 lines) ===")
-          for i, line in enumerate(s.splitlines()[:40], 1):
-              print(i, line)
+          FIELDS = ['sOverlayWm', 'sOverlayLp', 'sDecorContainer', 'sFabSize', 'sFabMargin', 'sOverlayActivity', 'sMenuOpen']
 
-          def remove_method(src, pattern):
-              """Remove ALL method bodies matching pattern."""
-              count = 0
-              while True:
-                  m = re.search(pattern, src)
-                  if not m: break
-                  i = src.index('{', m.end()-1)
-                  d = 0; e = -1
-                  for k in range(i, len(src)):
-                      if src[k] == '{': d += 1
-                      elif src[k] == '}':
-                          d -= 1
-                          if d == 0: e = k + 1; break
-                  if e < 0: break
-                  src = src[:m.start()] + src[e:]
-                  count += 1
-              return src, count
+          def count_field(src, name):
+              # Match: private static <type> <name>;  (standalone or inline at line start)
+              return len(re.findall(
+                  r'\b(?:private|public|protected)?\s*static\s+(?:final\s+)?[\w.<>\[\], ]+\s+' + re.escape(name) + r'\b[^;\n]*;',
+                  src))
 
-          # 1. Remove ALL existing attach/setMenuOpen/doAttach methods
-          s, n1 = remove_method(s, r'public\s+static\s+void\s+attach\s*\(\s*(?:final\s+)?(?:android\.content\.)?Context\s+\w+\s*\)\s*\{')
-          print("Removed attach methods:", n1)
-          s, n2 = remove_method(s, r'public\s+static\s+void\s+setMenuOpen\s*\([^)]*\)\s*\{')
-          print("Removed setMenuOpen methods:", n2)
-          s, n3 = remove_method(s, r'(?:static|private\s+static|public\s+static)\s+void\s+doAttach\s*\([^)]*\)\s*\{')
-          print("Removed doAttach methods:", n3)
+          print("=== INITIAL field counts ===")
+          for f in FIELDS + ['overlay']:
+              print(f, count_field(s, f))
 
-          # 2. Add fields right after class opening
+          # 1. Normalize inline multi-declaration of overlay
+          s = re.sub(
+              r'private\s+static\s+OverlaySurfaceView\s+overlay;[^\n]*?sOverlayWm[^\n]*?sOverlayLp[^\n]*?;',
+              'private static OverlaySurfaceView overlay;', s)
+
+          # 2. Remove ALL standalone declarations of FIELDS (not overlay)
+          for fname in FIELDS:
+              pattern = re.compile(
+                  r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[\w.<>\[\], ]+\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?'
+              )
+              before = len(pattern.findall(s))
+              s = pattern.sub('', s)
+              if before > 0:
+                  print("Removed", before, "declaration(s) of", fname)
+
+          # 3. Remove any inline occurrences of these fields (safety net)
+          for fname in FIELDS:
+              inline_pattern = re.compile(
+                  r'(?:private|public|protected)?\s*static\s+(?:final\s+)?[\w.<>\[\], ]+\s+' + re.escape(fname) + r'\b[^;\n]*;\s*'
+              )
+              before = len(inline_pattern.findall(s))
+              s = inline_pattern.sub('', s)
+              if before > 0:
+                  print("Removed", before, "inline occurrence(s) of", fname)
+
+          # 4. Add all fields at class top
           m = re.search(r'public\s+class\s+Helper\s*\{', s)
           if not m:
               print("FATAL: class Helper not found")
               raise SystemExit(2)
-          fields = "\n".join([
+          new_fields = "\n" + "\n".join([
               "    private static android.view.WindowManager sOverlayWm;",
               "    private static android.view.WindowManager.LayoutParams sOverlayLp;",
               "    private static android.widget.FrameLayout sDecorContainer;",
@@ -173,116 +180,129 @@ jobs:
               "    private static int sFabMargin = 40;",
               "    private static android.app.Activity sOverlayActivity;",
               "    private static boolean sMenuOpen = false;",
-              "",
-          ])
-          s = s[:m.end()] + "\n" + fields + s[m.end():]
-          print("PASS: fields added after class opening")
+          ]) + "\n"
+          s = s[:m.end()] + new_fields + s[m.end():]
 
-          # 3. Insert new methods before registerLifecycle (or after class opening if not found)
-          new_methods = textwrap.dedent("""\
-              public static void attach(final Context context) {
-                  final android.app.Activity activity;
-                  if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
-                  else if (context instanceof android.content.ContextWrapper) {
-                      android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();
-                      activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
-                  } else activity = null;
-                  if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
-                  sOverlayActivity = activity;
-                  activity.getWindow().getDecorView().post(new Runnable() {
-                      @Override public void run() { doAttach(activity); }
-                  });
-              }
+          # 5. Remove existing attach/setMenuOpen/doAttach methods
+          def remove_method(src, pattern):
+              count = 0
+              while True:
+                  mm = re.search(pattern, src)
+                  if not mm: break
+                  i = src.index('{', mm.end()-1)
+                  d = 0; e = -1
+                  for k in range(i, len(src)):
+                      if src[k] == '{': d += 1
+                      elif src[k] == '}':
+                          d -= 1
+                          if d == 0: e = k + 1; break
+                  if e < 0: break
+                  src = src[:mm.start()] + src[e:]
+                  count += 1
+              return src, count
 
-              static void doAttach(android.app.Activity activity) {
-                  OverlaySurfaceView glView = new OverlaySurfaceView(activity);
-                  android.view.WindowManager wm = activity.getWindowManager();
-                  android.util.DisplayMetrics dm = activity.getResources().getDisplayMetrics();
-                  int fabSize = (int)(80 * dm.density);
-                  int margin = (int)(20 * dm.density);
-                  sFabSize = fabSize; sFabMargin = margin;
+          s, n1 = remove_method(s, r'public\s+static\s+void\s+attach\s*\(\s*(?:final\s+)?(?:android\.content\.)?Context\s+\w+\s*\)\s*\{')
+          print("Removed attach methods:", n1)
+          s, n2 = remove_method(s, r'public\s+static\s+void\s+setMenuOpen\s*\([^)]*\)\s*\{')
+          print("Removed setMenuOpen methods:", n2)
+          s, n3 = remove_method(s, r'(?:public\s+|private\s+)?static\s+void\s+doAttach\s*\([^)]*\)\s*\{')
+          print("Removed doAttach methods:", n3)
 
-                  android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
-                      fabSize, fabSize,
-                      android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                      android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                          | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                      android.graphics.PixelFormat.TRANSPARENT);
-                  lp.token = activity.getWindow().getDecorView().getWindowToken();
-                  lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
-                  lp.x = dm.widthPixels - fabSize - margin;
-                  lp.y = margin * 4;
+          # 6. Insert new methods before registerLifecycle (or before class-end)
+          new_methods = '''    public static void attach(final Context context) {
+          final android.app.Activity activity;
+          if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
+          else if (context instanceof android.content.ContextWrapper) {
+              android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();
+              activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
+          } else activity = null;
+          if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
+          sOverlayActivity = activity;
+          activity.getWindow().getDecorView().post(new Runnable() {
+              @Override public void run() { doAttach(activity); }
+          });
+      }
 
+      static void doAttach(android.app.Activity activity) {
+          OverlaySurfaceView glView = new OverlaySurfaceView(activity);
+          android.view.WindowManager wm = activity.getWindowManager();
+          android.util.DisplayMetrics dm = activity.getResources().getDisplayMetrics();
+          int fabSize = (int)(80 * dm.density);
+          int margin = (int)(20 * dm.density);
+          sFabSize = fabSize; sFabMargin = margin;
+          android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
+              fabSize, fabSize,
+              android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+              android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                  | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+              android.graphics.PixelFormat.TRANSPARENT);
+          lp.token = activity.getWindow().getDecorView().getWindowToken();
+          lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
+          lp.x = dm.widthPixels - fabSize - margin;
+          lp.y = margin * 4;
+          try {
+              wm.addView(glView, lp);
+              sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
+              android.util.Log.i("DexTool", "Overlay added via WM (size=" + fabSize + ")");
+          } catch (Throwable t) {
+              android.util.Log.w("DexTool", "WM failed, decor fallback", t);
+              try {
+                  android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
+                  android.widget.FrameLayout container = new android.widget.FrameLayout(activity);
+                  container.setClipChildren(false);
+                  android.widget.FrameLayout.LayoutParams clp = new android.widget.FrameLayout.LayoutParams(fabSize, fabSize);
+                  clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
+                  clp.rightMargin = margin; clp.topMargin = margin * 4;
+                  container.addView(glView, clp);
+                  sDecorContainer = container; overlay = glView;
+                  decor.addView(container, new android.view.ViewGroup.LayoutParams(-1, -1));
+                  android.util.Log.i("DexTool", "Overlay added to DecorView (small container)");
+              } catch (Throwable t2) { android.util.Log.e("DexTool", "ALL FAILED", t2); }
+          }
+          registerLifecycle(activity, glView);
+      }
+
+      public static void setMenuOpen(final boolean open) {
+          sMenuOpen = open;
+          if (overlay == null) return;
+          final int w = sFabSize, m = sFabMargin;
+          overlay.post(new Runnable() {
+              @Override public void run() {
                   try {
-                      wm.addView(glView, lp);
-                      sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
-                      android.util.Log.i("DexTool", "Overlay added via WM (size=" + fabSize + ")");
-                  } catch (Throwable t) {
-                      android.util.Log.w("DexTool", "WM failed, decor fallback", t);
-                      try {
-                          android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
-                          android.widget.FrameLayout container = new android.widget.FrameLayout(activity);
-                          container.setClipChildren(false);
-                          android.widget.FrameLayout.LayoutParams clp = new android.widget.FrameLayout.LayoutParams(fabSize, fabSize);
-                          clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-                          clp.rightMargin = margin; clp.topMargin = margin * 4;
-                          container.addView(glView, clp);
-                          sDecorContainer = container; overlay = glView;
-                          decor.addView(container, new android.view.ViewGroup.LayoutParams(-1, -1));
-                          android.util.Log.i("DexTool", "Overlay added to DecorView (small container)");
-                      } catch (Throwable t2) { android.util.Log.e("DexTool", "ALL FAILED", t2); }
-                  }
-                  registerLifecycle(activity, glView);
-              }
-
-              public static void setMenuOpen(final boolean open) {
-                  sMenuOpen = open;
-                  if (overlay == null) return;
-                  final int w = sFabSize, m = sFabMargin;
-                  overlay.post(new Runnable() {
-                      @Override public void run() {
-                          try {
-                              if (sOverlayWm != null && sOverlayLp != null) {
-                                  if (open) {
-                                      sOverlayLp.width = android.view.WindowManager.LayoutParams.MATCH_PARENT;
-                                      sOverlayLp.height = android.view.WindowManager.LayoutParams.MATCH_PARENT;
-                                      sOverlayLp.x = 0; sOverlayLp.y = 0;
-                                  } else {
-                                      sOverlayLp.width = w; sOverlayLp.height = w;
-                                      sOverlayLp.x = sOverlayActivity.getResources().getDisplayMetrics().widthPixels - w - m;
-                                      sOverlayLp.y = m * 4;
-                                  }
-                                  sOverlayWm.updateViewLayout(overlay, sOverlayLp);
-                              } else if (sDecorContainer != null) {
-                                  android.widget.FrameLayout.LayoutParams clp = (android.widget.FrameLayout.LayoutParams) overlay.getLayoutParams();
-                                  if (open) {
-                                      clp.width = -1; clp.height = -1; clp.gravity = 0;
-                                      clp.rightMargin = 0; clp.topMargin = 0;
-                                  } else {
-                                      clp.width = w; clp.height = w; clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-                                      clp.rightMargin = m; clp.topMargin = m * 4;
-                                  }
-                                  overlay.setLayoutParams(clp);
-                              }
-                              android.util.Log.i("DexTool", "setMenuOpen(" + open + ")");
-                          } catch (Throwable t) { android.util.Log.w("DexTool", "setMenuOpen err", t); }
+                      if (sOverlayWm != null && sOverlayLp != null) {
+                          if (open) {
+                              sOverlayLp.width = android.view.WindowManager.LayoutParams.MATCH_PARENT;
+                              sOverlayLp.height = android.view.WindowManager.LayoutParams.MATCH_PARENT;
+                              sOverlayLp.x = 0; sOverlayLp.y = 0;
+                          } else {
+                              sOverlayLp.width = w; sOverlayLp.height = w;
+                              sOverlayLp.x = sOverlayActivity.getResources().getDisplayMetrics().widthPixels - w - m;
+                              sOverlayLp.y = m * 4;
+                          }
+                          sOverlayWm.updateViewLayout(overlay, sOverlayLp);
+                      } else if (sDecorContainer != null) {
+                          android.widget.FrameLayout.LayoutParams clp = (android.widget.FrameLayout.LayoutParams) overlay.getLayoutParams();
+                          if (open) { clp.width = -1; clp.height = -1; clp.gravity = 0; clp.rightMargin = 0; clp.topMargin = 0; }
+                          else { clp.width = w; clp.height = w; clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END; clp.rightMargin = m; clp.topMargin = m * 4; }
+                          overlay.setLayoutParams(clp);
                       }
-                  });
+                      android.util.Log.i("DexTool", "setMenuOpen(" + open + ")");
+                  } catch (Throwable t) { android.util.Log.w("DexTool", "setMenuOpen err", t); }
               }
-          """).strip()
+          });
+      }
 
+      '''
           anchor = re.search(r'(?:private\s+static|public\s+static|static)\s+void\s+registerLifecycle\b', s)
           if anchor:
-              s = s[:anchor.start()] + new_methods + "\n\n" + s[anchor.start():]
+              s = s[:anchor.start()] + new_methods + s[anchor.start():]
               print("PASS: methods inserted before registerLifecycle")
           else:
-              # insert after class opening + fields
               m2 = re.search(r'public\s+class\s+Helper\s*\{', s)
-              if m2:
-                  s = s[:m2.end()] + "\n" + new_methods + "\n" + s[m2.end():]
-                  print("PASS: methods inserted after class opening")
+              s = s[:m2.end()] + "\n" + new_methods + s[m2.end():]
+              print("PASS: methods inserted after class opening")
 
-          # 4. registerLifecycle re-attach
+          # 7. registerLifecycle re-attach
           old = "if (a == activity) { glView.onResume(); }"
           new = ("if (a == activity) { try { glView.onResume(); } catch (Throwable t) {} "
                  "try { if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { "
@@ -291,14 +311,14 @@ jobs:
               s = s.replace(old, new, 1)
               print("PASS: registerLifecycle re-attach")
 
-          # 5. nativePatchMethod declaration
+          # 8. nativePatchMethod declaration
           if "nativePatchMethod" not in s:
               m2 = re.search(r'static\s+native\s+void\s+nativeSetPatches\s*\([^)]*\)\s*;', s)
               if m2:
                   s = s[:m2.start()] + "static native void nativePatchMethod(String c, String m, String v); " + s[m2.start():]
                   print("PASS: nativePatchMethod decl")
 
-          # 6. requestPatchMethod rewrite
+          # 9. requestPatchMethod rewrite
           m = re.search(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', s)
           if m:
               i = s.index('{', m.end()-1); d=0; e=-1
@@ -318,10 +338,11 @@ jobs:
                   s = s[:m.start()] + body + s[e:]
                   print("PASS: requestPatchMethod rewritten")
 
+          print("=== FINAL field counts ===")
+          for f in FIELDS + ['overlay']:
+              print(f, count_field(s, f))
+
           p.write_text(s)
-          print("=== AFTER (first 50 lines) ===")
-          for i, line in enumerate(s.splitlines()[:50], 1):
-              print(i, line)
           print("Helper.java DONE")
           PYEOF
 
@@ -331,7 +352,7 @@ jobs:
       - name: Patch OverlaySurfaceView.java
         run: |
           python3 - <<'PYEOF'
-          import re, pathlib, textwrap
+          import re, pathlib
           p = pathlib.Path("app/src/main/java/com/menu/imgui/OverlaySurfaceView.java")
           s = p.read_text()
 
@@ -355,23 +376,22 @@ jobs:
               if not m:
                   print("FATAL: class decl not found")
                   raise SystemExit(2)
-              methods = textwrap.dedent(r"""
-                  @Override public boolean onTouchEvent(android.view.MotionEvent e) {
-                      int action = e.getActionMasked();
-                      boolean handled = Helper.nativeTouch(action, e.getX(), e.getY());
-                      if (action == android.view.MotionEvent.ACTION_DOWN) return handled;
-                      return super.onTouchEvent(e);
-                  }
-                  @Override public boolean dispatchKeyEvent(android.view.KeyEvent e) {
-                      int c = e.getKeyCode();
-                      if (e.getAction() == android.view.KeyEvent.ACTION_DOWN) {
-                          if (c >= android.view.KeyEvent.KEYCODE_0 && c <= android.view.KeyEvent.KEYCODE_9) { Helper.nativeAddInputChar((char)('0'+(c-android.view.KeyEvent.KEYCODE_0))); return true; }
-                          if (c == android.view.KeyEvent.KEYCODE_PERIOD || c == android.view.KeyEvent.KEYCODE_NUMPAD_DOT) { Helper.nativeAddInputChar('.'); return true; }
-                          if (c == android.view.KeyEvent.KEYCODE_MINUS || c == android.view.KeyEvent.KEYCODE_NUMPAD_SUBTRACT) { Helper.nativeAddInputChar('-'); return true; }
-                      }
-                      return super.dispatchKeyEvent(e);
-                  }
-              """).strip()
+              methods = '''    @Override public boolean onTouchEvent(android.view.MotionEvent e) {
+          int action = e.getActionMasked();
+          boolean handled = Helper.nativeTouch(action, e.getX(), e.getY());
+          if (action == android.view.MotionEvent.ACTION_DOWN) return handled;
+          return super.onTouchEvent(e);
+      }
+      @Override public boolean dispatchKeyEvent(android.view.KeyEvent e) {
+          int c = e.getKeyCode();
+          if (e.getAction() == android.view.KeyEvent.ACTION_DOWN) {
+              if (c >= android.view.KeyEvent.KEYCODE_0 && c <= android.view.KeyEvent.KEYCODE_9) { Helper.nativeAddInputChar((char)('0'+(c-android.view.KeyEvent.KEYCODE_0))); return true; }
+              if (c == android.view.KeyEvent.KEYCODE_PERIOD || c == android.view.KeyEvent.KEYCODE_NUMPAD_DOT) { Helper.nativeAddInputChar('.'); return true; }
+              if (c == android.view.KeyEvent.KEYCODE_MINUS || c == android.view.KeyEvent.KEYCODE_NUMPAD_SUBTRACT) { Helper.nativeAddInputChar('-'); return true; }
+          }
+          return super.dispatchKeyEvent(e);
+      }
+      '''
               s = s[:m.end()] + "\n" + methods + "\n" + s[m.end():]
               print("PASS: onTouchEvent + dispatchKeyEvent")
 
@@ -385,7 +405,7 @@ jobs:
       - name: Patch native-lib.cpp (globals + notifyMenuOpen)
         run: |
           python3 - <<'PYEOF'
-          import re, pathlib, textwrap
+          import re, pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
@@ -423,26 +443,25 @@ jobs:
                   print("PASS: g_jvm = " + var)
 
           if "notifyMenuOpen" not in s:
-              helper = textwrap.dedent(r"""
-                  static void notifyMenuOpen(bool open) {
-                      if (!g_jvm) return;
-                      JNIEnv* env = nullptr;
-                      bool detach = false;
-                      if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-                          if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
-                          detach = true;
-                      }
-                      jclass cls = env->FindClass("com/menu/imgui/Helper");
-                      if (cls) {
-                          jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
-                          if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
-                          env->DeleteLocalRef(cls);
-                      }
-                      if (detach) g_jvm->DetachCurrentThread();
-                  }
-              """).strip()
+              helper = '''static void notifyMenuOpen(bool open) {
+          if (!g_jvm) return;
+          JNIEnv* env = nullptr;
+          bool detach = false;
+          if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+              if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+              detach = true;
+          }
+          jclass cls = env->FindClass("com/menu/imgui/Helper");
+          if (cls) {
+              jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
+              if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
+              env->DeleteLocalRef(cls);
+          }
+          if (detach) g_jvm->DetachCurrentThread();
+      }
+      '''
               s = s.replace("static GumScript* g_script = nullptr;",
-                            "static GumScript* g_script = nullptr;\n\n" + helper + "\n", 1)
+                            "static GumScript* g_script = nullptr;\n\n" + helper, 1)
               print("PASS: notifyMenuOpen helper")
 
           if "lastMenuOpen" not in s and "void nativeRender()" in s:
@@ -455,101 +474,100 @@ jobs:
           PYEOF
 
       # ============================================================
-      # PATCH 4: native-lib.cpp - agent + JNI methods + Log tab
+      # PATCH 4: native-lib.cpp - agent + JNI + log
       # ============================================================
       - name: Patch native-lib.cpp (agent + JNI + log)
         run: |
           python3 - <<'PYEOF'
-          import re, pathlib, textwrap
+          import re, pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
-          new_js = textwrap.dedent(r"""
-              Java.perform(function() {
-                function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
-                log("agent loaded");
-                var HOOKED = {};
-                recv(function(raw) {
-                  try {
-                    var cmd = JSON.parse(raw);
-                    log("recv: "+raw);
-                    if (cmd.action !== "patchMethod") return;
-                    var key = cmd.className+"#"+cmd.methodName;
-                    if (HOOKED[key]) { log("already patched: "+key); return; }
-                    var loaders = Java.enumerateClassLoadersSync();
-                    var loader = null;
-                    for (var i=0;i<loaders.length;i++){ try{ if(loaders[i].findClass(cmd.className)){ loader=loaders[i]; break; } }catch(e){} }
-                    if (loader) Java.classFactory.loader = loader;
-                    var cls = Java.use(cmd.className);
-                    var ovs = cls[cmd.methodName].overloads;
-                    var target = null;
-                    for (var i=0;i<ovs.length;i++){ if(target===null && ovs[i].argumentTypes.length===0) target=ovs[i]; }
-                    if (!target) target = ovs[0];
-                    var rt = target.returnType.className;
-                    var rv = cmd.returnValue;
-                    target.implementation = function() {
-                      log("HOOK HIT: "+cmd.methodName);
-                      if (rt==="int"||rt==="long"||rt==="short"||rt==="byte") return parseInt(rv,10);
-                      if (rt==="float"||rt==="double") return parseFloat(rv);
-                      if (rt==="boolean") return rv==="true"||rv==="1";
-                      if (rt==="void") return undefined;
-                      return rv;
-                    };
-                    HOOKED[key] = true;
-                    log("PATCHED: "+key);
-                  } catch(e) { log("ERROR: "+e.message); }
-                });
-                send({type:"ready"});
-              });
-          """).strip()
+          new_js = '''Java.perform(function() {
+        function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
+        log("agent loaded");
+        var HOOKED = {};
+        recv(function(raw) {
+          try {
+            var cmd = JSON.parse(raw);
+            log("recv: "+raw);
+            if (cmd.action !== "patchMethod") return;
+            var key = cmd.className+"#"+cmd.methodName;
+            if (HOOKED[key]) { log("already patched: "+key); return; }
+            var loaders = Java.enumerateClassLoadersSync();
+            var loader = null;
+            for (var i=0;i<loaders.length;i++){ try{ if(loaders[i].findClass(cmd.className)){ loader=loaders[i]; break; } }catch(e){} }
+            if (loader) Java.classFactory.loader = loader;
+            var cls = Java.use(cmd.className);
+            var ovs = cls[cmd.methodName].overloads;
+            var target = null;
+            for (var i=0;i<ovs.length;i++){ if(target===null && ovs[i].argumentTypes.length===0) target=ovs[i]; }
+            if (!target) target = ovs[0];
+            var rt = target.returnType.className;
+            var rv = cmd.returnValue;
+            target.implementation = function() {
+              log("HOOK HIT: "+cmd.methodName);
+              if (rt==="int"||rt==="long"||rt==="short"||rt==="byte") return parseInt(rv,10);
+              if (rt==="float"||rt==="double") return parseFloat(rv);
+              if (rt==="boolean") return rv==="true"||rv==="1";
+              if (rt==="void") return undefined;
+              return rv;
+            };
+            HOOKED[key] = true;
+            log("PATCHED: "+key);
+          } catch(e) { log("ERROR: "+e.message); }
+        });
+        send({type:"ready"});
+      });
+      '''
           if 'PATCH_AGENT_JS' in s:
               s = re.sub(r'const gchar\* PATCH_AGENT_JS = R"\(.*?\)";',
                   'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
               print("PASS: agent replaced")
 
           if "Java_com_menu_imgui_Helper_nativePatchMethod" not in s:
-              impl = textwrap.dedent(r"""
-                  extern "C" JNIEXPORT void JNICALL
-                  Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
-                      if (!g_script) return;
-                      const char* c = env->GetStringUTFChars(jc, nullptr);
-                      const char* m = env->GetStringUTFChars(jm, nullptr);
-                      const char* v = env->GetStringUTFChars(jv, nullptr);
-                      std::string json = "{\"action\":\"patchMethod\",\"className\":\"";
-                      json += c; json += "\",\"methodName\":\""; json += m;
-                      json += "\",\"returnValue\":\""; json += v; json += "\"}";
-                      gum_script_post(g_script, json.c_str(), nullptr, nullptr);
-                      env->ReleaseStringUTFChars(jc, c);
-                      env->ReleaseStringUTFChars(jm, m);
-                      env->ReleaseStringUTFChars(jv, v);
-                  }
-              """).strip()
+              impl = '''extern "C" JNIEXPORT void JNICALL
+      Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
+          if (!g_script) return;
+          const char* c = env->GetStringUTFChars(jc, nullptr);
+          const char* m = env->GetStringUTFChars(jm, nullptr);
+          const char* v = env->GetStringUTFChars(jv, nullptr);
+          std::string json = "{\\"action\\":\\"patchMethod\\",\\"className\\":\\"";
+          json += c; json += "\\",\\"methodName\\":\\""; json += m;
+          json += "\\",\\"returnValue\\":\\""; json += v; json += "\\"}";
+          gum_script_post(g_script, json.c_str(), nullptr, nullptr);
+          env->ReleaseStringUTFChars(jc, c);
+          env->ReleaseStringUTFChars(jm, m);
+          env->ReleaseStringUTFChars(jv, v);
+      }
+
+      '''
               anchor = 'static void drawSigil'
               if anchor in s:
-                  s = s.replace(anchor, impl + "\n\n" + anchor, 1)
+                  s = s.replace(anchor, impl + anchor, 1)
               else:
                   pos = s.find('extern "C" JNIEXPORT')
-                  if pos > 0: s = s[:pos] + impl + "\n\n" + s[pos:]
+                  if pos > 0: s = s[:pos] + impl + s[pos:]
               print("PASS: nativePatchMethod impl")
 
           if "Java_com_menu_imgui_Helper_nativeTouch" not in s:
-              touch = textwrap.dedent(r"""
-                  extern "C" JNIEXPORT jboolean JNICALL
-                  Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
-                      ImGuiIO& io = ImGui::GetIO();
-                      io.AddMousePosEvent(x, y);
-                      if (action == 0) io.AddMouseButtonEvent(0, true);
-                      else if (action == 1) io.AddMouseButtonEvent(0, false);
-                      else if (action == 3) io.AddMouseButtonEvent(0, false);
-                      return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
-                  }
-              """).strip()
+              touch = '''extern "C" JNIEXPORT jboolean JNICALL
+      Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
+          ImGuiIO& io = ImGui::GetIO();
+          io.AddMousePosEvent(x, y);
+          if (action == 0) io.AddMouseButtonEvent(0, true);
+          else if (action == 1) io.AddMouseButtonEvent(0, false);
+          else if (action == 3) io.AddMouseButtonEvent(0, false);
+          return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
+      }
+
+      '''
               anchor = 'static void drawSigil'
               if anchor in s:
-                  s = s.replace(anchor, touch + "\n\n" + anchor, 1)
+                  s = s.replace(anchor, touch + anchor, 1)
               else:
                   pos = s.find('extern "C" JNIEXPORT')
-                  if pos > 0: s = s[:pos] + touch + "\n\n" + s[pos:]
+                  if pos > 0: s = s[:pos] + touch + s[pos:]
               print("PASS: nativeTouch impl")
 
           if 'type\\":\\"log' not in s:
@@ -598,11 +616,9 @@ jobs:
             $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo D8_FAILED; cat /tmp/d8.log; exit 1; }
           ls -lah /tmp/dex_out/classes.dex
-          echo "=== xxd -n imgui_dex ==="
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
           head -3 app/src/main/cpp/tool/dex_data.h
           tail -2 app/src/main/cpp/tool/dex_data.h
-          wc -l app/src/main/cpp/tool/dex_data.h
 
       - name: Verify
         run: |
@@ -620,12 +636,13 @@ jobs:
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
-          N_SETMENU=$(grep -c "public static void setMenuOpen" app/src/main/java/com/menu/imgui/Helper.java || true)
-          if [ "$N_SETMENU" -ne 1 ]; then echo "ERR setMenuOpen count=$N_SETMENU (expected 1)"; FAIL=1; else echo "OK  exactly one setMenuOpen"; fi
-          if grep -q "lp.alpha = 0.01f" app/src/main/java/com/menu/imgui/Helper.java; then echo ERR_alpha; FAIL=1; fi
-          if grep -q "if (if (" app/src/main/cpp/tool/native-lib.cpp; then echo ERR_if_if; FAIL=1; fi
+          # duplicate check: each field should appear exactly once as a declaration
+          for field in sOverlayWm sOverlayLp sDecorContainer sFabSize sFabMargin sOverlayActivity sMenuOpen; do
+            n=$(grep -cE "^\s*(private|public|protected)?\s*static\s+(final\s+)?[A-Za-z_][A-Za-z0-9_.<>\[\]]*\s+$field\b" app/src/main/java/com/menu/imgui/Helper.java || true)
+            if [ "$n" -ne 1 ]; then echo "ERR field $field declared $n times (expected 1)"; FAIL=1; else echo "OK  $field declared once"; fi
+          done
           if [ $FAIL -ne 0 ]; then
-            echo "=== Helper head ==="; head -40 app/src/main/java/com/menu/imgui/Helper.java
+            echo "=== Helper head (first 30 lines) ==="; head -30 app/src/main/java/com/menu/imgui/Helper.java
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -708,5 +725,5 @@ jobs:
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: remove pre-existing setMenuOpen/doAttach, insert fields after class opening, bulletproof patch [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: dedupe all field declarations, always rebuild fields block [skip ci]"
           git push
