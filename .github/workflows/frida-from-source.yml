@@ -59,17 +59,45 @@ jobs:
           ./configure --host=android-arm64 -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a64.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a64.log; exit 1; }
           make -j$(nproc) 2>&1 | tee -a /tmp/a64.log
-          LIB=$(find build -name "libfrida-gumjs.a" | head -1)
-          [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
+          LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
+          [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true)
+          [ -z "$LIB" ] && { echo "NO_LIB"; tail -60 /tmp/a64.log; exit 1; }
+          echo "arm64 lib: $LIB"
+
+      - name: Stage arm64
+        run: |
+          set -e
           D=/tmp/frida-built/arm64-v8a
           rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
+          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1 || true)
+          if [ -z "$LIB" ]; then LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true); fi
+          if [ -z "$LIB" ]; then echo "FATAL_no_lib"; exit 1; fi
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-          cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
-          G=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
-          [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
-          GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1)
-          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
+
+          GUMJS_H=$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1 || true)
+          if [ -z "$GUMJS_H" ]; then echo "FATAL_no_gumjs_h"; exit 1; fi
+          cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
+
+          G=$(find /tmp/dk64 -name "frida-gum.h" | head -1 || true)
+          if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
+          if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1 || true); fi
+          if [ -n "$G" ]; then
+              echo "Found frida-gum.h at: $G"
+              cp -v "$G" "$D/include/frida-gum.h"
+          else
+              echo "WARN: frida-gum.h not found (diet mode may not need it)"
+          fi
+
+          GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
+          if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
+          if [ -n "$GLIB_DIR" ]; then
+              echo "Found glib-2.0 at: $GLIB_DIR"
+              cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
+          else
+              echo "WARN: glib-2.0 headers not found (diet mode may not need them)"
+          fi
+
+          ls -lah "$D/lib/" "$D/include/" || true
 
       - name: Build armv7
         run: |
@@ -80,17 +108,45 @@ jobs:
           ./configure --host=android-arm -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a32.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a32.log; exit 1; }
           make -j$(nproc) 2>&1 | tee -a /tmp/a32.log
-          LIB=$(find build -name "libfrida-gumjs.a" | head -1)
-          [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
+          LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
+          [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true)
+          [ -z "$LIB" ] && { echo "NO_LIB"; tail -60 /tmp/a32.log; exit 1; }
+          echo "armv7 lib: $LIB"
+
+      - name: Stage armv7
+        run: |
+          set -e
           D=/tmp/frida-built/armeabi-v7a
           rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
+          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1 || true)
+          if [ -z "$LIB" ]; then LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true); fi
+          if [ -z "$LIB" ]; then echo "FATAL_no_lib"; exit 1; fi
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-          cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
-          G=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
-          [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
-          GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1)
-          [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
+
+          GUMJS_H=$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1 || true)
+          if [ -z "$GUMJS_H" ]; then echo "FATAL_no_gumjs_h"; exit 1; fi
+          cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
+
+          G=$(find /tmp/dk32 -name "frida-gum.h" | head -1 || true)
+          if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
+          if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1 || true); fi
+          if [ -n "$G" ]; then
+              echo "Found frida-gum.h at: $G"
+              cp -v "$G" "$D/include/frida-gum.h"
+          else
+              echo "WARN: frida-gum.h not found"
+          fi
+
+          GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
+          if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
+          if [ -n "$GLIB_DIR" ]; then
+              echo "Found glib-2.0 at: $GLIB_DIR"
+              cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
+          else
+              echo "WARN: glib-2.0 headers not found"
+          fi
+
+          ls -lah "$D/lib/" "$D/include/" || true
 
       - name: Write Include/ImGui.h
         run: |
@@ -178,7 +234,7 @@ jobs:
           }
           INPUTEOF
 
-      - name: Patch native-lib.cpp (remove old, append DrawMenu + JNI_OnLoad)
+      - name: Patch native-lib.cpp
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -200,38 +256,28 @@ jobs:
                   src = src[:m.start()] + src[e:]; n+=1
               return src, n
 
-          # Remove pollThread, nativeTouch, doInit, doResize
           s, _ = rm_method(s, r'static\s+void\*\s+pollThread\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+jboolean\s+JNICALL\s+Java_com_menu_imgui_Helper_nativeTouch\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'static\s+void\s+doInit\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'static\s+void\s+doResize\s*\([^)]*\)\s*\{')
-
-          # Remove old JNI_OnLoad (both variants)
           s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
 
-          # Strip old JNI VM globals
           s = re.sub(r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s*gVM[^\n;]*;\s*\n?', '', s)
           s = re.sub(r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s*g_jvm[^\n;]*;\s*\n?', '', s)
           s = re.sub(r'(?m)^[ \t]*(?:static\s+)?bool\s+g_menuVisible[^\n;]*;\s*\n?', '', s)
 
-          # Fix include paths (use "ImGui.h" not "Include/ImGui.h")
           s = s.replace('#include "Include/ImGui.h"', '#include "ImGui.h"')
           s = s.replace('#include "Include/Input.h"', '#include "Input.h"')
-
-          # Add new includes if not present
           if '#include "ImGui.h"' not in s:
               s = s.replace('#include "dex_data.h"', '#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
 
-          # Append footer with textwrap.dedent so YAML indentation is safe
           footer = textwrap.dedent(r"""
-              // ====== GLOBALS ======
               static JavaVM* gVM = nullptr;
               static JavaVM* g_jvm = nullptr;
               static bool g_menuVisible = true;
 
-              // ====== DRAW MENU ======
               void DrawMenu() {
                   if (!g_menuVisible) return;
                   ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
@@ -251,33 +297,24 @@ jobs:
                   ImGui::End();
               }
 
-              // ====== JNI_OnLoad ======
               extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
                   gVM = vm;
                   g_jvm = vm;
                   JNIEnv* env = nullptr;
                   if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
-
                   loadDex(env);
-
-                  std::call_once(frida_once, []() {
-                      gum_init_embedded();
-                  });
+                  std::call_once(frida_once, []() { gum_init_embedded(); });
                   init_frida_script();
-
                   pthread_t t;
                   pthread_create(&t, nullptr, initModMenu, (void*)DrawMenu);
                   hookInput();
-
                   return JNI_VERSION_1_6;
               }
           """).strip()
 
           s = s.rstrip() + "\n\n" + footer + "\n"
           p.write_text(s)
-          print("native-lib.cpp patched successfully")
-          print("JNI_OnLoad count:", s.count("JNI_OnLoad"))
-          print("DrawMenu count:", s.count("void DrawMenu()"))
+          print("native-lib.cpp patched")
           PYEOF
 
       - name: Patch Helper.java (remove overlay)
@@ -286,10 +323,8 @@ jobs:
           import re, pathlib
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
-
           for fname in ['sOverlayWm','sOverlayLp','sDecorContainer','sFabSize','sFabMargin','sOverlayActivity','sMenuOpen']:
               s = re.sub(r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?', '', s)
-
           def rm_method(src, pat):
               n = 0
               while True:
@@ -304,14 +339,11 @@ jobs:
                   if e<0: break
                   src = src[:m.start()] + src[e:]; n+=1
               return src, n
-
           s, _ = rm_method(s, r'public\s+static\s+void\s+attach\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'public\s+static\s+void\s+setMenuOpen\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'(?:static|private\s+static|public\s+static)\s+void\s+doAttach\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'private\s+static\s+void\s+registerLifecycle\s*\([^)]*\)\s*\{')
-
           s = re.sub(r'(?m)^[ \t]*(?:static\s+)?native\s+(?:jboolean|boolean|void)\s+nativeTouch\s*\([^)]*\)\s*;\s*\n?', '', s)
-
           p.write_text(s)
           print("Helper.java cleaned")
           PYEOF
@@ -366,13 +398,14 @@ jobs:
           FAIL=0
           test -s app/src/main/cpp/Include/ImGui.h && echo "OK ImGui.h" || { echo "ERR ImGui.h"; FAIL=1; }
           test -s app/src/main/cpp/Include/Input.h && echo "OK Input.h" || { echo "ERR Input.h"; FAIL=1; }
-          if [ "$(grep -cF 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp)" -eq 1 ]; then echo "OK exactly 1 JNI_OnLoad"; else echo "ERR JNI_OnLoad count=$(grep -cF 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp)"; FAIL=1; fi
+          N_JNI=$(grep -cF 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp || true)
+          if [ "$N_JNI" -eq 1 ]; then echo "OK exactly 1 JNI_OnLoad"; else echo "ERR JNI_OnLoad count=$N_JNI"; FAIL=1; fi
           grep -qF "void DrawMenu()" app/src/main/cpp/tool/native-lib.cpp && echo "OK DrawMenu" || { echo "ERR DrawMenu"; FAIL=1; }
           grep -qF "initModMenu" app/src/main/cpp/tool/native-lib.cpp && echo "OK initModMenu" || { echo "ERR initModMenu"; FAIL=1; }
           grep -qF "hookInput" app/src/main/cpp/tool/native-lib.cpp && echo "OK hookInput" || { echo "ERR hookInput"; FAIL=1; }
           test ! -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java && echo "OK OverlaySurfaceView removed" || { echo "ERR"; FAIL=1; }
           if grep -qF "sOverlayWm" app/src/main/java/com/menu/imgui/Helper.java; then echo "ERR overlay fields in Helper"; FAIL=1; else echo "OK Helper cleaned"; fi
-          [ $FAIL -ne 0 ] && exit 1
+          if [ $FAIL -ne 0 ]; then exit 1; fi
           echo "ALL CHECKS PASSED"
 
       - uses: gradle/actions/setup-gradle@v3
@@ -403,5 +436,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "feat: migrate to eglSwapBuffers + libinput (reveny pattern) [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: frida-gum.h fallback + set -e safe if blocks [skip ci]"
           git push
