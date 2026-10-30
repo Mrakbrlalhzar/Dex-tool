@@ -8,10 +8,12 @@
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_android.h"
 #include "Dobby/include/dobby.h"
+#ifndef LOGI
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "DexTool", __VA_ARGS__)
+#endif
 using swapbuffers_orig = EGLBoolean (*)(EGLDisplay, EGLSurface);
 static swapbuffers_orig o_swapbuffers = nullptr;
-static bool isInitialized = false;
+static bool imgui_sw_initialized = false;
 static void (*menuAddress)() = nullptr;
 static bool isLibraryLoaded(const char *name) {
     FILE *fp = fopen("/proc/self/maps", "rt");
@@ -21,21 +23,23 @@ static bool isLibraryLoaded(const char *name) {
     fclose(fp); return false;
 }
 static EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf) {
-    EGLint w, h;
+    EGLint w = 0, h = 0;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-    if (!isInitialized) {
+    if (!imgui_sw_initialized) {
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.DisplaySize = ImVec2((float)w, (float)h);
         io.IniFilename = nullptr;
-        ImGui_ImplAndroid_Init();
+        ImGui_ImplAndroid_Init(nullptr);
         ImGui_ImplOpenGL3_Init("#version 300 es");
-        isInitialized = true;
+        imgui_sw_initialized = true;
         LOGI("ImGui initialized %dx%d", w, h);
     }
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)w, (float)h);
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(w, h);
+    ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
     if (menuAddress) menuAddress();
     ImGui::Render();

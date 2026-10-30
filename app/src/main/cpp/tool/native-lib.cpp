@@ -216,6 +216,10 @@ static void send_to_js(const char* json) {
 
 
 
+static JavaVM* gVM = nullptr;
+static JavaVM* g_jvm = nullptr;
+static bool g_menuVisible = true;
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
     if (!g_jvm) env->GetJavaVM(&g_jvm);
@@ -823,10 +827,6 @@ void DrawMenu() {
     }
     ImGui::End();
 }
-
-static JavaVM* gVM = nullptr;
-static JavaVM* g_jvm = nullptr;
-static bool g_menuVisible = true;
 
 void DrawMenu() {
     if (!g_menuVisible) return;
