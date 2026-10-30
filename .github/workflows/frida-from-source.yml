@@ -17,12 +17,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Cleanup old workflows
-        run: |
-          cd .github/workflows
-          for f in *.yml *.yaml; do [ -f "$f" ] && [ "$f" != "frida-from-source.yml" ] && rm -f "$f"; done
-          ls -la
-
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -34,7 +28,11 @@ jobs:
           echo "NDK_PATH=/tmp/android-ndk-r25c" >> $GITHUB_ENV
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
-          node --version
+
+      - name: Clone Dobby
+        run: |
+          git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
+          ls app/src/main/cpp/Include/Dobby
 
       - name: Download Frida devkit
         run: |
@@ -42,19 +40,15 @@ jobs:
           V=17.1.0
           B="https://github.com/frida/frida/releases/download/$V"
           wget -q "$B/frida-gumjs-devkit-$V-android-arm64.tar.xz" -O /tmp/dk64.tar.xz
-          mkdir -p /tmp/dk64
-          tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
+          mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
           wget -q "$B/frida-gumjs-devkit-$V-android-arm.tar.xz" -O /tmp/dk32.tar.xz
-          mkdir -p /tmp/dk32
-          tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
-          echo "devkits ready"
+          mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
 
       - name: Clone frida-gum
         run: |
           git clone --recursive --depth 1 --branch 17.1.0 https://github.com/frida/frida-gum.git /tmp/frida-gum
           cd /tmp/frida-gum
           sed -i '1i void glib_init(void);' bindings/gumjs/gumquickcompile.c
-          echo "patched"
 
       - name: Build arm64
         run: |
@@ -65,29 +59,17 @@ jobs:
           ./configure --host=android-arm64 -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a64.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a64.log; exit 1; }
           make -j$(nproc) 2>&1 | tee -a /tmp/a64.log
-          python3 releng/devkit.py frida-gumjs android-arm64 2>&1 | tail -20 || true
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
-          echo "arm64 lib: $LIB"
-
-      - name: Stage arm64
-        run: |
-          set -e
           D=/tmp/frida-built/arm64-v8a
-          rm -rf "$D"
-          mkdir -p "$D/lib" "$D/include"
-          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
-          [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo "FATAL_no_lib"; exit 1; }
+          rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
           cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
           G=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
-          [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
           [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
-          ls -lah "$D/lib/"
 
       - name: Build armv7
         run: |
@@ -98,466 +80,260 @@ jobs:
           ./configure --host=android-arm -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a32.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a32.log; exit 1; }
           make -j$(nproc) 2>&1 | tee -a /tmp/a32.log
-          python3 releng/devkit.py frida-gumjs android-arm 2>&1 | tail -20 || true
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
           [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
-          echo "armv7 lib: $LIB"
-
-      - name: Stage armv7
-        run: |
-          set -e
           D=/tmp/frida-built/armeabi-v7a
-          rm -rf "$D"
-          mkdir -p "$D/lib" "$D/include"
-          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
-          [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo "FATAL_no_lib"; exit 1; }
+          rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
           cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
           G=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
-          [ -z "$G" ] && G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1)
           [ -n "$G" ] && cp -v "$G" "$D/include/frida-gum.h"
           GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1)
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
-          ls -lah "$D/lib/"
 
-      - name: Patch Helper.java
+      - name: Write Include/ImGui.h
+        run: |
+          mkdir -p app/src/main/cpp/Include
+          cat > app/src/main/cpp/Include/ImGui.h <<'IMGUIEOF'
+          #pragma once
+          #include <EGL/egl.h>
+          #include <android/log.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <cstring>
+          #include "imgui.h"
+          #include "imgui_impl_opengl3.h"
+          #include "imgui_impl_android.h"
+          #include "Dobby/include/dobby.h"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "DexTool", __VA_ARGS__)
+          using swapbuffers_orig = EGLBoolean (*)(EGLDisplay, EGLSurface);
+          static swapbuffers_orig o_swapbuffers = nullptr;
+          static bool isInitialized = false;
+          static void (*menuAddress)() = nullptr;
+          static bool isLibraryLoaded(const char *name) {
+              FILE *fp = fopen("/proc/self/maps", "rt");
+              if (!fp) return false;
+              char line[512];
+              while (fgets(line, sizeof(line), fp)) { if (strstr(line, name)) { fclose(fp); return true; } }
+              fclose(fp); return false;
+          }
+          static EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf) {
+              EGLint w, h;
+              eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
+              eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+              if (!isInitialized) {
+                  ImGui::CreateContext();
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.DisplaySize = ImVec2((float)w, (float)h);
+                  io.IniFilename = nullptr;
+                  ImGui_ImplAndroid_Init();
+                  ImGui_ImplOpenGL3_Init("#version 300 es");
+                  isInitialized = true;
+                  LOGI("ImGui initialized %dx%d", w, h);
+              }
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui_ImplAndroid_NewFrame(w, h);
+              ImGui::NewFrame();
+              if (menuAddress) menuAddress();
+              ImGui::Render();
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+              return o_swapbuffers(dpy, surf);
+          }
+          void *initModMenu(void *menu_addr) {
+              menuAddress = (void (*)())menu_addr;
+              while (!isLibraryLoaded("libEGL.so")) sleep(1);
+              auto swapBuffers = (uintptr_t)DobbySymbolResolver("libEGL.so", "eglSwapBuffers");
+              DobbyHook((void*)swapBuffers, (void*)swapbuffers_hook, (void**)&o_swapbuffers);
+              LOGI("eglSwapBuffers hooked");
+              return nullptr;
+          }
+          IMGUIEOF
+
+      - name: Write Include/Input.h
+        run: |
+          cat > app/src/main/cpp/Include/Input.h <<'INPUTEOF'
+          #pragma once
+          #include <android/input.h>
+          #include <cstdint>
+          #include "Dobby/include/dobby.h"
+          using Input_orig = void (*)(void*, void*, void*);
+          static Input_orig o_input = nullptr;
+          static void input_hook(void* thiz, void* ex_ab, void* ex_ac) {
+              o_input(thiz, ex_ab, ex_ac);
+              ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+          }
+          using Consume_orig = int32_t (*)(void*, void*, bool, long, uint32_t*, AInputEvent**);
+          static Consume_orig o_consume = nullptr;
+          static int32_t consume_hook(void* thiz, void* factory, bool raw, long seq, uint32_t* flags, AInputEvent** event) {
+              int32_t ret = o_consume(thiz, factory, raw, seq, flags, event);
+              if (ret == 0 && event && *event) ImGui_ImplAndroid_HandleInputEvent(*event);
+              return ret;
+          }
+          static void hookInput() {
+              void* sym = DobbySymbolResolver("libinput.so", "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE");
+              if (sym) { DobbyHook(sym, (void*)input_hook, (void**)&o_input); LOGI("input hooked (legacy)"); return; }
+              sym = DobbySymbolResolver("libinput.so", "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE");
+              if (sym) { DobbyHook(sym, (void*)consume_hook, (void**)&o_consume); LOGI("consume hooked (Android 15+)"); }
+          }
+          INPUTEOF
+
+      - name: Patch native-lib.cpp (remove old, append DrawMenu + JNI_OnLoad)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
+          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
+          s = p.read_text()
+
+          def rm_method(src, pat):
+              n = 0
+              while True:
+                  m = re.search(pat, src)
+                  if not m: break
+                  i = src.index('{', m.end()-1); d=0; e=-1
+                  for k in range(i, len(src)):
+                      if src[k]=='{': d+=1
+                      elif src[k]=='}':
+                          d-=1
+                          if d==0: e=k+1; break
+                  if e<0: break
+                  src = src[:m.start()] + src[e:]; n+=1
+              return src, n
+
+          # Remove pollThread, nativeTouch, doInit, doResize
+          s, _ = rm_method(s, r'static\s+void\*\s+pollThread\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+jboolean\s+JNICALL\s+Java_com_menu_imgui_Helper_nativeTouch\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'static\s+void\s+doInit\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'static\s+void\s+doResize\s*\([^)]*\)\s*\{')
+
+          # Remove old JNI_OnLoad (both variants)
+          s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
+
+          # Strip old JNI VM globals
+          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s*gVM[^\n;]*;\s*\n?', '', s)
+          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s*g_jvm[^\n;]*;\s*\n?', '', s)
+          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?bool\s+g_menuVisible[^\n;]*;\s*\n?', '', s)
+
+          # Fix include paths (use "ImGui.h" not "Include/ImGui.h")
+          s = s.replace('#include "Include/ImGui.h"', '#include "ImGui.h"')
+          s = s.replace('#include "Include/Input.h"', '#include "Input.h"')
+
+          # Add new includes if not present
+          if '#include "ImGui.h"' not in s:
+              s = s.replace('#include "dex_data.h"', '#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
+
+          # Append footer with textwrap.dedent so YAML indentation is safe
+          footer = textwrap.dedent(r"""
+              // ====== GLOBALS ======
+              static JavaVM* gVM = nullptr;
+              static JavaVM* g_jvm = nullptr;
+              static bool g_menuVisible = true;
+
+              // ====== DRAW MENU ======
+              void DrawMenu() {
+                  if (!g_menuVisible) return;
+                  ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
+                  if (ImGui::Begin("DexTool", &g_menuVisible)) {
+                      if (ImGui::BeginTabBar("##tabs")) {
+                          if (ImGui::BeginTabItem("Classes")) {
+                              if (!gSections.empty()) renderSectionContent(gSections[0]);
+                              ImGui::EndTabItem();
+                          }
+                          if (ImGui::BeginTabItem("Patches")) {
+                              renderPatchesTab();
+                              ImGui::EndTabItem();
+                          }
+                          ImGui::EndTabBar();
+                      }
+                  }
+                  ImGui::End();
+              }
+
+              // ====== JNI_OnLoad ======
+              extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+                  gVM = vm;
+                  g_jvm = vm;
+                  JNIEnv* env = nullptr;
+                  if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
+
+                  loadDex(env);
+
+                  std::call_once(frida_once, []() {
+                      gum_init_embedded();
+                  });
+                  init_frida_script();
+
+                  pthread_t t;
+                  pthread_create(&t, nullptr, initModMenu, (void*)DrawMenu);
+                  hookInput();
+
+                  return JNI_VERSION_1_6;
+              }
+          """).strip()
+
+          s = s.rstrip() + "\n\n" + footer + "\n"
+          p.write_text(s)
+          print("native-lib.cpp patched successfully")
+          print("JNI_OnLoad count:", s.count("JNI_OnLoad"))
+          print("DrawMenu count:", s.count("void DrawMenu()"))
+          PYEOF
+
+      - name: Patch Helper.java (remove overlay)
+        run: |
+          python3 - <<'PYEOF'
+          import re, pathlib
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
 
-          FIELDS = ['sOverlayWm','sOverlayLp','sDecorContainer','sFabSize','sFabMargin','sOverlayActivity','sMenuOpen']
-
-          s = re.sub(r'private\s+static\s+OverlaySurfaceView\s+overlay;[^\n]*?sOverlayWm[^\n]*?sOverlayLp[^\n]*?;',
-                     'private static OverlaySurfaceView overlay;', s)
-          for fname in FIELDS:
+          for fname in ['sOverlayWm','sOverlayLp','sDecorContainer','sFabSize','sFabMargin','sOverlayActivity','sMenuOpen']:
               s = re.sub(r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?', '', s)
-              s = re.sub(r'(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*', '', s)
-
-          m = re.search(r'public\s+class\s+Helper\s*\{', s)
-          if not m: print("FATAL: class"); raise SystemExit(2)
-          s = s[:m.end()] + "\n" + "\n".join([
-              "    private static android.view.WindowManager sOverlayWm;",
-              "    private static android.view.WindowManager.LayoutParams sOverlayLp;",
-              "    private static android.widget.FrameLayout sDecorContainer;",
-              "    private static int sFabSize = 200;",
-              "    private static int sFabMargin = 40;",
-              "    private static android.app.Activity sOverlayActivity;",
-              "    private static boolean sMenuOpen = false;",
-          ]) + "\n" + s[m.end():]
 
           def rm_method(src, pat):
               n = 0
               while True:
-                  mm = re.search(pat, src)
-                  if not mm: break
-                  i = src.index('{', mm.end()-1); d=0; e=-1
+                  m = re.search(pat, src)
+                  if not m: break
+                  i = src.index('{', m.end()-1); d=0; e=-1
                   for k in range(i, len(src)):
                       if src[k]=='{': d+=1
                       elif src[k]=='}':
                           d-=1
                           if d==0: e=k+1; break
                   if e<0: break
-                  src = src[:mm.start()] + src[e:]; n+=1
+                  src = src[:m.start()] + src[e:]; n+=1
               return src, n
 
-          s, _ = rm_method(s, r'public\s+static\s+void\s+attach\s*\(\s*(?:final\s+)?(?:android\.content\.)?Context\s+\w+\s*\)\s*\{')
+          s, _ = rm_method(s, r'public\s+static\s+void\s+attach\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'public\s+static\s+void\s+setMenuOpen\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'(?:public\s+|private\s+)?static\s+void\s+doAttach\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'(?:static|private\s+static|public\s+static)\s+void\s+doAttach\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'private\s+static\s+void\s+registerLifecycle\s*\([^)]*\)\s*\{')
 
-          methods = textwrap.dedent(r"""
-              public static void attach(final Context context) {
-                  final android.app.Activity activity;
-                  if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
-                  else if (context instanceof android.content.ContextWrapper) {
-                      android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();
-                      activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
-                  } else activity = null;
-                  if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
-                  sOverlayActivity = activity;
-                  activity.getWindow().getDecorView().post(new Runnable() {
-                      @Override public void run() { doAttach(activity); }
-                  });
-              }
+          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?native\s+(?:jboolean|boolean|void)\s+nativeTouch\s*\([^)]*\)\s*;\s*\n?', '', s)
 
-              static void doAttach(android.app.Activity activity) {
-                  OverlaySurfaceView glView = new OverlaySurfaceView(activity);
-                  android.view.WindowManager wm = activity.getWindowManager();
-                  android.util.DisplayMetrics dm = activity.getResources().getDisplayMetrics();
-                  int fabSize = (int)(80 * dm.density);
-                  int margin = (int)(20 * dm.density);
-                  sFabSize = fabSize; sFabMargin = margin;
-                  android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
-                      fabSize, fabSize,
-                      android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-                      android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                          | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                      android.graphics.PixelFormat.TRANSPARENT);
-                  lp.token = activity.getWindow().getDecorView().getWindowToken();
-                  lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
-                  lp.x = dm.widthPixels - fabSize - margin;
-                  lp.y = margin * 4;
-                  try {
-                      wm.addView(glView, lp);
-                      sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
-                      android.util.Log.i("DexTool", "Overlay added via WM (size=" + fabSize + ")");
-                  } catch (Throwable t) {
-                      android.util.Log.w("DexTool", "WM failed, decor fallback", t);
-                      try {
-                          android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
-                          android.widget.FrameLayout container = new android.widget.FrameLayout(activity);
-                          container.setClipChildren(false);
-                          android.widget.FrameLayout.LayoutParams clp = new android.widget.FrameLayout.LayoutParams(fabSize, fabSize);
-                          clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-                          clp.rightMargin = margin; clp.topMargin = margin * 4;
-                          container.addView(glView, clp);
-                          sDecorContainer = container; overlay = glView;
-                          decor.addView(container, new android.view.ViewGroup.LayoutParams(-1, -1));
-                          android.util.Log.i("DexTool", "Overlay added to DecorView (small container)");
-                      } catch (Throwable t2) { android.util.Log.e("DexTool", "ALL FAILED", t2); }
-                  }
-                  registerLifecycle(activity, glView);
-              }
-
-              public static void setMenuOpen(final boolean open) {
-                  sMenuOpen = open;
-                  if (overlay == null) return;
-                  final int w = sFabSize, m = sFabMargin;
-                  overlay.post(new Runnable() {
-                      @Override public void run() {
-                          try {
-                              if (sOverlayWm != null && sOverlayLp != null) {
-                                  if (open) {
-                                      sOverlayLp.width = android.view.WindowManager.LayoutParams.MATCH_PARENT;
-                                      sOverlayLp.height = android.view.WindowManager.LayoutParams.MATCH_PARENT;
-                                      sOverlayLp.x = 0; sOverlayLp.y = 0;
-                                  } else {
-                                      sOverlayLp.width = w; sOverlayLp.height = w;
-                                      sOverlayLp.x = sOverlayActivity.getResources().getDisplayMetrics().widthPixels - w - m;
-                                      sOverlayLp.y = m * 4;
-                                  }
-                                  sOverlayWm.updateViewLayout(overlay, sOverlayLp);
-                              } else if (sDecorContainer != null) {
-                                  android.widget.FrameLayout.LayoutParams clp = (android.widget.FrameLayout.LayoutParams) overlay.getLayoutParams();
-                                  if (open) { clp.width = -1; clp.height = -1; clp.gravity = 0; clp.rightMargin = 0; clp.topMargin = 0; }
-                                  else { clp.width = w; clp.height = w; clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END; clp.rightMargin = m; clp.topMargin = m * 4; }
-                                  overlay.setLayoutParams(clp);
-                              }
-                              android.util.Log.i("DexTool", "setMenuOpen(" + open + ")");
-                          } catch (Throwable t) { android.util.Log.w("DexTool", "setMenuOpen err", t); }
-                      }
-                  });
-              }
-          """).strip()
-
-          anchor = re.search(r'(?:private\s+static|public\s+static|static)\s+void\s+registerLifecycle\b', s)
-          if anchor:
-              s = s[:anchor.start()] + methods + "\n\n" + s[anchor.start():]
-          else:
-              m2 = re.search(r'public\s+class\s+Helper\s*\{', s)
-              s = s[:m2.end()] + "\n" + methods + "\n" + s[m2.end():]
-
-          old = "if (a == activity) { glView.onResume(); }"
-          new = ("if (a == activity) { try { glView.onResume(); } catch (Throwable t) {} "
-                 "try { if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { "
-                 "sOverlayWm.addView(glView, sOverlayLp); android.util.Log.i(\"DexTool\", \"re-attached\"); } } catch (Throwable t) {} }")
-          if old in s and "re-attached" not in s:
-              s = s.replace(old, new, 1)
-
-          if "nativePatchMethod" not in s:
-              m2 = re.search(r'static\s+native\s+void\s+nativeSetPatches\s*\([^)]*\)\s*;', s)
-              if m2:
-                  s = s[:m2.start()] + "static native void nativePatchMethod(String c, String m, String v); " + s[m2.start():]
-
-          m = re.search(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', s)
-          if m:
-              i = s.index('{', m.end()-1); d=0; e=-1
-              for k in range(i, len(s)):
-                  if s[k]=='{': d+=1
-                  elif s[k]=='}':
-                      d-=1
-                      if d==0: e=k+1; break
-              if e>0:
-                  body = ('public static void requestPatchMethod(String className, String target, String value) { '
-                      'for (PatchRecord __p : sActivePatches) { '
-                      'if ("Method".equals(__p.type) && className.equals(__p.className) && target.equals(__p.targetName)) { '
-                      '__p.currentValue = value; syncPatches(); nativePatchMethod(className, target, value); return; } } '
-                      'PatchRecord p = new PatchRecord(); p.id = sPatchCounter++; p.type = "Method"; p.className = className; '
-                      'p.targetName = target; p.originalValue = "(original)"; p.currentValue = value; sActivePatches.add(p); '
-                      'syncPatches(); nativePatchMethod(className, target, value); }')
-                  s = s[:m.start()] + body + s[e:]
           p.write_text(s)
-          print("Helper.java done")
+          print("Helper.java cleaned")
           PYEOF
 
-      - name: Patch OverlaySurfaceView.java
+      - name: Remove OverlaySurfaceView.java
         run: |
-          python3 - <<'PYEOF'
-          import re, pathlib, textwrap
-          p = pathlib.Path("app/src/main/java/com/menu/imgui/OverlaySurfaceView.java")
-          s = p.read_text()
-          if "setZOrderMediaOverlay" not in s:
-              if "setZOrderOnTop(true);" in s:
-                  s = s.replace("setZOrderOnTop(true);", "setZOrderOnTop(true);\n        setZOrderMediaOverlay(true);", 1)
-              else:
-                  s = s.replace("super(context);", "super(context);\n        setZOrderOnTop(true);\n        setZOrderMediaOverlay(true);", 1)
-          if "setPreserveEGLContextOnPause" not in s:
-              s = s.replace("setRenderMode(RENDERMODE_CONTINUOUSLY);", "setRenderMode(RENDERMODE_CONTINUOUSLY);\n        setPreserveEGLContextOnPause(true);", 1)
-          if "onTouchEvent" not in s:
-              m = re.search(r'public\s+class\s+OverlaySurfaceView\b[^{]*\{', s)
-              if not m: print("FATAL: class"); raise SystemExit(2)
-              methods = textwrap.dedent(r"""
-                  @Override public boolean onTouchEvent(android.view.MotionEvent e) {
-                      int action = e.getActionMasked();
-                      boolean handled = Helper.nativeTouch(action, e.getX(), e.getY());
-                      if (action == android.view.MotionEvent.ACTION_DOWN) return handled;
-                      return super.onTouchEvent(e);
-                  }
-                  @Override public boolean dispatchKeyEvent(android.view.KeyEvent e) {
-                      int c = e.getKeyCode();
-                      if (e.getAction() == android.view.KeyEvent.ACTION_DOWN) {
-                          if (c >= android.view.KeyEvent.KEYCODE_0 && c <= android.view.KeyEvent.KEYCODE_9) { Helper.nativeAddInputChar((char)('0'+(c-android.view.KeyEvent.KEYCODE_0))); return true; }
-                          if (c == android.view.KeyEvent.KEYCODE_PERIOD || c == android.view.KeyEvent.KEYCODE_NUMPAD_DOT) { Helper.nativeAddInputChar('.'); return true; }
-                          if (c == android.view.KeyEvent.KEYCODE_MINUS || c == android.view.KeyEvent.KEYCODE_NUMPAD_SUBTRACT) { Helper.nativeAddInputChar('-'); return true; }
-                      }
-                      return super.dispatchKeyEvent(e);
-                  }
-              """).strip()
-              s = s[:m.end()] + "\n" + methods + "\n" + s[m.end():]
-          p.write_text(s)
-          print("OverlaySurfaceView.java done")
-          PYEOF
+          rm -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
+          echo "Removed OverlaySurfaceView.java"
 
-      - name: Fix native-lib.cpp (globals + nativeTouch + nativePatchMethod)
-        run: |
-          python3 - <<'PYEOF'
-          import re, pathlib, textwrap
-          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
-          s = p.read_text()
-
-          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s*g_jvm[^\n;]*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?bool\s+gMenuOpen[^\n;]*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?std::vector<std::string>\s+gCallLog[^\n;]*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?std::mutex\s+gCallLogMutex[^\n;]*;\s*\n?', '', s)
-          s = re.sub(r'env\s*->\s*GetJavaVM\s*\(\s*&g_jvm\s*\)\s*;', '', s)
-
-          def rm_method(src, pat):
-              n = 0
-              while True:
-                  mm = re.search(pat, src)
-                  if not mm: break
-                  i = src.index('{', mm.end()-1); d=0; e=-1
-                  for k in range(i, len(src)):
-                      if src[k]=='{': d+=1
-                      elif src[k]=='}':
-                          d-=1
-                          if d==0: e=k+1; break
-                  if e<0: break
-                  src = src[:mm.start()] + src[e:]; n+=1
-              return src, n
-
-          s, _ = rm_method(s, r'static\s+void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+jboolean\s+JNICALL\s+Java_com_menu_imgui_Helper_nativeTouch\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+void\s+JNICALL\s+Java_com_menu_imgui_Helper_nativePatchMethod\s*\([^)]*\)\s*\{')
-
-          for inc in ['<mutex>', '<vector>', '<string>']:
-              if '#include ' + inc not in s:
-                  s = s.replace('#include <jni.h>', '#include <jni.h>\n#include ' + inc, 1)
-
-          lines = s.split('\n')
-          last_inc = 0
-          for i, line in enumerate(lines[:60]):
-              if line.strip().startswith('#include'):
-                  last_inc = i
-          lines[last_inc+1:last_inc+1] = [
-              '',
-              'static JavaVM* g_jvm = nullptr;',
-              'static bool gMenuOpen = false;',
-              'static std::vector<std::string> gCallLog;',
-              'static std::mutex gCallLogMutex;',
-              '',
-          ]
-          s = '\n'.join(lines)
-
-          notify_helper = textwrap.dedent(r"""
-              static void notifyMenuOpen(bool open) {
-                  if (!g_jvm) return;
-                  JNIEnv* env = nullptr;
-                  bool detach = false;
-                  if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-                      if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
-                      detach = true;
-                  }
-                  jclass cls = env->FindClass("com/menu/imgui/Helper");
-                  if (cls) {
-                      jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
-                      if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
-                      env->DeleteLocalRef(cls);
-                  }
-                  if (detach) g_jvm->DetachCurrentThread();
-              }
-          """).strip()
-          gpos = s.find('static std::mutex gCallLogMutex;')
-          if gpos > 0:
-              end = s.find('\n', gpos) + 1
-              s = s[:end] + '\n' + notify_helper + '\n\n' + s[end:]
-
-          new_touch = textwrap.dedent(r"""
-              extern "C" JNIEXPORT jboolean JNICALL
-              Java_com_menu_imgui_Helper_nativeTouch(JNIEnv* env, jclass, jint action, jfloat x, jfloat y) {
-                  if (!g_jvm) env->GetJavaVM(&g_jvm);
-                  ImGuiIO& io = ImGui::GetIO();
-                  io.AddMousePosEvent(x, y);
-                  if (action == 0) io.AddMouseButtonEvent(0, true);
-                  else if (action == 1) io.AddMouseButtonEvent(0, false);
-                  else if (action == 3) io.AddMouseButtonEvent(0, false);
-                  return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
-              }
-          """).strip()
-          anchor = 'static void drawSigil'
-          if anchor in s:
-              s = s.replace(anchor, new_touch + '\n\n' + anchor, 1)
-          else:
-              pos = s.find('extern "C" JNIEXPORT')
-              if pos > 0: s = s[:pos] + new_touch + '\n\n' + s[pos:]
-
-          new_patch = textwrap.dedent(r"""
-              extern "C" JNIEXPORT void JNICALL
-              Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
-                  if (!g_jvm) env->GetJavaVM(&g_jvm);
-                  if (!g_script) return;
-                  const char* c = env->GetStringUTFChars(jc, nullptr);
-                  const char* m = env->GetStringUTFChars(jm, nullptr);
-                  const char* v = env->GetStringUTFChars(jv, nullptr);
-                  std::string json = "{\"action\":\"patchMethod\",\"className\":\"";
-                  json += c; json += "\",\"methodName\":\""; json += m;
-                  json += "\",\"returnValue\":\""; json += v; json += "\"}";
-                  gum_script_post(g_script, json.c_str(), nullptr);
-                  env->ReleaseStringUTFChars(jc, c);
-                  env->ReleaseStringUTFChars(jm, m);
-                  env->ReleaseStringUTFChars(jv, v);
-              }
-          """).strip()
-          if anchor in s:
-              s = s.replace(anchor, new_patch + '\n\n' + anchor, 1)
-          else:
-              pos = s.find('extern "C" JNIEXPORT')
-              if pos > 0: s = s[:pos] + new_patch + '\n\n' + s[pos:]
-
-          if 'void nativeRender()' in s and 'lastMenuOpen' not in s:
-              s = s.replace('void nativeRender() {',
-                            'void nativeRender() {\n    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }', 1)
-
-          p.write_text(s)
-          print("native-lib.cpp done")
-          PYEOF
-
-      - name: Patch native-lib.cpp (agent + log)
-        run: |
-          python3 - <<'PYEOF'
-          import re, pathlib, textwrap
-          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
-          s = p.read_text()
-
-          new_js = textwrap.dedent(r"""
-              Java.perform(function() {
-                function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
-                log("agent loaded");
-                var HOOKED = {};
-                recv(function(raw) {
-                  try {
-                    var cmd = JSON.parse(raw);
-                    log("recv: "+raw);
-                    if (cmd.action !== "patchMethod") return;
-                    var key = cmd.className+"#"+cmd.methodName;
-                    if (HOOKED[key]) { log("already patched: "+key); return; }
-                    var loaders = Java.enumerateClassLoadersSync();
-                    var loader = null;
-                    for (var i=0;i<loaders.length;i++){ try{ if(loaders[i].findClass(cmd.className)){ loader=loaders[i]; break; } }catch(e){} }
-                    if (loader) Java.classFactory.loader = loader;
-                    var cls = Java.use(cmd.className);
-                    var ovs = cls[cmd.methodName].overloads;
-                    var target = null;
-                    for (var i=0;i<ovs.length;i++){ if(target===null && ovs[i].argumentTypes.length===0) target=ovs[i]; }
-                    if (!target) target = ovs[0];
-                    var rt = target.returnType.className;
-                    var rv = cmd.returnValue;
-                    target.implementation = function() {
-                      log("HOOK HIT: "+cmd.methodName);
-                      if (rt==="int"||rt==="long"||rt==="short"||rt==="byte") return parseInt(rv,10);
-                      if (rt==="float"||rt==="double") return parseFloat(rv);
-                      if (rt==="boolean") return rv==="true"||rv==="1";
-                      if (rt==="void") return undefined;
-                      return rv;
-                    };
-                    HOOKED[key] = true;
-                    log("PATCHED: "+key);
-                  } catch(e) { log("ERROR: "+e.message); }
-                });
-                send({type:"ready"});
-              });
-          """).strip()
-          if 'PATCH_AGENT_JS' in s:
-              s = re.sub(r'const gchar\* PATCH_AGENT_JS = R"\(.*?\)";',
-                  'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
-
-          if 'type\\":\\"log' not in s:
-              s = s.replace('LOGI("Frida JS: %s", message);',
-                  'LOGI("Frida JS: %s", message); if (message && strstr(message, "\\"type\\":\\"log\\"")) { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[JS] ")+message); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }', 1)
-
-          if 'push_back("[CALL]' not in s:
-              s = s.replace("gPendingCallReqs.push_back(c);",
-                  "gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string(\"[CALL] \")+className+\".\"+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }", 1)
-
-          if 'BeginTabItem("Log")' not in s:
-              old = 'if (ImGui::BeginTabItem("Patches"))'
-              new = ('if (ImGui::BeginTabItem("Log")) { std::lock_guard<std::mutex> lk(gCallLogMutex); '
-                     'ImGui::BeginChild("##logchild", ImVec2(0,0), true); '
-                     'for (auto& l : gCallLog) ImGui::TextUnformatted(l.c_str()); '
-                     'ImGui::EndChild(); ImGui::EndTabItem(); }\n        ' + old)
-              if old in s:
-                  s = s.replace(old, new, 1)
-          p.write_text(s)
-          print("native-lib.cpp agent done")
-          PYEOF
-
-      - name: Rebuild dex_data.h
+      - name: Rebuild dex_data.h (Helper only)
         run: |
           set -e
           ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -1)
           D8=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -1)
           rm -rf /tmp/dex_build /tmp/dex_out
           mkdir -p /tmp/dex_build /tmp/dex_out
-          javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build $(find app/src/main/java/com/menu/imgui -name "*.java") 2>&1 | tee /tmp/javac.log
+          javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build app/src/main/java/com/menu/imgui/Helper.java 2>&1 | tee /tmp/javac.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC_FAILED"; cat /tmp/javac.log; exit 1; }
           "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
           echo "dex_data.h rebuilt"
-
-      - name: Verify
-        run: |
-          FAIL=0
-          chk() { if grep -qF "$2" "$1"; then echo "OK  $2"; else echo "ERR $2"; FAIL=1; fi; }
-          chk app/src/main/cpp/tool/native-lib.cpp "static JavaVM* g_jvm = nullptr;"
-          chk app/src/main/cpp/tool/native-lib.cpp "notifyMenuOpen"
-          chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
-          chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
-          chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
-          chk app/src/main/java/com/menu/imgui/Helper.java "nativePatchMethod"
-          if grep -qF "gum_script_post(g_script, json.c_str(), nullptr);" app/src/main/cpp/tool/native-lib.cpp; then
-            echo "OK  gum_script_post has 3 args"
-          else
-            echo "ERR gum_script_post signature"; FAIL=1
-          fi
-          if [ $FAIL -ne 0 ]; then
-            echo "=== native-lib top 40 ==="; head -40 app/src/main/cpp/tool/native-lib.cpp
-            exit 1
-          fi
-          echo "ALL CHECKS PASSED"
 
       - name: Write CMakeLists.txt
         run: |
@@ -575,38 +351,29 @@ jobs:
           include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
           add_library(frida-gumjs STATIC IMPORTED)
           set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
-          include_directories(imgui imgui/backends tool)
-          add_library(tool SHARED tool/native-lib.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
+          add_subdirectory(Include/Dobby dobby.out)
+          include_directories(Include Include/Dobby/include imgui imgui/backends tool)
+          add_library(tool SHARED
+              tool/native-lib.cpp
+              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
+              imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
           target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
-          target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
+          target_link_libraries(tool dobby frida-gumjs android log EGL GLESv3 dl)
           CMEOF
 
-      - name: Write build.gradle.kts
+      - name: Verify
         run: |
-          cat > app/build.gradle.kts <<'GEOF'
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-          }
-          android {
-              namespace = "com.example.tool"
-              compileSdk = 34
-              defaultConfig {
-                  applicationId = "com.example.tool"
-                  minSdk = 27
-                  targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
-                  externalNativeBuild { cmake { cppFlags += "-std=c++17"; arguments += "-DCMAKE_BUILD_TYPE=Release" } }
-                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
-              }
-              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
-              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
-              kotlinOptions { jvmTarget = "17" }
-              packaging { jniLibs { useLegacyPackaging = true } }
-          }
-          dependencies { implementation("androidx.core:core-ktx:1.12.0") }
-          GEOF
+          FAIL=0
+          test -s app/src/main/cpp/Include/ImGui.h && echo "OK ImGui.h" || { echo "ERR ImGui.h"; FAIL=1; }
+          test -s app/src/main/cpp/Include/Input.h && echo "OK Input.h" || { echo "ERR Input.h"; FAIL=1; }
+          if [ "$(grep -cF 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp)" -eq 1 ]; then echo "OK exactly 1 JNI_OnLoad"; else echo "ERR JNI_OnLoad count=$(grep -cF 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp)"; FAIL=1; fi
+          grep -qF "void DrawMenu()" app/src/main/cpp/tool/native-lib.cpp && echo "OK DrawMenu" || { echo "ERR DrawMenu"; FAIL=1; }
+          grep -qF "initModMenu" app/src/main/cpp/tool/native-lib.cpp && echo "OK initModMenu" || { echo "ERR initModMenu"; FAIL=1; }
+          grep -qF "hookInput" app/src/main/cpp/tool/native-lib.cpp && echo "OK hookInput" || { echo "ERR hookInput"; FAIL=1; }
+          test ! -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java && echo "OK OverlaySurfaceView removed" || { echo "ERR"; FAIL=1; }
+          if grep -qF "sOverlayWm" app/src/main/java/com/menu/imgui/Helper.java; then echo "ERR overlay fields in Helper"; FAIL=1; else echo "OK Helper cleaned"; fi
+          [ $FAIL -ne 0 ] && exit 1
+          echo "ALL CHECKS PASSED"
 
       - uses: gradle/actions/setup-gradle@v3
         with:
@@ -624,10 +391,8 @@ jobs:
           APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
           cp "$APK" /tmp/un.apk
           zipalign -p -f 4 /tmp/un.apk "$APK"
-          unzip -l "$APK" | grep "\.so"
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: app-slim
           path: app/build/outputs/apk/debug/*.apk
@@ -638,5 +403,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: gum_script_post 3-arg signature (Frida 17) [skip ci]"
+          git diff --staged --quiet || git commit -m "feat: migrate to eglSwapBuffers + libinput (reveny pattern) [skip ci]"
           git push
