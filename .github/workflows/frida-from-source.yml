@@ -61,7 +61,7 @@ jobs:
           make -j$(nproc) 2>&1 | tee -a /tmp/a64.log
           LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true)
-          [ -z "$LIB" ] && { echo "NO_LIB"; tail -60 /tmp/a64.log; exit 1; }
+          [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
           echo "arm64 lib: $LIB"
 
       - name: Stage arm64
@@ -73,30 +73,16 @@ jobs:
           if [ -z "$LIB" ]; then LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true); fi
           if [ -z "$LIB" ]; then echo "FATAL_no_lib"; exit 1; fi
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-
           GUMJS_H=$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1 || true)
           if [ -z "$GUMJS_H" ]; then echo "FATAL_no_gumjs_h"; exit 1; fi
           cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
-
           G=$(find /tmp/dk64 -name "frida-gum.h" | head -1 || true)
           if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
           if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1 || true); fi
-          if [ -n "$G" ]; then
-              echo "Found frida-gum.h at: $G"
-              cp -v "$G" "$D/include/frida-gum.h"
-          else
-              echo "WARN: frida-gum.h not found (diet mode may not need it)"
-          fi
-
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN: frida-gum.h not found"; fi
           GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
           if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
-          if [ -n "$GLIB_DIR" ]; then
-              echo "Found glib-2.0 at: $GLIB_DIR"
-              cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
-          else
-              echo "WARN: glib-2.0 headers not found (diet mode may not need them)"
-          fi
-
+          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN: glib-2.0 not found"; fi
           ls -lah "$D/lib/" "$D/include/" || true
 
       - name: Build armv7
@@ -110,7 +96,7 @@ jobs:
           make -j$(nproc) 2>&1 | tee -a /tmp/a32.log
           LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true)
-          [ -z "$LIB" ] && { echo "NO_LIB"; tail -60 /tmp/a32.log; exit 1; }
+          [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
           echo "armv7 lib: $LIB"
 
       - name: Stage armv7
@@ -122,30 +108,16 @@ jobs:
           if [ -z "$LIB" ]; then LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true); fi
           if [ -z "$LIB" ]; then echo "FATAL_no_lib"; exit 1; fi
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-
           GUMJS_H=$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1 || true)
           if [ -z "$GUMJS_H" ]; then echo "FATAL_no_gumjs_h"; exit 1; fi
           cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
-
           G=$(find /tmp/dk32 -name "frida-gum.h" | head -1 || true)
           if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
           if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1 || true); fi
-          if [ -n "$G" ]; then
-              echo "Found frida-gum.h at: $G"
-              cp -v "$G" "$D/include/frida-gum.h"
-          else
-              echo "WARN: frida-gum.h not found"
-          fi
-
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN"; fi
           GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
           if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
-          if [ -n "$GLIB_DIR" ]; then
-              echo "Found glib-2.0 at: $GLIB_DIR"
-              cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
-          else
-              echo "WARN: glib-2.0 headers not found"
-          fi
-
+          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN"; fi
           ls -lah "$D/lib/" "$D/include/" || true
 
       - name: Write Include/ImGui.h
@@ -317,14 +289,25 @@ jobs:
           print("native-lib.cpp patched")
           PYEOF
 
-      - name: Patch Helper.java (remove overlay)
+      - name: Patch Helper.java (REMOVE OVERLAY FIELD + METHODS)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib
           p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
           s = p.read_text()
-          for fname in ['sOverlayWm','sOverlayLp','sDecorContainer','sFabSize','sFabMargin','sOverlayActivity','sMenuOpen']:
-              s = re.sub(r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?', '', s)
+
+          # 1. Remove ALL overlay-related field declarations (INCLUDING 'overlay')
+          for fname in ['sOverlayWm','sOverlayLp','sDecorContainer','sFabSize','sFabMargin','sOverlayActivity','sMenuOpen','overlay']:
+              # Match: [private static] OverlaySurfaceView overlay;  OR  [private static] int sFabSize = ...;
+              pattern = re.compile(
+                  r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[\w.<>\[\], ]+\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?'
+              )
+              before = len(pattern.findall(s))
+              s = pattern.sub('', s)
+              if before > 0:
+                  print("Removed", before, "declaration(s) of", fname)
+
+          # 2. Remove ALL methods that reference overlay
           def rm_method(src, pat):
               n = 0
               while True:
@@ -339,13 +322,41 @@ jobs:
                   if e<0: break
                   src = src[:m.start()] + src[e:]; n+=1
               return src, n
-          s, _ = rm_method(s, r'public\s+static\s+void\s+attach\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'public\s+static\s+void\s+setMenuOpen\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'(?:static|private\s+static|public\s+static)\s+void\s+doAttach\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'private\s+static\s+void\s+registerLifecycle\s*\([^)]*\)\s*\{')
+
+          s, n1 = rm_method(s, r'public\s+static\s+void\s+attach\s*\([^)]*\)\s*\{')
+          s, n2 = rm_method(s, r'public\s+static\s+void\s+setMenuOpen\s*\([^)]*\)\s*\{')
+          s, n3 = rm_method(s, r'(?:static|private\s+static|public\s+static)\s+void\s+doAttach\s*\([^)]*\)\s*\{')
+          s, n4 = rm_method(s, r'private\s+static\s+void\s+registerLifecycle\s*\([^)]*\)\s*\{')
+          print("Removed methods:", n1, n2, n3, n4)
+
+          # 3. Remove nativeTouch declaration
           s = re.sub(r'(?m)^[ \t]*(?:static\s+)?native\s+(?:jboolean|boolean|void)\s+nativeTouch\s*\([^)]*\)\s*;\s*\n?', '', s)
+
+          # 4. Remove any remaining 'overlay' references (safety)
+          # If any method still references 'overlay', remove that method
+          while 'overlay' in s:
+              # Find method containing 'overlay'
+              found = False
+              for m in re.finditer(r'\b(?:public|private|protected)\s+static\s+[\w.<>]+\s+\w+\s*\([^)]*\)\s*\{', s):
+                  i = s.index('{', m.end()-1); d=0; e=-1
+                  for k in range(i, len(s)):
+                      if s[k]=='{': d+=1
+                      elif s[k]=='}':
+                          d-=1
+                          if d==0: e=k+1; break
+                  if e<0: continue
+                  body = s[m.start():e]
+                  if 'overlay' in body:
+                      s = s[:m.start()] + s[e:]
+                      print("Removed method referencing 'overlay'")
+                      found = True
+                      break
+              if not found:
+                  break
+
           p.write_text(s)
-          print("Helper.java cleaned")
+          print("Helper.java cleaned. 'overlay' occurrences remaining:", s.count('overlay'))
+          print("'OverlaySurfaceView' occurrences remaining:", s.count('OverlaySurfaceView'))
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
@@ -361,7 +372,7 @@ jobs:
           rm -rf /tmp/dex_build /tmp/dex_out
           mkdir -p /tmp/dex_build /tmp/dex_out
           javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build app/src/main/java/com/menu/imgui/Helper.java 2>&1 | tee /tmp/javac.log
-          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC_FAILED"; cat /tmp/javac.log; exit 1; }
+          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC_FAILED"; cat /tmp/javac.log; echo "=== Helper.java head ==="; head -60 app/src/main/java/com/menu/imgui/Helper.java; exit 1; }
           "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
@@ -403,9 +414,20 @@ jobs:
           grep -qF "void DrawMenu()" app/src/main/cpp/tool/native-lib.cpp && echo "OK DrawMenu" || { echo "ERR DrawMenu"; FAIL=1; }
           grep -qF "initModMenu" app/src/main/cpp/tool/native-lib.cpp && echo "OK initModMenu" || { echo "ERR initModMenu"; FAIL=1; }
           grep -qF "hookInput" app/src/main/cpp/tool/native-lib.cpp && echo "OK hookInput" || { echo "ERR hookInput"; FAIL=1; }
-          test ! -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java && echo "OK OverlaySurfaceView removed" || { echo "ERR"; FAIL=1; }
-          if grep -qF "sOverlayWm" app/src/main/java/com/menu/imgui/Helper.java; then echo "ERR overlay fields in Helper"; FAIL=1; else echo "OK Helper cleaned"; fi
-          if [ $FAIL -ne 0 ]; then exit 1; fi
+          test ! -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java && echo "OK OverlaySurfaceView.java removed" || { echo "ERR"; FAIL=1; }
+          if grep -qF "OverlaySurfaceView" app/src/main/java/com/menu/imgui/Helper.java; then
+            echo "ERR OverlaySurfaceView still referenced in Helper.java"
+            echo "=== Helper.java overlay area ==="
+            grep -n "OverlaySurfaceView\|overlay\|sOverlay" app/src/main/java/com/menu/imgui/Helper.java | head -20
+            FAIL=1
+          else
+            echo "OK no OverlaySurfaceView references in Helper"
+          fi
+          if grep -qF "sOverlayWm" app/src/main/java/com/menu/imgui/Helper.java; then echo "ERR sOverlayWm still in Helper"; FAIL=1; else echo "OK Helper cleaned"; fi
+          if [ $FAIL -ne 0 ]; then
+            echo "=== Helper.java head 60 ==="; head -60 app/src/main/java/com/menu/imgui/Helper.java
+            exit 1
+          fi
           echo "ALL CHECKS PASSED"
 
       - uses: gradle/actions/setup-gradle@v3
@@ -436,5 +458,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: frida-gum.h fallback + set -e safe if blocks [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: remove 'overlay' field from Helper.java (was overlooked) [skip ci]"
           git push
