@@ -134,7 +134,7 @@ jobs:
 
           def count_field(src, name):
               return len(re.findall(
-                  r'\b(?:private|public|protected)?\s*static\s+(?:final\s+)?[\w.<>\[\], ]+\s+' + re.escape(name) + r'\b[^;\n]*;',
+                  r'(?m)^\s*(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(name) + r'\b[^;\n]*;',
                   src))
 
           print("=== INITIAL field counts ===")
@@ -146,20 +146,20 @@ jobs:
               r'private\s+static\s+OverlaySurfaceView\s+overlay;[^\n]*?sOverlayWm[^\n]*?sOverlayLp[^\n]*?;',
               'private static OverlaySurfaceView overlay;', s)
 
-          # 2. Remove ALL standalone declarations of FIELDS
+          # 2. Remove ALL standalone declarations
           for fname in FIELDS:
               pattern = re.compile(
-                  r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[\w.<>\[\], ]+\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?'
+                  r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?'
               )
               before = len(pattern.findall(s))
               s = pattern.sub('', s)
               if before > 0:
                   print("Removed", before, "declaration(s) of", fname)
 
-          # 3. Remove any inline occurrences (safety net)
+          # 3. Remove any inline occurrences
           for fname in FIELDS:
               inline_pattern = re.compile(
-                  r'(?:private|public|protected)?\s*static\s+(?:final\s+)?[\w.<>\[\], ]+\s+' + re.escape(fname) + r'\b[^;\n]*;\s*'
+                  r'(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*'
               )
               before = len(inline_pattern.findall(s))
               s = inline_pattern.sub('', s)
@@ -623,6 +623,9 @@ jobs:
           head -3 app/src/main/cpp/tool/dex_data.h
           tail -2 app/src/main/cpp/tool/dex_data.h
 
+      # ============================================================
+      # VERIFY (fixed grep + diagnostics)
+      # ============================================================
       - name: Verify
         run: |
           FAIL=0
@@ -639,12 +642,30 @@ jobs:
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativeTouch"
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
+
+          # Field declaration check (POSIX ERE, no \s / \b)
           for field in sOverlayWm sOverlayLp sDecorContainer sFabSize sFabMargin sOverlayActivity sMenuOpen; do
-            n=$(grep -cE "^\s*(private|public|protected)?\s*static\s+(final\s+)?[A-Za-z_][A-Za-z0-9_.<>\[\]]*\s+$field\b" app/src/main/java/com/menu/imgui/Helper.java || true)
-            if [ "$n" -ne 1 ]; then echo "ERR field $field declared $n times (expected 1)"; FAIL=1; else echo "OK  $field declared once"; fi
+            n=$(grep -cE "^[[:space:]]*private[[:space:]]+static[[:space:]]+[^;]*[[:space:]]${field}[[:space:]=;]" app/src/main/java/com/menu/imgui/Helper.java || echo 0)
+            if [ "$n" -eq 1 ]; then
+              echo "OK  $field declared exactly once"
+            else
+              echo "ERR field $field declared $n times (expected 1)"
+              FAIL=1
+            fi
           done
+
+          if grep -q "lp.alpha = 0.01f" app/src/main/java/com/menu/imgui/Helper.java; then
+            echo "ERR alpha=0.01 still present"; FAIL=1
+          fi
+          if grep -q "if (if (" app/src/main/cpp/tool/native-lib.cpp; then
+            echo "ERR broken if(if("; FAIL=1
+          fi
+
           if [ $FAIL -ne 0 ]; then
-            echo "=== Helper head ==="; head -30 app/src/main/java/com/menu/imgui/Helper.java
+            echo "=== Helper.java first 60 lines ==="
+            head -60 app/src/main/java/com/menu/imgui/Helper.java
+            echo "=== all field lines ==="
+            grep -nE "sOverlayWm|sOverlayLp|sDecorContainer|sFabSize|sFabMargin|sOverlayActivity|sMenuOpen" app/src/main/java/com/menu/imgui/Helper.java | head -40
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -727,5 +748,5 @@ jobs:
         run: |
           git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: YAML textwrap.dedent everywhere + dedupe fields + rebuild dex [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: verify grep uses POSIX [[:space:]] instead of \\s [skip ci]"
           git push
