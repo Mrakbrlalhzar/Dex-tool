@@ -805,37 +805,6 @@ static void doSetPatches(JNIEnv* env, jclass, jobjectArray arr) {
     }
 }
 
-JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
-    JNIEnv* env = nullptr;
-    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return JNI_VERSION_1_6;
-    gVM = vm;
-    if (!loadDex(env)) return JNI_VERSION_1_6;
-
-    // Init Frida (FIXED)
-    std::call_once(frida_once, []() { 
-    gum_init_embedded(); });
-    LOGI("Frida Gum initialized");
-    init_frida_script();
-
-    JNINativeMethod methods[] = {
-        {(char*)"nativeInit",            (char*)"(Landroid/view/Surface;)V",   (void*)doInit},
-        {(char*)"nativeResize",          (char*)"(II)V",                        (void*)doResize},
-        {(char*)"nativeRender",          (char*)"()V",                          (void*)doRender},
-        {(char*)"nativeTouch",           (char*)"(IFF)Z",                       (void*)doTouch},
-        {(char*)"nativeSetClassList",    (char*)"([Ljava/lang/String;)V",       (void*)doSetClassList},
-        {(char*)"nativeWantKeyboard",    (char*)"()Z",                          (void*)doWantKeyboard},
-        {(char*)"nativeAddInputChar",    (char*)"(I)V",                         (void*)doAddInputChar},
-        {(char*)"nativeAddKeyEvent",     (char*)"(IZ)V",                        (void*)doAddKeyEvent},
-        {(char*)"nativeSetClassDetails", (char*)"(ILjava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V", (void*)doSetClassDetails},
-        {(char*)"nativeSetMethodResult", (char*)"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", (void*)doSetMethodResult},
-        {(char*)"nativeSetFieldValue",   (char*)"(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V", (void*)doSetFieldValue},
-        {(char*)"nativeSetPatches",      (char*)"([Ljava/lang/String;)V",       (void*)doSetPatches},
-    };
-    if (env->RegisterNatives(gHelperClass, methods, 12) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
-    pthread_t t; if (pthread_create(&t, nullptr, pollThread, nullptr) == 0) pthread_detach(t);
-    return JNI_VERSION_1_6;
-}
-
 void DrawMenu() {
     if (!g_menuVisible) return;
     ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
@@ -861,19 +830,14 @@ static bool g_menuVisible = true;
 
 void DrawMenu() {
     if (!g_menuVisible) return;
-    ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("DexTool", &g_menuVisible)) {
-        if (ImGui::BeginTabBar("##tabs")) {
-            if (ImGui::BeginTabItem("Classes")) {
-                if (!gSections.empty()) renderSectionContent(gSections[0]);
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Patches")) {
-                renderPatchesTab();
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
-        }
+        ImGui::Text("DexTool running via eglSwapBuffers hook");
+        ImGui::Text("Touch via libinput hook");
+        ImGui::Separator();
+        static char buf[256] = "";
+        ImGui::InputText("Test input", buf, sizeof(buf));
+        if (ImGui::Button("Close Menu")) g_menuVisible = false;
     }
     ImGui::End();
 }
@@ -884,7 +848,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
     if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
     loadDex(env);
-    std::call_once(frida_once, []() { gum_init_embedded(); });
+    gum_init_embedded();
     init_frida_script();
     pthread_t t;
     pthread_create(&t, nullptr, initModMenu, (void*)DrawMenu);
