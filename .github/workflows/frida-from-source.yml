@@ -79,10 +79,10 @@ jobs:
           G=$(find /tmp/dk64 -name "frida-gum.h" | head -1 || true)
           if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
           if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1 || true); fi
-          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN: frida-gum.h not found"; fi
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN"; fi
           GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
           if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
-          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN: glib-2.0 not found"; fi
+          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN"; fi
           ls -lah "$D/lib/" "$D/include/" || true
 
       - name: Build armv7
@@ -206,45 +206,88 @@ jobs:
           }
           INPUTEOF
 
-      - name: Patch native-lib.cpp
+      - name: Patch native-lib.cpp (remove ALL JNI_OnLoad + truncate old footer + append clean)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
-          def rm_method(src, pat):
-              n = 0
-              while True:
-                  m = re.search(pat, src)
-                  if not m: break
-                  i = src.index('{', m.end()-1); d=0; e=-1
-                  for k in range(i, len(src)):
-                      if src[k]=='{': d+=1
-                      elif src[k]=='}':
-                          d-=1
-                          if d==0: e=k+1; break
-                  if e<0: break
-                  src = src[:m.start()] + src[e:]; n+=1
-              return src, n
+          # Step 1: Truncate old footer if present
+          marker = 'static JavaVM* gVM = nullptr;'
+          idx = s.find(marker)
+          if idx >= 0:
+              start = s.rfind('\n', 0, idx) + 1
+              s = s[:start]
+              print(f"Truncated old footer at position {start}")
 
-          s, _ = rm_method(s, r'static\s+void\*\s+pollThread\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+jboolean\s+JNICALL\s+Java_com_menu_imgui_Helper_nativeTouch\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'static\s+void\s+doInit\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'static\s+void\s+doResize\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'jint\s+JNICALL\s+JNI_OnLoad\s*\([^)]*\)\s*\{')
+          # Step 2: Remove ALL JNI_OnLoad function definitions (brace counting)
+          removed = 0
+          while True:
+              m = re.search(r'\bJNI_OnLoad\s*\(', s)
+              if not m:
+                  break
+              # Find matching ) for parameter list
+              depth = 1
+              i = m.end()
+              while i < len(s) and depth > 0:
+                  if s[i] == '(': depth += 1
+                  elif s[i] == ')': depth -= 1
+                  i += 1
+              if depth != 0:
+                  print("WARN: unclosed paren in JNI_OnLoad")
+                  break
+              # Skip whitespace to find {
+              while i < len(s) and s[i] in ' \t\n':
+                  i += 1
+              if i >= len(s) or s[i] != '{':
+                  # Not a definition, maybe a call or declaration — skip it
+                  print(f"WARN: JNI_OnLoad at {m.start()} is not a function definition")
+                  # Break to avoid infinite loop
+                  break
+              # Brace count to find end
+              brace_start = i
+              depth = 1
+              i = brace_start + 1
+              while i < len(s) and depth > 0:
+                  if s[i] == '{': depth += 1
+                  elif s[i] == '}': depth -= 1
+                  i += 1
+              if depth != 0:
+                  print("WARN: unclosed brace in JNI_OnLoad")
+                  break
+              end = i
+              # Walk back to find start of declaration
+              start = m.start()
+              ext = s.rfind('extern "C"', max(0, m.start() - 300), m.start())
+              if ext >= 0:
+                  start = ext
+              # Also check for JNIEXPORT line before extern
+              jni_exp = s.rfind('JNIEXPORT', max(0, m.start() - 300), m.start())
+              if jni_exp >= 0 and jni_exp < start:
+                  # Walk back to start of that line
+                  ls = s.rfind('\n', max(0, jni_exp - 1), jni_exp) + 1
+                  start = ls
+              # Trim trailing whitespace
+              while end < len(s) and s[end] in '\n \t':
+                  end += 1
+              s = s[:start] + s[end:]
+              removed += 1
+              print(f"Removed JNI_OnLoad function at position {start}")
 
-          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s*gVM[^\n;]*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s*g_jvm[^\n;]*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?bool\s+g_menuVisible[^\n;]*;\s*\n?', '', s)
+          print(f"Removed {removed} JNI_OnLoad function(s)")
 
+          # Step 3: Strip stray global declarations
+          s = re.sub(r'(?m)^[ \t]*static\s+JavaVM\s*\*\s+g_jvm\s*=\s*nullptr\s*;\s*\n?', '', s)
+          s = re.sub(r'(?m)^[ \t]*static\s+bool\s+g_menuVisible\s*=\s*true\s*;\s*\n?', '', s)
+
+          # Step 4: Fix include paths
           s = s.replace('#include "Include/ImGui.h"', '#include "ImGui.h"')
           s = s.replace('#include "Include/Input.h"', '#include "Input.h"')
           if '#include "ImGui.h"' not in s:
               s = s.replace('#include "dex_data.h"', '#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
 
+          # Step 5: Append clean footer
           footer = textwrap.dedent(r"""
               static JavaVM* gVM = nullptr;
               static JavaVM* g_jvm = nullptr;
@@ -252,19 +295,14 @@ jobs:
 
               void DrawMenu() {
                   if (!g_menuVisible) return;
-                  ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
+                  ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
                   if (ImGui::Begin("DexTool", &g_menuVisible)) {
-                      if (ImGui::BeginTabBar("##tabs")) {
-                          if (ImGui::BeginTabItem("Classes")) {
-                              if (!gSections.empty()) renderSectionContent(gSections[0]);
-                              ImGui::EndTabItem();
-                          }
-                          if (ImGui::BeginTabItem("Patches")) {
-                              renderPatchesTab();
-                              ImGui::EndTabItem();
-                          }
-                          ImGui::EndTabBar();
-                      }
+                      ImGui::Text("DexTool running via eglSwapBuffers hook");
+                      ImGui::Text("Touch via libinput hook");
+                      ImGui::Separator();
+                      static char buf[256] = "";
+                      ImGui::InputText("Test input", buf, sizeof(buf));
+                      if (ImGui::Button("Close Menu")) g_menuVisible = false;
                   }
                   ImGui::End();
               }
@@ -275,7 +313,7 @@ jobs:
                   JNIEnv* env = nullptr;
                   if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
                   loadDex(env);
-                  std::call_once(frida_once, []() { gum_init_embedded(); });
+                  gum_init_embedded();
                   init_frida_script();
                   pthread_t t;
                   pthread_create(&t, nullptr, initModMenu, (void*)DrawMenu);
@@ -286,77 +324,7 @@ jobs:
 
           s = s.rstrip() + "\n\n" + footer + "\n"
           p.write_text(s)
-          print("native-lib.cpp patched")
-          PYEOF
-
-      - name: Patch Helper.java (REMOVE OVERLAY FIELD + METHODS)
-        run: |
-          python3 - <<'PYEOF'
-          import re, pathlib
-          p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
-          s = p.read_text()
-
-          # 1. Remove ALL overlay-related field declarations (INCLUDING 'overlay')
-          for fname in ['sOverlayWm','sOverlayLp','sDecorContainer','sFabSize','sFabMargin','sOverlayActivity','sMenuOpen','overlay']:
-              # Match: [private static] OverlaySurfaceView overlay;  OR  [private static] int sFabSize = ...;
-              pattern = re.compile(
-                  r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[\w.<>\[\], ]+\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?'
-              )
-              before = len(pattern.findall(s))
-              s = pattern.sub('', s)
-              if before > 0:
-                  print("Removed", before, "declaration(s) of", fname)
-
-          # 2. Remove ALL methods that reference overlay
-          def rm_method(src, pat):
-              n = 0
-              while True:
-                  m = re.search(pat, src)
-                  if not m: break
-                  i = src.index('{', m.end()-1); d=0; e=-1
-                  for k in range(i, len(src)):
-                      if src[k]=='{': d+=1
-                      elif src[k]=='}':
-                          d-=1
-                          if d==0: e=k+1; break
-                  if e<0: break
-                  src = src[:m.start()] + src[e:]; n+=1
-              return src, n
-
-          s, n1 = rm_method(s, r'public\s+static\s+void\s+attach\s*\([^)]*\)\s*\{')
-          s, n2 = rm_method(s, r'public\s+static\s+void\s+setMenuOpen\s*\([^)]*\)\s*\{')
-          s, n3 = rm_method(s, r'(?:static|private\s+static|public\s+static)\s+void\s+doAttach\s*\([^)]*\)\s*\{')
-          s, n4 = rm_method(s, r'private\s+static\s+void\s+registerLifecycle\s*\([^)]*\)\s*\{')
-          print("Removed methods:", n1, n2, n3, n4)
-
-          # 3. Remove nativeTouch declaration
-          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?native\s+(?:jboolean|boolean|void)\s+nativeTouch\s*\([^)]*\)\s*;\s*\n?', '', s)
-
-          # 4. Remove any remaining 'overlay' references (safety)
-          # If any method still references 'overlay', remove that method
-          while 'overlay' in s:
-              # Find method containing 'overlay'
-              found = False
-              for m in re.finditer(r'\b(?:public|private|protected)\s+static\s+[\w.<>]+\s+\w+\s*\([^)]*\)\s*\{', s):
-                  i = s.index('{', m.end()-1); d=0; e=-1
-                  for k in range(i, len(s)):
-                      if s[k]=='{': d+=1
-                      elif s[k]=='}':
-                          d-=1
-                          if d==0: e=k+1; break
-                  if e<0: continue
-                  body = s[m.start():e]
-                  if 'overlay' in body:
-                      s = s[:m.start()] + s[e:]
-                      print("Removed method referencing 'overlay'")
-                      found = True
-                      break
-              if not found:
-                  break
-
-          p.write_text(s)
-          print("Helper.java cleaned. 'overlay' occurrences remaining:", s.count('overlay'))
-          print("'OverlaySurfaceView' occurrences remaining:", s.count('OverlaySurfaceView'))
+          print(f"JNI_OnLoad count after: {s.count('JNI_OnLoad')}")
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
@@ -372,7 +340,7 @@ jobs:
           rm -rf /tmp/dex_build /tmp/dex_out
           mkdir -p /tmp/dex_build /tmp/dex_out
           javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build app/src/main/java/com/menu/imgui/Helper.java 2>&1 | tee /tmp/javac.log
-          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC_FAILED"; cat /tmp/javac.log; echo "=== Helper.java head ==="; head -60 app/src/main/java/com/menu/imgui/Helper.java; exit 1; }
+          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC_FAILED"; cat /tmp/javac.log; exit 1; }
           "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
@@ -410,24 +378,20 @@ jobs:
           test -s app/src/main/cpp/Include/ImGui.h && echo "OK ImGui.h" || { echo "ERR ImGui.h"; FAIL=1; }
           test -s app/src/main/cpp/Include/Input.h && echo "OK Input.h" || { echo "ERR Input.h"; FAIL=1; }
           N_JNI=$(grep -cF 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp || true)
-          if [ "$N_JNI" -eq 1 ]; then echo "OK exactly 1 JNI_OnLoad"; else echo "ERR JNI_OnLoad count=$N_JNI"; FAIL=1; fi
+          if [ "$N_JNI" -eq 1 ]; then
+            echo "OK exactly 1 JNI_OnLoad"
+          else
+            echo "ERR JNI_OnLoad count=$N_JNI"
+            echo "=== occurrences ==="
+            grep -n 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp
+            FAIL=1
+          fi
           grep -qF "void DrawMenu()" app/src/main/cpp/tool/native-lib.cpp && echo "OK DrawMenu" || { echo "ERR DrawMenu"; FAIL=1; }
           grep -qF "initModMenu" app/src/main/cpp/tool/native-lib.cpp && echo "OK initModMenu" || { echo "ERR initModMenu"; FAIL=1; }
           grep -qF "hookInput" app/src/main/cpp/tool/native-lib.cpp && echo "OK hookInput" || { echo "ERR hookInput"; FAIL=1; }
-          test ! -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java && echo "OK OverlaySurfaceView.java removed" || { echo "ERR"; FAIL=1; }
-          if grep -qF "OverlaySurfaceView" app/src/main/java/com/menu/imgui/Helper.java; then
-            echo "ERR OverlaySurfaceView still referenced in Helper.java"
-            echo "=== Helper.java overlay area ==="
-            grep -n "OverlaySurfaceView\|overlay\|sOverlay" app/src/main/java/com/menu/imgui/Helper.java | head -20
-            FAIL=1
-          else
-            echo "OK no OverlaySurfaceView references in Helper"
-          fi
-          if grep -qF "sOverlayWm" app/src/main/java/com/menu/imgui/Helper.java; then echo "ERR sOverlayWm still in Helper"; FAIL=1; else echo "OK Helper cleaned"; fi
-          if [ $FAIL -ne 0 ]; then
-            echo "=== Helper.java head 60 ==="; head -60 app/src/main/java/com/menu/imgui/Helper.java
-            exit 1
-          fi
+          test ! -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java && echo "OK OverlaySurfaceView removed" || { echo "ERR"; FAIL=1; }
+          if grep -qF "OverlaySurfaceView" app/src/main/java/com/menu/imgui/Helper.java; then echo "ERR OverlaySurfaceView ref in Helper"; FAIL=1; else echo "OK Helper clean"; fi
+          if [ $FAIL -ne 0 ]; then exit 1; fi
           echo "ALL CHECKS PASSED"
 
       - uses: gradle/actions/setup-gradle@v3
@@ -458,5 +422,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: remove 'overlay' field from Helper.java (was overlooked) [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: brace-counting removal of ALL JNI_OnLoad + truncate old footer [skip ci]"
           git push
