@@ -44,8 +44,7 @@ public class Helper {
     
 
     private static final String TAG = "ImGuiTool";
-    private static OverlaySurfaceView overlay;
-    private static final Map<String, Object> sInstances = new HashMap<>();
+private static final Map<String, Object> sInstances = new HashMap<>();
     private static Object sCurrentActivity = null;
     private static Object sApplicationContext = null;
     private static int sPatchCounter = 1;

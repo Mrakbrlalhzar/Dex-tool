@@ -11,7 +11,11 @@ endif()
 include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
 add_library(frida-gumjs STATIC IMPORTED)
 set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
-include_directories(imgui imgui/backends tool)
-add_library(tool SHARED tool/native-lib.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
+add_subdirectory(Include/Dobby dobby.out)
+include_directories(Include Include/Dobby/include imgui imgui/backends tool)
+add_library(tool SHARED
+    tool/native-lib.cpp
+    imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
+    imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
 target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
-target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
+target_link_libraries(tool dobby frida-gumjs android log EGL GLESv3 dl)

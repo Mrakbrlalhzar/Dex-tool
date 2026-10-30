@@ -836,6 +836,25 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     return JNI_VERSION_1_6;
 }
 
+void DrawMenu() {
+    if (!g_menuVisible) return;
+    ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("DexTool", &g_menuVisible)) {
+        if (ImGui::BeginTabBar("##tabs")) {
+            if (ImGui::BeginTabItem("Classes")) {
+                if (!gSections.empty()) renderSectionContent(gSections[0]);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Patches")) {
+                renderPatchesTab();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+    }
+    ImGui::End();
+}
+
 static JavaVM* gVM = nullptr;
 static JavaVM* g_jvm = nullptr;
 static bool g_menuVisible = true;
