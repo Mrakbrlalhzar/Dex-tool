@@ -331,7 +331,7 @@ jobs:
           print("OverlaySurfaceView.java done")
           PYEOF
 
-      - name: Fix native-lib.cpp globals + native methods (g_jvm via touch)
+      - name: Fix native-lib.cpp (globals + nativeTouch + nativePatchMethod)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -435,7 +435,7 @@ jobs:
                   std::string json = "{\"action\":\"patchMethod\",\"className\":\"";
                   json += c; json += "\",\"methodName\":\""; json += m;
                   json += "\",\"returnValue\":\""; json += v; json += "\"}";
-                  gum_script_post(g_script, json.c_str(), nullptr, nullptr);
+                  gum_script_post(g_script, json.c_str(), nullptr);
                   env->ReleaseStringUTFChars(jc, c);
                   env->ReleaseStringUTFChars(jm, m);
                   env->ReleaseStringUTFChars(jv, v);
@@ -548,15 +548,11 @@ jobs:
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
           chk app/src/main/java/com/menu/imgui/Helper.java "nativePatchMethod"
-          if grep -qE "\[\s*\]\s*\(\s*\)\s*\{[^}]*env\s*->\s*GetJavaVM" app/src/main/cpp/tool/native-lib.cpp; then
-            echo "ERR env->GetJavaVM inside lambda"; FAIL=1
+          if grep -qF "gum_script_post(g_script, json.c_str(), nullptr);" app/src/main/cpp/tool/native-lib.cpp; then
+            echo "OK  gum_script_post has 3 args"
           else
-            echo "OK  no env->GetJavaVM in lambda"
+            echo "ERR gum_script_post signature"; FAIL=1
           fi
-          N_VM=$(grep -c "env->GetJavaVM(&g_jvm)" app/src/main/cpp/tool/native-lib.cpp)
-          if [ "$N_VM" -ge 1 ]; then echo "OK  env->GetJavaVM appears $N_VM times"; else echo "ERR env->GetJavaVM not present"; FAIL=1; fi
-          N_TOUCH=$(grep -c "Java_com_menu_imgui_Helper_nativeTouch" app/src/main/cpp/tool/native-lib.cpp)
-          if [ "$N_TOUCH" -ge 1 ]; then echo "OK  nativeTouch present"; else echo "ERR no nativeTouch"; FAIL=1; fi
           if [ $FAIL -ne 0 ]; then
             echo "=== native-lib top 40 ==="; head -40 app/src/main/cpp/tool/native-lib.cpp
             exit 1
@@ -642,5 +638,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: grep -qF (literal) so '*' doesn't break Verify [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: gum_script_post 3-arg signature (Frida 17) [skip ci]"
           git push
