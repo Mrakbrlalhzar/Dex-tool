@@ -41,7 +41,12 @@ public class Helper {
     private static boolean sMenuOpen = false;
 
 
-    public static void attach(final Context context) {
+
+
+
+
+
+public static void attach(final Context context) {
     final android.app.Activity activity;
     if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
     else if (context instanceof android.content.ContextWrapper) {
@@ -62,7 +67,6 @@ static void doAttach(android.app.Activity activity) {
     int fabSize = (int)(80 * dm.density);
     int margin = (int)(20 * dm.density);
     sFabSize = fabSize; sFabMargin = margin;
-
     android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
         fabSize, fabSize,
         android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
@@ -73,7 +77,6 @@ static void doAttach(android.app.Activity activity) {
     lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
     lp.x = dm.widthPixels - fabSize - margin;
     lp.y = margin * 4;
-
     try {
         wm.addView(glView, lp);
         sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
@@ -116,13 +119,8 @@ public static void setMenuOpen(final boolean open) {
                     sOverlayWm.updateViewLayout(overlay, sOverlayLp);
                 } else if (sDecorContainer != null) {
                     android.widget.FrameLayout.LayoutParams clp = (android.widget.FrameLayout.LayoutParams) overlay.getLayoutParams();
-                    if (open) {
-                        clp.width = -1; clp.height = -1; clp.gravity = 0;
-                        clp.rightMargin = 0; clp.topMargin = 0;
-                    } else {
-                        clp.width = w; clp.height = w; clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-                        clp.rightMargin = m; clp.topMargin = m * 4;
-                    }
+                    if (open) { clp.width = -1; clp.height = -1; clp.gravity = 0; clp.rightMargin = 0; clp.topMargin = 0; }
+                    else { clp.width = w; clp.height = w; clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END; clp.rightMargin = m; clp.topMargin = m * 4; }
                     overlay.setLayoutParams(clp);
                 }
                 android.util.Log.i("DexTool", "setMenuOpen(" + open + ")");
@@ -148,7 +146,7 @@ private static void registerLifecycle(Activity activity, OverlaySurfaceView glVi
     
 
     private static final String TAG = "ImGuiTool";
-    private static OverlaySurfaceView overlay; private static android.view.WindowManager sOverlayWm; private static android.view.WindowManager.LayoutParams sOverlayLp;
+    private static OverlaySurfaceView overlay;
     private static final Map<String, Object> sInstances = new HashMap<>();
     private static Object sCurrentActivity = null;
     private static Object sApplicationContext = null;
