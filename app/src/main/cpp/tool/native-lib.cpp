@@ -1,5 +1,10 @@
 #include <jni.h>
 #include <mutex>
+static JavaVM* gVM = nullptr;
+static JavaVM* g_jvm = nullptr;
+static bool g_menuVisible = true;
+static bool gMenuOpen = false;
+
 static std::once_flag frida_once;
 #include <android/log.h>
 #include <android/native_window_jni.h>
@@ -25,40 +30,14 @@ static std::once_flag frida_once;
 #include <algorithm>
 #include <frida-gumjs.h>
 
-static bool gMenuOpen = false;
 static std::vector<std::string> gCallLog;
 static std::mutex gCallLogMutex;
 
-static void notifyMenuOpen(bool open) {
-    if (!g_jvm) return;
-    JNIEnv* env = nullptr;
-    bool detach = false;
-    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
-        detach = true;
-    }
-    jclass cls = env->FindClass("com/menu/imgui/Helper");
-    if (cls) {
-        jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
-        if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
-        env->DeleteLocalRef(cls);
-    }
-    if (detach) g_jvm->DetachCurrentThread();
-}
-
-
-
-
-
-
-
-
-
-
-
 #define MY_PI 3.14159265358979323846f
 #define LOG_TAG "ImGuiTool"
+#ifndef LOGI
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#endif
 
 static jclass gHelperClass = nullptr;
 static ANativeWindow* gWindow = nullptr;
@@ -215,10 +194,6 @@ static void send_to_js(const char* json) {
 
 
 
-
-static JavaVM* gVM = nullptr;
-static JavaVM* g_jvm = nullptr;
-static bool g_menuVisible = true;
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
@@ -811,33 +786,13 @@ static void doSetPatches(JNIEnv* env, jclass, jobjectArray arr) {
 
 void DrawMenu() {
     if (!g_menuVisible) return;
-    ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("DexTool", &g_menuVisible)) {
-        if (ImGui::BeginTabBar("##tabs")) {
-            if (ImGui::BeginTabItem("Classes")) {
-                if (!gSections.empty()) renderSectionContent(gSections[0]);
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Patches")) {
-                renderPatchesTab();
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
-        }
-    }
-    ImGui::End();
-}
-
-void DrawMenu() {
-    if (!g_menuVisible) return;
     ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("DexTool", &g_menuVisible)) {
-        ImGui::Text("DexTool running via eglSwapBuffers hook");
-        ImGui::Text("Touch via libinput hook");
+        ImGui::Text("DexTool via eglSwapBuffers + libinput hooks");
         ImGui::Separator();
         static char buf[256] = "";
         ImGui::InputText("Test input", buf, sizeof(buf));
-        if (ImGui::Button("Close Menu")) g_menuVisible = false;
+        if (ImGui::Button("Close")) g_menuVisible = false;
     }
     ImGui::End();
 }
