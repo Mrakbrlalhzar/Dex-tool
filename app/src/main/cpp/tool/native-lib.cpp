@@ -23,6 +23,30 @@ static std::once_flag frida_once;
 #include <algorithm>
 #include <frida-gumjs.h>
 
+static JavaVM* g_jvm = nullptr;
+static bool gMenuOpen = false;
+static std::vector<std::string> gCallLog;
+static std::mutex gCallLogMutex;
+
+static void notifyMenuOpen(bool open) {
+    if (!g_jvm) return;
+    JNIEnv* env = nullptr;
+    bool detach = false;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        detach = true;
+    }
+    jclass cls = env->FindClass("com/menu/imgui/Helper");
+    if (cls) {
+        jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
+        if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
+        env->DeleteLocalRef(cls);
+    }
+    if (detach) g_jvm->DetachCurrentThread();
+}
+
+
+
 #define MY_PI 3.14159265358979323846f
 #define LOG_TAG "ImGuiTool"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -92,22 +116,6 @@ static float g_virtX = 0, g_virtY = 0, g_realPrevX = 0, g_realPrevY = 0, g_title
 // ====== FRIDA INIT (FIXED: 6 args for create_sync) ======
 static GumScript* g_script = nullptr;
 
-static void notifyMenuOpen(bool open) {
-    if (!g_jvm) return;
-    JNIEnv* env = nullptr;
-    bool detach = false;
-    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
-        detach = true;
-    }
-    jclass cls = env->FindClass("com/menu/imgui/Helper");
-    if (cls) {
-        jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
-        if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
-        env->DeleteLocalRef(cls);
-    }
-    if (detach) g_jvm->DetachCurrentThread();
-}
 
 
 
@@ -121,13 +129,7 @@ static void notifyMenuOpen(bool open) {
 
 
 
-static JavaVM* g_jvm = nullptr;
-static bool gMenuOpen = false;
 
-
-
-static std::vector<std::string> gCallLog;
-static std::mutex gCallLogMutex;
 static GumScriptBackend* g_backend = nullptr;
 
 const gchar* PATCH_AGENT_JS = R"(Java.perform(function() {
@@ -192,8 +194,25 @@ static void send_to_js(const char* json) {
 
 // ====== SIGIL ======
 
+
+
+
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_menu_imgui_Helper_nativeTouch(JNIEnv* env, jclass, jint action, jfloat x, jfloat y) {
+    if (!g_jvm) env->GetJavaVM(&g_jvm);
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(x, y);
+    if (action == 0) io.AddMouseButtonEvent(0, true);
+    else if (action == 1) io.AddMouseButtonEvent(0, false);
+    else if (action == 3) io.AddMouseButtonEvent(0, false);
+    return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
+    if (!g_jvm) env->GetJavaVM(&g_jvm);
     if (!g_script) return;
     const char* c = env->GetStringUTFChars(jc, nullptr);
     const char* m = env->GetStringUTFChars(jm, nullptr);
@@ -201,21 +220,10 @@ Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, js
     std::string json = "{\"action\":\"patchMethod\",\"className\":\"";
     json += c; json += "\",\"methodName\":\""; json += m;
     json += "\",\"returnValue\":\""; json += v; json += "\"}";
-    send_to_js(json.c_str());
+    gum_script_post(g_script, json.c_str(), nullptr, nullptr);
     env->ReleaseStringUTFChars(jc, c);
     env->ReleaseStringUTFChars(jm, m);
     env->ReleaseStringUTFChars(jv, v);
-}
-
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
-    ImGuiIO& io = ImGui::GetIO();
-    io.AddMousePosEvent(x, y);
-    if (action == 0) io.AddMouseButtonEvent(0, true);
-    else if (action == 1) io.AddMouseButtonEvent(0, false);
-    else if (action == 3) io.AddMouseButtonEvent(0, false);
-    return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
 }
 
 static void drawSigil(ImDrawList* dl, ImVec2 c, float r) {
@@ -449,7 +457,7 @@ else { ImGui::SetNextItemWidth(-1); ImGui::InputText("##arg", st.argBufs[i], siz
         PendingCallReq c; c.sectionId = sec.id; c.className = className; c.methodSig = m.display; c.methodName = m.name; c.paramTypes = m.paramTypes; c.args.resize(st.numParams);
         for (int i = 0; i < st.numParams; i++) c.args[i] = std::string(st.argBufs[i]);
         c.isStatic = m.isStatic; c.isConstructor = m.isConstructor; c.runInMain = st.runInMain;
-        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
+        { std::lock_guard<std::mutex> lk(gQueuesMutex); gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[CALL] ")+className+"."+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); } }
         st.calling = true; st.hasResult = false;
     }
     ImGui::SameLine();
@@ -818,7 +826,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     if (!loadDex(env)) return JNI_VERSION_1_6;
 
     // Init Frida (FIXED)
-    std::call_once(frida_once, []() { env->GetJavaVM(&g_jvm);
+    std::call_once(frida_once, []() { 
     gum_init_embedded(); });
     LOGI("Frida Gum initialized");
     init_frida_script();
