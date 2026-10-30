@@ -34,6 +34,19 @@ jobs:
           git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
           ls app/src/main/cpp/Include/Dobby
 
+      - name: Patch Dobby ARM64 assembly for Android NDK
+        run: |
+          echo "=== BEFORE patch ==="
+          head -60 app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm || true
+          find app/src/main/cpp/Include/Dobby \( -name "*.asm" -o -name "*.S" \) -print0 | while IFS= read -r -d '' f; do
+            if grep -qE '@PAGE|@PAGEOFF' "$f"; then
+              sed -i 's/@PAGE/:pg_hi21:/g; s/@PAGEOFF/:lo12:/g' "$f"
+              echo "Patched: $f"
+            fi
+          done
+          echo "=== AFTER patch ==="
+          grep -nE 'pg_hi21|lo12|@PAGE|@PAGEOFF' app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm || true
+
       - name: Download Frida devkit
         run: |
           set -e
@@ -237,13 +250,11 @@ jobs:
                   n += 1
               return src, n
 
-          # Strip all dead / duplicate functions
           s, n1 = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
           s, n2 = rm_method(s, r'void\s+DrawMenu\s*\([^)]*\)\s*\{')
           s, n3 = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{')
           print(f"Removed: notifyMenuOpen={n1}, DrawMenu={n2}, JNI_OnLoad={n3}")
 
-          # Strip ALL global declarations (all variants)
           for pat in [
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?',
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+g_jvm\s*=\s*nullptr\s*;\s*\n?',
@@ -252,19 +263,16 @@ jobs:
           ]:
               s = re.sub(pat, '', s)
 
-          # Fix include paths
           s = s.replace('#include "Include/ImGui.h"', '')
           s = s.replace('#include "Include/Input.h"', '')
           if '#include "ImGui.h"' not in s:
               s = s.replace('#include "dex_data.h"', '#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
 
-          # Guard LOGI redefinition in native-lib.cpp
           m = re.search(r'(?m)^[ \t]*#define\s+LOGI\s*\([^\n]*\n', s)
           if m:
               s = s[:m.start()] + '#ifndef LOGI\n' + m.group(0) + '#endif\n' + s[m.end():]
               print("Guarded LOGI")
 
-          # Insert globals BEFORE the first real code line (after all includes/comments)
           lines = s.split('\n')
           insert_at = None
           for i, line in enumerate(lines):
@@ -288,7 +296,6 @@ jobs:
           s = '\n'.join(lines)
           print(f"Globals inserted at line {insert_at+1}")
 
-          # Append clean footer
           footer = textwrap.dedent(r"""
               void DrawMenu() {
                   if (!g_menuVisible) return;
@@ -388,7 +395,6 @@ jobs:
           N_DM=$(grep -cF 'void DrawMenu()' app/src/main/cpp/tool/native-lib.cpp || true)
           if [ "$N_DM" -eq 1 ]; then echo "OK 1 DrawMenu"; else echo "ERR DrawMenu=$N_DM"; grep -n 'void DrawMenu()' app/src/main/cpp/tool/native-lib.cpp; FAIL=1; fi
 
-          # g_jvm must be in first 60 lines
           if head -60 app/src/main/cpp/tool/native-lib.cpp | grep -qF 'static JavaVM* g_jvm = nullptr;'; then
             echo "OK g_jvm in first 60 lines"
           else
@@ -403,7 +409,6 @@ jobs:
             echo "ERR gVM not in first 60 lines"; FAIL=1
           fi
 
-          # g_jvm decl position must be < first usage
           DECL_LINE=$(grep -n 'static JavaVM\* g_jvm = nullptr;' app/src/main/cpp/tool/native-lib.cpp | head -1 | cut -d: -f1)
           USE_LINE=$(grep -n 'g_jvm' app/src/main/cpp/tool/native-lib.cpp | grep -v 'static JavaVM\* g_jvm' | head -1 | cut -d: -f1)
           echo "g_jvm decl at $DECL_LINE, first use at $USE_LINE"
@@ -417,6 +422,17 @@ jobs:
             echo "ERR notifyMenuOpen still present (dead code)"; FAIL=1
           else
             echo "OK notifyMenuOpen removed"
+          fi
+
+          # Check Dobby asm was patched
+          ASM_FILE="app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
+          if [ -f "$ASM_FILE" ]; then
+            if grep -qF '@PAGE' "$ASM_FILE"; then
+              echo "ERR Dobby asm still has @PAGE"
+              FAIL=1
+            else
+              echo "OK Dobby asm patched (no @PAGE)"
+            fi
           fi
 
           if [ $FAIL -ne 0 ]; then
@@ -454,5 +470,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: strip ALL DrawMenu/notifyMenuOpen/JNI_OnLoad, insert globals before first code line, guard LOGI [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: patch Dobby arm64 asm @PAGE/@PAGEOFF for Android NDK [skip ci]"
           git push
