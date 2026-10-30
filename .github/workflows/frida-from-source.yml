@@ -68,7 +68,7 @@ jobs:
           python3 releng/devkit.py frida-gumjs android-arm64 2>&1 | tail -20 || true
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo "NO_LIB"; tail -60 /tmp/a64.log; exit 1; }
+          [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
           echo "arm64 lib: $LIB"
 
       - name: Stage arm64
@@ -101,7 +101,7 @@ jobs:
           python3 releng/devkit.py frida-gumjs android-arm 2>&1 | tail -20 || true
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo "NO_LIB"; tail -60 /tmp/a32.log; exit 1; }
+          [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
           echo "armv7 lib: $LIB"
 
       - name: Stage armv7
@@ -138,9 +138,8 @@ jobs:
               s = re.sub(r'(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*', '', s)
 
           m = re.search(r'public\s+class\s+Helper\s*\{', s)
-          if not m:
-              print("FATAL: class Helper"); raise SystemExit(2)
-          fields = "\n" + "\n".join([
+          if not m: print("FATAL: class"); raise SystemExit(2)
+          s = s[:m.end()] + "\n" + "\n".join([
               "    private static android.view.WindowManager sOverlayWm;",
               "    private static android.view.WindowManager.LayoutParams sOverlayLp;",
               "    private static android.widget.FrameLayout sDecorContainer;",
@@ -148,22 +147,21 @@ jobs:
               "    private static int sFabMargin = 40;",
               "    private static android.app.Activity sOverlayActivity;",
               "    private static boolean sMenuOpen = false;",
-          ]) + "\n"
-          s = s[:m.end()] + fields + s[m.end():]
+          ]) + "\n" + s[m.end():]
 
           def rm_method(src, pat):
               n = 0
               while True:
                   mm = re.search(pat, src)
                   if not mm: break
-                  i = src.index('{', mm.end()-1); d = 0; e = -1
+                  i = src.index('{', mm.end()-1); d=0; e=-1
                   for k in range(i, len(src)):
-                      if src[k] == '{': d += 1
-                      elif src[k] == '}':
-                          d -= 1
-                          if d == 0: e = k + 1; break
-                  if e < 0: break
-                  src = src[:mm.start()] + src[e:]; n += 1
+                      if src[k]=='{': d+=1
+                      elif src[k]=='}':
+                          d-=1
+                          if d==0: e=k+1; break
+                  if e<0: break
+                  src = src[:mm.start()] + src[e:]; n+=1
               return src, n
 
           s, _ = rm_method(s, r'public\s+static\s+void\s+attach\s*\(\s*(?:final\s+)?(?:android\.content\.)?Context\s+\w+\s*\)\s*\{')
@@ -276,13 +274,13 @@ jobs:
 
           m = re.search(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', s)
           if m:
-              i = s.index('{', m.end()-1); d = 0; e = -1
+              i = s.index('{', m.end()-1); d=0; e=-1
               for k in range(i, len(s)):
-                  if s[k] == '{': d += 1
-                  elif s[k] == '}':
-                      d -= 1
-                      if d == 0: e = k + 1; break
-              if e > 0:
+                  if s[k]=='{': d+=1
+                  elif s[k]=='}':
+                      d-=1
+                      if d==0: e=k+1; break
+              if e>0:
                   body = ('public static void requestPatchMethod(String className, String target, String value) { '
                       'for (PatchRecord __p : sActivePatches) { '
                       'if ("Method".equals(__p.type) && className.equals(__p.className) && target.equals(__p.targetName)) { '
@@ -310,8 +308,7 @@ jobs:
               s = s.replace("setRenderMode(RENDERMODE_CONTINUOUSLY);", "setRenderMode(RENDERMODE_CONTINUOUSLY);\n        setPreserveEGLContextOnPause(true);", 1)
           if "onTouchEvent" not in s:
               m = re.search(r'public\s+class\s+OverlaySurfaceView\b[^{]*\{', s)
-              if not m:
-                  print("FATAL: class"); raise SystemExit(2)
+              if not m: print("FATAL: class"); raise SystemExit(2)
               methods = textwrap.dedent(r"""
                   @Override public boolean onTouchEvent(android.view.MotionEvent e) {
                       int action = e.getActionMasked();
@@ -334,90 +331,162 @@ jobs:
           print("OverlaySurfaceView.java done")
           PYEOF
 
-      - name: Fix g_jvm in native-lib.cpp
+      - name: Fix native-lib.cpp globals + native methods (g_jvm via touch)
         run: |
           python3 - <<'PYEOF'
-          import re, pathlib
+          import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
-          s = re.sub(r'std::call_once\s*\(\s*frida_once\s*,\s*\[\s*\]\s*\(\s*\)\s*\{\s*', 'std::call_once(frida_once, []() { ', s)
-          s = re.sub(r'env\s*->\s*GetJavaVM\s*\(\s*&g_jvm\s*\)\s*;', '/* moved */', s)
-          s = re.sub(r'(?m)^[ \t]*static\s+JavaVM\s*\*\s*g_jvm\s*=\s*nullptr\s*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*static\s+bool\s+gMenuOpen\s*=\s*false\s*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*static\s+std::vector<std::string>\s+gCallLog\s*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*static\s+std::mutex\s+gCallLogMutex\s*;\s*\n?', '', s)
+          print("=== BEFORE ===")
+          print("g_jvm decl:", 'static JavaVM* g_jvm' in s)
+          print("nativeTouch:", 'Java_com_menu_imgui_Helper_nativeTouch' in s)
+          print("nativePatchMethod:", 'Java_com_menu_imgui_Helper_nativePatchMethod' in s)
 
+          # 1. Strip ALL old g_jvm artifacts
+          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s*g_jvm[^\n;]*;\s*\n?', '', s)
+          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?bool\s+gMenuOpen[^\n;]*;\s*\n?', '', s)
+          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?std::vector<std::string>\s+gCallLog[^\n;]*;\s*\n?', '', s)
+          s = re.sub(r'(?m)^[ \t]*(?:static\s+)?std::mutex\s+gCallLogMutex[^\n;]*;\s*\n?', '', s)
+          s = re.sub(r'env\s*->\s*GetJavaVM\s*\(\s*&g_jvm\s*\)\s*;', '', s)
+
+          # 2. Remove old notifyMenuOpen
+          def rm_method(src, pat):
+              n = 0
+              while True:
+                  mm = re.search(pat, src)
+                  if not mm: break
+                  i = src.index('{', mm.end()-1); d=0; e=-1
+                  for k in range(i, len(src)):
+                      if src[k]=='{': d+=1
+                      elif src[k]=='}':
+                          d-=1
+                          if d==0: e=k+1; break
+                  if e<0: break
+                  src = src[:mm.start()] + src[e:]; n+=1
+              return src, n
+
+          s, _ = rm_method(s, r'static\s+void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+jboolean\s+JNICALL\s+Java_com_menu_imgui_Helper_nativeTouch\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'extern\s+"C"\s+JNIEXPORT\s+void\s+JNICALL\s+Java_com_menu_imgui_Helper_nativePatchMethod\s*\([^)]*\)\s*\{')
+          print("removed old notifyMenuOpen/nativeTouch/nativePatchMethod")
+
+          # 3. Includes
           for inc in ['<mutex>', '<vector>', '<string>']:
               if '#include ' + inc not in s:
                   s = s.replace('#include <jni.h>', '#include <jni.h>\n#include ' + inc, 1)
 
+          # 4. Insert globals after last include
           lines = s.split('\n')
-          insert_at = None
-          for i, line in enumerate(lines):
-              stripped = line.strip()
-              if not stripped: continue
-              if line[0] in ' \t': continue
-              if line[0] == '#': continue
-              if stripped.startswith('//'): continue
-              if stripped.startswith('/*'): continue
-              if stripped.startswith('*'): continue
-              insert_at = i
-              break
-          if insert_at is None:
-              print("FATAL no code"); raise SystemExit(2)
-          lines[insert_at:insert_at] = [
+          last_inc = 0
+          for i, line in enumerate(lines[:60]):
+              if line.strip().startswith('#include'):
+                  last_inc = i
+          globals_block = [
+              '',
               'static JavaVM* g_jvm = nullptr;',
               'static bool gMenuOpen = false;',
               'static std::vector<std::string> gCallLog;',
               'static std::mutex gCallLogMutex;',
               '',
           ]
+          lines[last_inc+1:last_inc+1] = globals_block
           s = '\n'.join(lines)
+          print(f"globals inserted after line {last_inc}")
 
-          m = re.search(r'JNI_OnLoad\s*\(\s*JavaVM\s*\*\s*(\w+)\s*,\s*void\s*\*\s*\w+\s*\)\s*\{', s)
-          if m:
-              var = m.group(1)
-              s = s[:m.end()] + '\n    g_jvm = ' + var + ';' + s[m.end():]
-              print("PASS: g_jvm = " + var)
+          # 5. Add notifyMenuOpen helper right after globals
+          notify_helper = textwrap.dedent(r"""
+              static void notifyMenuOpen(bool open) {
+                  if (!g_jvm) return;
+                  JNIEnv* env = nullptr;
+                  bool detach = false;
+                  if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+                      if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+                      detach = true;
+                  }
+                  jclass cls = env->FindClass("com/menu/imgui/Helper");
+                  if (cls) {
+                      jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
+                      if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
+                      env->DeleteLocalRef(cls);
+                  }
+                  if (detach) g_jvm->DetachCurrentThread();
+              }
+          """).strip()
+          gpos = s.find('static std::mutex gCallLogMutex;')
+          if gpos > 0:
+              end = s.find('\n', gpos) + 1
+              s = s[:end] + '\n' + notify_helper + '\n\n' + s[end:]
+              print("notifyMenuOpen added")
+
+          # 6. Add new nativeTouch with g_jvm capture
+          new_touch = textwrap.dedent(r"""
+              extern "C" JNIEXPORT jboolean JNICALL
+              Java_com_menu_imgui_Helper_nativeTouch(JNIEnv* env, jclass, jint action, jfloat x, jfloat y) {
+                  if (!g_jvm) env->GetJavaVM(&g_jvm);
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.AddMousePosEvent(x, y);
+                  if (action == 0) io.AddMouseButtonEvent(0, true);
+                  else if (action == 1) io.AddMouseButtonEvent(0, false);
+                  else if (action == 3) io.AddMouseButtonEvent(0, false);
+                  return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
+              }
+          """).strip()
+          anchor = 'static void drawSigil'
+          if anchor in s:
+              s = s.replace(anchor, new_touch + '\n\n' + anchor, 1)
           else:
-              print("FATAL JNI_OnLoad"); raise SystemExit(2)
+              pos = s.find('extern "C" JNIEXPORT')
+              if pos > 0: s = s[:pos] + new_touch + '\n\n' + s[pos:]
+          print("nativeTouch added with g_jvm capture")
 
-          if 'static void notifyMenuOpen' not in s:
-              helper = (
-                  'static void notifyMenuOpen(bool open) {\n'
-                  '    if (!g_jvm) return;\n'
-                  '    JNIEnv* env = nullptr;\n'
-                  '    bool detach = false;\n'
-                  '    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {\n'
-                  '        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;\n'
-                  '        detach = true;\n'
-                  '    }\n'
-                  '    jclass cls = env->FindClass("com/menu/imgui/Helper");\n'
-                  '    if (cls) {\n'
-                  '        jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");\n'
-                  '        if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);\n'
-                  '        env->DeleteLocalRef(cls);\n'
-                  '    }\n'
-                  '    if (detach) g_jvm->DetachCurrentThread();\n'
-                  '}\n\n'
-              )
-              pos = s.find('static std::mutex gCallLogMutex;')
-              if pos >= 0:
-                  end = s.find('\n', pos) + 1
-                  s = s[:end] + '\n' + helper + s[end:]
-                  print("PASS: notifyMenuOpen")
+          # 7. Add new nativePatchMethod with g_jvm capture
+          new_patch = textwrap.dedent(r"""
+              extern "C" JNIEXPORT void JNICALL
+              Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
+                  if (!g_jvm) env->GetJavaVM(&g_jvm);
+                  if (!g_script) return;
+                  const char* c = env->GetStringUTFChars(jc, nullptr);
+                  const char* m = env->GetStringUTFChars(jm, nullptr);
+                  const char* v = env->GetStringUTFChars(jv, nullptr);
+                  std::string json = "{\"action\":\"patchMethod\",\"className\":\"";
+                  json += c; json += "\",\"methodName\":\""; json += m;
+                  json += "\",\"returnValue\":\""; json += v; json += "\"}";
+                  gum_script_post(g_script, json.c_str(), nullptr, nullptr);
+                  env->ReleaseStringUTFChars(jc, c);
+                  env->ReleaseStringUTFChars(jm, m);
+                  env->ReleaseStringUTFChars(jv, v);
+              }
+          """).strip()
+          anchor = 'static void drawSigil'
+          if anchor in s:
+              s = s.replace(anchor, new_patch + '\n\n' + anchor, 1)
+          else:
+              pos = s.find('extern "C" JNIEXPORT')
+              if pos > 0: s = s[:pos] + new_patch + '\n\n' + s[pos:]
+          print("nativePatchMethod added with g_jvm capture")
 
-          if 'notifyMenuOpen' in s and 'lastMenuOpen' not in s and 'void nativeRender()' in s:
+          # 8. Wire notifyMenuOpen to nativeRender
+          if 'void nativeRender()' in s and 'lastMenuOpen' not in s:
               s = s.replace('void nativeRender() {',
                             'void nativeRender() {\n    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }', 1)
-              print("PASS: wired")
+              print("notifyMenuOpen wired to nativeRender")
 
           p.write_text(s)
-          print("native-lib.cpp done")
+
+          # Diagnostic
+          print("=== TOP 30 ===")
+          for i, line in enumerate(s.split('\n')[:30], 1):
+              print(f"{i}: {line}")
+          print("=== CHECK ===")
+          print("static JavaVM* g_jvm:", 'static JavaVM* g_jvm = nullptr;' in s)
+          print("env->GetJavaVM count:", s.count('env->GetJavaVM(&g_jvm)'))
+          print("nativeTouch:", 'Java_com_menu_imgui_Helper_nativeTouch' in s)
+          print("nativePatchMethod:", 'Java_com_menu_imgui_Helper_nativePatchMethod' in s)
+          print("notifyMenuOpen:", 'notifyMenuOpen' in s)
           PYEOF
 
-      - name: Patch native-lib.cpp (agent + JNI)
+      - name: Patch native-lib.cpp (agent + log)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -465,60 +534,17 @@ jobs:
           if 'PATCH_AGENT_JS' in s:
               s = re.sub(r'const gchar\* PATCH_AGENT_JS = R"\(.*?\)";',
                   'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
-              print("PASS: agent")
-
-          if "Java_com_menu_imgui_Helper_nativePatchMethod" not in s:
-              impl = textwrap.dedent(r"""
-                  extern "C" JNIEXPORT void JNICALL
-                  Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
-                      if (!g_script) return;
-                      const char* c = env->GetStringUTFChars(jc, nullptr);
-                      const char* m = env->GetStringUTFChars(jm, nullptr);
-                      const char* v = env->GetStringUTFChars(jv, nullptr);
-                      std::string json = "{\"action\":\"patchMethod\",\"className\":\"";
-                      json += c; json += "\",\"methodName\":\""; json += m;
-                      json += "\",\"returnValue\":\""; json += v; json += "\"}";
-                      gum_script_post(g_script, json.c_str(), nullptr, nullptr);
-                      env->ReleaseStringUTFChars(jc, c);
-                      env->ReleaseStringUTFChars(jm, m);
-                      env->ReleaseStringUTFChars(jv, v);
-                  }
-              """).strip()
-              anchor = 'static void drawSigil'
-              if anchor in s:
-                  s = s.replace(anchor, impl + "\n\n" + anchor, 1)
-              else:
-                  pos = s.find('extern "C" JNIEXPORT')
-                  if pos > 0: s = s[:pos] + impl + "\n\n" + s[pos:]
-              print("PASS: nativePatchMethod")
-
-          if "Java_com_menu_imgui_Helper_nativeTouch" not in s:
-              touch = textwrap.dedent(r"""
-                  extern "C" JNIEXPORT jboolean JNICALL
-                  Java_com_menu_imgui_Helper_nativeTouch(JNIEnv*, jclass, jint action, jfloat x, jfloat y) {
-                      ImGuiIO& io = ImGui::GetIO();
-                      io.AddMousePosEvent(x, y);
-                      if (action == 0) io.AddMouseButtonEvent(0, true);
-                      else if (action == 1) io.AddMouseButtonEvent(0, false);
-                      else if (action == 3) io.AddMouseButtonEvent(0, false);
-                      return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
-                  }
-              """).strip()
-              anchor = 'static void drawSigil'
-              if anchor in s:
-                  s = s.replace(anchor, touch + "\n\n" + anchor, 1)
-              else:
-                  pos = s.find('extern "C" JNIEXPORT')
-                  if pos > 0: s = s[:pos] + touch + "\n\n" + s[pos:]
-              print("PASS: nativeTouch")
+              print("agent replaced")
 
           if 'type\\":\\"log' not in s:
               s = s.replace('LOGI("Frida JS: %s", message);',
                   'LOGI("Frida JS: %s", message); if (message && strstr(message, "\\"type\\":\\"log\\"")) { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[JS] ")+message); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }', 1)
+              print("log handler")
 
           if 'push_back("[CALL]' not in s:
               s = s.replace("gPendingCallReqs.push_back(c);",
                   "gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string(\"[CALL] \")+className+\".\"+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }", 1)
+              print("call log")
 
           if 'BeginTabItem("Log")' not in s:
               old = 'if (ImGui::BeginTabItem("Patches"))'
@@ -528,9 +554,9 @@ jobs:
                      'ImGui::EndChild(); ImGui::EndTabItem(); }\n        ' + old)
               if old in s:
                   s = s.replace(old, new, 1)
-
+                  print("Log tab")
           p.write_text(s)
-          print("native-lib.cpp JNI done")
+          print("native-lib.cpp done")
           PYEOF
 
       - name: Rebuild dex_data.h
@@ -541,9 +567,9 @@ jobs:
           rm -rf /tmp/dex_build /tmp/dex_out
           mkdir -p /tmp/dex_build /tmp/dex_out
           javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build $(find app/src/main/java/com/menu/imgui -name "*.java") 2>&1 | tee /tmp/javac.log
-          [ ${PIPESTATUS[0]} -ne 0 ] && { echo JAVAC_FAILED; cat /tmp/javac.log; exit 1; }
+          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC_FAILED"; cat /tmp/javac.log; exit 1; }
           "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
-          [ ${PIPESTATUS[0]} -ne 0 ] && { echo D8_FAILED; cat /tmp/d8.log; exit 1; }
+          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
           echo "dex_data.h rebuilt"
 
@@ -557,18 +583,21 @@ jobs:
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
           chk app/src/main/java/com/menu/imgui/Helper.java "nativePatchMethod"
-          if grep -q "env->GetJavaVM(&g_jvm)" app/src/main/cpp/tool/native-lib.cpp; then
-            echo "ERR env->GetJavaVM still present"; FAIL=1
+          if grep -qE "\[\s*\]\s*\(\s*\)\s*\{[^}]*env\s*->\s*GetJavaVM" app/src/main/cpp/tool/native-lib.cpp; then
+            echo "ERR env->GetJavaVM inside lambda"; FAIL=1
           else
-            echo "OK  env->GetJavaVM removed"
+            echo "OK  no env->GetJavaVM in lambda"
           fi
-          if grep -qE "g_jvm = [a-zA-Z_]+;" app/src/main/cpp/tool/native-lib.cpp; then
-            echo "OK  g_jvm assigned"
+          N_VM=$(grep -c "env->GetJavaVM(&g_jvm)" app/src/main/cpp/tool/native-lib.cpp)
+          if [ "$N_VM" -ge 1 ]; then
+            echo "OK  env->GetJavaVM appears $N_VM times (in nativeTouch/nativePatchMethod)"
           else
-            echo "ERR g_jvm not assigned"; FAIL=1
+            echo "ERR env->GetJavaVM not present"; FAIL=1
           fi
+          N_TOUCH=$(grep -c "Java_com_menu_imgui_Helper_nativeTouch" app/src/main/cpp/tool/native-lib.cpp)
+          if [ "$N_TOUCH" -ge 1 ]; then echo "OK  nativeTouch present"; else echo "ERR no nativeTouch"; FAIL=1; fi
           if [ $FAIL -ne 0 ]; then
-            echo "=== native-lib.cpp top 40 ==="; head -40 app/src/main/cpp/tool/native-lib.cpp
+            echo "=== native-lib top 40 ==="; head -40 app/src/main/cpp/tool/native-lib.cpp
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -652,5 +681,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: simplified on-block + robust globals insertion [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: capture g_jvm in nativeTouch/nativePatchMethod (no JNI_OnLoad dependency) [skip ci]"
           git push
