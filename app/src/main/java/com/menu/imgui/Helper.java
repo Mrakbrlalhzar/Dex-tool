@@ -32,13 +32,6 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 public class Helper {
-    private static android.view.WindowManager sOverlayWm;
-    private static android.view.WindowManager.LayoutParams sOverlayLp;
-    private static android.widget.FrameLayout sDecorContainer;
-    private static int sFabSize = 200;
-    private static int sFabMargin = 40;
-    private static android.app.Activity sOverlayActivity;
-    private static boolean sMenuOpen = false;
 
 
 
@@ -46,101 +39,6 @@ public class Helper {
 
 
 
-public static void attach(final Context context) {
-    final android.app.Activity activity;
-    if (context instanceof android.app.Activity) activity = (android.app.Activity) context;
-    else if (context instanceof android.content.ContextWrapper) {
-        android.content.Context base = ((android.content.ContextWrapper) context).getBaseContext();
-        activity = (base instanceof android.app.Activity) ? (android.app.Activity) base : null;
-    } else activity = null;
-    if (activity == null) { android.util.Log.e("DexTool", "attach: no Activity"); return; }
-    sOverlayActivity = activity;
-    activity.getWindow().getDecorView().post(new Runnable() {
-        @Override public void run() { doAttach(activity); }
-    });
-}
-
-static void doAttach(android.app.Activity activity) {
-    OverlaySurfaceView glView = new OverlaySurfaceView(activity);
-    android.view.WindowManager wm = activity.getWindowManager();
-    android.util.DisplayMetrics dm = activity.getResources().getDisplayMetrics();
-    int fabSize = (int)(80 * dm.density);
-    int margin = (int)(20 * dm.density);
-    sFabSize = fabSize; sFabMargin = margin;
-    android.view.WindowManager.LayoutParams lp = new android.view.WindowManager.LayoutParams(
-        fabSize, fabSize,
-        android.view.WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-        android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-            | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-        android.graphics.PixelFormat.TRANSPARENT);
-    lp.token = activity.getWindow().getDecorView().getWindowToken();
-    lp.gravity = android.view.Gravity.TOP | android.view.Gravity.START;
-    lp.x = dm.widthPixels - fabSize - margin;
-    lp.y = margin * 4;
-    try {
-        wm.addView(glView, lp);
-        sOverlayWm = wm; sOverlayLp = lp; overlay = glView;
-        android.util.Log.i("DexTool", "Overlay added via WM (size=" + fabSize + ")");
-    } catch (Throwable t) {
-        android.util.Log.w("DexTool", "WM failed, decor fallback", t);
-        try {
-            android.view.ViewGroup decor = (android.view.ViewGroup) activity.getWindow().getDecorView();
-            android.widget.FrameLayout container = new android.widget.FrameLayout(activity);
-            container.setClipChildren(false);
-            android.widget.FrameLayout.LayoutParams clp = new android.widget.FrameLayout.LayoutParams(fabSize, fabSize);
-            clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-            clp.rightMargin = margin; clp.topMargin = margin * 4;
-            container.addView(glView, clp);
-            sDecorContainer = container; overlay = glView;
-            decor.addView(container, new android.view.ViewGroup.LayoutParams(-1, -1));
-            android.util.Log.i("DexTool", "Overlay added to DecorView (small container)");
-        } catch (Throwable t2) { android.util.Log.e("DexTool", "ALL FAILED", t2); }
-    }
-    registerLifecycle(activity, glView);
-}
-
-public static void setMenuOpen(final boolean open) {
-    sMenuOpen = open;
-    if (overlay == null) return;
-    final int w = sFabSize, m = sFabMargin;
-    overlay.post(new Runnable() {
-        @Override public void run() {
-            try {
-                if (sOverlayWm != null && sOverlayLp != null) {
-                    if (open) {
-                        sOverlayLp.width = android.view.WindowManager.LayoutParams.MATCH_PARENT;
-                        sOverlayLp.height = android.view.WindowManager.LayoutParams.MATCH_PARENT;
-                        sOverlayLp.x = 0; sOverlayLp.y = 0;
-                    } else {
-                        sOverlayLp.width = w; sOverlayLp.height = w;
-                        sOverlayLp.x = sOverlayActivity.getResources().getDisplayMetrics().widthPixels - w - m;
-                        sOverlayLp.y = m * 4;
-                    }
-                    sOverlayWm.updateViewLayout(overlay, sOverlayLp);
-                } else if (sDecorContainer != null) {
-                    android.widget.FrameLayout.LayoutParams clp = (android.widget.FrameLayout.LayoutParams) overlay.getLayoutParams();
-                    if (open) { clp.width = -1; clp.height = -1; clp.gravity = 0; clp.rightMargin = 0; clp.topMargin = 0; }
-                    else { clp.width = w; clp.height = w; clp.gravity = android.view.Gravity.TOP | android.view.Gravity.END; clp.rightMargin = m; clp.topMargin = m * 4; }
-                    overlay.setLayoutParams(clp);
-                }
-                android.util.Log.i("DexTool", "setMenuOpen(" + open + ")");
-            } catch (Throwable t) { android.util.Log.w("DexTool", "setMenuOpen err", t); }
-        }
-    });
-}
-
-private static void registerLifecycle(Activity activity, OverlaySurfaceView glView) {
-        activity.getApplication().registerActivityLifecycleCallbacks(
-            new android.app.Application.ActivityLifecycleCallbacks() {
-                @Override public void onActivityPaused(Activity a) { if (a == activity) glView.onPause(); }
-                @Override public void onActivityResumed(Activity a) { if (a == activity) { glView.onResume(); try { if (glView.getParent() == null && sOverlayWm != null && sOverlayLp != null) { sOverlayWm.addView(glView, sOverlayLp); android.util.Log.i("DexTool", "re-attached on resume"); } } catch (Throwable t) {} } }
-                @Override public void onActivityCreated(Activity a, android.os.Bundle b) {}
-                @Override public void onActivityStarted(Activity a) {}
-                @Override public void onActivityStopped(Activity a) {}
-                @Override public void onActivitySaveInstanceState(Activity a, android.os.Bundle b) {}
-                @Override public void onActivityDestroyed(Activity a) {}
-            });
-    }
 
 
     
@@ -498,8 +396,7 @@ private static void registerLifecycle(Activity activity, OverlaySurfaceView glVi
     static native void nativeInit(android.view.Surface s);
     static native void nativeResize(int w, int h);
     static native void nativeRender();
-    static native boolean nativeTouch(int action, float x, float y);
-    static native void nativeSetClassList(String[] classNames);
+static native void nativeSetClassList(String[] classNames);
     static native boolean nativeWantKeyboard();
     static native void nativeAddInputChar(int codepoint);
     static native void nativeAddKeyEvent(int keycode, boolean down);

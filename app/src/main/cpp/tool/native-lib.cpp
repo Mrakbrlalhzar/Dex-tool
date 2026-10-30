@@ -8,6 +8,8 @@ static std::once_flag frida_once;
 #include "imgui_impl_opengl3.h"
 #include <GLES3/gl3.h>
 #include "dex_data.h"
+#include "ImGui.h"
+#include "Input.h"
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -23,7 +25,6 @@ static std::once_flag frida_once;
 #include <algorithm>
 #include <frida-gumjs.h>
 
-static JavaVM* g_jvm = nullptr;
 static bool gMenuOpen = false;
 static std::vector<std::string> gCallLog;
 static std::mutex gCallLogMutex;
@@ -59,7 +60,6 @@ static void notifyMenuOpen(bool open) {
 #define LOG_TAG "ImGuiTool"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-static JavaVM* gVM = nullptr;
 static jclass gHelperClass = nullptr;
 static ANativeWindow* gWindow = nullptr;
 static bool gInitialized = false;
@@ -115,7 +115,6 @@ static std::vector<FieldResult> gFieldResults;
 static std::mutex gQueuesMutex;
 
 static float g_settingFontScale = 1.00f, g_settingDragSpeed = 0.55f, g_settingScrollSpeed = 1.40f;
-static bool g_menuVisible = true;
 static float g_fabSize = 58.0f, g_fabX = -1.0f, g_fabY = -1.0f;
 static bool g_fabDown = false, g_fabMoved = false;
 static float g_fabDownAtX = 0, g_fabDownAtY = 0, g_fabDragStartX = 0, g_fabDragStartY = 0;
@@ -215,16 +214,7 @@ static void send_to_js(const char* json) {
 
 
 
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_menu_imgui_Helper_nativeTouch(JNIEnv* env, jclass, jint action, jfloat x, jfloat y) {
-    if (!g_jvm) env->GetJavaVM(&g_jvm);
-    ImGuiIO& io = ImGui::GetIO();
-    io.AddMousePosEvent(x, y);
-    if (action == 0) io.AddMouseButtonEvent(0, true);
-    else if (action == 1) io.AddMouseButtonEvent(0, false);
-    else if (action == 3) io.AddMouseButtonEvent(0, false);
-    return io.WantCaptureMouse ? JNI_TRUE : JNI_FALSE;
-}
+
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_menu_imgui_Helper_nativePatchMethod(JNIEnv* env, jclass, jstring jc, jstring jm, jstring jv) {
@@ -302,17 +292,7 @@ static jobject getCurrentActivity(JNIEnv* env) {
     return nullptr;
 }
 
-static void* pollThread(void*) {
-    JNIEnv* env = nullptr;
-    if (gVM->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return nullptr;
-    jobject activity = nullptr;
-    for (int i = 0; i < 200; i++) { activity = getCurrentActivity(env); if (activity) break; usleep(100000); }
-    if (!activity || !gHelperClass) { gVM->DetachCurrentThread(); return nullptr; }
-    jmethodID attach = env->GetStaticMethodID(gHelperClass, "attach", "(Landroid/content/Context;)V");
-    if (attach) env->CallStaticVoidMethod(gHelperClass, attach, activity);
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    gVM->DetachCurrentThread(); return nullptr;
-}
+
 
 static void setupStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
@@ -350,18 +330,8 @@ static void setupStyle() {
     c[ImGuiCol_Separator] = ImVec4(1.00f, 0.78f, 0.34f, 0.25f);
 }
 
-static void doInit(JNIEnv* env, jclass, jobject surface) {
-    if (gInitialized || !surface) return;
-    gWindow = ANativeWindow_fromSurface(env, surface); if (!gWindow) return;
-    IMGUI_CHECKVERSION(); ImGui::CreateContext();
-    ImGui::GetIO().IniFilename = nullptr;
-    setupStyle();
-    if (!ImGui_ImplAndroid_Init(gWindow)) return;
-    if (!ImGui_ImplOpenGL3_Init("#version 300 es")) return;
-    gInitialized = true;
-    if (gSections.empty()) { Section s; s.id = gNextSectionId++; gSections.push_back(std::move(s)); gActiveSection = gSections.back().id; }
-}
-static void doResize(JNIEnv*, jclass, jint w, jint h) { gWidth = w; gHeight = h; glViewport(0, 0, w, h); }
+
+
 
 static void splitStr(const std::string& s, char d, std::vector<std::string>& out) {
     out.clear(); size_t start = 0;
@@ -863,5 +833,42 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     };
     if (env->RegisterNatives(gHelperClass, methods, 12) != 0) { env->ExceptionClear(); return JNI_VERSION_1_6; }
     pthread_t t; if (pthread_create(&t, nullptr, pollThread, nullptr) == 0) pthread_detach(t);
+    return JNI_VERSION_1_6;
+}
+
+static JavaVM* gVM = nullptr;
+static JavaVM* g_jvm = nullptr;
+static bool g_menuVisible = true;
+
+void DrawMenu() {
+    if (!g_menuVisible) return;
+    ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("DexTool", &g_menuVisible)) {
+        if (ImGui::BeginTabBar("##tabs")) {
+            if (ImGui::BeginTabItem("Classes")) {
+                if (!gSections.empty()) renderSectionContent(gSections[0]);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Patches")) {
+                renderPatchesTab();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+    }
+    ImGui::End();
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    gVM = vm;
+    g_jvm = vm;
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
+    loadDex(env);
+    std::call_once(frida_once, []() { gum_init_embedded(); });
+    init_frida_script();
+    pthread_t t;
+    pthread_create(&t, nullptr, initModMenu, (void*)DrawMenu);
+    hookInput();
     return JNI_VERSION_1_6;
 }
