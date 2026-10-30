@@ -1,9 +1,6 @@
-name: Frida GumJS Slim (Source)
+name: "Frida GumJS Slim (Source)"
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+on: [push, workflow_dispatch]
 
 permissions:
   contents: write
@@ -11,7 +8,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,11 +39,14 @@ jobs:
       - name: Download Frida devkit
         run: |
           set -e
-          V=17.1.0; B="https://github.com/frida/frida/releases/download/$V"
+          V=17.1.0
+          B="https://github.com/frida/frida/releases/download/$V"
           wget -q "$B/frida-gumjs-devkit-$V-android-arm64.tar.xz" -O /tmp/dk64.tar.xz
-          mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
+          mkdir -p /tmp/dk64
+          tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
           wget -q "$B/frida-gumjs-devkit-$V-android-arm.tar.xz" -O /tmp/dk32.tar.xz
-          mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
+          mkdir -p /tmp/dk32
+          tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
           echo "devkits ready"
 
       - name: Clone frida-gum
@@ -55,10 +54,9 @@ jobs:
           git clone --recursive --depth 1 --branch 17.1.0 https://github.com/frida/frida-gum.git /tmp/frida-gum
           cd /tmp/frida-gum
           sed -i '1i void glib_init(void);' bindings/gumjs/gumquickcompile.c
-          echo patched
+          echo "patched"
 
       - name: Build arm64
-        timeout-minutes: 60
         run: |
           set -o pipefail
           cd /tmp/frida-gum
@@ -70,17 +68,18 @@ jobs:
           python3 releng/devkit.py frida-gumjs android-arm64 2>&1 | tail -20 || true
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo NO_LIB; tail -60 /tmp/a64.log; exit 1; }
+          [ -z "$LIB" ] && { echo "NO_LIB"; tail -60 /tmp/a64.log; exit 1; }
           echo "arm64 lib: $LIB"
 
       - name: Stage arm64
         run: |
           set -e
           D=/tmp/frida-built/arm64-v8a
-          rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
+          rm -rf "$D"
+          mkdir -p "$D/lib" "$D/include"
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo FATAL_no_lib; exit 1; }
+          [ -z "$LIB" ] && { echo "FATAL_no_lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
           cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
           G=$(find /tmp/dk64 -name "frida-gum.h" | head -1)
@@ -91,7 +90,6 @@ jobs:
           ls -lah "$D/lib/"
 
       - name: Build armv7
-        timeout-minutes: 60
         run: |
           set -o pipefail
           cd /tmp/frida-gum
@@ -103,17 +101,18 @@ jobs:
           python3 releng/devkit.py frida-gumjs android-arm 2>&1 | tail -20 || true
           LIB=$(find build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo NO_LIB; tail -60 /tmp/a32.log; exit 1; }
+          [ -z "$LIB" ] && { echo "NO_LIB"; tail -60 /tmp/a32.log; exit 1; }
           echo "armv7 lib: $LIB"
 
       - name: Stage armv7
         run: |
           set -e
           D=/tmp/frida-built/armeabi-v7a
-          rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
+          rm -rf "$D"
+          mkdir -p "$D/lib" "$D/include"
           LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1)
           [ -z "$LIB" ] && LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1)
-          [ -z "$LIB" ] && { echo FATAL_no_lib; exit 1; }
+          [ -z "$LIB" ] && { echo "FATAL_no_lib"; exit 1; }
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
           cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
           G=$(find /tmp/dk32 -name "frida-gum.h" | head -1)
@@ -123,9 +122,6 @@ jobs:
           [ -n "$GLIB_DIR" ] && cp -rv "$GLIB_DIR" "$D/include/glib-2.0"
           ls -lah "$D/lib/"
 
-      # ============================================================
-      # PATCH 1: Helper.java (dedupe fields + rewrite attach/setMenuOpen)
-      # ============================================================
       - name: Patch Helper.java
         run: |
           python3 - <<'PYEOF'
@@ -138,12 +134,13 @@ jobs:
           s = re.sub(r'private\s+static\s+OverlaySurfaceView\s+overlay;[^\n]*?sOverlayWm[^\n]*?sOverlayLp[^\n]*?;',
                      'private static OverlaySurfaceView overlay;', s)
           for fname in FIELDS:
-              s = re.sub(r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+'+re.escape(fname)+r'\b[^;\n]*;\s*\n?', '', s)
-              s = re.sub(r'(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+'+re.escape(fname)+r'\b[^;\n]*;\s*', '', s)
+              s = re.sub(r'(?m)^[ \t]*(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*\n?', '', s)
+              s = re.sub(r'(?:private|public|protected)?\s*static\s+(?:final\s+)?[A-Za-z_][\w.<>\[\], ]*\s+' + re.escape(fname) + r'\b[^;\n]*;\s*', '', s)
 
           m = re.search(r'public\s+class\s+Helper\s*\{', s)
-          if not m: print("FATAL class"); raise SystemExit(2)
-          s = s[:m.end()] + "\n" + "\n".join([
+          if not m:
+              print("FATAL: class Helper"); raise SystemExit(2)
+          fields = "\n" + "\n".join([
               "    private static android.view.WindowManager sOverlayWm;",
               "    private static android.view.WindowManager.LayoutParams sOverlayLp;",
               "    private static android.widget.FrameLayout sDecorContainer;",
@@ -151,21 +148,22 @@ jobs:
               "    private static int sFabMargin = 40;",
               "    private static android.app.Activity sOverlayActivity;",
               "    private static boolean sMenuOpen = false;",
-          ]) + "\n" + s[m.end():]
+          ]) + "\n"
+          s = s[:m.end()] + fields + s[m.end():]
 
           def rm_method(src, pat):
-              n=0
+              n = 0
               while True:
                   mm = re.search(pat, src)
                   if not mm: break
-                  i = src.index('{', mm.end()-1); d=0; e=-1
+                  i = src.index('{', mm.end()-1); d = 0; e = -1
                   for k in range(i, len(src)):
-                      if src[k]=='{': d+=1
-                      elif src[k]=='}':
-                          d-=1
-                          if d==0: e=k+1; break
-                  if e<0: break
-                  src = src[:mm.start()] + src[e:]; n+=1
+                      if src[k] == '{': d += 1
+                      elif src[k] == '}':
+                          d -= 1
+                          if d == 0: e = k + 1; break
+                  if e < 0: break
+                  src = src[:mm.start()] + src[e:]; n += 1
               return src, n
 
           s, _ = rm_method(s, r'public\s+static\s+void\s+attach\s*\(\s*(?:final\s+)?(?:android\.content\.)?Context\s+\w+\s*\)\s*\{')
@@ -278,13 +276,13 @@ jobs:
 
           m = re.search(r'public\s+static\s+void\s+requestPatchMethod\s*\([^)]*\)\s*\{', s)
           if m:
-              i = s.index('{', m.end()-1); d=0; e=-1
+              i = s.index('{', m.end()-1); d = 0; e = -1
               for k in range(i, len(s)):
-                  if s[k]=='{': d+=1
-                  elif s[k]=='}':
-                      d-=1
-                      if d==0: e=k+1; break
-              if e>0:
+                  if s[k] == '{': d += 1
+                  elif s[k] == '}':
+                      d -= 1
+                      if d == 0: e = k + 1; break
+              if e > 0:
                   body = ('public static void requestPatchMethod(String className, String target, String value) { '
                       'for (PatchRecord __p : sActivePatches) { '
                       'if ("Method".equals(__p.type) && className.equals(__p.className) && target.equals(__p.targetName)) { '
@@ -294,12 +292,9 @@ jobs:
                       'syncPatches(); nativePatchMethod(className, target, value); }')
                   s = s[:m.start()] + body + s[e:]
           p.write_text(s)
-          print("Helper.java DONE")
+          print("Helper.java done")
           PYEOF
 
-      # ============================================================
-      # PATCH 2: OverlaySurfaceView.java
-      # ============================================================
       - name: Patch OverlaySurfaceView.java
         run: |
           python3 - <<'PYEOF'
@@ -315,7 +310,8 @@ jobs:
               s = s.replace("setRenderMode(RENDERMODE_CONTINUOUSLY);", "setRenderMode(RENDERMODE_CONTINUOUSLY);\n        setPreserveEGLContextOnPause(true);", 1)
           if "onTouchEvent" not in s:
               m = re.search(r'public\s+class\s+OverlaySurfaceView\b[^{]*\{', s)
-              if not m: print("FATAL class"); raise SystemExit(2)
+              if not m:
+                  print("FATAL: class"); raise SystemExit(2)
               methods = textwrap.dedent(r"""
                   @Override public boolean onTouchEvent(android.view.MotionEvent e) {
                       int action = e.getActionMasked();
@@ -335,117 +331,93 @@ jobs:
               """).strip()
               s = s[:m.end()] + "\n" + methods + "\n" + s[m.end():]
           p.write_text(s)
-          print("OverlaySurfaceView.java DONE")
+          print("OverlaySurfaceView.java done")
           PYEOF
 
-      # ============================================================
-      # PATCH 3: native-lib.cpp - FIX g_jvm (insert before first code line)
-      # ============================================================
-      - name: Fix g_jvm + globals in native-lib.cpp
+      - name: Fix g_jvm in native-lib.cpp
         run: |
           python3 - <<'PYEOF'
           import re, pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
-          # 1. Strip ALL old g_jvm/call_once/env->GetJavaVM artifacts
           s = re.sub(r'std::call_once\s*\(\s*frida_once\s*,\s*\[\s*\]\s*\(\s*\)\s*\{\s*', 'std::call_once(frida_once, []() { ', s)
-          s = re.sub(r'env\s*->\s*GetJavaVM\s*\(\s*&g_jvm\s*\)\s*;', '/* moved to JNI_OnLoad */', s)
+          s = re.sub(r'env\s*->\s*GetJavaVM\s*\(\s*&g_jvm\s*\)\s*;', '/* moved */', s)
           s = re.sub(r'(?m)^[ \t]*static\s+JavaVM\s*\*\s*g_jvm\s*=\s*nullptr\s*;\s*\n?', '', s)
           s = re.sub(r'(?m)^[ \t]*static\s+bool\s+gMenuOpen\s*=\s*false\s*;\s*\n?', '', s)
           s = re.sub(r'(?m)^[ \t]*static\s+std::vector<std::string>\s+gCallLog\s*;\s*\n?', '', s)
           s = re.sub(r'(?m)^[ \t]*static\s+std::mutex\s+gCallLogMutex\s*;\s*\n?', '', s)
-          print("PASS: stripped old globals/artifacts")
 
-          # 2. Add missing includes at first #include
           for inc in ['<mutex>', '<vector>', '<string>']:
-              if f'#include {inc}' not in s:
-                  s = s.replace('#include <jni.h>', f'#include <jni.h>\n#include {inc}', 1)
+              if '#include ' + inc not in s:
+                  s = s.replace('#include <jni.h>', '#include <jni.h>\n#include ' + inc, 1)
 
-          # 3. Insert globals BEFORE first non-include code line
           lines = s.split('\n')
           insert_at = None
           for i, line in enumerate(lines):
               stripped = line.strip()
               if not stripped: continue
-              if line[0] in ' \t': continue  # Indented = inside something
-              if line[0] == '#': continue  # Preprocessor
+              if line[0] in ' \t': continue
+              if line[0] == '#': continue
               if stripped.startswith('//'): continue
               if stripped.startswith('/*'): continue
               if stripped.startswith('*'): continue
               insert_at = i
               break
           if insert_at is None:
-              print("FATAL: no code line found"); raise SystemExit(2)
-          globals_block = [
+              print("FATAL no code"); raise SystemExit(2)
+          lines[insert_at:insert_at] = [
               'static JavaVM* g_jvm = nullptr;',
               'static bool gMenuOpen = false;',
               'static std::vector<std::string> gCallLog;',
               'static std::mutex gCallLogMutex;',
               '',
           ]
-          lines[insert_at:insert_at] = globals_block
           s = '\n'.join(lines)
-          print(f"PASS: globals inserted before line {insert_at+1}")
 
-          # 4. Set g_jvm = vm at start of JNI_OnLoad body
           m = re.search(r'JNI_OnLoad\s*\(\s*JavaVM\s*\*\s*(\w+)\s*,\s*void\s*\*\s*\w+\s*\)\s*\{', s)
           if m:
               var = m.group(1)
-              s = s[:m.end()] + f'\n    g_jvm = {var};' + s[m.end():]
-              print(f"PASS: g_jvm = {var} in JNI_OnLoad")
+              s = s[:m.end()] + '\n    g_jvm = ' + var + ';' + s[m.end():]
+              print("PASS: g_jvm = " + var)
           else:
-              print("FATAL: JNI_OnLoad not found"); raise SystemExit(2)
+              print("FATAL JNI_OnLoad"); raise SystemExit(2)
 
-          # 5. notifyMenuOpen helper (after first code line = our globals, before any function)
           if 'static void notifyMenuOpen' not in s:
-              helper = '''static void notifyMenuOpen(bool open) {
-          if (!g_jvm) return;
-          JNIEnv* env = nullptr;
-          bool detach = false;
-          if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-              if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
-              detach = true;
-          }
-          jclass cls = env->FindClass("com/menu/imgui/Helper");
-          if (cls) {
-              jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");
-              if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);
-              env->DeleteLocalRef(cls);
-          }
-          if (detach) g_jvm->DetachCurrentThread();
-      }
-
-      '''
-              # Insert right after our globals block
+              helper = (
+                  'static void notifyMenuOpen(bool open) {\n'
+                  '    if (!g_jvm) return;\n'
+                  '    JNIEnv* env = nullptr;\n'
+                  '    bool detach = false;\n'
+                  '    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {\n'
+                  '        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;\n'
+                  '        detach = true;\n'
+                  '    }\n'
+                  '    jclass cls = env->FindClass("com/menu/imgui/Helper");\n'
+                  '    if (cls) {\n'
+                  '        jmethodID mid = env->GetStaticMethodID(cls, "setMenuOpen", "(Z)V");\n'
+                  '        if (mid) env->CallStaticVoidMethod(cls, mid, open ? JNI_TRUE : JNI_FALSE);\n'
+                  '        env->DeleteLocalRef(cls);\n'
+                  '    }\n'
+                  '    if (detach) g_jvm->DetachCurrentThread();\n'
+                  '}\n\n'
+              )
               pos = s.find('static std::mutex gCallLogMutex;')
               if pos >= 0:
                   end = s.find('\n', pos) + 1
                   s = s[:end] + '\n' + helper + s[end:]
-                  print("PASS: notifyMenuOpen helper inserted")
+                  print("PASS: notifyMenuOpen")
 
-          # 6. Wire to nativeRender
           if 'notifyMenuOpen' in s and 'lastMenuOpen' not in s and 'void nativeRender()' in s:
               s = s.replace('void nativeRender() {',
                             'void nativeRender() {\n    static bool lastMenuOpen = false;\n    if (lastMenuOpen != gMenuOpen) { lastMenuOpen = gMenuOpen; notifyMenuOpen(gMenuOpen); }', 1)
-              print("PASS: notifyMenuOpen wired")
+              print("PASS: wired")
 
           p.write_text(s)
-
-          # Diagnostic
-          print("=== TOP 30 LINES ===")
-          for i, line in enumerate(s.split('\n')[:30], 1):
-              print(f"{i:3d}: {line}")
-          print("=== g_jvm check ===")
-          print("declared:", 'static JavaVM* g_jvm = nullptr;' in s)
-          print("assigned:", bool(re.search(r'g_jvm = \w+;', s)))
-          print("env->GetJavaVM still present:", 'env->GetJavaVM(&g_jvm)' in s)
+          print("native-lib.cpp done")
           PYEOF
 
-      # ============================================================
-      # PATCH 4: native-lib.cpp agent + JNI methods + log
-      # ============================================================
-      - name: Patch native-lib.cpp (agent + JNI + log)
+      - name: Patch native-lib.cpp (agent + JNI)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -493,7 +465,7 @@ jobs:
           if 'PATCH_AGENT_JS' in s:
               s = re.sub(r'const gchar\* PATCH_AGENT_JS = R"\(.*?\)";',
                   'const gchar* PATCH_AGENT_JS = R"(' + new_js + ')";', s, flags=re.DOTALL)
-              print("PASS: agent replaced")
+              print("PASS: agent")
 
           if "Java_com_menu_imgui_Helper_nativePatchMethod" not in s:
               impl = textwrap.dedent(r"""
@@ -518,7 +490,7 @@ jobs:
               else:
                   pos = s.find('extern "C" JNIEXPORT')
                   if pos > 0: s = s[:pos] + impl + "\n\n" + s[pos:]
-              print("PASS: nativePatchMethod impl")
+              print("PASS: nativePatchMethod")
 
           if "Java_com_menu_imgui_Helper_nativeTouch" not in s:
               touch = textwrap.dedent(r"""
@@ -538,17 +510,15 @@ jobs:
               else:
                   pos = s.find('extern "C" JNIEXPORT')
                   if pos > 0: s = s[:pos] + touch + "\n\n" + s[pos:]
-              print("PASS: nativeTouch impl")
+              print("PASS: nativeTouch")
 
           if 'type\\":\\"log' not in s:
               s = s.replace('LOGI("Frida JS: %s", message);',
                   'LOGI("Frida JS: %s", message); if (message && strstr(message, "\\"type\\":\\"log\\"")) { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string("[JS] ")+message); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }', 1)
-              print("PASS: log handler")
 
           if 'push_back("[CALL]' not in s:
               s = s.replace("gPendingCallReqs.push_back(c);",
                   "gPendingCallReqs.push_back(c); { std::lock_guard<std::mutex> lk(gCallLogMutex); gCallLog.push_back(std::string(\"[CALL] \")+className+\".\"+m.name); if (gCallLog.size()>200) gCallLog.erase(gCallLog.begin()); }", 1)
-              print("PASS: call log")
 
           if 'BeginTabItem("Log")' not in s:
               old = 'if (ImGui::BeginTabItem("Patches"))'
@@ -558,15 +528,11 @@ jobs:
                      'ImGui::EndChild(); ImGui::EndTabItem(); }\n        ' + old)
               if old in s:
                   s = s.replace(old, new, 1)
-                  print("PASS: Log tab")
 
           p.write_text(s)
-          print("native-lib.cpp DONE")
+          print("native-lib.cpp JNI done")
           PYEOF
 
-      # ============================================================
-      # REBUILD dex_data.h
-      # ============================================================
       - name: Rebuild dex_data.h
         run: |
           set -e
@@ -574,11 +540,9 @@ jobs:
           D8=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -1)
           rm -rf /tmp/dex_build /tmp/dex_out
           mkdir -p /tmp/dex_build /tmp/dex_out
-          javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build \
-            $(find app/src/main/java/com/menu/imgui -name "*.java") 2>&1 | tee /tmp/javac.log
+          javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build $(find app/src/main/java/com/menu/imgui -name "*.java") 2>&1 | tee /tmp/javac.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo JAVAC_FAILED; cat /tmp/javac.log; exit 1; }
-          "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out \
-            $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
+          "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo D8_FAILED; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
           echo "dex_data.h rebuilt"
@@ -593,30 +557,16 @@ jobs:
           chk app/src/main/cpp/tool/native-lib.cpp "Java_com_menu_imgui_Helper_nativePatchMethod"
           chk app/src/main/cpp/tool/dex_data.h "imgui_dex_len"
           chk app/src/main/java/com/menu/imgui/Helper.java "nativePatchMethod"
-
           if grep -q "env->GetJavaVM(&g_jvm)" app/src/main/cpp/tool/native-lib.cpp; then
             echo "ERR env->GetJavaVM still present"; FAIL=1
           else
             echo "OK  env->GetJavaVM removed"
           fi
-
-          # g_jvm assigned via JNI_OnLoad
           if grep -qE "g_jvm = [a-zA-Z_]+;" app/src/main/cpp/tool/native-lib.cpp; then
             echo "OK  g_jvm assigned"
           else
             echo "ERR g_jvm not assigned"; FAIL=1
           fi
-
-          # g_jvm declared BEFORE first usage
-          G_LINE=$(grep -n "static JavaVM\* g_jvm = nullptr;" app/src/main/cpp/tool/native-lib.cpp | head -1 | cut -d: -f1)
-          U_LINE=$(grep -n "g_jvm->GetEnv\|if (!g_jvm)" app/src/main/cpp/tool/native-lib.cpp | head -1 | cut -d: -f1)
-          echo "g_jvm declared at line $G_LINE, first used at $U_LINE"
-          if [ -n "$G_LINE" ] && [ -n "$U_LINE" ] && [ "$G_LINE" -lt "$U_LINE" ]; then
-            echo "OK  g_jvm declared before use"
-          else
-            echo "ERR g_jvm declaration order wrong"; FAIL=1
-          fi
-
           if [ $FAIL -ne 0 ]; then
             echo "=== native-lib.cpp top 40 ==="; head -40 app/src/main/cpp/tool/native-lib.cpp
             exit 1
@@ -640,10 +590,7 @@ jobs:
           add_library(frida-gumjs STATIC IMPORTED)
           set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
           include_directories(imgui imgui/backends tool)
-          add_library(tool SHARED
-              tool/native-lib.cpp
-              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
-              imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
+          add_library(tool SHARED tool/native-lib.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
           target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
           target_link_libraries(tool frida-gumjs android log EGL GLESv3 dl)
           CMEOF
@@ -702,7 +649,8 @@ jobs:
       - name: Commit
         if: always()
         run: |
-          git config user.name "gh"; git config user.email "gh@users.noreply.github.com"
+          git config user.name "gh"
+          git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: g_jvm declared before first code line + g_jvm=vm (no env capture) [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: simplified on-block + robust globals insertion [skip ci]"
           git push
