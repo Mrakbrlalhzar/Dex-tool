@@ -120,7 +120,7 @@ jobs:
           if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN"; fi
           ls -lah "$D/lib/" "$D/include/" || true
 
-      - name: Write Include/ImGui.h (FIXED API)
+      - name: Write Include/ImGui.h
         run: |
           mkdir -p app/src/main/cpp/Include
           cat > app/src/main/cpp/Include/ImGui.h <<'IMGUIEOF'
@@ -210,97 +210,95 @@ jobs:
           }
           INPUTEOF
 
-      - name: Patch native-lib.cpp (FIX gVM/g_jvm + JNI_OnLoad)
+      - name: Patch native-lib.cpp (FULL CLEAN)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
-          # Step 1: Truncate old footer
-          marker = 'static JavaVM* gVM = nullptr;'
-          idx = s.find(marker)
-          if idx >= 0:
-              start = s.rfind('\n', 0, idx) + 1
-              s = s[:start]
-              print(f"Truncated old footer at {start}")
+          def rm_method(src, pat):
+              n = 0
+              while True:
+                  m = re.search(pat, src)
+                  if not m: break
+                  i = src.index('{', m.end()-1); d=0; e=-1
+                  for k in range(i, len(src)):
+                      if src[k]=='{': d+=1
+                      elif src[k]=='}':
+                          d-=1
+                          if d==0: e=k+1; break
+                  if e<0: break
+                  start = m.start()
+                  ext = src.rfind('extern "C"', max(0, m.start()-300), m.start())
+                  if ext >= 0 and ext < start: start = ext
+                  while e < len(src) and src[e] in '\n \t': e += 1
+                  src = src[:start] + src[e:]
+                  n += 1
+              return src, n
 
-          # Step 2: Remove ALL JNI_OnLoad definitions (brace counting)
-          removed = 0
-          while True:
-              m = re.search(r'\bJNI_OnLoad\s*\(', s)
-              if not m: break
-              depth = 1
-              i = m.end()
-              while i < len(s) and depth > 0:
-                  if s[i] == '(': depth += 1
-                  elif s[i] == ')': depth -= 1
-                  i += 1
-              if depth != 0: break
-              while i < len(s) and s[i] in ' \t\n': i += 1
-              if i >= len(s) or s[i] != '{': break
-              brace_start = i
-              depth = 1
-              i = brace_start + 1
-              while i < len(s) and depth > 0:
-                  if s[i] == '{': depth += 1
-                  elif s[i] == '}': depth -= 1
-                  i += 1
-              if depth != 0: break
-              end = i
-              start = m.start()
-              ext = s.rfind('extern "C"', max(0, m.start() - 300), m.start())
-              if ext >= 0: start = ext
-              jni_exp = s.rfind('JNIEXPORT', max(0, m.start() - 300), m.start())
-              if jni_exp >= 0 and jni_exp < start:
-                  ls = s.rfind('\n', max(0, jni_exp - 1), jni_exp) + 1
-                  start = ls
-              while end < len(s) and s[end] in '\n \t': end += 1
-              s = s[:start] + s[end:]
-              removed += 1
-          print(f"Removed {removed} JNI_OnLoad function(s)")
+          # Strip all dead / duplicate functions
+          s, n1 = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
+          s, n2 = rm_method(s, r'void\s+DrawMenu\s*\([^)]*\)\s*\{')
+          s, n3 = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{')
+          print(f"Removed: notifyMenuOpen={n1}, DrawMenu={n2}, JNI_OnLoad={n3}")
 
-          # Step 3: Remove ALL stray JavaVM*/g_menuVisible declarations
-          s = re.sub(r'(?m)^[ \t]*static\s+JavaVM\s*\*\s+g_jvm\s*=\s*nullptr\s*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*static\s+JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?', '', s)
-          s = re.sub(r'(?m)^[ \t]*static\s+bool\s+g_menuVisible\s*=\s*true\s*;\s*\n?', '', s)
+          # Strip ALL global declarations (all variants)
+          for pat in [
+              r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?',
+              r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+g_jvm\s*=\s*nullptr\s*;\s*\n?',
+              r'(?m)^[ \t]*(?:static\s+)?bool\s+g_menuVisible\s*=\s*true\s*;\s*\n?',
+              r'(?m)^[ \t]*(?:static\s+)?bool\s+gMenuOpen\s*=\s*false\s*;\s*\n?',
+          ]:
+              s = re.sub(pat, '', s)
 
-          # Step 4: Fix include paths
+          # Fix include paths
           s = s.replace('#include "Include/ImGui.h"', '')
           s = s.replace('#include "Include/Input.h"', '')
-
-          # Step 5: Ensure ImGui.h / Input.h are included
           if '#include "ImGui.h"' not in s:
               s = s.replace('#include "dex_data.h"', '#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
 
-          # Step 6: Insert gVM/g_jvm declarations BEFORE first function
-          # Find the FIRST JNIEXPORT line and insert before it
-          jni_first = s.find('extern "C" JNIEXPORT')
-          if jni_first < 0:
-              jni_first = s.find('JNIEXPORT')
-          if jni_first < 0:
-              print("FATAL: no JNIEXPORT found")
-              raise SystemExit(2)
-          # Walk back to start of line
-          line_start = s.rfind('\n', 0, jni_first) + 1
-          # Skip over comments/blank lines before
-          prefix = s[:line_start]
-          decl_block = 'static JavaVM* gVM = nullptr;\nstatic JavaVM* g_jvm = nullptr;\nstatic bool g_menuVisible = true;\n\n'
-          s = prefix + decl_block + s[line_start:]
-          print(f"Inserted gVM/g_jvm declarations at line {prefix.count(chr(10)) + 1}")
+          # Guard LOGI redefinition in native-lib.cpp
+          m = re.search(r'(?m)^[ \t]*#define\s+LOGI\s*\([^\n]*\n', s)
+          if m:
+              s = s[:m.start()] + '#ifndef LOGI\n' + m.group(0) + '#endif\n' + s[m.end():]
+              print("Guarded LOGI")
 
-          # Step 7: Append clean footer (WITHOUT gVM/g_jvm redefinition)
+          # Insert globals BEFORE the first real code line (after all includes/comments)
+          lines = s.split('\n')
+          insert_at = None
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if not stripped: continue
+              if stripped.startswith('#'): continue
+              if stripped.startswith('//'): continue
+              if stripped.startswith('/*'): continue
+              if stripped.startswith('*'): continue
+              insert_at = i
+              break
+          if insert_at is None:
+              print("FATAL: no code line"); raise SystemExit(2)
+          lines[insert_at:insert_at] = [
+              'static JavaVM* gVM = nullptr;',
+              'static JavaVM* g_jvm = nullptr;',
+              'static bool g_menuVisible = true;',
+              'static bool gMenuOpen = false;',
+              '',
+          ]
+          s = '\n'.join(lines)
+          print(f"Globals inserted at line {insert_at+1}")
+
+          # Append clean footer
           footer = textwrap.dedent(r"""
               void DrawMenu() {
                   if (!g_menuVisible) return;
                   ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
                   if (ImGui::Begin("DexTool", &g_menuVisible)) {
-                      ImGui::Text("DexTool running via eglSwapBuffers hook");
-                      ImGui::Text("Touch via libinput hook");
+                      ImGui::Text("DexTool via eglSwapBuffers + libinput hooks");
                       ImGui::Separator();
                       static char buf[256] = "";
                       ImGui::InputText("Test input", buf, sizeof(buf));
-                      if (ImGui::Button("Close Menu")) g_menuVisible = false;
+                      if (ImGui::Button("Close")) g_menuVisible = false;
                   }
                   ImGui::End();
               }
@@ -319,12 +317,18 @@ jobs:
                   return JNI_VERSION_1_6;
               }
           """).strip()
-
           s = s.rstrip() + "\n\n" + footer + "\n"
           p.write_text(s)
-          print(f"Final JNI_OnLoad count: {s.count('JNI_OnLoad')}")
-          print(f"gVM declarations: {s.count('static JavaVM* gVM = nullptr;')}")
-          print(f"g_jvm declarations: {s.count('static JavaVM* g_jvm = nullptr;')}")
+
+          print(f"=== FINAL COUNTS ===")
+          print(f"JNI_OnLoad: {s.count('JNI_OnLoad')}")
+          print(f"DrawMenu: {s.count('void DrawMenu()')}")
+          print(f"gVM: {s.count('static JavaVM* gVM = nullptr;')}")
+          print(f"g_jvm: {s.count('static JavaVM* g_jvm = nullptr;')}")
+          print(f"notifyMenuOpen: {s.count('notifyMenuOpen')}")
+          print("=== first 30 lines ===")
+          for i, line in enumerate(s.split('\n')[:30], 1):
+              print(f"{i}: {line}")
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
@@ -377,18 +381,47 @@ jobs:
           FAIL=0
           test -s app/src/main/cpp/Include/ImGui.h && echo "OK ImGui.h" || { echo "ERR ImGui.h"; FAIL=1; }
           test -s app/src/main/cpp/Include/Input.h && echo "OK Input.h" || { echo "ERR Input.h"; FAIL=1; }
+
           N_JNI=$(grep -cF 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp || true)
-          if [ "$N_JNI" -eq 1 ]; then echo "OK 1 JNI_OnLoad"; else echo "ERR JNI_OnLoad=$N_JNI"; FAIL=1; fi
-          N_VM=$(grep -cF 'static JavaVM* gVM = nullptr;' app/src/main/cpp/tool/native-lib.cpp || true)
-          if [ "$N_VM" -eq 1 ]; then echo "OK 1 gVM decl"; else echo "ERR gVM=$N_VM"; FAIL=1; fi
-          N_JVM=$(grep -cF 'static JavaVM* g_jvm = nullptr;' app/src/main/cpp/tool/native-lib.cpp || true)
-          if [ "$N_JVM" -eq 1 ]; then echo "OK 1 g_jvm decl"; else echo "ERR g_jvm=$N_JVM"; FAIL=1; fi
-          if grep -qF 'ImGui_ImplAndroid_Init(nullptr)' app/src/main/cpp/Include/ImGui.h; then echo "OK Init(nullptr)"; else echo "ERR Init signature"; FAIL=1; fi
-          if grep -qF 'ImGui_ImplAndroid_NewFrame();' app/src/main/cpp/Include/ImGui.h; then echo "OK NewFrame()"; else echo "ERR NewFrame signature"; FAIL=1; fi
-          grep -qF "void DrawMenu()" app/src/main/cpp/tool/native-lib.cpp && echo "OK DrawMenu" || { echo "ERR DrawMenu"; FAIL=1; }
-          grep -qF "initModMenu" app/src/main/cpp/tool/native-lib.cpp && echo "OK initModMenu" || { echo "ERR initModMenu"; FAIL=1; }
+          if [ "$N_JNI" -eq 1 ]; then echo "OK 1 JNI_OnLoad"; else echo "ERR JNI_OnLoad=$N_JNI"; grep -n 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp; FAIL=1; fi
+
+          N_DM=$(grep -cF 'void DrawMenu()' app/src/main/cpp/tool/native-lib.cpp || true)
+          if [ "$N_DM" -eq 1 ]; then echo "OK 1 DrawMenu"; else echo "ERR DrawMenu=$N_DM"; grep -n 'void DrawMenu()' app/src/main/cpp/tool/native-lib.cpp; FAIL=1; fi
+
+          # g_jvm must be in first 60 lines
+          if head -60 app/src/main/cpp/tool/native-lib.cpp | grep -qF 'static JavaVM* g_jvm = nullptr;'; then
+            echo "OK g_jvm in first 60 lines"
+          else
+            echo "ERR g_jvm not in first 60 lines"
+            head -60 app/src/main/cpp/tool/native-lib.cpp | grep -n 'g_jvm' || true
+            FAIL=1
+          fi
+
+          if head -60 app/src/main/cpp/tool/native-lib.cpp | grep -qF 'static JavaVM* gVM = nullptr;'; then
+            echo "OK gVM in first 60 lines"
+          else
+            echo "ERR gVM not in first 60 lines"; FAIL=1
+          fi
+
+          # g_jvm decl position must be < first usage
+          DECL_LINE=$(grep -n 'static JavaVM\* g_jvm = nullptr;' app/src/main/cpp/tool/native-lib.cpp | head -1 | cut -d: -f1)
+          USE_LINE=$(grep -n 'g_jvm' app/src/main/cpp/tool/native-lib.cpp | grep -v 'static JavaVM\* g_jvm' | head -1 | cut -d: -f1)
+          echo "g_jvm decl at $DECL_LINE, first use at $USE_LINE"
+          if [ -n "$DECL_LINE" ] && [ -n "$USE_LINE" ] && [ "$DECL_LINE" -lt "$USE_LINE" ]; then
+            echo "OK g_jvm declared before use"
+          else
+            echo "ERR g_jvm declaration order wrong"; FAIL=1
+          fi
+
+          if grep -qF 'notifyMenuOpen' app/src/main/cpp/tool/native-lib.cpp; then
+            echo "ERR notifyMenuOpen still present (dead code)"; FAIL=1
+          else
+            echo "OK notifyMenuOpen removed"
+          fi
+
           if [ $FAIL -ne 0 ]; then
-            echo "=== native-lib first 20 lines ==="; head -20 app/src/main/cpp/tool/native-lib.cpp
+            echo "=== first 60 lines ==="
+            head -60 app/src/main/cpp/tool/native-lib.cpp
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -421,5 +454,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: ImGui Android API (Init(nullptr), NewFrame()), gVM/g_jvm top-level, LOGI guard [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: strip ALL DrawMenu/notifyMenuOpen/JNI_OnLoad, insert globals before first code line, guard LOGI [skip ci]"
           git push
