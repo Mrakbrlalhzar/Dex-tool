@@ -5,22 +5,16 @@ set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
 if(${ANDROID_ABI} STREQUAL "arm64-v8a")
     set(FRIDA_DIR /tmp/frida-built/arm64-v8a)
+    set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Include/Dobby/lib/arm64-v8a)
 else()
     set(FRIDA_DIR /tmp/frida-built/armeabi-v7a)
+    set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Include/Dobby/lib/armeabi-v7a)
 endif()
 include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
 add_library(frida-gumjs STATIC IMPORTED)
 set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
-
-if(ANDROID AND ${ANDROID_ABI} STREQUAL "arm64-v8a")
-    set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
-endif()
-set_source_files_properties(
-    Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
-    PROPERTIES LANGUAGE ASM
-)
-
-add_subdirectory(Include/Dobby dobby.out)
+add_library(dobby STATIC IMPORTED)
+set_target_properties(dobby PROPERTIES IMPORTED_LOCATION ${DOBBY_DIR}/libdobby.a)
 include_directories(Include Include/Dobby/include imgui imgui/backends tool)
 add_library(tool SHARED
     tool/native-lib.cpp
