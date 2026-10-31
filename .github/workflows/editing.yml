@@ -39,7 +39,7 @@ jobs:
           rm -rf app/src/main/cpp/Include/Dobby
           git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
 
-      - name: Patch Dobby ARM64 asm (correct :pg_hi21: and #:lo12:)
+      - name: "Patch Dobby ARM64 asm (correct :pg_hi21: and #:lo12:)"
         run: |
           python3 - <<'PYEOF'
           import re, pathlib
@@ -338,7 +338,7 @@ jobs:
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
 
-      - name: Write CMakeLists.txt (with Dobby ASM fix)
+      - name: "Write CMakeLists.txt (with Dobby ASM fix)"
         run: |
           cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
           cmake_minimum_required(VERSION 3.22.1)
@@ -355,7 +355,6 @@ jobs:
           add_library(frida-gumjs STATIC IMPORTED)
           set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
 
-          # ---- Dobby ASM fixes ----
           if(ANDROID AND ${ANDROID_ABI} STREQUAL "arm64-v8a")
               set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
           endif()
@@ -363,7 +362,6 @@ jobs:
               Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
               PROPERTIES LANGUAGE ASM
           )
-          # -------------------------
 
           add_subdirectory(Include/Dobby dobby.out)
           include_directories(Include Include/Dobby/include imgui imgui/backends tool)
