@@ -234,27 +234,14 @@ jobs:
           }
           LOGEOF
 
-      - name: Remove Include/ImGui.h and Include/Input.h
+      - name: Remove old Include headers
         run: |
           rm -f app/src/main/cpp/Include/ImGui.h
           rm -f app/src/main/cpp/Include/Input.h
 
-      - name: Patch Helper.java add overlay methods
+      - name: Write overlay Java to /tmp/overlay.java
         run: |
-          python3 - <<'PYEOF'
-          import pathlib
-          p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
-          s = p.read_text()
-
-          # Remove existing overlay block if present (idempotent)
-          if "public static void startOverlay" in s:
-              start = s.index("public static void startOverlay")
-              # find end: last occurrence of "nativeOnTouch"
-              key = "public static native void nativeOnTouch"
-              end_pos = s.find(";", s.index(key)) + 1
-              s = s[:start] + s[end_pos:]
-
-          overlay_code = '''
+          cat > /tmp/overlay.java <<'JAVAEOF'
     public static void startOverlay(final android.content.Context context) {
         try {
             final android.view.WindowManager wm =
@@ -314,14 +301,27 @@ jobs:
     public static native void nativeOnSurfaceChanged(int w, int h);
     public static native void nativeOnDrawFrame();
     public static native void nativeOnTouch(int action, float x, float y);
-'''
+          JAVAEOF
+          echo "=== overlay.java preview ==="
+          head -5 /tmp/overlay.java
 
+      - name: Patch Helper.java with overlay methods
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, textwrap
+          p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
+          s = p.read_text()
+          if "public static void startOverlay" in s:
+              start = s.index("public static void startOverlay")
+              key = "public static native void nativeOnTouch"
+              end_pos = s.find(";", s.index(key)) + 1
+              s = s[:start] + s[end_pos:]
+          with open('/tmp/overlay.java') as f:
+              overlay = f.read()
           idx = s.rstrip().rfind("}")
-          if idx < 0:
-              raise SystemExit("no closing brace in Helper.java")
-          s = s[:idx] + overlay_code + "\n" + s[idx:]
+          s = s[:idx] + overlay + "\n" + s[idx:]
           p.write_text(s)
-          print("Helper.java patched with overlay methods")
+          print("Helper.java patched")
           PYEOF
 
       - name: Patch native-lib.cpp overlay JNI callbacks
@@ -352,18 +352,15 @@ jobs:
               print("rm_method[" + label + "]: removed " + str(n))
               return src
 
-          # Remove old overlay callbacks
           for name in ['nativeOnSurfaceCreated', 'nativeOnSurfaceChanged',
                        'nativeOnDrawFrame', 'nativeOnTouch']:
               s = rm_method(s, r'Java_com_menu_imgui_Helper_' + name + r'\s*\([^)]*\)\s*\{', name)
 
-          # Remove old notifyMenuOpen / setup_log_path / DrawMenu / JNI_OnLoad
           s = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{', 'notifyMenuOpen')
           s = rm_method(s, r'(?:static\s+)?void\s+setup_log_path\s*\([^)]*\)\s*\{', 'setup_log_path')
           s = rm_method(s, r'(?:static\s+)?void\s+DrawMenu\s*\([^)]*\)\s*\{', 'DrawMenu')
           s = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{', 'JNI_OnLoad')
 
-          # Remove old globals
           for pat in [
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?',
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+g_jvm\s*=\s*nullptr\s*;\s*\n?',
@@ -372,13 +369,11 @@ jobs:
           ]:
               s = re.sub(pat, '', s)
 
-          # Remove include lines for ImGui.h / Input.h if present
           s = s.replace('#include "Include/ImGui.h"', '')
           s = s.replace('#include "Include/Input.h"', '')
           s = s.replace('#include "ImGui.h"', '')
           s = s.replace('#include "Input.h"', '')
 
-          # Add Log.h include after dex_data.h or first include
           if '#include "Log.h"' not in s:
               if '#include "dex_data.h"' in s:
                   s = s.replace('#include "dex_data.h"', '#include "Log.h"\n#include "dex_data.h"', 1)
@@ -390,11 +385,9 @@ jobs:
                           break
                   s = '\n'.join(lines)
 
-          # Add GLES3 include for glViewport/glClear
           if '#include <GLES3/gl3.h>' not in s:
               s = s.replace('#include "Log.h"', '#include "Log.h"\n#include <GLES3/gl3.h>', 1)
 
-          # Insert globals before first non-include/non-comment line
           lines = s.split('\n')
           insert_at = None
           for i, line in enumerate(lines):
@@ -416,152 +409,153 @@ jobs:
           ]
           s = '\n'.join(lines)
 
-          # Sanity check
           for label, pat in [
               ('setup_log_path_def', r'static\s+void\s+setup_log_path\s*\(JNIEnv'),
               ('DrawMenu_def', r'void\s+DrawMenu\s*\(\s*\)'),
               ('JNI_OnLoad_def', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
+              ('nativeOnSurfaceCreated', r'Java_com_menu_imgui_Helper_nativeOnSurfaceCreated'),
+              ('nativeOnDrawFrame', r'Java_com_menu_imgui_Helper_nativeOnDrawFrame'),
           ]:
               cnt = len(re.findall(pat, s))
               if cnt != 0:
-                  raise SystemExit("FAIL: " + label + " still present " + str(cnt) + " times")
+                  raise SystemExit("FAIL: " + label + " still present " + str(cnt))
               print("OK no leftover: " + label)
 
           footer = textwrap.dedent(r"""
-              void DrawMenu() {
-                  if (!g_menuVisible) return;
-                  ImGuiIO& io = ImGui::GetIO();
-                  ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_FirstUseEver);
-                  ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_FirstUseEver);
-                  if (ImGui::Begin("DexTool", &g_menuVisible)) {
-                      ImGui::Text("DexTool overlay via WindowManager");
-                      ImGui::Separator();
-                      static char buf[256] = "";
-                      ImGui::InputText("Test input", buf, sizeof(buf));
-                      ImGui::Text("Touch: tap inside to test");
-                      if (ImGui::Button("Close")) g_menuVisible = false;
-                  }
-                  ImGui::End();
-              }
+void DrawMenu() {
+    if (!g_menuVisible) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("DexTool", &g_menuVisible)) {
+        ImGui::Text("DexTool overlay via WindowManager");
+        ImGui::Separator();
+        static char buf[256] = "";
+        ImGui::InputText("Test input", buf, sizeof(buf));
+        ImGui::Text("Touch: tap inside to test");
+        if (ImGui::Button("Close")) g_menuVisible = false;
+    }
+    ImGui::End();
+}
 
-              extern "C" JNIEXPORT void JNICALL
-              Java_com_menu_imgui_Helper_nativeOnSurfaceCreated(JNIEnv* env, jclass) {
-                  flog("[overlay] onSurfaceCreated");
-                  if (!ImGui::GetCurrentContext()) {
-                      ImGui::CreateContext();
-                      ImGuiIO& io = ImGui::GetIO();
-                      io.IniFilename = nullptr;
-                      ImGui_ImplAndroid_Init(nullptr);
-                      ImGui_ImplOpenGL3_Init("#version 300 es");
-                      flog("[overlay] ImGui initialized");
-                  }
-              }
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeOnSurfaceCreated(JNIEnv* env, jclass) {
+    flog("[overlay] onSurfaceCreated");
+    if (!ImGui::GetCurrentContext()) {
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        ImGui_ImplAndroid_Init(nullptr);
+        ImGui_ImplOpenGL3_Init("#version 300 es");
+        flog("[overlay] ImGui initialized");
+    }
+}
 
-              extern "C" JNIEXPORT void JNICALL
-              Java_com_menu_imgui_Helper_nativeOnSurfaceChanged(JNIEnv* env, jclass, jint w, jint h) {
-                  flog("[overlay] onSurfaceChanged %dx%d", w, h);
-                  if (!ImGui::GetCurrentContext()) return;
-                  ImGuiIO& io = ImGui::GetIO();
-                  io.DisplaySize = ImVec2((float)w, (float)h);
-              }
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeOnSurfaceChanged(JNIEnv* env, jclass, jint w, jint h) {
+    flog("[overlay] onSurfaceChanged %dx%d", w, h);
+    if (!ImGui::GetCurrentContext()) return;
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)w, (float)h);
+}
 
-              extern "C" JNIEXPORT void JNICALL
-              Java_com_menu_imgui_Helper_nativeOnDrawFrame(JNIEnv* env, jclass) {
-                  static bool first = true;
-                  if (first) { flog("[overlay] first onDrawFrame"); first = false; }
-                  if (!ImGui::GetCurrentContext()) return;
-                  ImGui_ImplOpenGL3_NewFrame();
-                  ImGui::NewFrame();
-                  DrawMenu();
-                  ImGui::Render();
-                  ImGuiIO& io = ImGui::GetIO();
-                  glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-                  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-                  glClear(GL_COLOR_BUFFER_BIT);
-                  ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-              }
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeOnDrawFrame(JNIEnv* env, jclass) {
+    static bool first = true;
+    if (first) { flog("[overlay] first onDrawFrame"); first = false; }
+    if (!ImGui::GetCurrentContext()) return;
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui::NewFrame();
+    DrawMenu();
+    ImGui::Render();
+    ImGuiIO& io = ImGui::GetIO();
+    glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+}
 
-              extern "C" JNIEXPORT void JNICALL
-              Java_com_menu_imgui_Helper_nativeOnTouch(JNIEnv* env, jclass, jint action, jfloat x, jfloat y) {
-                  if (!ImGui::GetCurrentContext()) return;
-                  ImGuiIO& io = ImGui::GetIO();
-                  io.AddMousePosEvent(x, y);
-                  if (action == 0) io.AddMouseButtonEvent(0, true);
-                  else if (action == 1) io.AddMouseButtonEvent(0, false);
-              }
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeOnTouch(JNIEnv* env, jclass, jint action, jfloat x, jfloat y) {
+    if (!ImGui::GetCurrentContext()) return;
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(x, y);
+    if (action == 0) io.AddMouseButtonEvent(0, true);
+    else if (action == 1) io.AddMouseButtonEvent(0, false);
+}
 
-              static void setup_log_path(JNIEnv* env) {
-                  std::string ext;
-                  jclass at = env->FindClass("android/app/ActivityThread");
-                  if (at) {
-                      jmethodID m = env->GetStaticMethodID(at, "currentApplication", "()Landroid/app/Application;");
-                      if (m) {
-                          jobject app = env->CallStaticObjectMethod(at, m);
-                          if (app) {
-                              jclass ctx = env->FindClass("android/content/Context");
-                              jmethodID gefd = env->GetMethodID(ctx, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
-                              if (gefd) {
-                                  jobject f = env->CallObjectMethod(app, gefd, nullptr);
-                                  if (f) {
-                                      jclass fc = env->FindClass("java/io/File");
-                                      jmethodID gap = env->GetMethodID(fc, "getAbsolutePath", "()Ljava/lang/String;");
-                                      jstring jp = (jstring)env->CallObjectMethod(f, gap);
-                                      if (jp) {
-                                          const char* c = env->GetStringUTFChars(jp, nullptr);
-                                          ext = c;
-                                          env->ReleaseStringUTFChars(jp, c);
-                                      }
-                                  }
-                              }
-                          }
-                      }
-                  }
-                  if (!ext.empty()) {
-                      snprintf(g_log_path, sizeof(g_log_path), "%s/DexTool.log", ext.c_str());
-                      const char* downloads[] = {
-                          "/sdcard/Download/DexTool.log",
-                          "/storage/emulated/0/Download/DexTool.log",
-                      };
-                      for (auto d : downloads) {
-                          int fd = open(d, O_WRONLY | O_APPEND | O_CREAT, 0666);
-                          if (fd >= 0) {
-                              close(fd);
-                              snprintf(g_log_path, sizeof(g_log_path), "%s", d);
-                              break;
-                          }
-                      }
-                  } else {
-                      snprintf(g_log_path, sizeof(g_log_path),
-                          "/sdcard/Android/data/com.example.tool/files/DexTool.log");
-                      mkdir("/sdcard/Android/data/com.example.tool", 0777);
-                      mkdir("/sdcard/Android/data/com.example.tool/files", 0777);
-                  }
-              }
+static void setup_log_path(JNIEnv* env) {
+    std::string ext;
+    jclass at = env->FindClass("android/app/ActivityThread");
+    if (at) {
+        jmethodID m = env->GetStaticMethodID(at, "currentApplication", "()Landroid/app/Application;");
+        if (m) {
+            jobject app = env->CallStaticObjectMethod(at, m);
+            if (app) {
+                jclass ctx = env->FindClass("android/content/Context");
+                jmethodID gefd = env->GetMethodID(ctx, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
+                if (gefd) {
+                    jobject f = env->CallObjectMethod(app, gefd, nullptr);
+                    if (f) {
+                        jclass fc = env->FindClass("java/io/File");
+                        jmethodID gap = env->GetMethodID(fc, "getAbsolutePath", "()Ljava/lang/String;");
+                        jstring jp = (jstring)env->CallObjectMethod(f, gap);
+                        if (jp) {
+                            const char* c = env->GetStringUTFChars(jp, nullptr);
+                            ext = c;
+                            env->ReleaseStringUTFChars(jp, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!ext.empty()) {
+        snprintf(g_log_path, sizeof(g_log_path), "%s/DexTool.log", ext.c_str());
+        const char* downloads[] = {
+            "/sdcard/Download/DexTool.log",
+            "/storage/emulated/0/Download/DexTool.log",
+        };
+        for (auto d : downloads) {
+            int fd = open(d, O_WRONLY | O_APPEND | O_CREAT, 0666);
+            if (fd >= 0) {
+                close(fd);
+                snprintf(g_log_path, sizeof(g_log_path), "%s", d);
+                break;
+            }
+        }
+    } else {
+        snprintf(g_log_path, sizeof(g_log_path),
+            "/sdcard/Android/data/com.example.tool/files/DexTool.log");
+        mkdir("/sdcard/Android/data/com.example.tool", 0777);
+        mkdir("/sdcard/Android/data/com.example.tool/files", 0777);
+    }
+}
 
-              extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
-                  gVM = vm; g_jvm = vm;
-                  JNIEnv* env = nullptr;
-                  if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    gVM = vm; g_jvm = vm;
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
 
-                  setup_log_path(env);
-                  flog("========== JNI_OnLoad start ==========");
-                  flog("Log path: %s", g_log_path);
+    setup_log_path(env);
+    flog("========== JNI_OnLoad start ==========");
+    flog("Log path: %s", g_log_path);
 
-                  install_crash_handler();
-                  flog("[1] crash handler installed");
+    install_crash_handler();
+    flog("[1] crash handler installed");
 
-                  loadDex(env);
-                  flog("[2] loadDex done");
+    loadDex(env);
+    flog("[2] loadDex done");
 
-                  gum_init_embedded();
-                  flog("[3] gum_init_embedded done");
+    gum_init_embedded();
+    flog("[3] gum_init_embedded done");
 
-                  init_frida_script();
-                  flog("[4] init_frida_script done (Frida will start overlay after 1.5s)");
+    init_frida_script();
+    flog("[4] init_frida_script done (Frida will start overlay after 1.5s)");
 
-                  flog("========== JNI_OnLoad done ==========");
-                  return JNI_VERSION_1_6;
-              }
+    flog("========== JNI_OnLoad done ==========");
+    return JNI_VERSION_1_6;
+}
           """).strip()
           s = s.rstrip() + "\n\n" + footer + "\n"
           p.write_text(s)
@@ -582,43 +576,16 @@ jobs:
       - name: Patch PATCH_AGENT_JS to start overlay
         run: |
           python3 - <<'PYEOF'
-          import pathlib, re
+          import pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
-
-          # Find PATCH_AGENT_JS string and modify it
-          # The JS should be inside R"JS( ... )JS" or similar raw string
-          # Strategy: find "agent loaded" then inject overlay start after it
-
           if "overlay started via Frida" in s:
               print("PATCH_AGENT_JS already patched")
               raise SystemExit(0)
-
-          # Locate the send({type:"ready"}); or agent loaded
           marker = 'log("agent loaded");'
           if marker not in s:
               raise SystemExit("PATCH_AGENT_JS marker not found")
-
-          overlay_js = '''log("agent loaded");
-      setTimeout(function() {
-        try {
-          var loaders = Java.enumerateClassLoadersSync();
-          for (var i = 0; i < loaders.length; i++) {
-            try {
-              loaders[i].loadClass("com.menu.imgui.Helper");
-              Java.classFactory.loader = loaders[i];
-              break;
-            } catch(e) {}
-          }
-          var AT = Java.use("android.app.ActivityThread");
-          var app = AT.currentApplication();
-          if (!app) { log("overlay: no app context"); return; }
-          var Helper = Java.use("com.menu.imgui.Helper");
-          Helper.startOverlay(app);
-          log("overlay started via Frida");
-        } catch(e) { log("overlay start error: " + e.message); }
-      }, 1500);'''
-
+          overlay_js = 'log("agent loaded");\n      setTimeout(function() {\n        try {\n          var loaders = Java.enumerateClassLoadersSync();\n          for (var i = 0; i < loaders.length; i++) {\n            try {\n              loaders[i].loadClass("com.menu.imgui.Helper");\n              Java.classFactory.loader = loaders[i];\n              break;\n            } catch(e) {}\n          }\n          var AT = Java.use("android.app.ActivityThread");\n          var app = AT.currentApplication();\n          if (!app) { log("overlay: no app context"); return; }\n          var Helper = Java.use("com.menu.imgui.Helper");\n          Helper.startOverlay(app);\n          log("overlay started via Frida");\n        } catch(e) { log("overlay start error: " + e.message); }\n      }, 1500);'
           s = s.replace(marker, overlay_js, 1)
           p.write_text(s)
           print("PATCH_AGENT_JS patched")
