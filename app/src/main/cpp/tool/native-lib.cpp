@@ -134,25 +134,40 @@ static GumScriptBackend* g_backend = nullptr;
 
 const gchar* PATCH_AGENT_JS = R"(Java.perform(function() {
   function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
-  log("agent loaded");
-setTimeout(function() {
-    try {
-        var loaders = Java.enumerateClassLoadersSync();
-        for (var i = 0; i < loaders.length; i++) {
-            try {
-                loaders[i].loadClass("com.menu.imgui.Helper");
-                Java.classFactory.loader = loaders[i];
-                break;
-            } catch(e) {}
-        }
-        var AT = Java.use("android.app.ActivityThread");
-        var app = AT.currentApplication();
-        if (!app) { log("overlay: no app context"); return; }
-        var Helper = Java.use("com.menu.imgui.Helper");
-        Helper.startOverlay(app);
-        log("overlay started via Frida");
-    } catch(e) { log("overlay start error: " + e.message); }
-}, 1500);
+    log("agent loaded");
+  var foundHelper = false;
+  function jlog(m) {
+      try { send({type:"log", msg:m}); } catch(e) {}
+      if (foundHelper) {
+          try { Java.use("com.menu.imgui.Helper").nativeLog(m); } catch(e) {}
+      }
+  }
+  try {
+      var loaders = Java.enumerateClassLoadersSync();
+      jlog("loaders: " + loaders.length);
+      for (var i = 0; i < loaders.length; i++) {
+          try {
+              loaders[i].loadClass("com.menu.imgui.Helper");
+              Java.classFactory.loader = loaders[i];
+              foundHelper = true;
+              jlog("Helper found in loader " + i);
+              break;
+          } catch(e) {}
+      }
+  } catch(e) { jlog("loaders err: " + e.message); }
+  if (!foundHelper) { jlog("ERROR Helper not found"); }
+  else {
+      try {
+          var AT = Java.use("android.app.ActivityThread");
+          var app = AT.currentApplication();
+          if (!app) { jlog("no app context"); }
+          else {
+              jlog("calling startOverlay");
+              Java.use("com.menu.imgui.Helper").startOverlay(app);
+              jlog("startOverlay returned");
+          }
+      } catch(e) { jlog("overlay err: " + e.message); }
+  }
   var HOOKED = {};
   recv(function(raw) {
     try {
@@ -816,17 +831,24 @@ static void doSetPatches(JNIEnv* env, jclass, jobjectArray arr) {
     }
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeLog(JNIEnv* env, jclass, jstring msg) {
+    if (!msg) return;
+    const char* c = env->GetStringUTFChars(msg, nullptr);
+    flog("%s", c);
+    env->ReleaseStringUTFChars(msg, c);
+}
+
 void DrawMenu() {
     if (!g_menuVisible) return;
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_FirstUseEver);
     if (ImGui::Begin("DexTool", &g_menuVisible)) {
-        ImGui::Text("DexTool overlay via WindowManager");
+        ImGui::Text("DexTool overlay");
         ImGui::Separator();
         static char buf[256] = "";
-        ImGui::InputText("Test input", buf, sizeof(buf));
-        ImGui::Text("Touch: tap inside to test");
+        ImGui::InputText("Test", buf, sizeof(buf));
         if (ImGui::Button("Close")) g_menuVisible = false;
     }
     ImGui::End();
@@ -945,7 +967,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     flog("[3] gum_init_embedded done");
 
     init_frida_script();
-    flog("[4] init_frida_script done (Frida will start overlay after 1.5s)");
+    flog("[4] init_frida_script done");
 
     flog("========== JNI_OnLoad done ==========");
     return JNI_VERSION_1_6;

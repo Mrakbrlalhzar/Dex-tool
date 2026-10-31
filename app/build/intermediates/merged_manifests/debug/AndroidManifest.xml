@@ -8,9 +8,8 @@
         android:minSdkVersion="27"
         android:targetSdkVersion="34" />
 
-    <uses-permission
-        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <permission
         android:name="com.example.tool.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
@@ -23,9 +22,8 @@
         android:appComponentFactory="androidx.core.app.CoreComponentFactory"
         android:debuggable="true"
         android:extractNativeLibs="true"
-        android:label="ImGuiTool"
-        android:requestLegacyExternalStorage="true"
-        android:theme="@android:style/Theme.Material.NoActionBar" >
+        android:label="DexTool Test"
+        android:supportsRtl="true" >
         <activity
             android:name="com.example.tool.MainActivity"
             android:exported="true" >

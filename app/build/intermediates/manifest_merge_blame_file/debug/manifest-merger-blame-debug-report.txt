@@ -8,55 +8,53 @@
 8        android:minSdkVersion="27"
 9        android:targetSdkVersion="34" />
 10
-11    <uses-permission
-11-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:3:5-4:38
-12        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-12-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:3:22-78
-13        android:maxSdkVersion="28" />
-13-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:4:9-35
-14
-15    <permission
-15-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:22:5-24:47
-16        android:name="com.example.tool.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
-16-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:23:9-81
-17        android:protectionLevel="signature" />
-17-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:24:9-44
-18
-19    <uses-permission android:name="com.example.tool.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
-19-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:26:5-97
-19-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:26:22-94
-20
-21    <application
-21-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:5:5-18:19
-22        android:allowBackup="true"
-22-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:6:9-35
-23        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
-23-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:28:18-86
-24        android:debuggable="true"
-25        android:extractNativeLibs="true"
-26        android:label="ImGuiTool"
-26-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:7:9-34
-27        android:requestLegacyExternalStorage="true"
-27-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:8:9-52
-28        android:theme="@android:style/Theme.Material.NoActionBar" >
-28-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:9:9-66
-29        <activity
-29-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:10:9-17:20
-30            android:name="com.example.tool.MainActivity"
-30-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:11:13-41
-31            android:exported="true" >
-31-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:12:13-36
-32            <intent-filter>
-32-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:13:13-16:29
-33                <action android:name="android.intent.action.MAIN" />
-33-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:14:17-69
-33-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:14:25-66
-34
-35                <category android:name="android.intent.category.LAUNCHER" />
-35-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:15:17-77
-35-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:15:27-74
-36            </intent-filter>
-37        </activity>
-38    </application>
-39
-40</manifest>
+11    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+11-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:4:5-78
+11-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:4:22-75
+12    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+12-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:5:5-77
+12-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:5:22-74
+13
+14    <permission
+14-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:22:5-24:47
+15        android:name="com.example.tool.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+15-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:23:9-81
+16        android:protectionLevel="signature" />
+16-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:24:9-44
+17
+18    <uses-permission android:name="com.example.tool.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+18-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:26:5-97
+18-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:26:22-94
+19
+20    <application
+20-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:6:5-18:19
+21        android:allowBackup="true"
+21-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:8:9-35
+22        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+22-->[androidx.core:core:1.12.0] /home/runner/.gradle/caches/transforms-3/0d4ffc60e85a7c7f9fbeb27599893adc/transformed/core-1.12.0/AndroidManifest.xml:28:18-86
+23        android:debuggable="true"
+24        android:extractNativeLibs="true"
+25        android:label="DexTool Test"
+25-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:7:9-37
+26        android:supportsRtl="true" >
+26-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:9:9-35
+27        <activity
+27-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:10:9-17:20
+28            android:name="com.example.tool.MainActivity"
+28-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:11:13-57
+29            android:exported="true" >
+29-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:12:13-36
+30            <intent-filter>
+30-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:13:13-16:29
+31                <action android:name="android.intent.action.MAIN" />
+31-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:14:17-69
+31-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:14:25-66
+32
+33                <category android:name="android.intent.category.LAUNCHER" />
+33-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:15:17-77
+33-->/home/runner/work/Dex-tool/Dex-tool/app/src/main/AndroidManifest.xml:15:27-74
+34            </intent-filter>
+35        </activity>
+36    </application>
+37
+38</manifest>
