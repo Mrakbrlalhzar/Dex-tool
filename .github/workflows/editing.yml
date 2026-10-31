@@ -239,7 +239,69 @@ jobs:
           rm -f app/src/main/cpp/Include/ImGui.h
           rm -f app/src/main/cpp/Include/Input.h
 
-      - name: Patch Helper.java add overlay methods
+      - name: Write AndroidManifest.xml with SYSTEM_ALERT_WINDOW
+        run: |
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'MANIFESTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.example.tool">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <application
+                  android:label="DexTool Test"
+                  android:allowBackup="true"
+                  android:supportsRtl="true">
+                  <activity
+                      android:name="com.example.tool.MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          MANIFESTEOF
+          echo "=== AndroidManifest.xml ==="
+          cat app/src/main/AndroidManifest.xml
+
+      - name: Write MainActivity.java
+        run: |
+          mkdir -p app/src/main/java/com/example/tool
+          cat > app/src/main/java/com/example/tool/MainActivity.java <<'MAEOF'
+          package com.example.tool;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+                      Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:" + getPackageName()));
+                      startActivity(i);
+                  }
+                  System.loadLibrary("tool");
+                  TextView tv = new TextView(this);
+                  tv.setText("DexTool Test\n\nIf overlay not shown:\n1. Grant 'Display over other apps' permission\n2. Restart this app\n3. Check /sdcard/Download/DexTool.log");
+                  tv.setTextSize(18);
+                  tv.setPadding(40, 200, 40, 40);
+                  setContentView(tv);
+              }
+          }
+          MAEOF
+          echo "=== MainActivity.java ==="
+          cat app/src/main/java/com/example/tool/MainActivity.java
+
+      - name: Patch Helper.java with main thread + nativeLog
         run: |
           python3 - <<'PYEOF'
           import pathlib, textwrap
@@ -249,65 +311,68 @@ jobs:
           if "public static void startOverlay" in s:
               start = s.index("public static void startOverlay")
               key = "public static native void nativeOnTouch"
-              end_pos = s.find(";", s.index(key)) + 1
-              s = s[:start] + s[end_pos:]
+              if key in s:
+                  end_pos = s.index(";", s.index(key)) + 1
+                  s = s[:start] + s[end_pos:]
 
           overlay_code = textwrap.dedent('''
               public static void startOverlay(final android.content.Context context) {
-                  try {
-                      final android.view.WindowManager wm =
-                          (android.view.WindowManager) context.getSystemService(android.content.Context.WINDOW_SERVICE);
-                      if (wm == null) {
-                          android.util.Log.e("DexTool", "WindowManager null");
-                          return;
+                  android.util.Log.i("DexTool", "startOverlay called");
+                  android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+                  h.post(new Runnable() {
+                      public void run() {
+                          try {
+                              android.view.WindowManager wm =
+                                  (android.view.WindowManager) context.getSystemService(android.content.Context.WINDOW_SERVICE);
+                              if (wm == null) {
+                                  nativeLog("ERROR: WindowManager null");
+                                  return;
+                              }
+                              android.opengl.GLSurfaceView view = new android.opengl.GLSurfaceView(context);
+                              view.setEGLContextClientVersion(3);
+                              view.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
+                              view.getHolder().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
+                              view.setZOrderOnTop(true);
+                              view.setRenderer(new android.opengl.GLSurfaceView.Renderer() {
+                                  public void onSurfaceCreated(javax.microedition.khronos.opengles.GL10 gl,
+                                                               javax.microedition.khronos.egl.EGLConfig config) {
+                                      nativeOnSurfaceCreated();
+                                  }
+                                  public void onSurfaceChanged(javax.microedition.khronos.opengles.GL10 gl,
+                                                               int w, int h) {
+                                      nativeOnSurfaceChanged(w, h);
+                                  }
+                                  public void onDrawFrame(javax.microedition.khronos.opengles.GL10 gl) {
+                                      nativeOnDrawFrame();
+                                  }
+                              });
+                              view.setOnTouchListener(new android.view.View.OnTouchListener() {
+                                  public boolean onTouch(android.view.View v, android.view.MotionEvent e) {
+                                      nativeOnTouch(e.getActionMasked(), e.getX(), e.getY());
+                                      return true;
+                                  }
+                              });
+                              int type = (android.os.Build.VERSION.SDK_INT >= 26)
+                                  ? android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                                  : android.view.WindowManager.LayoutParams.TYPE_PHONE;
+                              android.view.WindowManager.LayoutParams lp =
+                                  new android.view.WindowManager.LayoutParams(
+                                      900, 1400, type,
+                                      android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                                      android.graphics.PixelFormat.TRANSLUCENT);
+                              lp.gravity = android.view.Gravity.TOP | android.view.Gravity.LEFT;
+                              lp.x = 50;
+                              lp.y = 200;
+                              wm.addView(view, lp);
+                              nativeLog("overlay added successfully");
+                          } catch (Throwable t) {
+                              nativeLog("startOverlay failed: " + t);
+                              android.util.Log.e("DexTool", "startOverlay failed", t);
+                          }
                       }
-                      final android.opengl.GLSurfaceView view =
-                          new android.opengl.GLSurfaceView(context);
-                      view.setEGLContextClientVersion(3);
-                      view.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
-                      view.getHolder().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
-                      view.setZOrderOnTop(true);
-                      view.setRenderer(new android.opengl.GLSurfaceView.Renderer() {
-                          @Override
-                          public void onSurfaceCreated(javax.microedition.khronos.opengles.GL10 gl,
-                                                       javax.microedition.khronos.egl.EGLConfig config) {
-                              nativeOnSurfaceCreated();
-                          }
-                          @Override
-                          public void onSurfaceChanged(javax.microedition.khronos.opengles.GL10 gl,
-                                                       int w, int h) {
-                              nativeOnSurfaceChanged(w, h);
-                          }
-                          @Override
-                          public void onDrawFrame(javax.microedition.khronos.opengles.GL10 gl) {
-                              nativeOnDrawFrame();
-                          }
-                      });
-                      view.setOnTouchListener(new android.view.View.OnTouchListener() {
-                          @Override
-                          public boolean onTouch(android.view.View v, android.view.MotionEvent e) {
-                              nativeOnTouch(e.getActionMasked(), e.getX(), e.getY());
-                              return true;
-                          }
-                      });
-                      int type = (android.os.Build.VERSION.SDK_INT >= 26)
-                          ? android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                          : android.view.WindowManager.LayoutParams.TYPE_PHONE;
-                      android.view.WindowManager.LayoutParams lp =
-                          new android.view.WindowManager.LayoutParams(
-                              800, 600, type,
-                              android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                  | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                              android.graphics.PixelFormat.TRANSLUCENT);
-                      lp.gravity = android.view.Gravity.TOP | android.view.Gravity.LEFT;
-                      lp.x = 0;
-                      lp.y = 100;
-                      wm.addView(view, lp);
-                      android.util.Log.i("DexTool", "overlay added");
-                  } catch (Throwable t) {
-                      android.util.Log.e("DexTool", "startOverlay failed: " + t, t);
-                  }
+                  });
               }
+              public static native void nativeLog(String msg);
               public static native void nativeOnSurfaceCreated();
               public static native void nativeOnSurfaceChanged(int w, int h);
               public static native void nativeOnDrawFrame();
@@ -316,13 +381,13 @@ jobs:
 
           idx = s.rstrip().rfind("}")
           if idx < 0:
-              raise SystemExit("no closing brace in Helper.java")
+              raise SystemExit("no closing brace")
           s = s[:idx] + overlay_code + "\n" + s[idx:]
           p.write_text(s)
-          print("Helper.java patched with overlay methods")
+          print("Helper.java patched")
           PYEOF
 
-      - name: Patch native-lib.cpp overlay JNI callbacks
+      - name: Patch native-lib.cpp overlay + nativeLog
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -347,11 +412,11 @@ jobs:
                   while e < len(src) and src[e] in '\n \t': e += 1
                   src = src[:start] + src[e:]
                   n += 1
-              print("rm_method[" + label + "]: removed " + str(n))
+              print("rm_method[" + label + "]: " + str(n))
               return src
 
           for name in ['nativeOnSurfaceCreated', 'nativeOnSurfaceChanged',
-                       'nativeOnDrawFrame', 'nativeOnTouch']:
+                       'nativeOnDrawFrame', 'nativeOnTouch', 'nativeLog']:
               s = rm_method(s, r'Java_com_menu_imgui_Helper_' + name + r'\s*\([^)]*\)\s*\{', name)
 
           s = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{', 'notifyMenuOpen')
@@ -408,17 +473,24 @@ jobs:
           s = '\n'.join(lines)
 
           footer = textwrap.dedent(r"""
+              extern "C" JNIEXPORT void JNICALL
+              Java_com_menu_imgui_Helper_nativeLog(JNIEnv* env, jclass, jstring msg) {
+                  if (!msg) return;
+                  const char* c = env->GetStringUTFChars(msg, nullptr);
+                  flog("%s", c);
+                  env->ReleaseStringUTFChars(msg, c);
+              }
+
               void DrawMenu() {
                   if (!g_menuVisible) return;
                   ImGuiIO& io = ImGui::GetIO();
                   ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_FirstUseEver);
                   ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_FirstUseEver);
                   if (ImGui::Begin("DexTool", &g_menuVisible)) {
-                      ImGui::Text("DexTool overlay via WindowManager");
+                      ImGui::Text("DexTool overlay");
                       ImGui::Separator();
                       static char buf[256] = "";
-                      ImGui::InputText("Test input", buf, sizeof(buf));
-                      ImGui::Text("Touch: tap inside to test");
+                      ImGui::InputText("Test", buf, sizeof(buf));
                       if (ImGui::Button("Close")) g_menuVisible = false;
                   }
                   ImGui::End();
@@ -537,7 +609,7 @@ jobs:
                   flog("[3] gum_init_embedded done");
 
                   init_frida_script();
-                  flog("[4] init_frida_script done (Frida will start overlay after 1.5s)");
+                  flog("[4] init_frida_script done");
 
                   flog("========== JNI_OnLoad done ==========");
                   return JNI_VERSION_1_6;
@@ -550,8 +622,8 @@ jobs:
               ('setup_log_path_def', r'static\s+void\s+setup_log_path\s*\(JNIEnv'),
               ('DrawMenu_def', r'void\s+DrawMenu\s*\(\s*\)'),
               ('JNI_OnLoad_def', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
+              ('nativeLog', r'Java_com_menu_imgui_Helper_nativeLog'),
               ('nativeOnSurfaceCreated', r'Java_com_menu_imgui_Helper_nativeOnSurfaceCreated'),
-              ('nativeOnDrawFrame', r'Java_com_menu_imgui_Helper_nativeOnDrawFrame'),
           ]:
               cnt = len(re.findall(pat, s))
               print("FINAL " + label + " count = " + str(cnt))
@@ -559,46 +631,56 @@ jobs:
                   raise SystemExit(4)
           PYEOF
 
-      - name: Patch PATCH_AGENT_JS to start overlay
+      - name: Patch PATCH_AGENT_JS - remove setTimeout use immediate call
         run: |
           python3 - <<'PYEOF'
-          import pathlib, textwrap
+          import re, pathlib
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
-          if "overlay started via Frida" in s:
-              print("PATCH_AGENT_JS already patched")
-              raise SystemExit(0)
+          pattern = r'log\("agent loaded"\);.*?var HOOKED = \{\};'
 
-          marker = 'log("agent loaded");'
-          if marker not in s:
-              raise SystemExit("PATCH_AGENT_JS marker not found")
+          replacement = '''log("agent loaded");
+    var foundHelper = false;
+    function jlog(m) {
+        try { send({type:"log", msg:m}); } catch(e) {}
+        if (foundHelper) {
+            try { Java.use("com.menu.imgui.Helper").nativeLog(m); } catch(e) {}
+        }
+    }
+    try {
+        var loaders = Java.enumerateClassLoadersSync();
+        jlog("loaders: " + loaders.length);
+        for (var i = 0; i < loaders.length; i++) {
+            try {
+                loaders[i].loadClass("com.menu.imgui.Helper");
+                Java.classFactory.loader = loaders[i];
+                foundHelper = true;
+                jlog("Helper found in loader " + i);
+                break;
+            } catch(e) {}
+        }
+    } catch(e) { jlog("loaders err: " + e.message); }
+    if (!foundHelper) { jlog("ERROR Helper not found"); }
+    else {
+        try {
+            var AT = Java.use("android.app.ActivityThread");
+            var app = AT.currentApplication();
+            if (!app) { jlog("no app context"); }
+            else {
+                jlog("calling startOverlay");
+                Java.use("com.menu.imgui.Helper").startOverlay(app);
+                jlog("startOverlay returned");
+            }
+        } catch(e) { jlog("overlay err: " + e.message); }
+    }
+    var HOOKED = {};'''
 
-          overlay_js = textwrap.dedent('''
-              log("agent loaded");
-              setTimeout(function() {
-                  try {
-                      var loaders = Java.enumerateClassLoadersSync();
-                      for (var i = 0; i < loaders.length; i++) {
-                          try {
-                              loaders[i].loadClass("com.menu.imgui.Helper");
-                              Java.classFactory.loader = loaders[i];
-                              break;
-                          } catch(e) {}
-                      }
-                      var AT = Java.use("android.app.ActivityThread");
-                      var app = AT.currentApplication();
-                      if (!app) { log("overlay: no app context"); return; }
-                      var Helper = Java.use("com.menu.imgui.Helper");
-                      Helper.startOverlay(app);
-                      log("overlay started via Frida");
-                  } catch(e) { log("overlay start error: " + e.message); }
-              }, 1500);
-          ''').strip()
-
-          s = s.replace(marker, overlay_js, 1)
-          p.write_text(s)
-          print("PATCH_AGENT_JS patched")
+          new_s, n = re.subn(pattern, replacement, s, count=1, flags=re.DOTALL)
+          if n == 0:
+              raise SystemExit("PATCH_AGENT_JS pattern not found")
+          p.write_text(new_s)
+          print("PATCH_AGENT_JS patched - removed setTimeout")
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
@@ -653,45 +735,40 @@ jobs:
       - name: Verify
         run: |
           FAIL=0
-          for ABI in arm64-v8a armeabi-v7a; do
-            if [ -f "app/src/main/cpp/Include/Dobby/lib/$ABI/libdobby.a" ]; then
-              echo "OK $ABI libdobby.a present"
+          if [ -f app/src/main/AndroidManifest.xml ]; then
+            if grep -qF 'SYSTEM_ALERT_WINDOW' app/src/main/AndroidManifest.xml; then
+              echo "OK SYSTEM_ALERT_WINDOW in manifest"
             else
-              echo "ERR $ABI libdobby.a missing"; FAIL=1
+              echo "ERR SYSTEM_ALERT_WINDOW missing"; FAIL=1
             fi
-          done
+          else
+            echo "ERR AndroidManifest missing"; FAIL=1
+          fi
+          if [ -f app/src/main/java/com/example/tool/MainActivity.java ]; then
+            echo "OK MainActivity present"
+          else
+            echo "ERR MainActivity missing"; FAIL=1
+          fi
           HJ="app/src/main/java/com/menu/imgui/Helper.java"
-          if grep -qF 'public static void startOverlay' "$HJ"; then
-            echo "OK Helper.java has startOverlay"
-          else
-            echo "ERR Helper.java missing startOverlay"; FAIL=1
-          fi
-          if grep -qF 'nativeOnDrawFrame' "$HJ"; then
-            echo "OK Helper.java has nativeOnDrawFrame"
-          else
-            echo "ERR Helper.java missing nativeOnDrawFrame"; FAIL=1
-          fi
+          for fn in startOverlay nativeLog nativeOnDrawFrame; do
+            if grep -qF "$fn" "$HJ"; then echo "OK Helper has $fn"; else echo "ERR Helper missing $fn"; FAIL=1; fi
+          done
           NL="app/src/main/cpp/tool/native-lib.cpp"
-          for fn in nativeOnSurfaceCreated nativeOnSurfaceChanged nativeOnDrawFrame nativeOnTouch; do
+          for fn in nativeLog nativeOnSurfaceCreated nativeOnDrawFrame nativeOnTouch; do
             C=$(grep -cF "Java_com_menu_imgui_Helper_$fn" "$NL" || true)
             if [ "$C" -eq 1 ]; then echo "OK $fn count=1"; else echo "ERR $fn count=$C"; FAIL=1; fi
           done
-          SP=$(grep -cF 'static void setup_log_path(JNIEnv* env)' "$NL" || true)
-          if [ "$SP" -eq 1 ]; then echo "OK setup_log_path count=1"; else echo "ERR setup_log_path count=$SP"; FAIL=1; fi
-          DM=$(grep -cF 'void DrawMenu()' "$NL" || true)
-          if [ "$DM" -eq 1 ]; then echo "OK DrawMenu count=1"; else echo "ERR DrawMenu count=$DM"; FAIL=1; fi
-          JL=$(grep -cF 'JNIEXPORT jint JNICALL JNI_OnLoad' "$NL" || true)
-          if [ "$JL" -eq 1 ]; then echo "OK JNI_OnLoad count=1"; else echo "ERR JNI_OnLoad count=$JL"; FAIL=1; fi
-          if grep -qF 'overlay started via Frida' "$NL"; then
-            echo "OK PATCH_AGENT_JS has overlay start"
+          if grep -qF 'setTimeout' "$NL"; then
+            echo "ERR setTimeout still in JS"; FAIL=1
           else
-            echo "ERR PATCH_AGENT_JS missing overlay start"; FAIL=1
+            echo "OK setTimeout removed"
           fi
-          if [ $FAIL -ne 0 ]; then
-            echo "=== Helper.java tail ==="; tail -60 "$HJ" || true
-            echo "=== native-lib.cpp grep ==="; grep -n 'startOverlay\|nativeOn' "$NL" | head -20 || true
-            exit 1
+          if grep -qF 'calling startOverlay' "$NL"; then
+            echo "OK JS calls startOverlay"
+          else
+            echo "ERR JS missing startOverlay call"; FAIL=1
           fi
+          if [ $FAIL -ne 0 ]; then exit 1; fi
           echo "ALL CHECKS PASSED"
 
       - uses: gradle/actions/setup-gradle@v3
@@ -722,5 +799,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: use textwrap.dedent for overlay_code and overlay_js to preserve YAML block indent [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: manifest+MainActivity with SYSTEM_ALERT_WINDOW, remove setTimeout, main-thread addView [skip ci]"
           git push
