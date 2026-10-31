@@ -29,43 +29,44 @@ jobs:
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
 
-      - name: Gitignore Dobby (remove corrupted from tracking)
+      - name: Download Prebuilt Dobby (release v0.4.0)
         run: |
-          echo "app/src/main/cpp/Include/Dobby/" >> .gitignore
-          git rm -r --cached app/src/main/cpp/Include/Dobby 2>/dev/null || true
+          set -e
+          mkdir -p /tmp/dobby-prebuilt
+          wget -q https://github.com/jmpews/Dobby/releases/download/v0.4.0/dobby-android-all.tar.gz -O /tmp/dobby.tar.gz
+          tar -xzf /tmp/dobby.tar.gz -C /tmp/dobby-prebuilt
+          echo "=== Extracted Dobby contents ==="
+          find /tmp/dobby-prebuilt -maxdepth 3 -type f | sort
+          echo "=== libdobby.a files ==="
+          find /tmp/dobby-prebuilt -name "libdobby.a" -o -name "libdobby.so" | sort
 
-      - name: Clone Dobby FRESH
+      - name: Stage Dobby into project
         run: |
-          rm -rf app/src/main/cpp/Include/Dobby
-          git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
-
-      - name: "Patch Dobby ARM64 asm (no prefix for adrp, #:lo12: for add)"
-        run: |
-          python3 - <<'PYEOF'
-          import re, pathlib
-
-          patched = 0
-          for p in pathlib.Path("app/src/main/cpp/Include/Dobby").rglob("*.asm"):
-              orig = p.read_text()
-              # 1) @PAGEOFF -> #:lo12:  (with #, required for add)
-              new = re.sub(r'(\S+?)@PAGEOFF\b', r'#:lo12:\1', orig)
-              # 2) @PAGE -> "" (no prefix at all for adrp on Android/clang)
-              new = re.sub(r'(\S+?)@PAGE\b', r'\1', new)
-              if new != orig:
-                  p.write_text(new)
-                  patched += 1
-                  print(f"Patched: {p}")
-          print(f"Total patched: {patched}")
-          if patched == 0:
-              raise SystemExit("ERROR: no .asm file patched!")
-
-          f = pathlib.Path("app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm")
-          if f.exists():
-              print("=== AFTER (relevant lines) ===")
-              for i, line in enumerate(f.read_text().split('\n'), 1):
-                  if any(k in line for k in ['adrp', 'add TMP_REG', 'lo12']):
-                      print(f"{i}: {line}")
-          PYEOF
+          set -e
+          # Locate arm64 and armv7 libs (release layout may vary)
+          ARM64_LIB=$(find /tmp/dobby-prebuilt -path "*arm64-v8a*" -name "libdobby.a" | head -1)
+          ARMV7_LIB=$(find /tmp/dobby-prebuilt -path "*armeabi-v7a*" -name "libdobby.a" | head -1)
+          if [ -z "$ARM64_LIB" ] || [ -z "$ARMV7_LIB" ]; then
+            echo "Could not find libdobby.a for both ABIs. Listing all .a files:"
+            find /tmp/dobby-prebuilt -name "*.a"
+            exit 1
+          fi
+          echo "ARM64_LIB=$ARM64_LIB"
+          echo "ARMV7_LIB=$ARMV7_LIB"
+          mkdir -p app/src/main/cpp/Include/Dobby/lib/arm64-v8a
+          mkdir -p app/src/main/cpp/Include/Dobby/lib/armeabi-v7a
+          cp "$ARM64_LIB" app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a
+          cp "$ARMV7_LIB" app/src/main/cpp/Include/Dobby/lib/armeabi-v7a/libdobby.a
+          # Copy headers (include/dobby.h and any others)
+          mkdir -p app/src/main/cpp/Include/Dobby/include
+          HEADER_DIR=$(dirname "$(find /tmp/dobby-prebuilt -name "dobby.h" | head -1)")
+          if [ -n "$HEADER_DIR" ]; then
+            cp -rv "$HEADER_DIR"/. app/src/main/cpp/Include/Dobby/include/
+          else
+            echo "dobby.h not found; assuming headers are already present in repo."
+          fi
+          echo "=== Staged Dobby ==="
+          find app/src/main/cpp/Include/Dobby -maxdepth 3 -type f | sort
 
       - name: Download Frida devkit
         run: |
@@ -89,7 +90,7 @@ jobs:
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
           rm -rf build
-          ./configure --host=android-arm64 -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static 2>&1 | tee /tmp/a64.log
+          ./configure --host=android-arm64 -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a64.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a64.log; exit 1; }
           make -j$(nproc) 2>&1 | tee -a /tmp/a64.log
           LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
@@ -113,7 +114,7 @@ jobs:
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
           rm -rf build
-          ./configure --host=android-arm -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static 2>&1 | tee /tmp/a32.log
+          ./configure --host=android-arm -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a32.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a32.log; exit 1; }
           make -j$(nproc) 2>&1 | tee -a /tmp/a32.log
           LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
@@ -337,7 +338,7 @@ jobs:
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
 
-      - name: "Write CMakeLists.txt (Dobby ASM: no adrp prefix, #:lo12: for add)"
+      - name: Write CMakeLists.txt (prebuilt Dobby)
         run: |
           cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
           cmake_minimum_required(VERSION 3.22.1)
@@ -347,22 +348,16 @@ jobs:
           set(CMAKE_CXX_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
           if(${ANDROID_ABI} STREQUAL "arm64-v8a")
               set(FRIDA_DIR /tmp/frida-built/arm64-v8a)
+              set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Include/Dobby/lib/arm64-v8a)
           else()
               set(FRIDA_DIR /tmp/frida-built/armeabi-v7a)
+              set(DOBBY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Include/Dobby/lib/armeabi-v7a)
           endif()
           include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
           add_library(frida-gumjs STATIC IMPORTED)
           set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
-
-          if(ANDROID AND ${ANDROID_ABI} STREQUAL "arm64-v8a")
-              set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
-          endif()
-          set_source_files_properties(
-              Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
-              PROPERTIES LANGUAGE ASM
-          )
-
-          add_subdirectory(Include/Dobby dobby.out)
+          add_library(dobby STATIC IMPORTED)
+          set_target_properties(dobby PROPERTIES IMPORTED_LOCATION ${DOBBY_DIR}/libdobby.a)
           include_directories(Include Include/Dobby/include imgui imgui/backends tool)
           add_library(tool SHARED
               tool/native-lib.cpp
@@ -378,32 +373,35 @@ jobs:
       - name: Verify
         run: |
           FAIL=0
-          ASM="app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
-
-          if grep -qE '@PAGE|@PAGEOFF|:pg_hi21:' "$ASM"; then
-            echo "ERR invalid token still present"; grep -nE '@PAGE|@PAGEOFF|:pg_hi21:' "$ASM"; FAIL=1
+          # Check prebuilt Dobby libs exist
+          if [ -f app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a ]; then
+            echo "OK arm64 libdobby.a present"
           else
-            echo "OK no invalid tokens (@PAGE, @PAGEOFF, :pg_hi21: all gone)"
+            echo "ERR arm64 libdobby.a missing"; FAIL=1
           fi
-
-          if grep -qF 'adrp TMP_REG_0, cdecl(common_closure_bridge_handler)' "$ASM"; then
-            echo "OK adrp has no prefix (correct for clang)"
+          if [ -f app/src/main/cpp/Include/Dobby/lib/armeabi-v7a/libdobby.a ]; then
+            echo "OK armv7 libdobby.a present"
           else
-            echo "ERR adrp prefix check failed"; grep -n 'adrp' "$ASM"; FAIL=1
+            echo "ERR armv7 libdobby.a missing"; FAIL=1
           fi
-
-          if grep -qF '#:lo12:cdecl(common_closure_bridge_handler)' "$ASM"; then
-            echo "OK #:lo12:cdecl(...) present (with #)"
+          if [ -f app/src/main/cpp/Include/Dobby/include/dobby.h ]; then
+            echo "OK dobby.h present"
           else
-            echo "ERR #:lo12:cdecl(...) missing"; grep -n 'add TMP_REG_0' "$ASM" | head -5; FAIL=1
+            echo "ERR dobby.h missing"; FAIL=1
           fi
-
           NL="app/src/main/cpp/tool/native-lib.cpp"
-          if grep -qF 'static JavaVM* g_jvm = nullptr;' "$NL"; then echo "OK g_jvm declared"; else echo "ERR g_jvm missing"; FAIL=1; fi
-          if [ "$(grep -c 'JNI_OnLoad' "$NL" || true)" -eq 1 ]; then echo "OK exactly one JNI_OnLoad"; else echo "ERR JNI_OnLoad count != 1"; FAIL=1; fi
-
+          if grep -qF 'static JavaVM* g_jvm = nullptr;' "$NL"; then
+            echo "OK g_jvm declared"
+          else
+            echo "ERR g_jvm missing"; FAIL=1
+          fi
+          if [ "$(grep -c 'JNI_OnLoad' "$NL" || true)" -eq 1 ]; then
+            echo "OK exactly one JNI_OnLoad"
+          else
+            echo "ERR JNI_OnLoad count != 1"; grep -n 'JNI_OnLoad' "$NL"; FAIL=1
+          fi
           if [ $FAIL -ne 0 ]; then
-            echo "=== $ASM (full) ==="; head -80 "$ASM"
+            echo "=== Dobby staged tree ==="; find app/src/main/cpp/Include/Dobby -maxdepth 3 -type f | sort
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -436,5 +434,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: adrp no prefix (clang) + #:lo12: for add [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: use prebuilt Dobby release v0.4.0 to avoid source compile errors [skip ci]"
           git push
