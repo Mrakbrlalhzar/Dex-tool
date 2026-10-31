@@ -468,10 +468,10 @@ jobs:
           s = '\n'.join(lines)
 
           for label, pat in [
-              ('setup_log_path', r'static\s+void\s+setup_log_path'),
-              ('DrawMenu', r'void\s+DrawMenu\s*\('),
-              ('JNI_OnLoad', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
-              ('notifyMenuOpen', r'notifyMenuOpen'),
+              ('setup_log_path_def', r'static\s+void\s+setup_log_path\s*\(JNIEnv'),
+              ('DrawMenu_def', r'void\s+DrawMenu\s*\(\s*\)'),
+              ('JNI_OnLoad_def', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
+              ('notifyMenuOpen_def', r'void\s+notifyMenuOpen'),
           ]:
               cnt = len(re.findall(pat, s))
               if cnt != 0:
@@ -583,9 +583,9 @@ jobs:
           p.write_text(s)
 
           for label, pat in [
-              ('setup_log_path', r'static\s+void\s+setup_log_path'),
-              ('DrawMenu', r'void\s+DrawMenu\s*\('),
-              ('JNI_OnLoad', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
+              ('setup_log_path_def', r'static\s+void\s+setup_log_path\s*\(JNIEnv'),
+              ('DrawMenu_def', r'void\s+DrawMenu\s*\(\s*\)'),
+              ('JNI_OnLoad_def', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
           ]:
               cnt = len(re.findall(pat, s))
               print("FINAL " + label + " count = " + str(cnt))
@@ -665,14 +665,14 @@ jobs:
             echo "ERR Input.h still passes thiz"; FAIL=1
           fi
           NL="app/src/main/cpp/tool/native-lib.cpp"
-          for label in setup_log_path DrawMenu; do
-            C=$(grep -cF "$label" "$NL" || true)
-            if [ "$C" -eq 1 ]; then echo "OK $label count=1"; else echo "ERR $label count=$C"; FAIL=1; fi
-          done
+          SP=$(grep -cF 'static void setup_log_path(JNIEnv* env)' "$NL" || true)
+          if [ "$SP" -eq 1 ]; then echo "OK setup_log_path definition count=1"; else echo "ERR setup_log_path definition count=$SP"; FAIL=1; fi
+          DM=$(grep -cF 'void DrawMenu()' "$NL" || true)
+          if [ "$DM" -eq 1 ]; then echo "OK DrawMenu definition count=1"; else echo "ERR DrawMenu definition count=$DM"; FAIL=1; fi
           JL=$(grep -cF 'JNIEXPORT jint JNICALL JNI_OnLoad' "$NL" || true)
-          if [ "$JL" -eq 1 ]; then echo "OK JNI_OnLoad count=1"; else echo "ERR JNI_OnLoad count=$JL"; FAIL=1; fi
-          NM=$(grep -cF 'notifyMenuOpen' "$NL" || true)
-          if [ "$NM" -eq 0 ]; then echo "OK no notifyMenuOpen"; else echo "ERR notifyMenuOpen=$NM"; FAIL=1; fi
+          if [ "$JL" -eq 1 ]; then echo "OK JNI_OnLoad definition count=1"; else echo "ERR JNI_OnLoad definition count=$JL"; FAIL=1; fi
+          NM=$(grep -cF 'void notifyMenuOpen' "$NL" || true)
+          if [ "$NM" -eq 0 ]; then echo "OK no notifyMenuOpen definition"; else echo "ERR notifyMenuOpen=$NM"; FAIL=1; fi
           if [ $FAIL -ne 0 ]; then exit 1; fi
           echo "ALL CHECKS PASSED"
 
@@ -704,5 +704,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: YAML step names without colon-space to avoid syntax error [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: Verify counts only function definitions, not call sites [skip ci]"
           git push
