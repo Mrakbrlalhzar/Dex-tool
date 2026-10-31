@@ -36,13 +36,8 @@ static std::mutex gCallLogMutex;
 #define MY_PI 3.14159265358979323846f
 #define LOG_TAG "ImGuiTool"
 #ifndef LOGI
-#ifndef LOGI
-#ifndef LOGI
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #endif
-#endif
-#endif
-
 static jclass gHelperClass = nullptr;
 static ANativeWindow* gWindow = nullptr;
 static bool gInitialized = false;
@@ -802,8 +797,7 @@ void DrawMenu() {
 }
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
-    gVM = vm;
-    g_jvm = vm;
+    gVM = vm; g_jvm = vm;
     JNIEnv* env = nullptr;
     if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
     loadDex(env);

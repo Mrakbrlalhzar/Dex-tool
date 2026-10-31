@@ -28,9 +28,9 @@ static EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf) {
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
     if (!imgui_sw_initialized) {
         ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.DisplaySize = ImVec2((float)w, (float)h);
-        io.IniFilename = nullptr;
+        ImGuiIO& io0 = ImGui::GetIO();
+        io0.DisplaySize = ImVec2((float)w, (float)h);
+        io0.IniFilename = nullptr;
         ImGui_ImplAndroid_Init(nullptr);
         ImGui_ImplOpenGL3_Init("#version 300 es");
         imgui_sw_initialized = true;
@@ -38,8 +38,8 @@ static EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf) {
     }
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)w, (float)h);
+    io.DeltaTime = 1.0f / 60.0f;
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
     if (menuAddress) menuAddress();
     ImGui::Render();
