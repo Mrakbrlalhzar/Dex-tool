@@ -1,0 +1,449 @@
+name: "Frida GumJS Slim (Source)"
+
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip ninja-build pkg-config libglib2.0-dev unzip curl zipalign xxd
+          pip3 install --quiet --upgrade pip
+          pip3 install --quiet meson
+          wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip -O /tmp/ndk-r25c.zip
+          unzip -q /tmp/ndk-r25c.zip -d /tmp/
+          echo "NDK_PATH=/tmp/android-ndk-r25c" >> $GITHUB_ENV
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+
+      - name: Gitignore Dobby (remove corrupted from tracking)
+        run: |
+          echo "app/src/main/cpp/Include/Dobby/" >> .gitignore
+          git rm -r --cached app/src/main/cpp/Include/Dobby 2>/dev/null || true
+          echo "=== .gitignore ==="
+          cat .gitignore
+
+      - name: Clone Dobby FRESH
+        run: |
+          rm -rf app/src/main/cpp/Include/Dobby
+          git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
+          echo "=== fresh Dobby original asm (before patch) ==="
+          head -60 app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm || true
+
+      - name: Patch Dobby ARM64 asm (handles cdecl(...) correctly)
+        run: |
+          python3 - <<'PYEOF'
+          import re, pathlib
+
+          patched = 0
+          for p in pathlib.Path("app/src/main/cpp/Include/Dobby").rglob("*.asm"):
+              orig = p.read_text()
+              # \S+? matches any non-whitespace token, including "cdecl(sym)"
+              # Order: @PAGEOFF first, then @PAGE (with \b to avoid matching inside @PAGEOFF)
+              new = re.sub(r'(\S+?)@PAGEOFF\b', r':lo12:\1', orig)
+              new = re.sub(r'(\S+?)@PAGE\b', r':pg_hi21:\1', new)
+              if new != orig:
+                  p.write_text(new)
+                  patched += 1
+                  print(f"Patched: {p}")
+          print(f"Total patched: {patched}")
+          if patched == 0:
+              print("WARNING: no .asm file was patched! Check Dobby layout.")
+              raise SystemExit(1)
+
+          f = pathlib.Path("app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm")
+          if f.exists():
+              print("=== AFTER (relevant lines) ===")
+              for i, line in enumerate(f.read_text().split('\n'), 1):
+                  if any(k in line for k in ['pg_hi21', 'lo12', 'adrp', 'add TMP_REG']):
+                      print(f"{i}: {line}")
+          PYEOF
+
+      - name: Download Frida devkit
+        run: |
+          set -e
+          V=17.1.0
+          B="https://github.com/frida/frida/releases/download/$V"
+          wget -q "$B/frida-gumjs-devkit-$V-android-arm64.tar.xz" -O /tmp/dk64.tar.xz
+          mkdir -p /tmp/dk64 && tar -xf /tmp/dk64.tar.xz -C /tmp/dk64
+          wget -q "$B/frida-gumjs-devkit-$V-android-arm.tar.xz" -O /tmp/dk32.tar.xz
+          mkdir -p /tmp/dk32 && tar -xf /tmp/dk32.tar.xz -C /tmp/dk32
+
+      - name: Clone frida-gum
+        run: |
+          git clone --recursive --depth 1 --branch 17.1.0 https://github.com/frida/frida-gum.git /tmp/frida-gum
+          cd /tmp/frida-gum
+          sed -i '1i void glib_init(void);' bindings/gumjs/gumquickcompile.c
+
+      - name: Build arm64
+        run: |
+          set -o pipefail
+          cd /tmp/frida-gum
+          export ANDROID_NDK_ROOT="$NDK_PATH"
+          rm -rf build
+          ./configure --host=android-arm64 -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a64.log
+          [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a64.log; exit 1; }
+          make -j$(nproc) 2>&1 | tee -a /tmp/a64.log
+          LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
+          [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true)
+          [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
+          D=/tmp/frida-built/arm64-v8a
+          rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
+          cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
+          cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
+          G=$(find /tmp/dk64 -name "frida-gum.h" | head -1 || true)
+          if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; fi
+          GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
+          if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
+          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; fi
+          ls -lah "$D/lib/"
+
+      - name: Build armv7
+        run: |
+          set -o pipefail
+          cd /tmp/frida-gum
+          export ANDROID_NDK_ROOT="$NDK_PATH"
+          rm -rf build
+          ./configure --host=android-arm -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a32.log
+          [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a32.log; exit 1; }
+          make -j$(nproc) 2>&1 | tee -a /tmp/a32.log
+          LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
+          [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true)
+          [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
+          D=/tmp/frida-built/armeabi-v7a
+          rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
+          cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
+          cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
+          G=$(find /tmp/dk32 -name "frida-gum.h" | head -1 || true)
+          if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; fi
+          GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
+          if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
+          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; fi
+          ls -lah "$D/lib/"
+
+      - name: Write Include/ImGui.h
+        run: |
+          mkdir -p app/src/main/cpp/Include
+          cat > app/src/main/cpp/Include/ImGui.h <<'IMGUIEOF'
+          #pragma once
+          #include <EGL/egl.h>
+          #include <android/log.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <cstring>
+          #include "imgui.h"
+          #include "imgui_impl_opengl3.h"
+          #include "imgui_impl_android.h"
+          #include "Dobby/include/dobby.h"
+          #ifndef LOGI
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "DexTool", __VA_ARGS__)
+          #endif
+          using swapbuffers_orig = EGLBoolean (*)(EGLDisplay, EGLSurface);
+          static swapbuffers_orig o_swapbuffers = nullptr;
+          static bool imgui_sw_initialized = false;
+          static void (*menuAddress)() = nullptr;
+          static bool isLibraryLoaded(const char *name) {
+              FILE *fp = fopen("/proc/self/maps", "rt");
+              if (!fp) return false;
+              char line[512];
+              while (fgets(line, sizeof(line), fp)) { if (strstr(line, name)) { fclose(fp); return true; } }
+              fclose(fp); return false;
+          }
+          static EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf) {
+              EGLint w = 0, h = 0;
+              eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
+              eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+              if (!imgui_sw_initialized) {
+                  ImGui::CreateContext();
+                  ImGuiIO& io0 = ImGui::GetIO();
+                  io0.DisplaySize = ImVec2((float)w, (float)h);
+                  io0.IniFilename = nullptr;
+                  ImGui_ImplAndroid_Init(nullptr);
+                  ImGui_ImplOpenGL3_Init("#version 300 es");
+                  imgui_sw_initialized = true;
+                  LOGI("ImGui initialized %dx%d", w, h);
+              }
+              ImGuiIO& io = ImGui::GetIO();
+              io.DisplaySize = ImVec2((float)w, (float)h);
+              io.DeltaTime = 1.0f / 60.0f;
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui::NewFrame();
+              if (menuAddress) menuAddress();
+              ImGui::Render();
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+              return o_swapbuffers(dpy, surf);
+          }
+          void *initModMenu(void *menu_addr) {
+              menuAddress = (void (*)())menu_addr;
+              while (!isLibraryLoaded("libEGL.so")) sleep(1);
+              auto swapBuffers = (uintptr_t)DobbySymbolResolver("libEGL.so", "eglSwapBuffers");
+              DobbyHook((void*)swapBuffers, (void*)swapbuffers_hook, (void**)&o_swapbuffers);
+              LOGI("eglSwapBuffers hooked");
+              return nullptr;
+          }
+          IMGUIEOF
+
+      - name: Write Include/Input.h
+        run: |
+          cat > app/src/main/cpp/Include/Input.h <<'INPUTEOF'
+          #pragma once
+          #include <android/input.h>
+          #include <cstdint>
+          #include "Dobby/include/dobby.h"
+          using Input_orig = void (*)(void*, void*, void*);
+          static Input_orig o_input = nullptr;
+          static void input_hook(void* thiz, void* ex_ab, void* ex_ac) {
+              o_input(thiz, ex_ab, ex_ac);
+              ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+          }
+          using Consume_orig = int32_t (*)(void*, void*, bool, long, uint32_t*, AInputEvent**);
+          static Consume_orig o_consume = nullptr;
+          static int32_t consume_hook(void* thiz, void* factory, bool raw, long seq, uint32_t* flags, AInputEvent** event) {
+              int32_t ret = o_consume(thiz, factory, raw, seq, flags, event);
+              if (ret == 0 && event && *event) ImGui_ImplAndroid_HandleInputEvent(*event);
+              return ret;
+          }
+          static void hookInput() {
+              void* sym = DobbySymbolResolver("libinput.so", "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE");
+              if (sym) { DobbyHook(sym, (void*)input_hook, (void**)&o_input); LOGI("input hooked (legacy)"); return; }
+              sym = DobbySymbolResolver("libinput.so", "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE");
+              if (sym) { DobbyHook(sym, (void*)consume_hook, (void**)&o_consume); LOGI("consume hooked (Android 15+)"); }
+          }
+          INPUTEOF
+
+      - name: Patch native-lib.cpp
+        run: |
+          python3 - <<'PYEOF'
+          import re, pathlib, textwrap
+          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
+          s = p.read_text()
+
+          def rm_method(src, pat):
+              n = 0
+              while True:
+                  m = re.search(pat, src)
+                  if not m: break
+                  i = src.index('{', m.end()-1); d=0; e=-1
+                  for k in range(i, len(src)):
+                      if src[k]=='{': d+=1
+                      elif src[k]=='}':
+                          d-=1
+                          if d==0: e=k+1; break
+                  if e<0: break
+                  start = m.start()
+                  ext = src.rfind('extern "C"', max(0, m.start()-300), m.start())
+                  if ext >= 0 and ext < start: start = ext
+                  while e < len(src) and src[e] in '\n \t': e += 1
+                  src = src[:start] + src[e:]
+                  n += 1
+              return src, n
+
+          s, _ = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'void\s+DrawMenu\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{')
+
+          for pat in [
+              r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?',
+              r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+g_jvm\s*=\s*nullptr\s*;\s*\n?',
+              r'(?m)^[ \t]*(?:static\s+)?bool\s+g_menuVisible\s*=\s*true\s*;\s*\n?',
+              r'(?m)^[ \t]*(?:static\s+)?bool\s+gMenuOpen\s*=\s*false\s*;\s*\n?',
+          ]:
+              s = re.sub(pat, '', s)
+
+          s = s.replace('#include "Include/ImGui.h"', '')
+          s = s.replace('#include "Include/Input.h"', '')
+          if '#include "ImGui.h"' not in s:
+              s = s.replace('#include "dex_data.h"', '#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
+
+          s = re.sub(r'(?:#ifndef LOGI\s*\n)+', '#ifndef LOGI\n', s)
+          s = re.sub(r'(?:#endif\s*\n)+', '#endif\n', s)
+
+          lines = s.split('\n')
+          insert_at = None
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if not stripped: continue
+              if stripped.startswith('#'): continue
+              if stripped.startswith('//'): continue
+              if stripped.startswith('/*'): continue
+              if stripped.startswith('*'): continue
+              insert_at = i
+              break
+          if insert_at is None: raise SystemExit(2)
+          lines[insert_at:insert_at] = [
+              'static JavaVM* gVM = nullptr;',
+              'static JavaVM* g_jvm = nullptr;',
+              'static bool g_menuVisible = true;',
+              'static bool gMenuOpen = false;',
+              '',
+          ]
+          s = '\n'.join(lines)
+
+          footer = textwrap.dedent(r"""
+              void DrawMenu() {
+                  if (!g_menuVisible) return;
+                  ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
+                  if (ImGui::Begin("DexTool", &g_menuVisible)) {
+                      ImGui::Text("DexTool via eglSwapBuffers + libinput hooks");
+                      ImGui::Separator();
+                      static char buf[256] = "";
+                      ImGui::InputText("Test input", buf, sizeof(buf));
+                      if (ImGui::Button("Close")) g_menuVisible = false;
+                  }
+                  ImGui::End();
+              }
+
+              extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+                  gVM = vm; g_jvm = vm;
+                  JNIEnv* env = nullptr;
+                  if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
+                  loadDex(env);
+                  gum_init_embedded();
+                  init_frida_script();
+                  pthread_t t;
+                  pthread_create(&t, nullptr, initModMenu, (void*)DrawMenu);
+                  hookInput();
+                  return JNI_VERSION_1_6;
+              }
+          """).strip()
+          s = s.rstrip() + "\n\n" + footer + "\n"
+          p.write_text(s)
+          PYEOF
+
+      - name: Remove OverlaySurfaceView.java
+        run: |
+          rm -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
+
+      - name: Rebuild dex_data.h
+        run: |
+          set -e
+          ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -1)
+          D8=$(find "$ANDROID_HOME/build-tools" -name "d8" | sort -V | tail -1)
+          rm -rf /tmp/dex_build /tmp/dex_out
+          mkdir -p /tmp/dex_build /tmp/dex_out
+          javac -source 8 -target 8 -Xlint:-options -cp "$ANDROID_JAR" -d /tmp/dex_build app/src/main/java/com/menu/imgui/Helper.java 2>&1 | tee /tmp/javac.log
+          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "JAVAC_FAILED"; cat /tmp/javac.log; exit 1; }
+          "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
+          [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
+          xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
+
+      - name: Write CMakeLists.txt (with Dobby asm march fix)
+        run: |
+          cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project("tool")
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_BUILD_TYPE Release)
+          set(CMAKE_CXX_FLAGS_RELEASE "-Oz -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden")
+          if(${ANDROID_ABI} STREQUAL "arm64-v8a")
+              set(FRIDA_DIR /tmp/frida-built/arm64-v8a)
+          else()
+              set(FRIDA_DIR /tmp/frida-built/armeabi-v7a)
+          endif()
+          include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
+          add_library(frida-gumjs STATIC IMPORTED)
+          set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
+          if(ANDROID AND ${ANDROID_ABI} STREQUAL "arm64-v8a")
+              set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
+          endif()
+          add_subdirectory(Include/Dobby dobby.out)
+          include_directories(Include Include/Dobby/include imgui imgui/backends tool)
+          add_library(tool SHARED
+              tool/native-lib.cpp
+              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
+              imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
+          if(${ANDROID_ABI} STREQUAL "arm64-v8a")
+              target_compile_options(tool PRIVATE -march=armv8-a)
+          endif()
+          target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
+          target_link_libraries(tool dobby frida-gumjs android log EGL GLESv3 dl)
+          CMEOF
+
+      - name: Verify
+        run: |
+          FAIL=0
+          ASM="app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
+
+          if grep -qE '@PAGE|@PAGEOFF' "$ASM"; then
+            echo "ERR raw @PAGE/@PAGEOFF still present"; grep -nE '@PAGE|@PAGEOFF' "$ASM"; FAIL=1
+          else
+            echo "OK no raw @PAGE/@PAGEOFF"
+          fi
+
+          if grep -qF ':pg_hi21:cdecl(common_closure_bridge_handler)' "$ASM"; then
+            echo "OK :pg_hi21:cdecl(...) present"
+          else
+            echo "ERR :pg_hi21:cdecl(...) missing"; grep -n 'adrp' "$ASM"; FAIL=1
+          fi
+
+          if grep -qF ':lo12:cdecl(common_closure_bridge_handler)' "$ASM"; then
+            echo "OK :lo12:cdecl(...) present"
+          else
+            echo "ERR :lo12:cdecl(...) missing"; grep -n 'add TMP_REG_0' "$ASM" | head -5; FAIL=1
+          fi
+
+          NL="app/src/main/cpp/tool/native-lib.cpp"
+          if grep -qF 'static JavaVM* g_jvm = nullptr;' "$NL"; then
+            echo "OK g_jvm declared"
+          else
+            echo "ERR g_jvm missing"; FAIL=1
+          fi
+
+          if [ "$(grep -c 'JNI_OnLoad' "$NL" || true)" -eq 1 ]; then
+            echo "OK exactly one JNI_OnLoad"
+          else
+            echo "ERR JNI_OnLoad count != 1"; grep -n 'JNI_OnLoad' "$NL"; FAIL=1
+          fi
+
+          if [ $FAIL -ne 0 ]; then
+            echo "=== $ASM (full) ==="; head -80 "$ASM"
+            echo "=== $NL (JNI_OnLoad context) ==="; grep -n -A2 -B2 'JNI_OnLoad' "$NL" || true
+            exit 1
+          fi
+          echo "ALL CHECKS PASSED"
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+
+      - name: Build APK
+        run: |
+          if [ ! -s gradlew ]; then gradle wrapper --gradle-version 8.5; fi
+          chmod +x gradlew
+          rm -rf app/.cxx app/build .gradle
+          ./gradlew :app:assembleDebug --no-build-cache
+
+      - name: Zipalign
+        run: |
+          APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          cp "$APK" /tmp/un.apk
+          zipalign -p -f 4 /tmp/un.apk "$APK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-slim
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Commit
+        if: always()
+        run: |
+          git config user.name "gh"
+          git config user.email "gh@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "fix: regex handles cdecl(...) in Dobby asm patch [skip ci]"
+          git push
