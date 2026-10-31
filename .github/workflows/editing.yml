@@ -29,38 +29,34 @@ jobs:
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
 
-      - name: Download Prebuilt Dobby (release v0.4.0)
+      - name: Download Prebuilt Dobby (from 3equals3/DobbyHook)
         run: |
           set -e
-          mkdir -p /tmp/dobby-prebuilt
-          wget -q https://github.com/jmpews/Dobby/releases/download/v0.4.0/dobby-android-all.tar.gz -O /tmp/dobby.tar.gz
-          tar -xzf /tmp/dobby.tar.gz -C /tmp/dobby-prebuilt
-          echo "=== Extracted Dobby contents ==="
-          find /tmp/dobby-prebuilt -maxdepth 3 -type f | sort
-          echo "=== libdobby.a files ==="
-          find /tmp/dobby-prebuilt -name "libdobby.a" -o -name "libdobby.so" | sort
+          BASE="https://raw.githubusercontent.com/3equals3/DobbyHook/main"
+          mkdir -p /tmp/dobby-prebuilt/arm64-v8a
+          mkdir -p /tmp/dobby-prebuilt/armeabi-v7a
+          echo "=== Downloading arm64-v8a/libdobby.a ==="
+          wget -q "$BASE/arm64-v8a/libdobby.a" -O /tmp/dobby-prebuilt/arm64-v8a/libdobby.a
+          ls -lah /tmp/dobby-prebuilt/arm64-v8a/libdobby.a
+          echo "=== Downloading armeabi-v7a/libdobby.a ==="
+          wget -q "$BASE/armeabi-v7a/libdobby.a" -O /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a
+          ls -lah /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a
+          echo "=== Downloading Dobby.h ==="
+          wget -q "$BASE/Dobby.h" -O /tmp/dobby-prebuilt/Dobby.h
+          ls -lah /tmp/dobby-prebuilt/Dobby.h
+          echo "=== Verify ELF magic ==="
+          file /tmp/dobby-prebuilt/arm64-v8a/libdobby.a || true
+          file /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a || true
 
       - name: Stage Dobby into project
         run: |
           set -e
-          ARM64_LIB=$(find /tmp/dobby-prebuilt -path "*arm64-v8a*" -name "libdobby.a" | head -1)
-          ARMV7_LIB=$(find /tmp/dobby-prebuilt -path "*armeabi-v7a*" -name "libdobby.a" | head -1)
-          if [ -z "$ARM64_LIB" ] || [ -z "$ARMV7_LIB" ]; then
-            echo "Could not find libdobby.a for both ABIs. Listing all .a files:"
-            find /tmp/dobby-prebuilt -name "*.a"
-            exit 1
-          fi
-          echo "ARM64_LIB=$ARM64_LIB"
-          echo "ARMV7_LIB=$ARMV7_LIB"
           mkdir -p app/src/main/cpp/Include/Dobby/lib/arm64-v8a
           mkdir -p app/src/main/cpp/Include/Dobby/lib/armeabi-v7a
-          cp "$ARM64_LIB" app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a
-          cp "$ARMV7_LIB" app/src/main/cpp/Include/Dobby/lib/armeabi-v7a/libdobby.a
           mkdir -p app/src/main/cpp/Include/Dobby/include
-          HEADER_DIR=$(dirname "$(find /tmp/dobby-prebuilt -name "dobby.h" | head -1)")
-          if [ -n "$HEADER_DIR" ]; then
-            cp -rv "$HEADER_DIR"/. app/src/main/cpp/Include/Dobby/include/
-          fi
+          cp /tmp/dobby-prebuilt/arm64-v8a/libdobby.a  app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a
+          cp /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a app/src/main/cpp/Include/Dobby/lib/armeabi-v7a/libdobby.a
+          cp /tmp/dobby-prebuilt/Dobby.h app/src/main/cpp/Include/Dobby/include/dobby.h
           echo "=== Staged Dobby ==="
           find app/src/main/cpp/Include/Dobby -maxdepth 3 -type f | sort
 
@@ -435,12 +431,10 @@ jobs:
           s = s.replace('#include "Input.h"', '')
           s = s.replace('#include "Log.h"', '')
 
-          # Insert our headers after the first #include line
           if '#include "dex_data.h"' in s:
               s = s.replace('#include "dex_data.h"',
                             '#include "Log.h"\n#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
           else:
-              # Fallback: insert after the first include
               lines = s.split('\n')
               for i, line in enumerate(lines):
                   if line.strip().startswith('#include'):
@@ -501,7 +495,6 @@ jobs:
                   }
                   if (!ext.empty()) {
                       snprintf(g_log_path, sizeof(g_log_path), "%s/DexTool.log", ext.c_str());
-                      // Try Downloads (may fail on Android 10+ without permission)
                       const char* downloads[] = {
                           "/sdcard/Download/DexTool.log",
                           "/storage/emulated/0/Download/DexTool.log",
@@ -659,10 +652,6 @@ jobs:
           else
             echo "ERR JNI_OnLoad count != 1"; grep -n 'JNI_OnLoad' "$NL"; FAIL=1
           fi
-          if [ -f app/src/main/AndroidManifest.xml ]; then
-            echo "=== AndroidManifest.xml ==="
-            cat app/src/main/AndroidManifest.xml
-          fi
           if [ $FAIL -ne 0 ]; then
             exit 1
           fi
@@ -696,5 +685,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "feat: crash handler + step logging to /sdcard/Download/DexTool.log [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: use prebuilt Dobby from 3equals3/DobbyHook (deleted release asset) [skip ci]"
           git push
