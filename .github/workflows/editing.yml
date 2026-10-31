@@ -29,37 +29,34 @@ jobs:
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
 
-      - name: Clone reveny repo for prebuilt Dobby
+      - name: Download Prebuilt Dobby (release v0.4.0)
         run: |
           set -e
-          git clone --depth 1 https://github.com/reveny/Android-ImGui-Mod-Menu.git /tmp/reveny-dobby
-          echo "=== Locating libdobby.a ==="
-          find /tmp/reveny-dobby -name "libdobby.a" | sort
-          echo "=== Locating dobby.h ==="
-          find /tmp/reveny-dobby -name "dobby.h" | sort
+          mkdir -p /tmp/dobby-prebuilt
+          wget -q https://github.com/jmpews/Dobby/releases/download/v0.4.0/dobby-android-all.tar.gz -O /tmp/dobby.tar.gz
+          tar -xzf /tmp/dobby.tar.gz -C /tmp/dobby-prebuilt
+          echo "=== Dobby tree ==="
+          find /tmp/dobby-prebuilt -maxdepth 3 -type f | sort
 
       - name: Stage Dobby into project
         run: |
           set -e
-          ARM64_LIB=$(find /tmp/reveny-dobby -path "*arm64-v8a*" -name "libdobby.a" | head -1)
-          ARMV7_LIB=$(find /tmp/reveny-dobby -path "*armeabi-v7a*" -name "libdobby.a" | head -1)
+          ARM64_LIB=$(find /tmp/dobby-prebuilt -path "*arm64-v8a*" -name "libdobby.a" | head -1)
+          ARMV7_LIB=$(find /tmp/dobby-prebuilt -path "*armeabi-v7a*" -name "libdobby.a" | head -1)
           if [ -z "$ARM64_LIB" ] || [ -z "$ARMV7_LIB" ]; then
-            echo "Could not find libdobby.a for both ABIs in reveny repo. Listing all .a files:"
-            find /tmp/reveny-dobby -name "*.a"
-            exit 1
+            echo "Could not find libdobby.a for both ABIs"; find /tmp/dobby-prebuilt -name "*.a"; exit 1
           fi
-          echo "ARM64_LIB=$ARM64_LIB"
-          echo "ARMV7_LIB=$ARMV7_LIB"
           mkdir -p app/src/main/cpp/Include/Dobby/lib/arm64-v8a
           mkdir -p app/src/main/cpp/Include/Dobby/lib/armeabi-v7a
+          mkdir -p app/src/main/cpp/Include/Dobby/include
           cp "$ARM64_LIB" app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a
           cp "$ARMV7_LIB" app/src/main/cpp/Include/Dobby/lib/armeabi-v7a/libdobby.a
-          mkdir -p app/src/main/cpp/Include/Dobby/include
-          HEADER=$(find /tmp/reveny-dobby -name "dobby.h" | head -1)
-          if [ -z "$HEADER" ]; then
-            echo "dobby.h not found in reveny repo"; exit 1
+          HEADER_DIR=$(dirname "$(find /tmp/dobby-prebuilt -name "dobby.h" | head -1)")
+          if [ -n "$HEADER_DIR" ]; then
+            cp -rv "$HEADER_DIR"/. app/src/main/cpp/Include/Dobby/include/
+          else
+            echo "dobby.h not found"; exit 1
           fi
-          cp "$HEADER" app/src/main/cpp/Include/Dobby/include/dobby.h
           echo "=== Staged Dobby ==="
           find app/src/main/cpp/Include/Dobby -maxdepth 3 -type f | sort
 
@@ -127,64 +124,274 @@ jobs:
           if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; fi
           ls -lah "$D/lib/"
 
-      - name: Write Include/ImGui.h
+      - name: Write Include/Logger.h
         run: |
           mkdir -p app/src/main/cpp/Include
+          cat > app/src/main/cpp/Include/Logger.h <<'LOGGEREOF'
+          #pragma once
+          #ifndef DEXTOOL_LOGGER_H
+          #define DEXTOOL_LOGGER_H
+          
+          #include <android/log.h>
+          #include <cstdio>
+          #include <cstdarg>
+          #include <cstring>
+          #include <cstdlib>
+          #include <ctime>
+          #include <cerrno>
+          #include <unistd.h>
+          #include <pthread.h>
+          #include <signal.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          
+          #define DEX_LOG_MAX_FILES 4
+          static FILE* g_dex_log_files[DEX_LOG_MAX_FILES] = {nullptr};
+          static char g_dex_log_paths[DEX_LOG_MAX_FILES][512] = {{0}};
+          static int g_dex_log_count = 0;
+          static pthread_mutex_t g_dex_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+          static int g_dex_log_initialized = 0;
+          
+          static void dex_log_open_locked(void) {
+              if (g_dex_log_initialized) return;
+              g_dex_log_initialized = 1;
+          
+              char pkg[256] = "unknown";
+              FILE* cmd = fopen("/proc/self/cmdline", "r");
+              if (cmd) {
+                  size_t n = fread(pkg, 1, sizeof(pkg) - 1, cmd);
+                  fclose(cmd);
+                  if (n > 0) {
+                      pkg[n] = 0;
+                      char* colon = strchr(pkg, ':');
+                      if (colon) *colon = 0;
+                  }
+              }
+          
+              char paths[DEX_LOG_MAX_FILES][512];
+              memset(paths, 0, sizeof(paths));
+              int pc = 0;
+          
+              // 1: Android/data/<pkg>/files/dextool.log (always accessible for own app)
+              {
+                  char dir[400];
+                  snprintf(dir, sizeof(dir), "/sdcard/Android/data/%s/files", pkg);
+                  mkdir(dir, 0777);
+                  snprintf(paths[pc++], 512, "%s/dextool.log", dir);
+              }
+              // 2: Download/DexTool/dextool.log (user preferred)
+              {
+                  mkdir("/sdcard/Download", 0777);
+                  mkdir("/sdcard/Download/DexTool", 0777);
+                  snprintf(paths[pc++], 512, "/sdcard/Download/DexTool/dextool.log");
+              }
+              // 3: /sdcard/dextool_<pkg>.log
+              {
+                  snprintf(paths[pc++], 512, "/sdcard/dextool_%s.log", pkg);
+              }
+              // 4: /data/local/tmp (root only)
+              if (pc < DEX_LOG_MAX_FILES) {
+                  snprintf(paths[pc++], 512, "/data/local/tmp/dextool.log");
+              }
+          
+              for (int i = 0; i < pc && g_dex_log_count < DEX_LOG_MAX_FILES; i++) {
+                  FILE* f = fopen(paths[i], "a");
+                  if (f) {
+                      strncpy(g_dex_log_paths[g_dex_log_count], paths[i], 511);
+                      g_dex_log_files[g_dex_log_count] = f;
+                      g_dex_log_count++;
+                  }
+              }
+          
+              time_t t = time(NULL);
+              struct tm tmbuf;
+              struct tm* tmp = localtime_r(&t, &tmbuf);
+              char ts[64] = "?";
+              if (tmp) strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tmp);
+              char hdr[1024];
+              int hn = snprintf(hdr, sizeof(hdr),
+                                "\n\n===== DexTool log %s pid=%d pkg=%s =====\n",
+                                ts, (int)getpid(), pkg);
+              for (int i = 0; i < g_dex_log_count; i++) {
+                  fwrite(hdr, 1, hn, g_dex_log_files[i]);
+                  fflush(g_dex_log_files[i]);
+              }
+          
+              __android_log_print(ANDROID_LOG_INFO, "DexTool", "Log files: %d opened", g_dex_log_count);
+              for (int i = 0; i < g_dex_log_count; i++) {
+                  __android_log_print(ANDROID_LOG_INFO, "DexTool", "  log[%d] = %s", i, g_dex_log_paths[i]);
+              }
+          }
+          
+          static void dex_log(const char* level, const char* fmt, ...) {
+              char msg[2048];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(msg, sizeof(msg), fmt, ap);
+              va_end(ap);
+          
+              int prio = ANDROID_LOG_INFO;
+              if (level[0] == 'E') prio = ANDROID_LOG_ERROR;
+              else if (level[0] == 'W') prio = ANDROID_LOG_WARN;
+              else if (level[0] == 'D') prio = ANDROID_LOG_DEBUG;
+              else if (level[0] == 'V') prio = ANDROID_LOG_VERBOSE;
+          
+              __android_log_print(prio, "DexTool", "[%s] %s", level, msg);
+          
+              pthread_mutex_lock(&g_dex_log_mutex);
+              dex_log_open_locked();
+              if (g_dex_log_count > 0) {
+                  time_t t = time(NULL);
+                  struct tm tmbuf;
+                  struct tm* tmp = localtime_r(&t, &tmbuf);
+                  char ts[32] = "??:??:??";
+                  if (tmp) strftime(ts, sizeof(ts), "%H:%M:%S", tmp);
+                  for (int i = 0; i < g_dex_log_count; i++) {
+                      if (g_dex_log_files[i]) {
+                          fprintf(g_dex_log_files[i], "[%s][%s] %s\n", ts, level, msg);
+                          fflush(g_dex_log_files[i]);
+                      }
+                  }
+              }
+              pthread_mutex_unlock(&g_dex_log_mutex);
+          }
+          
+          static void dex_log_crash_handler(int sig, siginfo_t* info, void* ctx) {
+              char buf[256];
+              const char* msg = "\n!!! CRASH detected !!!\n";
+              size_t msg_len = strlen(msg);
+              int n = snprintf(buf, sizeof(buf), "signal=%d addr=%p\n", sig, info ? info->si_addr : NULL);
+              for (int i = 0; i < g_dex_log_count; i++) {
+                  if (g_dex_log_files[i]) {
+                      int fd = fileno(g_dex_log_files[i]);
+                      if (fd >= 0) {
+                          write(fd, msg, msg_len);
+                          if (n > 0) write(fd, buf, (size_t)n);
+                      }
+                  }
+              }
+              signal(sig, SIG_DFL);
+              raise(sig);
+          }
+          
+          static void dex_install_crash_handler(void) {
+              struct sigaction sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sa_sigaction = dex_log_crash_handler;
+              sa.sa_flags = SA_SIGINFO;
+              sigemptyset(&sa.sa_mask);
+              sigaction(SIGSEGV, &sa, NULL);
+              sigaction(SIGABRT, &sa, NULL);
+              sigaction(SIGBUS,  &sa, NULL);
+              sigaction(SIGILL,  &sa, NULL);
+              sigaction(SIGFPE,  &sa, NULL);
+          }
+          
+          #define LOGI(...) dex_log("I", __VA_ARGS__)
+          #define LOGE(...) dex_log("E", __VA_ARGS__)
+          #define LOGW(...) dex_log("W", __VA_ARGS__)
+          #define LOGD(...) dex_log("D", __VA_ARGS__)
+          #define LOGV(...) dex_log("V", __VA_ARGS__)
+          
+          #endif
+          LOGGEREOF
+
+      - name: Write Include/ImGui.h
+        run: |
           cat > app/src/main/cpp/Include/ImGui.h <<'IMGUIEOF'
           #pragma once
           #include <EGL/egl.h>
-          #include <android/log.h>
+          #include <GLES3/gl3.h>
           #include <pthread.h>
           #include <unistd.h>
           #include <cstring>
+          #include "Logger.h"
           #include "imgui.h"
           #include "imgui_impl_opengl3.h"
           #include "imgui_impl_android.h"
           #include "Dobby/include/dobby.h"
-          #ifndef LOGI
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "DexTool", __VA_ARGS__)
-          #endif
+          
           using swapbuffers_orig = EGLBoolean (*)(EGLDisplay, EGLSurface);
           static swapbuffers_orig o_swapbuffers = nullptr;
           static bool imgui_sw_initialized = false;
           static void (*menuAddress)() = nullptr;
+          static int g_frame_count = 0;
+          
           static bool isLibraryLoaded(const char *name) {
               FILE *fp = fopen("/proc/self/maps", "rt");
               if (!fp) return false;
               char line[512];
-              while (fgets(line, sizeof(line), fp)) { if (strstr(line, name)) { fclose(fp); return true; } }
-              fclose(fp); return false;
+              while (fgets(line, sizeof(line), fp)) {
+                  if (strstr(line, name)) { fclose(fp); return true; }
+              }
+              fclose(fp);
+              return false;
           }
+          
           static EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf) {
+              if (!o_swapbuffers) {
+                  LOGE("o_swapbuffers is NULL - cannot continue");
+                  return EGL_TRUE;
+              }
               EGLint w = 0, h = 0;
               eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+              if (w <= 0 || h <= 0) {
+                  if (g_frame_count < 5) LOGW("invalid surface size %dx%d", w, h);
+                  return o_swapbuffers(dpy, surf);
+              }
+          
               if (!imgui_sw_initialized) {
+                  LOGI("first frame %dx%d, initializing ImGui", w, h);
                   ImGui::CreateContext();
                   ImGuiIO& io0 = ImGui::GetIO();
                   io0.DisplaySize = ImVec2((float)w, (float)h);
                   io0.IniFilename = nullptr;
+                  LOGI("calling ImGui_ImplAndroid_Init(nullptr)");
                   ImGui_ImplAndroid_Init(nullptr);
-                  ImGui_ImplOpenGL3_Init("#version 300 es");
+                  const char* glv = (const char*)glGetString(GL_VERSION);
+                  LOGI("GL_VERSION = %s", glv ? glv : "(null)");
+                  LOGI("calling ImGui_ImplOpenGL3_Init");
+                  bool ok = ImGui_ImplOpenGL3_Init("#version 300 es");
+                  LOGI("ImGui_ImplOpenGL3_Init returned %d", (int)ok);
                   imgui_sw_initialized = true;
-                  LOGI("ImGui initialized %dx%d", w, h);
+                  LOGI("ImGui init complete");
               }
+          
               ImGuiIO& io = ImGui::GetIO();
               io.DisplaySize = ImVec2((float)w, (float)h);
               io.DeltaTime = 1.0f / 60.0f;
               ImGui_ImplOpenGL3_NewFrame();
+              ImGui_ImplAndroid_NewFrame();
               ImGui::NewFrame();
               if (menuAddress) menuAddress();
               ImGui::Render();
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+              if (g_frame_count < 3) LOGD("frame %d rendered", g_frame_count);
+              g_frame_count++;
               return o_swapbuffers(dpy, surf);
           }
+          
           void *initModMenu(void *menu_addr) {
+              LOGI("initModMenu thread started");
               menuAddress = (void (*)())menu_addr;
-              while (!isLibraryLoaded("libEGL.so")) sleep(1);
+              int wait_count = 0;
+              while (!isLibraryLoaded("libEGL.so")) {
+                  if (wait_count++ % 5 == 0) LOGD("waiting for libEGL.so (%d)", wait_count);
+                  sleep(1);
+              }
+              LOGI("libEGL.so loaded");
               auto swapBuffers = (uintptr_t)DobbySymbolResolver("libEGL.so", "eglSwapBuffers");
-              DobbyHook((void*)swapBuffers, (void*)swapbuffers_hook, (void**)&o_swapbuffers);
-              LOGI("eglSwapBuffers hooked");
+              if (!swapBuffers) {
+                  LOGE("DobbySymbolResolver failed for eglSwapBuffers");
+                  return nullptr;
+              }
+              LOGI("eglSwapBuffers at %p", (void*)swapBuffers);
+              int r = DobbyHook((void*)swapBuffers, (void*)swapbuffers_hook, (void**)&o_swapbuffers);
+              LOGI("DobbyHook returned %d, o_swapbuffers=%p", r, (void*)o_swapbuffers);
+              if (!o_swapbuffers) {
+                  LOGE("DobbyHook did not populate o_swapbuffers");
+              }
               return nullptr;
           }
           IMGUIEOF
@@ -195,25 +402,51 @@ jobs:
           #pragma once
           #include <android/input.h>
           #include <cstdint>
+          #include "Logger.h"
           #include "Dobby/include/dobby.h"
+          
           using Input_orig = void (*)(void*, void*, void*);
           static Input_orig o_input = nullptr;
+          
           static void input_hook(void* thiz, void* ex_ab, void* ex_ac) {
-              o_input(thiz, ex_ab, ex_ac);
-              ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+              if (o_input) o_input(thiz, ex_ab, ex_ac);
+              if (thiz) {
+                  ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+              }
           }
+          
           using Consume_orig = int32_t (*)(void*, void*, bool, long, uint32_t*, AInputEvent**);
           static Consume_orig o_consume = nullptr;
+          
           static int32_t consume_hook(void* thiz, void* factory, bool raw, long seq, uint32_t* flags, AInputEvent** event) {
-              int32_t ret = o_consume(thiz, factory, raw, seq, flags, event);
-              if (ret == 0 && event && *event) ImGui_ImplAndroid_HandleInputEvent(*event);
+              int32_t ret = 0;
+              if (o_consume) ret = o_consume(thiz, factory, raw, seq, flags, event);
+              if (ret == 0 && event && *event) {
+                  ImGui_ImplAndroid_HandleInputEvent(*event);
+              }
               return ret;
           }
+          
           static void hookInput() {
-              void* sym = DobbySymbolResolver("libinput.so", "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE");
-              if (sym) { DobbyHook(sym, (void*)input_hook, (void**)&o_input); LOGI("input hooked (legacy)"); return; }
-              sym = DobbySymbolResolver("libinput.so", "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE");
-              if (sym) { DobbyHook(sym, (void*)consume_hook, (void**)&o_consume); LOGI("consume hooked (Android 15+)"); }
+              LOGI("hookInput: trying legacy initializeMotionEvent");
+              void* sym = DobbySymbolResolver("libinput.so",
+                  "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE");
+              if (sym) {
+                  LOGI("found legacy sym at %p", sym);
+                  int r = DobbyHook(sym, (void*)input_hook, (void**)&o_input);
+                  LOGI("legacy hook returned %d", r);
+                  return;
+              }
+              LOGI("hookInput: trying Android 15+ consume");
+              sym = DobbySymbolResolver("libinput.so",
+                  "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE");
+              if (sym) {
+                  LOGI("found consume sym at %p", sym);
+                  int r = DobbyHook(sym, (void*)consume_hook, (void**)&o_consume);
+                  LOGI("consume hook returned %d", r);
+                  return;
+              }
+              LOGE("hookInput: neither symbol found - touch will not work");
           }
           INPUTEOF
 
@@ -223,7 +456,7 @@ jobs:
           import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
-
+          
           def rm_method(src, pat):
               n = 0
               while True:
@@ -243,11 +476,14 @@ jobs:
                   src = src[:start] + src[e:]
                   n += 1
               return src, n
-
+          
           s, _ = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'void\s+DrawMenu\s*\([^)]*\)\s*\{')
           s, _ = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{')
-
+          
+          # Remove old LOGI block so Logger.h's LOGI takes over
+          s = re.sub(r'#ifndef LOGI\s*\n#define LOGI.*?#endif\s*\n', '', s, flags=re.DOTALL)
+          
           for pat in [
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?',
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+g_jvm\s*=\s*nullptr\s*;\s*\n?',
@@ -255,15 +491,12 @@ jobs:
               r'(?m)^[ \t]*(?:static\s+)?bool\s+gMenuOpen\s*=\s*false\s*;\s*\n?',
           ]:
               s = re.sub(pat, '', s)
-
+          
           s = s.replace('#include "Include/ImGui.h"', '')
           s = s.replace('#include "Include/Input.h"', '')
           if '#include "ImGui.h"' not in s:
               s = s.replace('#include "dex_data.h"', '#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
-
-          s = re.sub(r'(?:#ifndef LOGI\s*\n)+', '#ifndef LOGI\n', s)
-          s = re.sub(r'(?:#endif\s*\n)+', '#endif\n', s)
-
+          
           lines = s.split('\n')
           insert_at = None
           for i, line in enumerate(lines):
@@ -282,11 +515,20 @@ jobs:
               'static bool g_menuVisible = true;',
               'static bool gMenuOpen = false;',
               '',
+              '__attribute__((constructor)) static void dex_so_constructor() {',
+              '    dex_install_crash_handler();',
+              '    LOGI("===== libtool.so constructor called =====");',
+              '    LOGI("logging to %d file(s)", g_dex_log_count);',
+              '    for (int _i = 0; _i < g_dex_log_count; _i++) LOGI("  path[%d] = %s", _i, g_dex_log_paths[_i]);',
+              '}',
+              '',
           ]
           s = '\n'.join(lines)
-
+          
           footer = textwrap.dedent(r"""
               void DrawMenu() {
+                  static bool logged_first = false;
+                  if (!logged_first) { LOGI("DrawMenu first call"); logged_first = true; }
                   if (!g_menuVisible) return;
                   ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
                   if (ImGui::Begin("DexTool", &g_menuVisible)) {
@@ -298,17 +540,27 @@ jobs:
                   }
                   ImGui::End();
               }
-
+          
               extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+                  LOGI("JNI_OnLoad entry");
                   gVM = vm; g_jvm = vm;
                   JNIEnv* env = nullptr;
-                  if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
+                  if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+                      LOGE("GetEnv failed");
+                      return JNI_ERR;
+                  }
+                  LOGI("calling loadDex");
                   loadDex(env);
+                  LOGI("calling gum_init_embedded");
                   gum_init_embedded();
+                  LOGI("calling init_frida_script");
                   init_frida_script();
+                  LOGI("starting initModMenu thread");
                   pthread_t t;
                   pthread_create(&t, nullptr, initModMenu, (void*)DrawMenu);
+                  LOGI("calling hookInput");
                   hookInput();
+                  LOGI("JNI_OnLoad done");
                   return JNI_VERSION_1_6;
               }
           """).strip()
@@ -369,33 +621,41 @@ jobs:
         run: |
           FAIL=0
           if [ -f app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a ]; then
-            echo "OK arm64 libdobby.a present"
+            echo "OK arm64 libdobby.a"
           else
             echo "ERR arm64 libdobby.a missing"; FAIL=1
           fi
           if [ -f app/src/main/cpp/Include/Dobby/lib/armeabi-v7a/libdobby.a ]; then
-            echo "OK armv7 libdobby.a present"
+            echo "OK armv7 libdobby.a"
           else
             echo "ERR armv7 libdobby.a missing"; FAIL=1
           fi
-          if [ -f app/src/main/cpp/Include/Dobby/include/dobby.h ]; then
-            echo "OK dobby.h present"
-          else
-            echo "ERR dobby.h missing"; FAIL=1
-          fi
+          for H in app/src/main/cpp/Include/Logger.h app/src/main/cpp/Include/ImGui.h app/src/main/cpp/Include/Input.h; do
+            if [ -s "$H" ]; then echo "OK $H"; else echo "ERR $H missing"; FAIL=1; fi
+          done
           NL="app/src/main/cpp/tool/native-lib.cpp"
           if grep -qF 'static JavaVM* g_jvm = nullptr;' "$NL"; then
-            echo "OK g_jvm declared"
+            echo "OK g_jvm"
           else
             echo "ERR g_jvm missing"; FAIL=1
           fi
           if [ "$(grep -c 'JNI_OnLoad' "$NL" || true)" -eq 1 ]; then
-            echo "OK exactly one JNI_OnLoad"
+            echo "OK JNI_OnLoad count"
           else
-            echo "ERR JNI_OnLoad count != 1"; grep -n 'JNI_OnLoad' "$NL"; FAIL=1
+            echo "ERR JNI_OnLoad count"; grep -n 'JNI_OnLoad' "$NL"; FAIL=1
+          fi
+          if grep -qF 'dex_so_constructor' "$NL"; then
+            echo "OK constructor installed"
+          else
+            echo "ERR constructor missing"; FAIL=1
+          fi
+          if grep -qF 'ImGui_ImplAndroid_NewFrame()' app/src/main/cpp/Include/ImGui.h; then
+            echo "OK ImGui_ImplAndroid_NewFrame() present"
+          else
+            echo "ERR ImGui_ImplAndroid_NewFrame() missing"; FAIL=1
           fi
           if [ $FAIL -ne 0 ]; then
-            echo "=== Dobby staged tree ==="; find app/src/main/cpp/Include/Dobby -maxdepth 3 -type f | sort
+            echo "=== native-lib.cpp (JNI context) ==="; grep -n -A2 -B2 'JNI_OnLoad' "$NL" || true
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -428,5 +688,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: use prebuilt Dobby from reveny repo [skip ci]"
+          git diff --staged --quiet || git commit -m "feat: write runtime log to /sdcard/Android/data + /sdcard/Download + crash handler [skip ci]"
           git push
