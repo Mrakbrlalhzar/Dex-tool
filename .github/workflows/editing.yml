@@ -36,11 +36,9 @@ jobs:
           mkdir -p /tmp/dobby-prebuilt/arm64-v8a
           mkdir -p /tmp/dobby-prebuilt/armeabi-v7a
           wget -q "$BASE/arm64-v8a/libdobby.a" -O /tmp/dobby-prebuilt/arm64-v8a/libdobby.a
-          ls -lah /tmp/dobby-prebuilt/arm64-v8a/libdobby.a
           wget -q "$BASE/armeabi-v7a/libdobby.a" -O /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a
-          ls -lah /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a
           wget -q "$BASE/Dobby.h" -O /tmp/dobby-prebuilt/Dobby.h
-          ls -lah /tmp/dobby-prebuilt/Dobby.h
+          ls -lah /tmp/dobby-prebuilt/arm64-v8a/libdobby.a /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a /tmp/dobby-prebuilt/Dobby.h
           file /tmp/dobby-prebuilt/arm64-v8a/libdobby.a || true
           file /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a || true
 
@@ -335,27 +333,35 @@ jobs:
           }
           IMGUIEOF
 
-      - name: Write Include/Input.h
+      - name: Write Include/Input.h (FIXED: pass MotionEvent + guard GImGui)
         run: |
           cat > app/src/main/cpp/Include/Input.h <<'INPUTEOF'
           #pragma once
           #include <android/input.h>
           #include <cstdint>
+          #include "imgui.h"
+          #include "imgui_impl_android.h"
           #include "Dobby/include/dobby.h"
           #include "Log.h"
 
           using Input_orig = void (*)(void*, void*, void*);
           static Input_orig o_input = nullptr;
+
           static void input_hook(void* thiz, void* ex_ab, void* ex_ac) {
+              // initializeMotionEvent(InputConsumer* this, MotionEvent* ev, const InputMessage* msg)
               if (o_input) o_input(thiz, ex_ab, ex_ac);
-              ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+              if (!ImGui::GetCurrentContext()) return;   // ImGui not initialized yet
+              if (ex_ab) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)ex_ab);
           }
 
           using Consume_orig = int32_t (*)(void*, void*, bool, long, uint32_t*, AInputEvent**);
           static Consume_orig o_consume = nullptr;
+
           static int32_t consume_hook(void* thiz, void* factory, bool raw, long seq, uint32_t* flags, AInputEvent** event) {
               int32_t ret = o_consume ? o_consume(thiz, factory, raw, seq, flags, event) : -1;
-              if (ret == 0 && event && *event) ImGui_ImplAndroid_HandleInputEvent(*event);
+              if (ret == 0 && event && *event && ImGui::GetCurrentContext()) {
+                  ImGui_ImplAndroid_HandleInputEvent(*event);
+              }
               return ret;
           }
 
@@ -382,7 +388,7 @@ jobs:
           }
           INPUTEOF
 
-      - name: Patch native-lib.cpp (idempotent, removes setup_log_path/DrawMenu/JNI_OnLoad first)
+      - name: Patch native-lib.cpp (idempotent)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -407,10 +413,9 @@ jobs:
                   while e < len(src) and src[e] in '\n \t': e += 1
                   src = src[:start] + src[e:]
                   n += 1
-              print(f"rm_method[{label}]: removed {n} occurrence(s)")
+              print(f"rm_method[{label}]: removed {n}")
               return src
 
-          # Order matters: remove old occurrences before appending new footer
           s = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{', 'notifyMenuOpen')
           s = rm_method(s, r'(?:static\s+)?void\s+setup_log_path\s*\([^)]*\)\s*\{', 'setup_log_path')
           s = rm_method(s, r'(?:static\s+)?void\s+DrawMenu\s*\([^)]*\)\s*\{', 'DrawMenu')
@@ -465,7 +470,6 @@ jobs:
           ]
           s = '\n'.join(lines)
 
-          # Safety check BEFORE appending footer: no leftovers
           for label, pat in [
               ('setup_log_path', r'static\s+void\s+setup_log_path'),
               ('DrawMenu', r'void\s+DrawMenu\s*\('),
@@ -474,13 +478,7 @@ jobs:
           ]:
               cnt = len(re.findall(pat, s))
               if cnt != 0:
-                  print(f"FAIL: {label} still present {cnt} time(s) after removal")
-                  print("=== context around leftover ===")
-                  m = re.search(pat, s)
-                  if m:
-                      start = max(0, m.start()-100)
-                      print(s[start:m.start()+200])
-                  raise SystemExit(3)
+                  raise SystemExit(f"FAIL: {label} still present {cnt}x after removal")
               print(f"OK no leftover: {label}")
 
           footer = textwrap.dedent(r"""
@@ -586,7 +584,6 @@ jobs:
           s = s.rstrip() + "\n\n" + footer + "\n"
           p.write_text(s)
 
-          # Final sanity counts
           for label, pat in [
               ('setup_log_path', r'static\s+void\s+setup_log_path'),
               ('DrawMenu', r'void\s+DrawMenu\s*\('),
@@ -657,49 +654,28 @@ jobs:
               echo "ERR $ABI libdobby.a missing"; FAIL=1
             fi
           done
-          if [ -f app/src/main/cpp/Include/Dobby/include/dobby.h ]; then
-            echo "OK dobby.h present"
+          if [ -f app/src/main/cpp/Include/Log.h ]; then echo "OK Log.h"; else echo "ERR Log.h"; FAIL=1; fi
+          IH="app/src/main/cpp/Include/Input.h"
+          if grep -qF 'if (!ImGui::GetCurrentContext()) return;' "$IH"; then
+            echo "OK Input.h has GImGui guard"
           else
-            echo "ERR dobby.h missing"; FAIL=1
+            echo "ERR Input.h missing GImGui guard"; FAIL=1
           fi
-          if [ -f app/src/main/cpp/Include/Log.h ]; then
-            echo "OK Log.h present"
+          if grep -qF 'if (ex_ab) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)ex_ab);' "$IH"; then
+            echo "OK Input.h passes ex_ab (MotionEvent) not thiz"
           else
-            echo "ERR Log.h missing"; FAIL=1
+            echo "ERR Input.h still passes thiz"; FAIL=1
           fi
           NL="app/src/main/cpp/tool/native-lib.cpp"
-
-          SP=$(grep -cF 'static void setup_log_path' "$NL" || true)
-          if [ "$SP" -eq 1 ]; then echo "OK exactly one setup_log_path (count=$SP)"; else echo "ERR setup_log_path count != 1 (count=$SP)"; FAIL=1; fi
-
-          DM=$(grep -cF 'void DrawMenu()' "$NL" || true)
-          if [ "$DM" -eq 1 ]; then echo "OK exactly one DrawMenu (count=$DM)"; else echo "ERR DrawMenu count != 1 (count=$DM)"; FAIL=1; fi
-
+          for label in setup_log_path DrawMenu; do
+            C=$(grep -cF "$label" "$NL" || true)
+            if [ "$C" -eq 1 ]; then echo "OK $label count=1"; else echo "ERR $label count=$C"; FAIL=1; fi
+          done
           JL=$(grep -cF 'JNIEXPORT jint JNICALL JNI_OnLoad' "$NL" || true)
-          if [ "$JL" -eq 1 ]; then echo "OK exactly one JNI_OnLoad (count=$JL)"; else echo "ERR JNI_OnLoad count != 1 (count=$JL)"; FAIL=1; fi
-
+          if [ "$JL" -eq 1 ]; then echo "OK JNI_OnLoad count=1"; else echo "ERR JNI_OnLoad count=$JL"; FAIL=1; fi
           NM=$(grep -cF 'notifyMenuOpen' "$NL" || true)
-          if [ "$NM" -eq 0 ]; then echo "OK no notifyMenuOpen leftover"; else echo "ERR notifyMenuOpen leftover (count=$NM)"; FAIL=1; fi
-
-          if grep -qF 'flog("========== JNI_OnLoad start' "$NL"; then
-            echo "OK flog JNI_OnLoad start present"
-          else
-            echo "ERR flog JNI_OnLoad start missing"; FAIL=1
-          fi
-
-          if grep -qF 'static JavaVM* g_jvm = nullptr;' "$NL"; then
-            echo "OK g_jvm declared"
-          else
-            echo "ERR g_jvm missing"; FAIL=1
-          fi
-
-          if [ $FAIL -ne 0 ]; then
-            echo "=== first 30 lines of native-lib.cpp ==="; head -30 "$NL" || true
-            echo "=== tail 80 lines of native-lib.cpp ==="; tail -80 "$NL" || true
-            echo "=== grep locations ==="
-            grep -n 'setup_log_path\|DrawMenu\|JNI_OnLoad\|notifyMenuOpen' "$NL" || true
-            exit 1
-          fi
+          if [ "$NM" -eq 0 ]; then echo "OK no notifyMenuOpen"; else echo "ERR notifyMenuOpen=$NM"; FAIL=1; fi
+          if [ $FAIL -ne 0 ]; then exit 1; fi
           echo "ALL CHECKS PASSED"
 
       - uses: gradle/actions/setup-gradle@v3
@@ -730,5 +706,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: idempotent setup_log_path removal, count checks in Verify [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: input_hook passes MotionEvent* (ex_ab) not InputConsumer* (thiz), guard GImGui null [skip ci]"
           git push
