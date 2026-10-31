@@ -640,17 +640,25 @@ jobs:
             echo "ERR Log.h missing"; FAIL=1
           fi
           NL="app/src/main/cpp/tool/native-lib.cpp"
-          for pat in 'static JavaVM\* g_jvm = nullptr;' 'install_crash_handler' 'setup_log_path' 'flog("========== JNI_OnLoad start'; do
+          for pat in 'static JavaVM\* g_jvm = nullptr;' 'install_crash_handler' 'setup_log_path'; do
             if grep -qE "$pat" "$NL"; then
               echo "OK pattern present: $pat"
             else
               echo "ERR pattern missing: $pat"; FAIL=1
             fi
           done
-          if [ "$(grep -c 'JNI_OnLoad' "$NL" || true)" -eq 1 ]; then
-            echo "OK exactly one JNI_OnLoad"
+          if grep -qF 'flog("========== JNI_OnLoad start' "$NL"; then
+            echo "OK flog JNI_OnLoad start present"
           else
-            echo "ERR JNI_OnLoad count != 1"; grep -n 'JNI_OnLoad' "$NL"; FAIL=1
+            echo "ERR flog JNI_OnLoad start missing"; FAIL=1
+          fi
+          DEF_COUNT=$(grep -cF 'JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*)' "$NL" || true)
+          if [ "$DEF_COUNT" -eq 1 ]; then
+            echo "OK exactly one JNI_OnLoad definition (count=$DEF_COUNT)"
+          else
+            echo "ERR JNI_OnLoad definition count != 1 (count=$DEF_COUNT)"
+            grep -nF 'JNIEXPORT jint JNICALL JNI_OnLoad' "$NL"
+            FAIL=1
           fi
           if [ $FAIL -ne 0 ]; then
             exit 1
@@ -685,5 +693,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: use prebuilt Dobby from 3equals3/DobbyHook (deleted release asset) [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: Verify uses grep -F for flog pattern and grep -cF for JNI_OnLoad def [skip ci]"
           git push
