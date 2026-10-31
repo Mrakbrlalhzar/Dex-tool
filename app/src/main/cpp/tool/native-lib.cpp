@@ -13,10 +13,13 @@ static std::once_flag frida_once;
 #include "imgui_impl_opengl3.h"
 #include <GLES3/gl3.h>
 
+
 #include "Log.h"
 #include "dex_data.h"
 #include "ImGui.h"
 #include "Input.h"
+
+
 
 
 
@@ -786,54 +789,6 @@ static void doSetPatches(JNIEnv* env, jclass, jobjectArray arr) {
             if (parts.size() == 7) { PatchItem p; p.id = std::stoi(parts[0]); p.type = parts[1]; p.className = parts[2]; p.targetName = parts[3]; p.originalValue = parts[4]; snprintf(p.currentValue, sizeof(p.currentValue), "%s", parts[5].c_str()); p.isActive = (parts[6] == "true"); gPatches.push_back(p); }
         }
         if (c) env->ReleaseStringUTFChars(s, c); env->DeleteLocalRef(s);
-    }
-}
-
-static void setup_log_path(JNIEnv* env) {
-    std::string ext;
-    jclass at = env->FindClass("android/app/ActivityThread");
-    if (at) {
-        jmethodID m = env->GetStaticMethodID(at, "currentApplication", "()Landroid/app/Application;");
-        if (m) {
-            jobject app = env->CallStaticObjectMethod(at, m);
-            if (app) {
-                jclass ctx = env->FindClass("android/content/Context");
-                jmethodID gefd = env->GetMethodID(ctx, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
-                if (gefd) {
-                    jobject f = env->CallObjectMethod(app, gefd, nullptr);
-                    if (f) {
-                        jclass fc = env->FindClass("java/io/File");
-                        jmethodID gap = env->GetMethodID(fc, "getAbsolutePath", "()Ljava/lang/String;");
-                        jstring jp = (jstring)env->CallObjectMethod(f, gap);
-                        if (jp) {
-                            const char* c = env->GetStringUTFChars(jp, nullptr);
-                            ext = c;
-                            env->ReleaseStringUTFChars(jp, c);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (!ext.empty()) {
-        snprintf(g_log_path, sizeof(g_log_path), "%s/DexTool.log", ext.c_str());
-        const char* downloads[] = {
-            "/sdcard/Download/DexTool.log",
-            "/storage/emulated/0/Download/DexTool.log",
-        };
-        for (auto d : downloads) {
-            int fd = open(d, O_WRONLY | O_APPEND | O_CREAT, 0666);
-            if (fd >= 0) {
-                close(fd);
-                snprintf(g_log_path, sizeof(g_log_path), "%s", d);
-                break;
-            }
-        }
-    } else {
-        snprintf(g_log_path, sizeof(g_log_path),
-            "/sdcard/Android/data/com.example.tool/files/DexTool.log");
-        mkdir("/sdcard/Android/data/com.example.tool", 0777);
-        mkdir("/sdcard/Android/data/com.example.tool/files", 0777);
     }
 }
 

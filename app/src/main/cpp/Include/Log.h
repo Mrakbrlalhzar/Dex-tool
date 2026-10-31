@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
