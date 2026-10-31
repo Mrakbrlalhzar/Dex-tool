@@ -234,158 +234,97 @@ jobs:
           }
           LOGEOF
 
-      - name: Write Include/ImGui.h
+      - name: Remove Include/ImGui.h and Include/Input.h
         run: |
-          cat > app/src/main/cpp/Include/ImGui.h <<'IMGUIEOF'
-          #pragma once
-          #include <EGL/egl.h>
-          #include <android/log.h>
-          #include <pthread.h>
-          #include <unistd.h>
-          #include <cstring>
-          #include "imgui.h"
-          #include "imgui_impl_opengl3.h"
-          #include "imgui_impl_android.h"
-          #include "Dobby/include/dobby.h"
-          #include "Log.h"
+          rm -f app/src/main/cpp/Include/ImGui.h
+          rm -f app/src/main/cpp/Include/Input.h
 
-          using swapbuffers_orig = EGLBoolean (*)(EGLDisplay, EGLSurface);
-          static swapbuffers_orig o_swapbuffers = nullptr;
-          static bool imgui_sw_initialized = false;
-          static void (*menuAddress)() = nullptr;
-          static int g_frame_count = 0;
-
-          static bool isLibraryLoaded(const char *name) {
-              FILE *fp = fopen("/proc/self/maps", "rt");
-              if (!fp) return false;
-              char line[512];
-              while (fgets(line, sizeof(line), fp)) {
-                  if (strstr(line, name)) { fclose(fp); return true; }
-              }
-              fclose(fp);
-              return false;
-          }
-
-          static EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf) {
-              g_frame_count++;
-              bool log_frame = (g_frame_count <= 10) || (g_frame_count % 60 == 0);
-              if (log_frame) flog("[swap] frame %d enter", g_frame_count);
-              EGLint w = 0, h = 0;
-              eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
-              eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-              if (!imgui_sw_initialized) {
-                  flog("[swap] FIRST FRAME - init ImGui (w=%d h=%d)", w, h);
-                  ImGui::CreateContext();
-                  flog("[swap] CreateContext OK");
-                  ImGuiIO& io0 = ImGui::GetIO();
-                  io0.DisplaySize = ImVec2((float)w, (float)h);
-                  io0.IniFilename = nullptr;
-                  ImGui_ImplAndroid_Init(nullptr);
-                  flog("[swap] ImGui_ImplAndroid_Init OK");
-                  ImGui_ImplOpenGL3_Init("#version 300 es");
-                  flog("[swap] ImGui_ImplOpenGL3_Init OK");
-                  imgui_sw_initialized = true;
-                  flog("[swap] ImGui init done");
-              }
-              ImGuiIO& io = ImGui::GetIO();
-              io.DisplaySize = ImVec2((float)w, (float)h);
-              io.DeltaTime = 1.0f / 60.0f;
-              ImGui_ImplOpenGL3_NewFrame();
-              if (log_frame) flog("[swap] OpenGL3_NewFrame OK");
-              ImGui::NewFrame();
-              if (log_frame) flog("[swap] NewFrame OK");
-              if (menuAddress) {
-                  menuAddress();
-                  if (log_frame) flog("[swap] DrawMenu OK");
-              }
-              ImGui::Render();
-              if (log_frame) flog("[swap] Render OK");
-              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-              if (log_frame) flog("[swap] RenderDrawData OK");
-              if (!o_swapbuffers) {
-                  flog("[swap] ERROR: o_swapbuffers is NULL!");
-                  return EGL_FALSE;
-              }
-              return o_swapbuffers(dpy, surf);
-          }
-
-          void *initModMenu(void *menu_addr) {
-              menuAddress = (void (*)())menu_addr;
-              flog("[init] waiting for libEGL.so");
-              while (!isLibraryLoaded("libEGL.so")) sleep(1);
-              flog("[init] libEGL.so loaded, resolving eglSwapBuffers");
-              auto swapBuffers = (uintptr_t)DobbySymbolResolver("libEGL.so", "eglSwapBuffers");
-              flog("[init] eglSwapBuffers addr=%p", (void*)swapBuffers);
-              if (!swapBuffers) {
-                  flog("[init] ERROR: could not resolve eglSwapBuffers");
-                  return nullptr;
-              }
-              int rc = DobbyHook((void*)swapBuffers, (void*)swapbuffers_hook, (void**)&o_swapbuffers);
-              flog("[init] DobbyHook rc=%d orig=%p", rc, (void*)o_swapbuffers);
-              if (rc != 0 || !o_swapbuffers) {
-                  flog("[init] ERROR: DobbyHook FAILED rc=%d orig=%p", rc, (void*)o_swapbuffers);
-                  return nullptr;
-              }
-              flog("[init] eglSwapBuffers hooked OK");
-              return nullptr;
-          }
-          IMGUIEOF
-
-      - name: Write Include/Input.h with MotionEvent fix
+      - name: Patch Helper.java add overlay methods
         run: |
-          cat > app/src/main/cpp/Include/Input.h <<'INPUTEOF'
-          #pragma once
-          #include <android/input.h>
-          #include <cstdint>
-          #include "imgui.h"
-          #include "imgui_impl_android.h"
-          #include "Dobby/include/dobby.h"
-          #include "Log.h"
+          python3 - <<'PYEOF'
+          import pathlib
+          p = pathlib.Path("app/src/main/java/com/menu/imgui/Helper.java")
+          s = p.read_text()
 
-          using Input_orig = void (*)(void*, void*, void*);
-          static Input_orig o_input = nullptr;
+          # Remove existing overlay block if present (idempotent)
+          if "public static void startOverlay" in s:
+              start = s.index("public static void startOverlay")
+              # find end: last occurrence of "nativeOnTouch"
+              key = "public static native void nativeOnTouch"
+              end_pos = s.find(";", s.index(key)) + 1
+              s = s[:start] + s[end_pos:]
 
-          static void input_hook(void* thiz, void* ex_ab, void* ex_ac) {
-              if (o_input) o_input(thiz, ex_ab, ex_ac);
-              if (!ImGui::GetCurrentContext()) return;
-              if (ex_ab) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)ex_ab);
-          }
+          overlay_code = '''
+    public static void startOverlay(final android.content.Context context) {
+        try {
+            final android.view.WindowManager wm =
+                (android.view.WindowManager) context.getSystemService(android.content.Context.WINDOW_SERVICE);
+            if (wm == null) {
+                android.util.Log.e("DexTool", "WindowManager null");
+                return;
+            }
+            final android.opengl.GLSurfaceView view =
+                new android.opengl.GLSurfaceView(context);
+            view.setEGLContextClientVersion(3);
+            view.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
+            view.getHolder().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
+            view.setZOrderOnTop(true);
+            view.setRenderer(new android.opengl.GLSurfaceView.Renderer() {
+                @Override
+                public void onSurfaceCreated(javax.microedition.khronos.opengles.GL10 gl,
+                                             javax.microedition.khronos.egl.EGLConfig config) {
+                    nativeOnSurfaceCreated();
+                }
+                @Override
+                public void onSurfaceChanged(javax.microedition.khronos.opengles.GL10 gl,
+                                             int w, int h) {
+                    nativeOnSurfaceChanged(w, h);
+                }
+                @Override
+                public void onDrawFrame(javax.microedition.khronos.opengles.GL10 gl) {
+                    nativeOnDrawFrame();
+                }
+            });
+            view.setOnTouchListener(new android.view.View.OnTouchListener() {
+                @Override
+                public boolean onTouch(android.view.View v, android.view.MotionEvent e) {
+                    nativeOnTouch(e.getActionMasked(), e.getX(), e.getY());
+                    return true;
+                }
+            });
+            int type = (android.os.Build.VERSION.SDK_INT >= 26)
+                ? android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : android.view.WindowManager.LayoutParams.TYPE_PHONE;
+            android.view.WindowManager.LayoutParams lp =
+                new android.view.WindowManager.LayoutParams(
+                    800, 600, type,
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    android.graphics.PixelFormat.TRANSLUCENT);
+            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.LEFT;
+            lp.x = 0;
+            lp.y = 100;
+            wm.addView(view, lp);
+            android.util.Log.i("DexTool", "overlay added");
+        } catch (Throwable t) {
+            android.util.Log.e("DexTool", "startOverlay failed: " + t, t);
+        }
+    }
+    public static native void nativeOnSurfaceCreated();
+    public static native void nativeOnSurfaceChanged(int w, int h);
+    public static native void nativeOnDrawFrame();
+    public static native void nativeOnTouch(int action, float x, float y);
+'''
 
-          using Consume_orig = int32_t (*)(void*, void*, bool, long, uint32_t*, AInputEvent**);
-          static Consume_orig o_consume = nullptr;
+          idx = s.rstrip().rfind("}")
+          if idx < 0:
+              raise SystemExit("no closing brace in Helper.java")
+          s = s[:idx] + overlay_code + "\n" + s[idx:]
+          p.write_text(s)
+          print("Helper.java patched with overlay methods")
+          PYEOF
 
-          static int32_t consume_hook(void* thiz, void* factory, bool raw, long seq, uint32_t* flags, AInputEvent** event) {
-              int32_t ret = o_consume ? o_consume(thiz, factory, raw, seq, flags, event) : -1;
-              if (ret == 0 && event && *event && ImGui::GetCurrentContext()) {
-                  ImGui_ImplAndroid_HandleInputEvent(*event);
-              }
-              return ret;
-          }
-
-          static void hookInput() {
-              flog("[input] hooking input (legacy path)");
-              void* sym = DobbySymbolResolver("libinput.so",
-                  "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE");
-              flog("[input] legacy symbol=%p", sym);
-              if (sym) {
-                  int rc = DobbyHook(sym, (void*)input_hook, (void**)&o_input);
-                  flog("[input] legacy DobbyHook rc=%d", rc);
-                  if (rc == 0) { flog("[input] legacy hook OK"); return; }
-              }
-              flog("[input] trying consume (Android 15+)");
-              sym = DobbySymbolResolver("libinput.so",
-                  "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE");
-              flog("[input] consume symbol=%p", sym);
-              if (sym) {
-                  int rc = DobbyHook(sym, (void*)consume_hook, (void**)&o_consume);
-                  flog("[input] consume DobbyHook rc=%d", rc);
-                  if (rc == 0) { flog("[input] consume hook OK"); return; }
-              }
-              flog("[input] WARN: no input hook installed");
-          }
-          INPUTEOF
-
-      - name: Patch native-lib.cpp idempotent
+      - name: Patch native-lib.cpp overlay JNI callbacks
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -410,14 +349,21 @@ jobs:
                   while e < len(src) and src[e] in '\n \t': e += 1
                   src = src[:start] + src[e:]
                   n += 1
-              print("rm_method[%s]: removed %d" % (label, n))
+              print("rm_method[" + label + "]: removed " + str(n))
               return src
 
+          # Remove old overlay callbacks
+          for name in ['nativeOnSurfaceCreated', 'nativeOnSurfaceChanged',
+                       'nativeOnDrawFrame', 'nativeOnTouch']:
+              s = rm_method(s, r'Java_com_menu_imgui_Helper_' + name + r'\s*\([^)]*\)\s*\{', name)
+
+          # Remove old notifyMenuOpen / setup_log_path / DrawMenu / JNI_OnLoad
           s = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{', 'notifyMenuOpen')
           s = rm_method(s, r'(?:static\s+)?void\s+setup_log_path\s*\([^)]*\)\s*\{', 'setup_log_path')
           s = rm_method(s, r'(?:static\s+)?void\s+DrawMenu\s*\([^)]*\)\s*\{', 'DrawMenu')
           s = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{', 'JNI_OnLoad')
 
+          # Remove old globals
           for pat in [
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?',
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+g_jvm\s*=\s*nullptr\s*;\s*\n?',
@@ -426,26 +372,29 @@ jobs:
           ]:
               s = re.sub(pat, '', s)
 
+          # Remove include lines for ImGui.h / Input.h if present
           s = s.replace('#include "Include/ImGui.h"', '')
           s = s.replace('#include "Include/Input.h"', '')
           s = s.replace('#include "ImGui.h"', '')
           s = s.replace('#include "Input.h"', '')
-          s = s.replace('#include "Log.h"', '')
 
-          if '#include "dex_data.h"' in s:
-              s = s.replace('#include "dex_data.h"',
-                            '#include "Log.h"\n#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
-          else:
-              lines = s.split('\n')
-              for i, line in enumerate(lines):
-                  if line.strip().startswith('#include'):
-                      lines.insert(i+1, '#include "Log.h"\n#include "ImGui.h"\n#include "Input.h"')
-                      break
-              s = '\n'.join(lines)
+          # Add Log.h include after dex_data.h or first include
+          if '#include "Log.h"' not in s:
+              if '#include "dex_data.h"' in s:
+                  s = s.replace('#include "dex_data.h"', '#include "Log.h"\n#include "dex_data.h"', 1)
+              else:
+                  lines = s.split('\n')
+                  for i, line in enumerate(lines):
+                      if line.strip().startswith('#include'):
+                          lines.insert(i+1, '#include "Log.h"')
+                          break
+                  s = '\n'.join(lines)
 
-          s = re.sub(r'(?:#ifndef LOGI\s*\n)+', '#ifndef LOGI\n', s)
-          s = re.sub(r'(?:#endif\s*\n)+', '#endif\n', s)
+          # Add GLES3 include for glViewport/glClear
+          if '#include <GLES3/gl3.h>' not in s:
+              s = s.replace('#include "Log.h"', '#include "Log.h"\n#include <GLES3/gl3.h>', 1)
 
+          # Insert globals before first non-include/non-comment line
           lines = s.split('\n')
           insert_at = None
           for i, line in enumerate(lines):
@@ -467,19 +416,80 @@ jobs:
           ]
           s = '\n'.join(lines)
 
+          # Sanity check
           for label, pat in [
               ('setup_log_path_def', r'static\s+void\s+setup_log_path\s*\(JNIEnv'),
               ('DrawMenu_def', r'void\s+DrawMenu\s*\(\s*\)'),
               ('JNI_OnLoad_def', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
-              ('notifyMenuOpen_def', r'void\s+notifyMenuOpen'),
           ]:
               cnt = len(re.findall(pat, s))
               if cnt != 0:
-                  print("FAIL: " + label + " still present " + str(cnt) + " times after removal")
-                  raise SystemExit(3)
+                  raise SystemExit("FAIL: " + label + " still present " + str(cnt) + " times")
               print("OK no leftover: " + label)
 
           footer = textwrap.dedent(r"""
+              void DrawMenu() {
+                  if (!g_menuVisible) return;
+                  ImGuiIO& io = ImGui::GetIO();
+                  ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_FirstUseEver);
+                  ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_FirstUseEver);
+                  if (ImGui::Begin("DexTool", &g_menuVisible)) {
+                      ImGui::Text("DexTool overlay via WindowManager");
+                      ImGui::Separator();
+                      static char buf[256] = "";
+                      ImGui::InputText("Test input", buf, sizeof(buf));
+                      ImGui::Text("Touch: tap inside to test");
+                      if (ImGui::Button("Close")) g_menuVisible = false;
+                  }
+                  ImGui::End();
+              }
+
+              extern "C" JNIEXPORT void JNICALL
+              Java_com_menu_imgui_Helper_nativeOnSurfaceCreated(JNIEnv* env, jclass) {
+                  flog("[overlay] onSurfaceCreated");
+                  if (!ImGui::GetCurrentContext()) {
+                      ImGui::CreateContext();
+                      ImGuiIO& io = ImGui::GetIO();
+                      io.IniFilename = nullptr;
+                      ImGui_ImplAndroid_Init(nullptr);
+                      ImGui_ImplOpenGL3_Init("#version 300 es");
+                      flog("[overlay] ImGui initialized");
+                  }
+              }
+
+              extern "C" JNIEXPORT void JNICALL
+              Java_com_menu_imgui_Helper_nativeOnSurfaceChanged(JNIEnv* env, jclass, jint w, jint h) {
+                  flog("[overlay] onSurfaceChanged %dx%d", w, h);
+                  if (!ImGui::GetCurrentContext()) return;
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.DisplaySize = ImVec2((float)w, (float)h);
+              }
+
+              extern "C" JNIEXPORT void JNICALL
+              Java_com_menu_imgui_Helper_nativeOnDrawFrame(JNIEnv* env, jclass) {
+                  static bool first = true;
+                  if (first) { flog("[overlay] first onDrawFrame"); first = false; }
+                  if (!ImGui::GetCurrentContext()) return;
+                  ImGui_ImplOpenGL3_NewFrame();
+                  ImGui::NewFrame();
+                  DrawMenu();
+                  ImGui::Render();
+                  ImGuiIO& io = ImGui::GetIO();
+                  glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+                  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                  glClear(GL_COLOR_BUFFER_BIT);
+                  ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+              }
+
+              extern "C" JNIEXPORT void JNICALL
+              Java_com_menu_imgui_Helper_nativeOnTouch(JNIEnv* env, jclass, jint action, jfloat x, jfloat y) {
+                  if (!ImGui::GetCurrentContext()) return;
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.AddMousePosEvent(x, y);
+                  if (action == 0) io.AddMouseButtonEvent(0, true);
+                  else if (action == 1) io.AddMouseButtonEvent(0, false);
+              }
+
               static void setup_log_path(JNIEnv* env) {
                   std::string ext;
                   jclass at = env->FindClass("android/app/ActivityThread");
@@ -528,21 +538,6 @@ jobs:
                   }
               }
 
-              void DrawMenu() {
-                  static int once = 0;
-                  if (!once) { flog("[menu] DrawMenu first call"); once = 1; }
-                  if (!g_menuVisible) return;
-                  ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
-                  if (ImGui::Begin("DexTool", &g_menuVisible)) {
-                      ImGui::Text("DexTool via eglSwapBuffers + libinput hooks");
-                      ImGui::Separator();
-                      static char buf[256] = "";
-                      ImGui::InputText("Test input", buf, sizeof(buf));
-                      if (ImGui::Button("Close")) g_menuVisible = false;
-                  }
-                  ImGui::End();
-              }
-
               extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
                   gVM = vm; g_jvm = vm;
                   JNIEnv* env = nullptr;
@@ -562,18 +557,7 @@ jobs:
                   flog("[3] gum_init_embedded done");
 
                   init_frida_script();
-                  flog("[4] init_frida_script done");
-
-                  pthread_attr_t attr;
-                  pthread_attr_init(&attr);
-                  pthread_attr_setstacksize(&attr, 4 * 1024 * 1024);
-                  pthread_t t;
-                  pthread_create(&t, &attr, initModMenu, (void*)DrawMenu);
-                  pthread_attr_destroy(&attr);
-                  flog("[5] initModMenu thread started");
-
-                  hookInput();
-                  flog("[6] hookInput done");
+                  flog("[4] init_frida_script done (Frida will start overlay after 1.5s)");
 
                   flog("========== JNI_OnLoad done ==========");
                   return JNI_VERSION_1_6;
@@ -586,11 +570,58 @@ jobs:
               ('setup_log_path_def', r'static\s+void\s+setup_log_path\s*\(JNIEnv'),
               ('DrawMenu_def', r'void\s+DrawMenu\s*\(\s*\)'),
               ('JNI_OnLoad_def', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
+              ('nativeOnSurfaceCreated', r'Java_com_menu_imgui_Helper_nativeOnSurfaceCreated'),
+              ('nativeOnDrawFrame', r'Java_com_menu_imgui_Helper_nativeOnDrawFrame'),
           ]:
               cnt = len(re.findall(pat, s))
               print("FINAL " + label + " count = " + str(cnt))
               if cnt != 1:
                   raise SystemExit(4)
+          PYEOF
+
+      - name: Patch PATCH_AGENT_JS to start overlay
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re
+          p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
+          s = p.read_text()
+
+          # Find PATCH_AGENT_JS string and modify it
+          # The JS should be inside R"JS( ... )JS" or similar raw string
+          # Strategy: find "agent loaded" then inject overlay start after it
+
+          if "overlay started via Frida" in s:
+              print("PATCH_AGENT_JS already patched")
+              raise SystemExit(0)
+
+          # Locate the send({type:"ready"}); or agent loaded
+          marker = 'log("agent loaded");'
+          if marker not in s:
+              raise SystemExit("PATCH_AGENT_JS marker not found")
+
+          overlay_js = '''log("agent loaded");
+      setTimeout(function() {
+        try {
+          var loaders = Java.enumerateClassLoadersSync();
+          for (var i = 0; i < loaders.length; i++) {
+            try {
+              loaders[i].loadClass("com.menu.imgui.Helper");
+              Java.classFactory.loader = loaders[i];
+              break;
+            } catch(e) {}
+          }
+          var AT = Java.use("android.app.ActivityThread");
+          var app = AT.currentApplication();
+          if (!app) { log("overlay: no app context"); return; }
+          var Helper = Java.use("com.menu.imgui.Helper");
+          Helper.startOverlay(app);
+          log("overlay started via Frida");
+        } catch(e) { log("overlay start error: " + e.message); }
+      }, 1500);'''
+
+          s = s.replace(marker, overlay_js, 1)
+          p.write_text(s)
+          print("PATCH_AGENT_JS patched")
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
@@ -652,28 +683,38 @@ jobs:
               echo "ERR $ABI libdobby.a missing"; FAIL=1
             fi
           done
-          if [ -f app/src/main/cpp/Include/Log.h ]; then echo "OK Log.h"; else echo "ERR Log.h"; FAIL=1; fi
-          IH="app/src/main/cpp/Include/Input.h"
-          if grep -qF 'if (!ImGui::GetCurrentContext()) return;' "$IH"; then
-            echo "OK Input.h has GImGui guard"
+          HJ="app/src/main/java/com/menu/imgui/Helper.java"
+          if grep -qF 'public static void startOverlay' "$HJ"; then
+            echo "OK Helper.java has startOverlay"
           else
-            echo "ERR Input.h missing GImGui guard"; FAIL=1
+            echo "ERR Helper.java missing startOverlay"; FAIL=1
           fi
-          if grep -qF 'if (ex_ab) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)ex_ab);' "$IH"; then
-            echo "OK Input.h passes ex_ab MotionEvent"
+          if grep -qF 'nativeOnDrawFrame' "$HJ"; then
+            echo "OK Helper.java has nativeOnDrawFrame"
           else
-            echo "ERR Input.h still passes thiz"; FAIL=1
+            echo "ERR Helper.java missing nativeOnDrawFrame"; FAIL=1
           fi
           NL="app/src/main/cpp/tool/native-lib.cpp"
+          for fn in nativeOnSurfaceCreated nativeOnSurfaceChanged nativeOnDrawFrame nativeOnTouch; do
+            C=$(grep -cF "Java_com_menu_imgui_Helper_$fn" "$NL" || true)
+            if [ "$C" -eq 1 ]; then echo "OK $fn count=1"; else echo "ERR $fn count=$C"; FAIL=1; fi
+          done
           SP=$(grep -cF 'static void setup_log_path(JNIEnv* env)' "$NL" || true)
-          if [ "$SP" -eq 1 ]; then echo "OK setup_log_path definition count=1"; else echo "ERR setup_log_path definition count=$SP"; FAIL=1; fi
+          if [ "$SP" -eq 1 ]; then echo "OK setup_log_path count=1"; else echo "ERR setup_log_path count=$SP"; FAIL=1; fi
           DM=$(grep -cF 'void DrawMenu()' "$NL" || true)
-          if [ "$DM" -eq 1 ]; then echo "OK DrawMenu definition count=1"; else echo "ERR DrawMenu definition count=$DM"; FAIL=1; fi
+          if [ "$DM" -eq 1 ]; then echo "OK DrawMenu count=1"; else echo "ERR DrawMenu count=$DM"; FAIL=1; fi
           JL=$(grep -cF 'JNIEXPORT jint JNICALL JNI_OnLoad' "$NL" || true)
-          if [ "$JL" -eq 1 ]; then echo "OK JNI_OnLoad definition count=1"; else echo "ERR JNI_OnLoad definition count=$JL"; FAIL=1; fi
-          NM=$(grep -cF 'void notifyMenuOpen' "$NL" || true)
-          if [ "$NM" -eq 0 ]; then echo "OK no notifyMenuOpen definition"; else echo "ERR notifyMenuOpen=$NM"; FAIL=1; fi
-          if [ $FAIL -ne 0 ]; then exit 1; fi
+          if [ "$JL" -eq 1 ]; then echo "OK JNI_OnLoad count=1"; else echo "ERR JNI_OnLoad count=$JL"; FAIL=1; fi
+          if grep -qF 'overlay started via Frida' "$NL"; then
+            echo "OK PATCH_AGENT_JS has overlay start"
+          else
+            echo "ERR PATCH_AGENT_JS missing overlay start"; FAIL=1
+          fi
+          if [ $FAIL -ne 0 ]; then
+            echo "=== Helper.java tail ==="; tail -60 "$HJ" || true
+            echo "=== native-lib.cpp grep ==="; grep -n 'startOverlay\|nativeOn' "$NL" | head -20 || true
+            exit 1
+          fi
           echo "ALL CHECKS PASSED"
 
       - uses: gradle/actions/setup-gradle@v3
@@ -704,5 +745,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: Verify counts only function definitions, not call sites [skip ci]"
+          git diff --staged --quiet || git commit -m "feat: overlay via WindowManager + GLSurfaceView (works on all apps) [skip ci]"
           git push
