@@ -33,17 +33,13 @@ jobs:
         run: |
           echo "app/src/main/cpp/Include/Dobby/" >> .gitignore
           git rm -r --cached app/src/main/cpp/Include/Dobby 2>/dev/null || true
-          echo "=== .gitignore ==="
-          cat .gitignore
 
       - name: Clone Dobby FRESH
         run: |
           rm -rf app/src/main/cpp/Include/Dobby
           git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
-          echo "=== fresh Dobby original asm (before patch) ==="
-          head -60 app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm || true
 
-      - name: Patch Dobby ARM64 asm (handles cdecl(...) correctly)
+      - name: Patch Dobby ARM64 asm (correct :pg_hi21: and #:lo12:)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib
@@ -51,9 +47,10 @@ jobs:
           patched = 0
           for p in pathlib.Path("app/src/main/cpp/Include/Dobby").rglob("*.asm"):
               orig = p.read_text()
-              # \S+? matches any non-whitespace token, including "cdecl(sym)"
-              # Order: @PAGEOFF first, then @PAGE (with \b to avoid matching inside @PAGEOFF)
-              new = re.sub(r'(\S+?)@PAGEOFF\b', r':lo12:\1', orig)
+              # Replace @PAGEOFF -> #:lo12: (with # sign, required for add)
+              # Replace @PAGE -> :pg_hi21: (without #, correct for adrp)
+              # \S+? matches any non-whitespace token (including cdecl(...))
+              new = re.sub(r'(\S+?)@PAGEOFF\b', r'#:lo12:\1', orig)
               new = re.sub(r'(\S+?)@PAGE\b', r':pg_hi21:\1', new)
               if new != orig:
                   p.write_text(new)
@@ -61,8 +58,7 @@ jobs:
                   print(f"Patched: {p}")
           print(f"Total patched: {patched}")
           if patched == 0:
-              print("WARNING: no .asm file was patched! Check Dobby layout.")
-              raise SystemExit(1)
+              raise SystemExit("ERROR: no .asm file patched!")
 
           f = pathlib.Path("app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm")
           if f.exists():
@@ -94,7 +90,7 @@ jobs:
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
           rm -rf build
-          ./configure --host=android-arm64 -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a64.log
+          ./configure --host=android-arm64 -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static 2>&1 | tee /tmp/a64.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a64.log; exit 1; }
           make -j$(nproc) 2>&1 | tee -a /tmp/a64.log
           LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
@@ -118,7 +114,7 @@ jobs:
           cd /tmp/frida-gum
           export ANDROID_NDK_ROOT="$NDK_PATH"
           rm -rf build
-          ./configure --host=android-arm -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static -Dlibunwind:minidebuginfo=disabled -Dlibdwarf:decompression=false 2>&1 | tee /tmp/a32.log
+          ./configure --host=android-arm -- -Ddevkits=gum,gumjs -Dgumjs=enabled -Dquickjs=enabled -Dv8=disabled -Ddatabase=disabled -Dtests=disabled -Ddiet=true -Db_ndebug=true -Ddefault_library=static 2>&1 | tee /tmp/a32.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { tail -60 /tmp/a32.log; exit 1; }
           make -j$(nproc) 2>&1 | tee -a /tmp/a32.log
           LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
@@ -342,7 +338,7 @@ jobs:
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
 
-      - name: Write CMakeLists.txt (with Dobby asm march fix)
+      - name: Write CMakeLists.txt (with Dobby ASM fix)
         run: |
           cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
           cmake_minimum_required(VERSION 3.22.1)
@@ -358,9 +354,17 @@ jobs:
           include_directories(${FRIDA_DIR}/include ${FRIDA_DIR}/include/glib-2.0)
           add_library(frida-gumjs STATIC IMPORTED)
           set_target_properties(frida-gumjs PROPERTIES IMPORTED_LOCATION ${FRIDA_DIR}/lib/libfrida-gumjs.a)
+
+          # ---- Dobby ASM fixes ----
           if(ANDROID AND ${ANDROID_ABI} STREQUAL "arm64-v8a")
               set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
           endif()
+          set_source_files_properties(
+              Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
+              PROPERTIES LANGUAGE ASM
+          )
+          # -------------------------
+
           add_subdirectory(Include/Dobby dobby.out)
           include_directories(Include Include/Dobby/include imgui imgui/backends tool)
           add_library(tool SHARED
@@ -391,28 +395,18 @@ jobs:
             echo "ERR :pg_hi21:cdecl(...) missing"; grep -n 'adrp' "$ASM"; FAIL=1
           fi
 
-          if grep -qF ':lo12:cdecl(common_closure_bridge_handler)' "$ASM"; then
-            echo "OK :lo12:cdecl(...) present"
+          if grep -qF '#:lo12:cdecl(common_closure_bridge_handler)' "$ASM"; then
+            echo "OK #:lo12:cdecl(...) present (with #)"
           else
-            echo "ERR :lo12:cdecl(...) missing"; grep -n 'add TMP_REG_0' "$ASM" | head -5; FAIL=1
+            echo "ERR #:lo12:cdecl(...) missing"; grep -n 'add TMP_REG_0' "$ASM" | head -5; FAIL=1
           fi
 
           NL="app/src/main/cpp/tool/native-lib.cpp"
-          if grep -qF 'static JavaVM* g_jvm = nullptr;' "$NL"; then
-            echo "OK g_jvm declared"
-          else
-            echo "ERR g_jvm missing"; FAIL=1
-          fi
-
-          if [ "$(grep -c 'JNI_OnLoad' "$NL" || true)" -eq 1 ]; then
-            echo "OK exactly one JNI_OnLoad"
-          else
-            echo "ERR JNI_OnLoad count != 1"; grep -n 'JNI_OnLoad' "$NL"; FAIL=1
-          fi
+          if grep -qF 'static JavaVM* g_jvm = nullptr;' "$NL"; then echo "OK g_jvm declared"; else echo "ERR g_jvm missing"; FAIL=1; fi
+          if [ "$(grep -c 'JNI_OnLoad' "$NL" || true)" -eq 1 ]; then echo "OK exactly one JNI_OnLoad"; else echo "ERR JNI_OnLoad count != 1"; FAIL=1; fi
 
           if [ $FAIL -ne 0 ]; then
             echo "=== $ASM (full) ==="; head -80 "$ASM"
-            echo "=== $NL (JNI_OnLoad context) ==="; grep -n -A2 -B2 'JNI_OnLoad' "$NL" || true
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -445,5 +439,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: regex handles cdecl(...) in Dobby asm patch [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: #:lo12: for add + set_source_files_properties ASM for Dobby [skip ci]"
           git push
