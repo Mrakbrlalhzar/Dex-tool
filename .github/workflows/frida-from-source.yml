@@ -34,17 +34,18 @@ jobs:
           git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
           ls app/src/main/cpp/Include/Dobby
 
-      - name: Patch Dobby ARM64 assembly for Android NDK
+      - name: Patch Dobby ARM64 assembly (FIXED order)
         run: |
-          echo "=== BEFORE patch ==="
+          echo "=== BEFORE ==="
           head -60 app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm || true
           find app/src/main/cpp/Include/Dobby \( -name "*.asm" -o -name "*.S" \) -print0 | while IFS= read -r -d '' f; do
             if grep -qE '@PAGE|@PAGEOFF' "$f"; then
-              sed -i 's/@PAGE/:pg_hi21:/g; s/@PAGEOFF/:lo12:/g' "$f"
+              # FIX: @PAGEOFF must be replaced FIRST, otherwise @PAGE rule corrupts it
+              sed -i 's/@PAGEOFF/:lo12:/g; s/@PAGE/:pg_hi21:/g' "$f"
               echo "Patched: $f"
             fi
           done
-          echo "=== AFTER patch ==="
+          echo "=== AFTER ==="
           grep -nE 'pg_hi21|lo12|@PAGE|@PAGEOFF' app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm || true
 
       - name: Download Frida devkit
@@ -223,7 +224,7 @@ jobs:
           }
           INPUTEOF
 
-      - name: Patch native-lib.cpp (FULL CLEAN)
+      - name: Patch native-lib.cpp
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -333,9 +334,6 @@ jobs:
           print(f"gVM: {s.count('static JavaVM* gVM = nullptr;')}")
           print(f"g_jvm: {s.count('static JavaVM* g_jvm = nullptr;')}")
           print(f"notifyMenuOpen: {s.count('notifyMenuOpen')}")
-          print("=== first 30 lines ===")
-          for i, line in enumerate(s.split('\n')[:30], 1):
-              print(f"{i}: {line}")
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
@@ -357,7 +355,7 @@ jobs:
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
           echo "dex_data.h rebuilt"
 
-      - name: Write CMakeLists.txt
+      - name: Write CMakeLists.txt (add -march=armv8-a for arm64)
         run: |
           cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
           cmake_minimum_required(VERSION 3.22.1)
@@ -379,6 +377,9 @@ jobs:
               tool/native-lib.cpp
               imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
               imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
+          if(${ANDROID_ABI} STREQUAL "arm64-v8a")
+              target_compile_options(tool PRIVATE -march=armv8-a)
+          endif()
           target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
           target_link_libraries(tool dobby frida-gumjs android log EGL GLESv3 dl)
           CMEOF
@@ -398,9 +399,7 @@ jobs:
           if head -60 app/src/main/cpp/tool/native-lib.cpp | grep -qF 'static JavaVM* g_jvm = nullptr;'; then
             echo "OK g_jvm in first 60 lines"
           else
-            echo "ERR g_jvm not in first 60 lines"
-            head -60 app/src/main/cpp/tool/native-lib.cpp | grep -n 'g_jvm' || true
-            FAIL=1
+            echo "ERR g_jvm not in first 60 lines"; FAIL=1
           fi
 
           if head -60 app/src/main/cpp/tool/native-lib.cpp | grep -qF 'static JavaVM* gVM = nullptr;'; then
@@ -424,15 +423,23 @@ jobs:
             echo "OK notifyMenuOpen removed"
           fi
 
-          # Check Dobby asm was patched
+          # Check Dobby asm: must have :pg_hi21: and :lo12:, must NOT have @PAGE/@PAGEOFF or :pg_hi21:OFF
           ASM_FILE="app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
           if [ -f "$ASM_FILE" ]; then
-            if grep -qF '@PAGE' "$ASM_FILE"; then
-              echo "ERR Dobby asm still has @PAGE"
+            if grep -qE '@PAGE|@PAGEOFF|:pg_hi21:OFF' "$ASM_FILE"; then
+              echo "ERR Dobby asm still has invalid syntax"
+              grep -nE '@PAGE|@PAGEOFF|:pg_hi21:OFF' "$ASM_FILE" || true
               FAIL=1
             else
-              echo "OK Dobby asm patched (no @PAGE)"
+              echo "OK Dobby asm has valid syntax"
             fi
+            if grep -qF ':pg_hi21:common_closure_bridge_handler' "$ASM_FILE" && grep -qF ':lo12:common_closure_bridge_handler' "$ASM_FILE"; then
+              echo "OK Dobby asm uses :pg_hi21: + :lo12:"
+            else
+              echo "ERR Dobby asm missing correct tokens"; FAIL=1
+            fi
+          else
+            echo "WARN: Dobby asm not found at expected path"
           fi
 
           if [ $FAIL -ne 0 ]; then
@@ -470,5 +477,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: patch Dobby arm64 asm @PAGE/@PAGEOFF for Android NDK [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: Dobby asm sed order (PAGEOFF first) + -march=armv8-a [skip ci]"
           git push
