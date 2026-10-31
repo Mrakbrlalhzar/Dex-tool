@@ -35,16 +35,12 @@ jobs:
           BASE="https://raw.githubusercontent.com/3equals3/DobbyHook/main"
           mkdir -p /tmp/dobby-prebuilt/arm64-v8a
           mkdir -p /tmp/dobby-prebuilt/armeabi-v7a
-          echo "=== Downloading arm64-v8a/libdobby.a ==="
           wget -q "$BASE/arm64-v8a/libdobby.a" -O /tmp/dobby-prebuilt/arm64-v8a/libdobby.a
           ls -lah /tmp/dobby-prebuilt/arm64-v8a/libdobby.a
-          echo "=== Downloading armeabi-v7a/libdobby.a ==="
           wget -q "$BASE/armeabi-v7a/libdobby.a" -O /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a
           ls -lah /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a
-          echo "=== Downloading Dobby.h ==="
           wget -q "$BASE/Dobby.h" -O /tmp/dobby-prebuilt/Dobby.h
           ls -lah /tmp/dobby-prebuilt/Dobby.h
-          echo "=== Verify ELF magic ==="
           file /tmp/dobby-prebuilt/arm64-v8a/libdobby.a || true
           file /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a || true
 
@@ -57,7 +53,6 @@ jobs:
           cp /tmp/dobby-prebuilt/arm64-v8a/libdobby.a  app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a
           cp /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a app/src/main/cpp/Include/Dobby/lib/armeabi-v7a/libdobby.a
           cp /tmp/dobby-prebuilt/Dobby.h app/src/main/cpp/Include/Dobby/include/dobby.h
-          echo "=== Staged Dobby ==="
           find app/src/main/cpp/Include/Dobby -maxdepth 3 -type f | sort
 
       - name: Download Frida devkit
@@ -124,7 +119,7 @@ jobs:
           if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; fi
           ls -lah "$D/lib/"
 
-      - name: Write Include/Log.h (crash handler + file logger)
+      - name: Write Include/Log.h
         run: |
           mkdir -p app/src/main/cpp/Include
           cat > app/src/main/cpp/Include/Log.h <<'LOGEOF'
@@ -134,6 +129,7 @@ jobs:
           #include <cstdarg>
           #include <cstdint>
           #include <cstdlib>
+          #include <string>
           #include <fcntl.h>
           #include <unistd.h>
           #include <signal.h>
@@ -242,7 +238,7 @@ jobs:
           }
           LOGEOF
 
-      - name: Write Include/ImGui.h (with step logging)
+      - name: Write Include/ImGui.h
         run: |
           cat > app/src/main/cpp/Include/ImGui.h <<'IMGUIEOF'
           #pragma once
@@ -339,7 +335,7 @@ jobs:
           }
           IMGUIEOF
 
-      - name: Write Include/Input.h (with logging)
+      - name: Write Include/Input.h
         run: |
           cat > app/src/main/cpp/Include/Input.h <<'INPUTEOF'
           #pragma once
@@ -386,14 +382,14 @@ jobs:
           }
           INPUTEOF
 
-      - name: Patch native-lib.cpp (with crash handler + step logging)
+      - name: Patch native-lib.cpp (idempotent, removes setup_log_path/DrawMenu/JNI_OnLoad first)
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
-          def rm_method(src, pat):
+          def rm_method(src, pat, label):
               n = 0
               while True:
                   m = re.search(pat, src)
@@ -411,11 +407,14 @@ jobs:
                   while e < len(src) and src[e] in '\n \t': e += 1
                   src = src[:start] + src[e:]
                   n += 1
-              return src, n
+              print(f"rm_method[{label}]: removed {n} occurrence(s)")
+              return src
 
-          s, _ = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'void\s+DrawMenu\s*\([^)]*\)\s*\{')
-          s, _ = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{')
+          # Order matters: remove old occurrences before appending new footer
+          s = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{', 'notifyMenuOpen')
+          s = rm_method(s, r'(?:static\s+)?void\s+setup_log_path\s*\([^)]*\)\s*\{', 'setup_log_path')
+          s = rm_method(s, r'(?:static\s+)?void\s+DrawMenu\s*\([^)]*\)\s*\{', 'DrawMenu')
+          s = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{', 'JNI_OnLoad')
 
           for pat in [
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?',
@@ -465,6 +464,24 @@ jobs:
               '',
           ]
           s = '\n'.join(lines)
+
+          # Safety check BEFORE appending footer: no leftovers
+          for label, pat in [
+              ('setup_log_path', r'static\s+void\s+setup_log_path'),
+              ('DrawMenu', r'void\s+DrawMenu\s*\('),
+              ('JNI_OnLoad', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
+              ('notifyMenuOpen', r'notifyMenuOpen'),
+          ]:
+              cnt = len(re.findall(pat, s))
+              if cnt != 0:
+                  print(f"FAIL: {label} still present {cnt} time(s) after removal")
+                  print("=== context around leftover ===")
+                  m = re.search(pat, s)
+                  if m:
+                      start = max(0, m.start()-100)
+                      print(s[start:m.start()+200])
+                  raise SystemExit(3)
+              print(f"OK no leftover: {label}")
 
           footer = textwrap.dedent(r"""
               static void setup_log_path(JNIEnv* env) {
@@ -568,6 +585,17 @@ jobs:
           """).strip()
           s = s.rstrip() + "\n\n" + footer + "\n"
           p.write_text(s)
+
+          # Final sanity counts
+          for label, pat in [
+              ('setup_log_path', r'static\s+void\s+setup_log_path'),
+              ('DrawMenu', r'void\s+DrawMenu\s*\('),
+              ('JNI_OnLoad', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
+          ]:
+              cnt = len(re.findall(pat, s))
+              print(f"FINAL {label} count = {cnt}")
+              if cnt != 1:
+                  raise SystemExit(4)
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
@@ -640,27 +668,36 @@ jobs:
             echo "ERR Log.h missing"; FAIL=1
           fi
           NL="app/src/main/cpp/tool/native-lib.cpp"
-          for pat in 'static JavaVM\* g_jvm = nullptr;' 'install_crash_handler' 'setup_log_path'; do
-            if grep -qE "$pat" "$NL"; then
-              echo "OK pattern present: $pat"
-            else
-              echo "ERR pattern missing: $pat"; FAIL=1
-            fi
-          done
+
+          SP=$(grep -cF 'static void setup_log_path' "$NL" || true)
+          if [ "$SP" -eq 1 ]; then echo "OK exactly one setup_log_path (count=$SP)"; else echo "ERR setup_log_path count != 1 (count=$SP)"; FAIL=1; fi
+
+          DM=$(grep -cF 'void DrawMenu()' "$NL" || true)
+          if [ "$DM" -eq 1 ]; then echo "OK exactly one DrawMenu (count=$DM)"; else echo "ERR DrawMenu count != 1 (count=$DM)"; FAIL=1; fi
+
+          JL=$(grep -cF 'JNIEXPORT jint JNICALL JNI_OnLoad' "$NL" || true)
+          if [ "$JL" -eq 1 ]; then echo "OK exactly one JNI_OnLoad (count=$JL)"; else echo "ERR JNI_OnLoad count != 1 (count=$JL)"; FAIL=1; fi
+
+          NM=$(grep -cF 'notifyMenuOpen' "$NL" || true)
+          if [ "$NM" -eq 0 ]; then echo "OK no notifyMenuOpen leftover"; else echo "ERR notifyMenuOpen leftover (count=$NM)"; FAIL=1; fi
+
           if grep -qF 'flog("========== JNI_OnLoad start' "$NL"; then
             echo "OK flog JNI_OnLoad start present"
           else
             echo "ERR flog JNI_OnLoad start missing"; FAIL=1
           fi
-          DEF_COUNT=$(grep -cF 'JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*)' "$NL" || true)
-          if [ "$DEF_COUNT" -eq 1 ]; then
-            echo "OK exactly one JNI_OnLoad definition (count=$DEF_COUNT)"
+
+          if grep -qF 'static JavaVM* g_jvm = nullptr;' "$NL"; then
+            echo "OK g_jvm declared"
           else
-            echo "ERR JNI_OnLoad definition count != 1 (count=$DEF_COUNT)"
-            grep -nF 'JNIEXPORT jint JNICALL JNI_OnLoad' "$NL"
-            FAIL=1
+            echo "ERR g_jvm missing"; FAIL=1
           fi
+
           if [ $FAIL -ne 0 ]; then
+            echo "=== first 30 lines of native-lib.cpp ==="; head -30 "$NL" || true
+            echo "=== tail 80 lines of native-lib.cpp ==="; tail -80 "$NL" || true
+            echo "=== grep locations ==="
+            grep -n 'setup_log_path\|DrawMenu\|JNI_OnLoad\|notifyMenuOpen' "$NL" || true
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -693,5 +730,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: Verify uses grep -F for flog pattern and grep -cF for JNI_OnLoad def [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: idempotent setup_log_path removal, count checks in Verify [skip ci]"
           git push
