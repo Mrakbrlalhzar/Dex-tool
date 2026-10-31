@@ -17,5 +17,8 @@ add_library(tool SHARED
     tool/native-lib.cpp
     imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
     imgui/backends/imgui_impl_android.cpp imgui/backends/imgui_impl_opengl3.cpp)
+if(${ANDROID_ABI} STREQUAL "arm64-v8a")
+    target_compile_options(tool PRIVATE -march=armv8-a)
+endif()
 target_link_options(tool PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--strip-all)
 target_link_libraries(tool dobby frida-gumjs android log EGL GLESv3 dl)
