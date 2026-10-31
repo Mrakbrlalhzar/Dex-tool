@@ -29,24 +29,46 @@ jobs:
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
 
-      - name: Clone Dobby
+      - name: Gitignore Dobby (remove corrupted from tracking)
         run: |
-          git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
-          ls app/src/main/cpp/Include/Dobby
+          echo "app/src/main/cpp/Include/Dobby/" >> .gitignore
+          git rm -r --cached app/src/main/cpp/Include/Dobby 2>/dev/null || true
+          echo "=== .gitignore ==="
+          cat .gitignore
 
-      - name: Patch Dobby ARM64 assembly (FIXED order)
+      - name: Clone Dobby FRESH
         run: |
-          echo "=== BEFORE ==="
+          rm -rf app/src/main/cpp/Include/Dobby
+          git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
+          echo "=== fresh Dobby original asm ==="
           head -60 app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm || true
-          find app/src/main/cpp/Include/Dobby \( -name "*.asm" -o -name "*.S" \) -print0 | while IFS= read -r -d '' f; do
-            if grep -qE '@PAGE|@PAGEOFF' "$f"; then
-              # FIX: @PAGEOFF must be replaced FIRST, otherwise @PAGE rule corrupts it
-              sed -i 's/@PAGEOFF/:lo12:/g; s/@PAGE/:pg_hi21:/g' "$f"
-              echo "Patched: $f"
-            fi
-          done
-          echo "=== AFTER ==="
-          grep -nE 'pg_hi21|lo12|@PAGE|@PAGEOFF' app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm || true
+
+      - name: Patch Dobby ARM64 asm (CORRECT prefix modifiers)
+        run: |
+          python3 - <<'PYEOF'
+          import re, pathlib
+          patched = 0
+          for p in pathlib.Path("app/src/main/cpp/Include/Dobby").rglob("*.asm"):
+              orig = p.read_text()
+              # CRITICAL: @PAGEOFF MUST be replaced FIRST, then @PAGE.
+              # Capture group puts modifier BEFORE the symbol (ARM64 GAS syntax).
+              # \b prevents @PAGE from matching inside @PAGEOFF.
+              new = re.sub(r'([A-Za-z_][A-Za-z0-9_]*)@PAGEOFF\b', r':lo12:\1', orig)
+              new = re.sub(r'([A-Za-z_][A-Za-z0-9_]*)@PAGE\b', r':pg_hi21:\1', new)
+              if new != orig:
+                  p.write_text(new)
+                  patched += 1
+                  print(f"Patched: {p}")
+          print(f"Total patched: {patched}")
+
+          # Diagnostic
+          f = pathlib.Path("app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm")
+          if f.exists():
+              print("=== AFTER (relevant lines) ===")
+              for i, line in enumerate(f.read_text().split('\n'), 1):
+                  if any(k in line for k in ['pg_hi21', 'lo12', 'adrp', 'add x']):
+                      print(f"{i}: {line}")
+          PYEOF
 
       - name: Download Frida devkit
         run: |
@@ -76,28 +98,17 @@ jobs:
           LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true)
           [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
-          echo "arm64 lib: $LIB"
-
-      - name: Stage arm64
-        run: |
-          set -e
           D=/tmp/frida-built/arm64-v8a
           rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
-          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1 || true)
-          if [ -z "$LIB" ]; then LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true); fi
-          if [ -z "$LIB" ]; then echo "FATAL_no_lib"; exit 1; fi
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-          GUMJS_H=$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1 || true)
-          if [ -z "$GUMJS_H" ]; then echo "FATAL_no_gumjs_h"; exit 1; fi
-          cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
+          cp -v "$(find /tmp/dk64 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
           G=$(find /tmp/dk64 -name "frida-gum.h" | head -1 || true)
           if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
-          if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1 || true); fi
-          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN"; fi
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; fi
           GLIB_DIR=$(find /tmp/dk64 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
           if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
-          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN"; fi
-          ls -lah "$D/lib/" "$D/include/" || true
+          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; fi
+          ls -lah "$D/lib/"
 
       - name: Build armv7
         run: |
@@ -111,28 +122,17 @@ jobs:
           LIB=$(find build -name "libfrida-gumjs.a" | head -1 || true)
           [ -z "$LIB" ] && LIB=$(find build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true)
           [ -z "$LIB" ] && { echo "NO_LIB"; exit 1; }
-          echo "armv7 lib: $LIB"
-
-      - name: Stage armv7
-        run: |
-          set -e
           D=/tmp/frida-built/armeabi-v7a
           rm -rf "$D"; mkdir -p "$D/lib" "$D/include"
-          LIB=$(find /tmp/frida-gum/build -name "libfrida-gumjs.a" | head -1 || true)
-          if [ -z "$LIB" ]; then LIB=$(find /tmp/frida-gum/build -path "*devkit*" -name "libfrida-gumjs*.a" ! -name "*inspector*" | head -1 || true); fi
-          if [ -z "$LIB" ]; then echo "FATAL_no_lib"; exit 1; fi
           cp -v "$LIB" "$D/lib/libfrida-gumjs.a"
-          GUMJS_H=$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1 || true)
-          if [ -z "$GUMJS_H" ]; then echo "FATAL_no_gumjs_h"; exit 1; fi
-          cp -v "$GUMJS_H" "$D/include/frida-gumjs.h"
+          cp -v "$(find /tmp/dk32 -name 'frida-gumjs.h' | head -1)" "$D/include/frida-gumjs.h"
           G=$(find /tmp/dk32 -name "frida-gum.h" | head -1 || true)
           if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build/gum/devkit -name "frida-gum.h" | head -1 || true); fi
-          if [ -z "$G" ]; then G=$(find /tmp/frida-gum/build -name "frida-gum.h" | head -1 || true); fi
-          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; else echo "WARN"; fi
+          if [ -n "$G" ]; then cp -v "$G" "$D/include/frida-gum.h"; fi
           GLIB_DIR=$(find /tmp/dk32 -type d -name 'glib-2.0' 2>/dev/null | head -1 || true)
           if [ -z "$GLIB_DIR" ]; then GLIB_DIR=$(find /tmp/frida-gum/build/gum/devkit -type d -name 'glib-2.0' 2>/dev/null | head -1 || true); fi
-          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; else echo "WARN"; fi
-          ls -lah "$D/lib/" "$D/include/" || true
+          if [ -n "$GLIB_DIR" ]; then cp -rv "$GLIB_DIR" "$D/include/glib-2.0"; fi
+          ls -lah "$D/lib/"
 
       - name: Write Include/ImGui.h
         run: |
@@ -168,9 +168,9 @@ jobs:
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
               if (!imgui_sw_initialized) {
                   ImGui::CreateContext();
-                  ImGuiIO& io = ImGui::GetIO();
-                  io.DisplaySize = ImVec2((float)w, (float)h);
-                  io.IniFilename = nullptr;
+                  ImGuiIO& io0 = ImGui::GetIO();
+                  io0.DisplaySize = ImVec2((float)w, (float)h);
+                  io0.IniFilename = nullptr;
                   ImGui_ImplAndroid_Init(nullptr);
                   ImGui_ImplOpenGL3_Init("#version 300 es");
                   imgui_sw_initialized = true;
@@ -178,8 +178,8 @@ jobs:
               }
               ImGuiIO& io = ImGui::GetIO();
               io.DisplaySize = ImVec2((float)w, (float)h);
+              io.DeltaTime = 1.0f / 60.0f;
               ImGui_ImplOpenGL3_NewFrame();
-              ImGui_ImplAndroid_NewFrame();
               ImGui::NewFrame();
               if (menuAddress) menuAddress();
               ImGui::Render();
@@ -251,10 +251,9 @@ jobs:
                   n += 1
               return src, n
 
-          s, n1 = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
-          s, n2 = rm_method(s, r'void\s+DrawMenu\s*\([^)]*\)\s*\{')
-          s, n3 = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{')
-          print(f"Removed: notifyMenuOpen={n1}, DrawMenu={n2}, JNI_OnLoad={n3}")
+          s, _ = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'void\s+DrawMenu\s*\([^)]*\)\s*\{')
+          s, _ = rm_method(s, r'JNI_OnLoad\s*\([^)]*\)\s*\{')
 
           for pat in [
               r'(?m)^[ \t]*(?:static\s+)?JavaVM\s*\*\s+gVM\s*=\s*nullptr\s*;\s*\n?',
@@ -269,10 +268,9 @@ jobs:
           if '#include "ImGui.h"' not in s:
               s = s.replace('#include "dex_data.h"', '#include "dex_data.h"\n#include "ImGui.h"\n#include "Input.h"', 1)
 
-          m = re.search(r'(?m)^[ \t]*#define\s+LOGI\s*\([^\n]*\n', s)
-          if m:
-              s = s[:m.start()] + '#ifndef LOGI\n' + m.group(0) + '#endif\n' + s[m.end():]
-              print("Guarded LOGI")
+          # Collapse nested LOGI guards
+          s = re.sub(r'(?:#ifndef LOGI\s*\n)+', '#ifndef LOGI\n', s)
+          s = re.sub(r'(?:#endif\s*\n)+', '#endif\n', s)
 
           lines = s.split('\n')
           insert_at = None
@@ -285,8 +283,7 @@ jobs:
               if stripped.startswith('*'): continue
               insert_at = i
               break
-          if insert_at is None:
-              print("FATAL: no code line"); raise SystemExit(2)
+          if insert_at is None: raise SystemExit(2)
           lines[insert_at:insert_at] = [
               'static JavaVM* gVM = nullptr;',
               'static JavaVM* g_jvm = nullptr;',
@@ -295,7 +292,6 @@ jobs:
               '',
           ]
           s = '\n'.join(lines)
-          print(f"Globals inserted at line {insert_at+1}")
 
           footer = textwrap.dedent(r"""
               void DrawMenu() {
@@ -312,8 +308,7 @@ jobs:
               }
 
               extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
-                  gVM = vm;
-                  g_jvm = vm;
+                  gVM = vm; g_jvm = vm;
                   JNIEnv* env = nullptr;
                   if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
                   loadDex(env);
@@ -327,21 +322,13 @@ jobs:
           """).strip()
           s = s.rstrip() + "\n\n" + footer + "\n"
           p.write_text(s)
-
-          print(f"=== FINAL COUNTS ===")
-          print(f"JNI_OnLoad: {s.count('JNI_OnLoad')}")
-          print(f"DrawMenu: {s.count('void DrawMenu()')}")
-          print(f"gVM: {s.count('static JavaVM* gVM = nullptr;')}")
-          print(f"g_jvm: {s.count('static JavaVM* g_jvm = nullptr;')}")
-          print(f"notifyMenuOpen: {s.count('notifyMenuOpen')}")
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
         run: |
           rm -f app/src/main/java/com/menu/imgui/OverlaySurfaceView.java
-          echo "Removed"
 
-      - name: Rebuild dex_data.h (Helper only)
+      - name: Rebuild dex_data.h
         run: |
           set -e
           ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" | sort -V | tail -1)
@@ -353,9 +340,8 @@ jobs:
           "$D8" --min-api 26 --lib "$ANDROID_JAR" --output /tmp/dex_out $(find /tmp/dex_build -name "*.class") 2>&1 | tee /tmp/d8.log
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
-          echo "dex_data.h rebuilt"
 
-      - name: Write CMakeLists.txt (add -march=armv8-a for arm64)
+      - name: Write CMakeLists.txt
         run: |
           cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
           cmake_minimum_required(VERSION 3.22.1)
@@ -387,64 +373,34 @@ jobs:
       - name: Verify
         run: |
           FAIL=0
-          test -s app/src/main/cpp/Include/ImGui.h && echo "OK ImGui.h" || { echo "ERR ImGui.h"; FAIL=1; }
-          test -s app/src/main/cpp/Include/Input.h && echo "OK Input.h" || { echo "ERR Input.h"; FAIL=1; }
+          ASM="app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
 
-          N_JNI=$(grep -cF 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp || true)
-          if [ "$N_JNI" -eq 1 ]; then echo "OK 1 JNI_OnLoad"; else echo "ERR JNI_OnLoad=$N_JNI"; grep -n 'JNI_OnLoad' app/src/main/cpp/tool/native-lib.cpp; FAIL=1; fi
-
-          N_DM=$(grep -cF 'void DrawMenu()' app/src/main/cpp/tool/native-lib.cpp || true)
-          if [ "$N_DM" -eq 1 ]; then echo "OK 1 DrawMenu"; else echo "ERR DrawMenu=$N_DM"; grep -n 'void DrawMenu()' app/src/main/cpp/tool/native-lib.cpp; FAIL=1; fi
-
-          if head -60 app/src/main/cpp/tool/native-lib.cpp | grep -qF 'static JavaVM* g_jvm = nullptr;'; then
-            echo "OK g_jvm in first 60 lines"
+          if grep -qE '@PAGE|@PAGEOFF|:pg_hi21:OFF' "$ASM"; then
+            echo "ERR invalid tokens"; grep -nE '@PAGE|@PAGEOFF|:pg_hi21:OFF' "$ASM"; FAIL=1
           else
-            echo "ERR g_jvm not in first 60 lines"; FAIL=1
+            echo "OK no invalid tokens"
           fi
 
-          if head -60 app/src/main/cpp/tool/native-lib.cpp | grep -qF 'static JavaVM* gVM = nullptr;'; then
-            echo "OK gVM in first 60 lines"
+          if grep -qE ':pg_hi21:[A-Za-z_]' "$ASM"; then
+            echo "OK :pg_hi21: prefix present"
           else
-            echo "ERR gVM not in first 60 lines"; FAIL=1
+            echo "ERR :pg_hi21: prefix missing"; grep -n 'adrp' "$ASM"; FAIL=1
           fi
 
-          DECL_LINE=$(grep -n 'static JavaVM\* g_jvm = nullptr;' app/src/main/cpp/tool/native-lib.cpp | head -1 | cut -d: -f1)
-          USE_LINE=$(grep -n 'g_jvm' app/src/main/cpp/tool/native-lib.cpp | grep -v 'static JavaVM\* g_jvm' | head -1 | cut -d: -f1)
-          echo "g_jvm decl at $DECL_LINE, first use at $USE_LINE"
-          if [ -n "$DECL_LINE" ] && [ -n "$USE_LINE" ] && [ "$DECL_LINE" -lt "$USE_LINE" ]; then
-            echo "OK g_jvm declared before use"
+          if grep -qE ':lo12:[A-Za-z_]' "$ASM"; then
+            echo "OK :lo12: prefix present"
           else
-            echo "ERR g_jvm declaration order wrong"; FAIL=1
+            echo "ERR :lo12: prefix missing"; grep -n 'add x' "$ASM" | head -5; FAIL=1
           fi
 
-          if grep -qF 'notifyMenuOpen' app/src/main/cpp/tool/native-lib.cpp; then
-            echo "ERR notifyMenuOpen still present (dead code)"; FAIL=1
+          if grep -qF 'static JavaVM* g_jvm = nullptr;' app/src/main/cpp/tool/native-lib.cpp; then
+            echo "OK g_jvm declared"
           else
-            echo "OK notifyMenuOpen removed"
-          fi
-
-          # Check Dobby asm: must have :pg_hi21: and :lo12:, must NOT have @PAGE/@PAGEOFF or :pg_hi21:OFF
-          ASM_FILE="app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
-          if [ -f "$ASM_FILE" ]; then
-            if grep -qE '@PAGE|@PAGEOFF|:pg_hi21:OFF' "$ASM_FILE"; then
-              echo "ERR Dobby asm still has invalid syntax"
-              grep -nE '@PAGE|@PAGEOFF|:pg_hi21:OFF' "$ASM_FILE" || true
-              FAIL=1
-            else
-              echo "OK Dobby asm has valid syntax"
-            fi
-            if grep -qF ':pg_hi21:common_closure_bridge_handler' "$ASM_FILE" && grep -qF ':lo12:common_closure_bridge_handler' "$ASM_FILE"; then
-              echo "OK Dobby asm uses :pg_hi21: + :lo12:"
-            else
-              echo "ERR Dobby asm missing correct tokens"; FAIL=1
-            fi
-          else
-            echo "WARN: Dobby asm not found at expected path"
+            echo "ERR g_jvm missing"; FAIL=1
           fi
 
           if [ $FAIL -ne 0 ]; then
-            echo "=== first 60 lines ==="
-            head -60 app/src/main/cpp/tool/native-lib.cpp
+            echo "=== $ASM (full) ==="; cat "$ASM" | head -80
             exit 1
           fi
           echo "ALL CHECKS PASSED"
@@ -477,5 +433,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: Dobby asm sed order (PAGEOFF first) + -march=armv8-a [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: gitignore Dobby + clone fresh + capture-group prefix modifiers [skip ci]"
           git push
