@@ -39,7 +39,7 @@ jobs:
           rm -rf app/src/main/cpp/Include/Dobby
           git clone --recursive --depth 1 https://github.com/jmpews/Dobby.git app/src/main/cpp/Include/Dobby
 
-      - name: "Patch Dobby ARM64 asm (correct :pg_hi21: and #:lo12:)"
+      - name: "Patch Dobby ARM64 asm (no prefix for adrp, #:lo12: for add)"
         run: |
           python3 - <<'PYEOF'
           import re, pathlib
@@ -47,11 +47,10 @@ jobs:
           patched = 0
           for p in pathlib.Path("app/src/main/cpp/Include/Dobby").rglob("*.asm"):
               orig = p.read_text()
-              # Replace @PAGEOFF -> #:lo12: (with # sign, required for add)
-              # Replace @PAGE -> :pg_hi21: (without #, correct for adrp)
-              # \S+? matches any non-whitespace token (including cdecl(...))
+              # 1) @PAGEOFF -> #:lo12:  (with #, required for add)
               new = re.sub(r'(\S+?)@PAGEOFF\b', r'#:lo12:\1', orig)
-              new = re.sub(r'(\S+?)@PAGE\b', r':pg_hi21:\1', new)
+              # 2) @PAGE -> "" (no prefix at all for adrp on Android/clang)
+              new = re.sub(r'(\S+?)@PAGE\b', r'\1', new)
               if new != orig:
                   p.write_text(new)
                   patched += 1
@@ -64,7 +63,7 @@ jobs:
           if f.exists():
               print("=== AFTER (relevant lines) ===")
               for i, line in enumerate(f.read_text().split('\n'), 1):
-                  if any(k in line for k in ['pg_hi21', 'lo12', 'adrp', 'add TMP_REG']):
+                  if any(k in line for k in ['adrp', 'add TMP_REG', 'lo12']):
                       print(f"{i}: {line}")
           PYEOF
 
@@ -338,7 +337,7 @@ jobs:
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
 
-      - name: "Write CMakeLists.txt (with Dobby ASM fix)"
+      - name: "Write CMakeLists.txt (Dobby ASM: no adrp prefix, #:lo12: for add)"
         run: |
           cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
           cmake_minimum_required(VERSION 3.22.1)
@@ -381,16 +380,16 @@ jobs:
           FAIL=0
           ASM="app/src/main/cpp/Include/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
 
-          if grep -qE '@PAGE|@PAGEOFF' "$ASM"; then
-            echo "ERR raw @PAGE/@PAGEOFF still present"; grep -nE '@PAGE|@PAGEOFF' "$ASM"; FAIL=1
+          if grep -qE '@PAGE|@PAGEOFF|:pg_hi21:' "$ASM"; then
+            echo "ERR invalid token still present"; grep -nE '@PAGE|@PAGEOFF|:pg_hi21:' "$ASM"; FAIL=1
           else
-            echo "OK no raw @PAGE/@PAGEOFF"
+            echo "OK no invalid tokens (@PAGE, @PAGEOFF, :pg_hi21: all gone)"
           fi
 
-          if grep -qF ':pg_hi21:cdecl(common_closure_bridge_handler)' "$ASM"; then
-            echo "OK :pg_hi21:cdecl(...) present"
+          if grep -qF 'adrp TMP_REG_0, cdecl(common_closure_bridge_handler)' "$ASM"; then
+            echo "OK adrp has no prefix (correct for clang)"
           else
-            echo "ERR :pg_hi21:cdecl(...) missing"; grep -n 'adrp' "$ASM"; FAIL=1
+            echo "ERR adrp prefix check failed"; grep -n 'adrp' "$ASM"; FAIL=1
           fi
 
           if grep -qF '#:lo12:cdecl(common_closure_bridge_handler)' "$ASM"; then
@@ -437,5 +436,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: #:lo12: for add + set_source_files_properties ASM for Dobby [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: adrp no prefix (clang) + #:lo12: for add [skip ci]"
           git push
