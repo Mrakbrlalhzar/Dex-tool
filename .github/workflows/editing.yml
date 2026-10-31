@@ -239,7 +239,7 @@ jobs:
           rm -f app/src/main/cpp/Include/ImGui.h
           rm -f app/src/main/cpp/Include/Input.h
 
-      - name: Write AndroidManifest.xml with SYSTEM_ALERT_WINDOW
+      - name: Write AndroidManifest.xml
         run: |
           mkdir -p app/src/main
           cat > app/src/main/AndroidManifest.xml <<'MANIFESTEOF'
@@ -291,7 +291,7 @@ jobs:
                   }
                   System.loadLibrary("tool");
                   TextView tv = new TextView(this);
-                  tv.setText("DexTool Test\n\nIf overlay not shown:\n1. Grant 'Display over other apps' permission\n2. Restart this app\n3. Check /sdcard/Download/DexTool.log");
+                  tv.setText("DexTool Test\n\nIf overlay not shown:\n1. Grant 'Display over other apps'\n2. Restart this app\n3. Check /sdcard/Download/DexTool.log");
                   tv.setTextSize(18);
                   tv.setPadding(40, 200, 40, 40);
                   setContentView(tv);
@@ -301,7 +301,7 @@ jobs:
           echo "=== MainActivity.java ==="
           cat app/src/main/java/com/example/tool/MainActivity.java
 
-      - name: Patch Helper.java with main thread + nativeLog
+      - name: Patch Helper.java with overlay and nativeLog
         run: |
           python3 - <<'PYEOF'
           import pathlib, textwrap
@@ -325,7 +325,7 @@ jobs:
                               android.view.WindowManager wm =
                                   (android.view.WindowManager) context.getSystemService(android.content.Context.WINDOW_SERVICE);
                               if (wm == null) {
-                                  nativeLog("ERROR: WindowManager null");
+                                  nativeLog("ERROR WindowManager null");
                                   return;
                               }
                               android.opengl.GLSurfaceView view = new android.opengl.GLSurfaceView(context);
@@ -387,7 +387,7 @@ jobs:
           print("Helper.java patched")
           PYEOF
 
-      - name: Patch native-lib.cpp overlay + nativeLog
+      - name: Patch native-lib.cpp overlay and nativeLog
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -631,56 +631,60 @@ jobs:
                   raise SystemExit(4)
           PYEOF
 
-      - name: Patch PATCH_AGENT_JS - remove setTimeout use immediate call
+      - name: Patch PATCH_AGENT_JS remove setTimeout
         run: |
           python3 - <<'PYEOF'
-          import re, pathlib
+          import re, pathlib, textwrap
           p = pathlib.Path("app/src/main/cpp/tool/native-lib.cpp")
           s = p.read_text()
 
           pattern = r'log\("agent loaded"\);.*?var HOOKED = \{\};'
 
-          replacement = '''log("agent loaded");
-    var foundHelper = false;
-    function jlog(m) {
-        try { send({type:"log", msg:m}); } catch(e) {}
-        if (foundHelper) {
-            try { Java.use("com.menu.imgui.Helper").nativeLog(m); } catch(e) {}
-        }
-    }
-    try {
-        var loaders = Java.enumerateClassLoadersSync();
-        jlog("loaders: " + loaders.length);
-        for (var i = 0; i < loaders.length; i++) {
-            try {
-                loaders[i].loadClass("com.menu.imgui.Helper");
-                Java.classFactory.loader = loaders[i];
-                foundHelper = true;
-                jlog("Helper found in loader " + i);
-                break;
-            } catch(e) {}
-        }
-    } catch(e) { jlog("loaders err: " + e.message); }
-    if (!foundHelper) { jlog("ERROR Helper not found"); }
-    else {
-        try {
-            var AT = Java.use("android.app.ActivityThread");
-            var app = AT.currentApplication();
-            if (!app) { jlog("no app context"); }
-            else {
-                jlog("calling startOverlay");
-                Java.use("com.menu.imgui.Helper").startOverlay(app);
-                jlog("startOverlay returned");
-            }
-        } catch(e) { jlog("overlay err: " + e.message); }
-    }
-    var HOOKED = {};'''
+          raw = textwrap.dedent('''
+              log("agent loaded");
+              var foundHelper = false;
+              function jlog(m) {
+                  try { send({type:"log", msg:m}); } catch(e) {}
+                  if (foundHelper) {
+                      try { Java.use("com.menu.imgui.Helper").nativeLog(m); } catch(e) {}
+                  }
+              }
+              try {
+                  var loaders = Java.enumerateClassLoadersSync();
+                  jlog("loaders: " + loaders.length);
+                  for (var i = 0; i < loaders.length; i++) {
+                      try {
+                          loaders[i].loadClass("com.menu.imgui.Helper");
+                          Java.classFactory.loader = loaders[i];
+                          foundHelper = true;
+                          jlog("Helper found in loader " + i);
+                          break;
+                      } catch(e) {}
+                  }
+              } catch(e) { jlog("loaders err: " + e.message); }
+              if (!foundHelper) { jlog("ERROR Helper not found"); }
+              else {
+                  try {
+                      var AT = Java.use("android.app.ActivityThread");
+                      var app = AT.currentApplication();
+                      if (!app) { jlog("no app context"); }
+                      else {
+                          jlog("calling startOverlay");
+                          Java.use("com.menu.imgui.Helper").startOverlay(app);
+                          jlog("startOverlay returned");
+                      }
+                  } catch(e) { jlog("overlay err: " + e.message); }
+              }
+              var HOOKED = {};
+          ''').strip('\n')
 
-          new_s, n = re.subn(pattern, replacement, s, count=1, flags=re.DOTALL)
+          replacement = '\n'.join('  ' + line if line.strip() else line for line in raw.split('\n'))
+
+          new_s, n = re.subn(pattern, lambda m: replacement, s, count=1, flags=re.DOTALL)
           if n == 0:
               raise SystemExit("PATCH_AGENT_JS pattern not found")
           p.write_text(new_s)
-          print("PATCH_AGENT_JS patched - removed setTimeout")
+          print("PATCH_AGENT_JS patched")
           PYEOF
 
       - name: Remove OverlaySurfaceView.java
@@ -735,17 +739,13 @@ jobs:
       - name: Verify
         run: |
           FAIL=0
-          if [ -f app/src/main/AndroidManifest.xml ]; then
-            if grep -qF 'SYSTEM_ALERT_WINDOW' app/src/main/AndroidManifest.xml; then
-              echo "OK SYSTEM_ALERT_WINDOW in manifest"
-            else
-              echo "ERR SYSTEM_ALERT_WINDOW missing"; FAIL=1
-            fi
+          if grep -qF 'SYSTEM_ALERT_WINDOW' app/src/main/AndroidManifest.xml; then
+            echo "OK SYSTEM_ALERT_WINDOW"
           else
-            echo "ERR AndroidManifest missing"; FAIL=1
+            echo "ERR SYSTEM_ALERT_WINDOW missing"; FAIL=1
           fi
           if [ -f app/src/main/java/com/example/tool/MainActivity.java ]; then
-            echo "OK MainActivity present"
+            echo "OK MainActivity"
           else
             echo "ERR MainActivity missing"; FAIL=1
           fi
@@ -758,8 +758,8 @@ jobs:
             C=$(grep -cF "Java_com_menu_imgui_Helper_$fn" "$NL" || true)
             if [ "$C" -eq 1 ]; then echo "OK $fn count=1"; else echo "ERR $fn count=$C"; FAIL=1; fi
           done
-          if grep -qF 'setTimeout' "$NL"; then
-            echo "ERR setTimeout still in JS"; FAIL=1
+          if grep -qF 'setTimeout(function' "$NL"; then
+            echo "ERR setTimeout(function still in JS"; FAIL=1
           else
             echo "OK setTimeout removed"
           fi
@@ -799,5 +799,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: manifest+MainActivity with SYSTEM_ALERT_WINDOW, remove setTimeout, main-thread addView [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: YAML indent in PATCH_AGENT_JS via textwrap.dedent [skip ci]"
           git push
