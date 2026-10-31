@@ -12,9 +12,12 @@ static std::once_flag frida_once;
 #include "imgui_impl_android.h"
 #include "imgui_impl_opengl3.h"
 #include <GLES3/gl3.h>
+#include "Log.h"
 #include "dex_data.h"
 #include "ImGui.h"
 #include "Input.h"
+
+
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -783,7 +786,57 @@ static void doSetPatches(JNIEnv* env, jclass, jobjectArray arr) {
     }
 }
 
+static void setup_log_path(JNIEnv* env) {
+    std::string ext;
+    jclass at = env->FindClass("android/app/ActivityThread");
+    if (at) {
+        jmethodID m = env->GetStaticMethodID(at, "currentApplication", "()Landroid/app/Application;");
+        if (m) {
+            jobject app = env->CallStaticObjectMethod(at, m);
+            if (app) {
+                jclass ctx = env->FindClass("android/content/Context");
+                jmethodID gefd = env->GetMethodID(ctx, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
+                if (gefd) {
+                    jobject f = env->CallObjectMethod(app, gefd, nullptr);
+                    if (f) {
+                        jclass fc = env->FindClass("java/io/File");
+                        jmethodID gap = env->GetMethodID(fc, "getAbsolutePath", "()Ljava/lang/String;");
+                        jstring jp = (jstring)env->CallObjectMethod(f, gap);
+                        if (jp) {
+                            const char* c = env->GetStringUTFChars(jp, nullptr);
+                            ext = c;
+                            env->ReleaseStringUTFChars(jp, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!ext.empty()) {
+        snprintf(g_log_path, sizeof(g_log_path), "%s/DexTool.log", ext.c_str());
+        const char* downloads[] = {
+            "/sdcard/Download/DexTool.log",
+            "/storage/emulated/0/Download/DexTool.log",
+        };
+        for (auto d : downloads) {
+            int fd = open(d, O_WRONLY | O_APPEND | O_CREAT, 0666);
+            if (fd >= 0) {
+                close(fd);
+                snprintf(g_log_path, sizeof(g_log_path), "%s", d);
+                break;
+            }
+        }
+    } else {
+        snprintf(g_log_path, sizeof(g_log_path),
+            "/sdcard/Android/data/com.example.tool/files/DexTool.log");
+        mkdir("/sdcard/Android/data/com.example.tool", 0777);
+        mkdir("/sdcard/Android/data/com.example.tool/files", 0777);
+    }
+}
+
 void DrawMenu() {
+    static int once = 0;
+    if (!once) { flog("[menu] DrawMenu first call"); once = 1; }
     if (!g_menuVisible) return;
     ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("DexTool", &g_menuVisible)) {
@@ -800,11 +853,34 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     gVM = vm; g_jvm = vm;
     JNIEnv* env = nullptr;
     if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
+
+    setup_log_path(env);
+    flog("========== JNI_OnLoad start ==========");
+    flog("Log path: %s", g_log_path);
+
+    install_crash_handler();
+    flog("[1] crash handler installed");
+
     loadDex(env);
+    flog("[2] loadDex done");
+
     gum_init_embedded();
+    flog("[3] gum_init_embedded done");
+
     init_frida_script();
+    flog("[4] init_frida_script done");
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 4 * 1024 * 1024);
     pthread_t t;
-    pthread_create(&t, nullptr, initModMenu, (void*)DrawMenu);
+    pthread_create(&t, &attr, initModMenu, (void*)DrawMenu);
+    pthread_attr_destroy(&attr);
+    flog("[5] initModMenu thread started");
+
     hookInput();
+    flog("[6] hookInput done");
+
+    flog("========== JNI_OnLoad done ==========");
     return JNI_VERSION_1_6;
 }
