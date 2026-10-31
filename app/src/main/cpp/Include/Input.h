@@ -1,21 +1,28 @@
 #pragma once
 #include <android/input.h>
 #include <cstdint>
+#include "imgui.h"
+#include "imgui_impl_android.h"
 #include "Dobby/include/dobby.h"
 #include "Log.h"
 
 using Input_orig = void (*)(void*, void*, void*);
 static Input_orig o_input = nullptr;
+
 static void input_hook(void* thiz, void* ex_ab, void* ex_ac) {
     if (o_input) o_input(thiz, ex_ab, ex_ac);
-    ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+    if (!ImGui::GetCurrentContext()) return;
+    if (ex_ab) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)ex_ab);
 }
 
 using Consume_orig = int32_t (*)(void*, void*, bool, long, uint32_t*, AInputEvent**);
 static Consume_orig o_consume = nullptr;
+
 static int32_t consume_hook(void* thiz, void* factory, bool raw, long seq, uint32_t* flags, AInputEvent** event) {
     int32_t ret = o_consume ? o_consume(thiz, factory, raw, seq, flags, event) : -1;
-    if (ret == 0 && event && *event) ImGui_ImplAndroid_HandleInputEvent(*event);
+    if (ret == 0 && event && *event && ImGui::GetCurrentContext()) {
+        ImGui_ImplAndroid_HandleInputEvent(*event);
+    }
     return ret;
 }
 
