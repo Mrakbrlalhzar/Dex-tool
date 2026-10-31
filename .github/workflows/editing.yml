@@ -29,7 +29,7 @@ jobs:
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
 
-      - name: Download Prebuilt Dobby (from 3equals3/DobbyHook)
+      - name: Download Prebuilt Dobby from 3equals3/DobbyHook
         run: |
           set -e
           BASE="https://raw.githubusercontent.com/3equals3/DobbyHook/main"
@@ -39,8 +39,6 @@ jobs:
           wget -q "$BASE/armeabi-v7a/libdobby.a" -O /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a
           wget -q "$BASE/Dobby.h" -O /tmp/dobby-prebuilt/Dobby.h
           ls -lah /tmp/dobby-prebuilt/arm64-v8a/libdobby.a /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a /tmp/dobby-prebuilt/Dobby.h
-          file /tmp/dobby-prebuilt/arm64-v8a/libdobby.a || true
-          file /tmp/dobby-prebuilt/armeabi-v7a/libdobby.a || true
 
       - name: Stage Dobby into project
         run: |
@@ -333,7 +331,7 @@ jobs:
           }
           IMGUIEOF
 
-      - name: Write Include/Input.h (FIXED: pass MotionEvent + guard GImGui)
+      - name: Write Include/Input.h with MotionEvent fix
         run: |
           cat > app/src/main/cpp/Include/Input.h <<'INPUTEOF'
           #pragma once
@@ -348,9 +346,8 @@ jobs:
           static Input_orig o_input = nullptr;
 
           static void input_hook(void* thiz, void* ex_ab, void* ex_ac) {
-              // initializeMotionEvent(InputConsumer* this, MotionEvent* ev, const InputMessage* msg)
               if (o_input) o_input(thiz, ex_ab, ex_ac);
-              if (!ImGui::GetCurrentContext()) return;   // ImGui not initialized yet
+              if (!ImGui::GetCurrentContext()) return;
               if (ex_ab) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)ex_ab);
           }
 
@@ -388,7 +385,7 @@ jobs:
           }
           INPUTEOF
 
-      - name: Patch native-lib.cpp (idempotent)
+      - name: Patch native-lib.cpp idempotent
         run: |
           python3 - <<'PYEOF'
           import re, pathlib, textwrap
@@ -413,7 +410,7 @@ jobs:
                   while e < len(src) and src[e] in '\n \t': e += 1
                   src = src[:start] + src[e:]
                   n += 1
-              print(f"rm_method[{label}]: removed {n}")
+              print("rm_method[%s]: removed %d" % (label, n))
               return src
 
           s = rm_method(s, r'(?:static\s+)?void\s+notifyMenuOpen\s*\([^)]*\)\s*\{', 'notifyMenuOpen')
@@ -478,8 +475,9 @@ jobs:
           ]:
               cnt = len(re.findall(pat, s))
               if cnt != 0:
-                  raise SystemExit(f"FAIL: {label} still present {cnt}x after removal")
-              print(f"OK no leftover: {label}")
+                  print("FAIL: " + label + " still present " + str(cnt) + " times after removal")
+                  raise SystemExit(3)
+              print("OK no leftover: " + label)
 
           footer = textwrap.dedent(r"""
               static void setup_log_path(JNIEnv* env) {
@@ -590,7 +588,7 @@ jobs:
               ('JNI_OnLoad', r'JNIEXPORT\s+jint\s+JNICALL\s+JNI_OnLoad'),
           ]:
               cnt = len(re.findall(pat, s))
-              print(f"FINAL {label} count = {cnt}")
+              print("FINAL " + label + " count = " + str(cnt))
               if cnt != 1:
                   raise SystemExit(4)
           PYEOF
@@ -612,7 +610,7 @@ jobs:
           [ ${PIPESTATUS[0]} -ne 0 ] && { echo "D8_FAILED"; cat /tmp/d8.log; exit 1; }
           xxd -i -n imgui_dex /tmp/dex_out/classes.dex > app/src/main/cpp/tool/dex_data.h
 
-      - name: Write CMakeLists.txt (prebuilt Dobby)
+      - name: Write CMakeLists.txt
         run: |
           cat > app/src/main/cpp/CMakeLists.txt <<'CMEOF'
           cmake_minimum_required(VERSION 3.22.1)
@@ -662,7 +660,7 @@ jobs:
             echo "ERR Input.h missing GImGui guard"; FAIL=1
           fi
           if grep -qF 'if (ex_ab) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)ex_ab);' "$IH"; then
-            echo "OK Input.h passes ex_ab (MotionEvent) not thiz"
+            echo "OK Input.h passes ex_ab MotionEvent"
           else
             echo "ERR Input.h still passes thiz"; FAIL=1
           fi
@@ -706,5 +704,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: input_hook passes MotionEvent* (ex_ab) not InputConsumer* (thiz), guard GImGui null [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: YAML step names without colon-space to avoid syntax error [skip ci]"
           git push
