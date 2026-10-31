@@ -18,8 +18,8 @@ static std::once_flag frida_once;
 
 #include "Log.h"
 #include "dex_data.h"
-#include "ImGui.h"
-#include "Input.h"
+
+
 
 
 
@@ -135,6 +135,24 @@ static GumScriptBackend* g_backend = nullptr;
 const gchar* PATCH_AGENT_JS = R"(Java.perform(function() {
   function log(m){ console.log("[DexTool] "+m); try{ send({type:"log", msg:m}); }catch(e){} }
   log("agent loaded");
+setTimeout(function() {
+    try {
+        var loaders = Java.enumerateClassLoadersSync();
+        for (var i = 0; i < loaders.length; i++) {
+            try {
+                loaders[i].loadClass("com.menu.imgui.Helper");
+                Java.classFactory.loader = loaders[i];
+                break;
+            } catch(e) {}
+        }
+        var AT = Java.use("android.app.ActivityThread");
+        var app = AT.currentApplication();
+        if (!app) { log("overlay: no app context"); return; }
+        var Helper = Java.use("com.menu.imgui.Helper");
+        Helper.startOverlay(app);
+        log("overlay started via Frida");
+    } catch(e) { log("overlay start error: " + e.message); }
+}, 1500);
   var HOOKED = {};
   recv(function(raw) {
     try {
@@ -798,6 +816,68 @@ static void doSetPatches(JNIEnv* env, jclass, jobjectArray arr) {
     }
 }
 
+void DrawMenu() {
+    if (!g_menuVisible) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("DexTool", &g_menuVisible)) {
+        ImGui::Text("DexTool overlay via WindowManager");
+        ImGui::Separator();
+        static char buf[256] = "";
+        ImGui::InputText("Test input", buf, sizeof(buf));
+        ImGui::Text("Touch: tap inside to test");
+        if (ImGui::Button("Close")) g_menuVisible = false;
+    }
+    ImGui::End();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeOnSurfaceCreated(JNIEnv* env, jclass) {
+    flog("[overlay] onSurfaceCreated");
+    if (!ImGui::GetCurrentContext()) {
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        ImGui_ImplAndroid_Init(nullptr);
+        ImGui_ImplOpenGL3_Init("#version 300 es");
+        flog("[overlay] ImGui initialized");
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeOnSurfaceChanged(JNIEnv* env, jclass, jint w, jint h) {
+    flog("[overlay] onSurfaceChanged %dx%d", w, h);
+    if (!ImGui::GetCurrentContext()) return;
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)w, (float)h);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeOnDrawFrame(JNIEnv* env, jclass) {
+    static bool first = true;
+    if (first) { flog("[overlay] first onDrawFrame"); first = false; }
+    if (!ImGui::GetCurrentContext()) return;
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui::NewFrame();
+    DrawMenu();
+    ImGui::Render();
+    ImGuiIO& io = ImGui::GetIO();
+    glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_menu_imgui_Helper_nativeOnTouch(JNIEnv* env, jclass, jint action, jfloat x, jfloat y) {
+    if (!ImGui::GetCurrentContext()) return;
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(x, y);
+    if (action == 0) io.AddMouseButtonEvent(0, true);
+    else if (action == 1) io.AddMouseButtonEvent(0, false);
+}
+
 static void setup_log_path(JNIEnv* env) {
     std::string ext;
     jclass at = env->FindClass("android/app/ActivityThread");
@@ -846,21 +926,6 @@ static void setup_log_path(JNIEnv* env) {
     }
 }
 
-void DrawMenu() {
-    static int once = 0;
-    if (!once) { flog("[menu] DrawMenu first call"); once = 1; }
-    if (!g_menuVisible) return;
-    ImGui::SetNextWindowSize(ImVec2(500, 300), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("DexTool", &g_menuVisible)) {
-        ImGui::Text("DexTool via eglSwapBuffers + libinput hooks");
-        ImGui::Separator();
-        static char buf[256] = "";
-        ImGui::InputText("Test input", buf, sizeof(buf));
-        if (ImGui::Button("Close")) g_menuVisible = false;
-    }
-    ImGui::End();
-}
-
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     gVM = vm; g_jvm = vm;
     JNIEnv* env = nullptr;
@@ -880,18 +945,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     flog("[3] gum_init_embedded done");
 
     init_frida_script();
-    flog("[4] init_frida_script done");
-
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 4 * 1024 * 1024);
-    pthread_t t;
-    pthread_create(&t, &attr, initModMenu, (void*)DrawMenu);
-    pthread_attr_destroy(&attr);
-    flog("[5] initModMenu thread started");
-
-    hookInput();
-    flog("[6] hookInput done");
+    flog("[4] init_frida_script done (Frida will start overlay after 1.5s)");
 
     flog("========== JNI_OnLoad done ==========");
     return JNI_VERSION_1_6;

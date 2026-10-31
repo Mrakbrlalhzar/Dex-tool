@@ -403,4 +403,63 @@ static native void nativeSetClassList(String[] classNames);
     static native void nativeSetMethodResult(int sectionId, String className, String methodSig, String result);
     static native void nativeSetFieldValue(int sectionId, String className, String fieldName, String value, boolean isSet);
     static native void nativePatchMethod(String className, String methodName, String returnValue); static native void nativeSetPatches(String[] patches);
+public static void startOverlay(final android.content.Context context) {
+    try {
+        final android.view.WindowManager wm =
+            (android.view.WindowManager) context.getSystemService(android.content.Context.WINDOW_SERVICE);
+        if (wm == null) {
+            android.util.Log.e("DexTool", "WindowManager null");
+            return;
+        }
+        final android.opengl.GLSurfaceView view =
+            new android.opengl.GLSurfaceView(context);
+        view.setEGLContextClientVersion(3);
+        view.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
+        view.getHolder().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
+        view.setZOrderOnTop(true);
+        view.setRenderer(new android.opengl.GLSurfaceView.Renderer() {
+            @Override
+            public void onSurfaceCreated(javax.microedition.khronos.opengles.GL10 gl,
+                                         javax.microedition.khronos.egl.EGLConfig config) {
+                nativeOnSurfaceCreated();
+            }
+            @Override
+            public void onSurfaceChanged(javax.microedition.khronos.opengles.GL10 gl,
+                                         int w, int h) {
+                nativeOnSurfaceChanged(w, h);
+            }
+            @Override
+            public void onDrawFrame(javax.microedition.khronos.opengles.GL10 gl) {
+                nativeOnDrawFrame();
+            }
+        });
+        view.setOnTouchListener(new android.view.View.OnTouchListener() {
+            @Override
+            public boolean onTouch(android.view.View v, android.view.MotionEvent e) {
+                nativeOnTouch(e.getActionMasked(), e.getX(), e.getY());
+                return true;
+            }
+        });
+        int type = (android.os.Build.VERSION.SDK_INT >= 26)
+            ? android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            : android.view.WindowManager.LayoutParams.TYPE_PHONE;
+        android.view.WindowManager.LayoutParams lp =
+            new android.view.WindowManager.LayoutParams(
+                800, 600, type,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                android.graphics.PixelFormat.TRANSLUCENT);
+        lp.gravity = android.view.Gravity.TOP | android.view.Gravity.LEFT;
+        lp.x = 0;
+        lp.y = 100;
+        wm.addView(view, lp);
+        android.util.Log.i("DexTool", "overlay added");
+    } catch (Throwable t) {
+        android.util.Log.e("DexTool", "startOverlay failed: " + t, t);
+    }
+}
+public static native void nativeOnSurfaceCreated();
+public static native void nativeOnSurfaceChanged(int w, int h);
+public static native void nativeOnDrawFrame();
+public static native void nativeOnTouch(int action, float x, float y);
 }
