@@ -29,26 +29,23 @@ jobs:
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
           sudo apt-get install -y nodejs
 
-      - name: Download Prebuilt Dobby (release v0.4.0)
+      - name: Clone reveny repo for prebuilt Dobby
         run: |
           set -e
-          mkdir -p /tmp/dobby-prebuilt
-          wget -q https://github.com/jmpews/Dobby/releases/download/v0.4.0/dobby-android-all.tar.gz -O /tmp/dobby.tar.gz
-          tar -xzf /tmp/dobby.tar.gz -C /tmp/dobby-prebuilt
-          echo "=== Extracted Dobby contents ==="
-          find /tmp/dobby-prebuilt -maxdepth 3 -type f | sort
-          echo "=== libdobby.a files ==="
-          find /tmp/dobby-prebuilt -name "libdobby.a" -o -name "libdobby.so" | sort
+          git clone --depth 1 https://github.com/reveny/Android-ImGui-Mod-Menu.git /tmp/reveny-dobby
+          echo "=== Locating libdobby.a ==="
+          find /tmp/reveny-dobby -name "libdobby.a" | sort
+          echo "=== Locating dobby.h ==="
+          find /tmp/reveny-dobby -name "dobby.h" | sort
 
       - name: Stage Dobby into project
         run: |
           set -e
-          # Locate arm64 and armv7 libs (release layout may vary)
-          ARM64_LIB=$(find /tmp/dobby-prebuilt -path "*arm64-v8a*" -name "libdobby.a" | head -1)
-          ARMV7_LIB=$(find /tmp/dobby-prebuilt -path "*armeabi-v7a*" -name "libdobby.a" | head -1)
+          ARM64_LIB=$(find /tmp/reveny-dobby -path "*arm64-v8a*" -name "libdobby.a" | head -1)
+          ARMV7_LIB=$(find /tmp/reveny-dobby -path "*armeabi-v7a*" -name "libdobby.a" | head -1)
           if [ -z "$ARM64_LIB" ] || [ -z "$ARMV7_LIB" ]; then
-            echo "Could not find libdobby.a for both ABIs. Listing all .a files:"
-            find /tmp/dobby-prebuilt -name "*.a"
+            echo "Could not find libdobby.a for both ABIs in reveny repo. Listing all .a files:"
+            find /tmp/reveny-dobby -name "*.a"
             exit 1
           fi
           echo "ARM64_LIB=$ARM64_LIB"
@@ -57,14 +54,12 @@ jobs:
           mkdir -p app/src/main/cpp/Include/Dobby/lib/armeabi-v7a
           cp "$ARM64_LIB" app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a
           cp "$ARMV7_LIB" app/src/main/cpp/Include/Dobby/lib/armeabi-v7a/libdobby.a
-          # Copy headers (include/dobby.h and any others)
           mkdir -p app/src/main/cpp/Include/Dobby/include
-          HEADER_DIR=$(dirname "$(find /tmp/dobby-prebuilt -name "dobby.h" | head -1)")
-          if [ -n "$HEADER_DIR" ]; then
-            cp -rv "$HEADER_DIR"/. app/src/main/cpp/Include/Dobby/include/
-          else
-            echo "dobby.h not found; assuming headers are already present in repo."
+          HEADER=$(find /tmp/reveny-dobby -name "dobby.h" | head -1)
+          if [ -z "$HEADER" ]; then
+            echo "dobby.h not found in reveny repo"; exit 1
           fi
+          cp "$HEADER" app/src/main/cpp/Include/Dobby/include/dobby.h
           echo "=== Staged Dobby ==="
           find app/src/main/cpp/Include/Dobby -maxdepth 3 -type f | sort
 
@@ -373,7 +368,6 @@ jobs:
       - name: Verify
         run: |
           FAIL=0
-          # Check prebuilt Dobby libs exist
           if [ -f app/src/main/cpp/Include/Dobby/lib/arm64-v8a/libdobby.a ]; then
             echo "OK arm64 libdobby.a present"
           else
@@ -434,5 +428,5 @@ jobs:
           git config user.name "gh"
           git config user.email "gh@users.noreply.github.com"
           git add -A
-          git diff --staged --quiet || git commit -m "fix: use prebuilt Dobby release v0.4.0 to avoid source compile errors [skip ci]"
+          git diff --staged --quiet || git commit -m "fix: use prebuilt Dobby from reveny repo [skip ci]"
           git push
