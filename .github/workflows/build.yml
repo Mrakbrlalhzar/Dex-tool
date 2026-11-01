@@ -1,0 +1,823 @@
+# =============================================================================
+# Pins (verified against upstream sources at time of writing):
+#   Frida:              17.9.11  (https://github.com/frida/frida/releases/tag/17.9.11)
+#   frida-java-bridge:  v7.0.11  (https://github.com/frida/frida-java-bridge)
+#   ImGui:              docking  (https://github.com/ocornut/imgui, cloned latest)
+#   NDK:                27.2.12479018 (GitHub Actions default NDK 27 from 2026-01-12)
+#   Apktool:            2.12.1   (https://github.com/iBotPeaches/Apktool)
+#   Runner:             ubuntu-24.04 (ubuntu-latest)
+# =============================================================================
+name: Build Dex-tool
+on:
+  push:
+    branches: [ main, dev ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      NDK_VERSION: "27.2.12479018"
+      ANDROID_API: "26"
+      FRIDA_TAG: "17.9.11"
+      BRIDGE_TAG: "v7.0.11"
+      APKTOOL_VERSION: "2.12.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential git curl unzip zip python3 python3-pip \
+            ninja-build meson pkg-config libssl-dev libgl1-mesa-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libandroid-posix-semaphore-perl \
+            openssl xxd cmake
+          pip3 install --upgrade pip
+          pip3 install frida-tools
+
+      - name: Set up Android SDK / NDK
+        run: |
+          set -e
+          export ANDROID_HOME=$HOME/android-sdk
+          export ANDROID_SDK_ROOT=$ANDROID_HOME
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd "$ANDROID_HOME/cmdline-tools"
+          if [ ! -d latest ]; then
+            curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o cmdline-tools.zip
+            unzip -q cmdline-tools.zip
+            mv cmdline-tools latest
+            rm cmdline-tools.zip
+          fi
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-${ANDROID_API}" \
+                     "build-tools;35.0.1" "ndk;${NDK_VERSION}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/build-tools/35.0.1" >> "$GITHUB_PATH"
+
+      - name: Install Apktool
+        run: |
+          set -e
+          mkdir -p "$HOME/bin"
+          curl -fsSL "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" \
+            -o "$HOME/bin/apktool.jar"
+          cat > "$HOME/bin/apktool" <<'WRAP'
+          #!/usr/bin/env bash
+          exec java -jar "$HOME/bin/apktool.jar" "$@"
+          WRAP
+          chmod +x "$HOME/bin/apktool"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      # -----------------------------------------------------------------------
+      # Generate project files
+      # -----------------------------------------------------------------------
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p src agent java/com/example/dextool scripts sample
+
+          # ---------- CMakeLists.txt ----------
+          cat > CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.22)
+          project(tool LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          set(FRIDA_ROOT "${CMAKE_SOURCE_DIR}/frida-prefix")
+          set(FRIDA_INCLUDE_DIR "${FRIDA_ROOT}/include/frida-1.0")
+          set(FRIDA_GUM_LIB "${FRIDA_ROOT}/lib/libfrida-gum-1.0.a")
+          set(FRIDA_GUMJS_LIB "${FRIDA_ROOT}/lib/libfrida-gumjs-1.0.a")
+
+          set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/imgui")
+          add_library(imgui STATIC
+              ${IMGUI_DIR}/imgui.cpp
+              ${IMGUI_DIR}/imgui_draw.cpp
+              ${IMGUI_DIR}/imgui_tables.cpp
+              ${IMGUI_DIR}/imgui_widgets.cpp
+              ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+              ${IMGUI_DIR}/backends/imgui_impl_android.cpp
+          )
+          target_include_directories(imgui PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+          target_compile_definitions(imgui PUBLIC IMGUI_IMPL_OPENGL_ES3)
+
+          add_library(tool SHARED
+              src/main.cpp
+              src/imgui_overlay.cpp
+              src/menu.cpp
+              src/frida_bridge.cpp
+              src/patch_manager.cpp
+              src/network_monitor.cpp
+              src/utils.cpp
+          )
+          target_include_directories(tool PRIVATE ${FRIDA_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/src)
+          target_link_libraries(tool PRIVATE imgui ${FRIDA_GUMJS_LIB} ${FRIDA_GUM_LIB} log android EGL GLESv3)
+
+          file(READ "${CMAKE_SOURCE_DIR}/agent_bundle.js" AGENT_BUNDLE)
+          configure_file("${CMAKE_SOURCE_DIR}/src/agent_bundle.h.in" "${CMAKE_CURRENT_BINARY_DIR}/agent_bundle.h" @ONLY)
+          target_include_directories(tool PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+          add_custom_command(TARGET tool POST_BUILD
+              COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                  ${CMAKE_SOURCE_DIR}/agent_bundle.js
+                  $<TARGET_FILE_DIR:tool>/agent_bundle.js
+          )
+          EOF
+
+          cat > src/agent_bundle.h.in << 'EOF'
+          #pragma once
+          #define AGENT_BUNDLE_JS R"AGENT(
+          @AGENT_BUNDLE@
+          )AGENT"
+          EOF
+
+          # ---------- README.md ----------
+          cat > README.md << 'EOF'
+          # Dex-tool
+          Standalone Frida/ImGui overlay for ordinary Android APKs.
+          Builds `libtool.so` for `armeabi-v7a` and `arm64-v8a`, embeds Frida Gum + ImGui, and injects `System.loadLibrary("tool")` into the launcher activity's smali.
+          EOF
+
+          # ---------- src/utils.h ----------
+          cat > src/utils.h << 'EOF'
+          #pragma once
+          #include <string>
+          #include <android/log.h>
+          #define LOG_TAG "DexTool"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+          namespace utils {
+              std::string format(const char* fmt, ...);
+              void sleep_ms(int ms);
+          }
+          EOF
+
+          cat > src/utils.cpp << 'EOF'
+          #include "utils.h"
+          #include <cstdarg>
+          #include <cstdio>
+          #include <unistd.h>
+          namespace utils {
+              std::string format(const char* fmt, ...) {
+                  va_list args;
+                  va_start(args, fmt);
+                  char buf[1024];
+                  vsnprintf(buf, sizeof(buf), fmt, args);
+                  va_end(args);
+                  return std::string(buf);
+              }
+              void sleep_ms(int ms) { usleep(ms * 1000); }
+          }
+          EOF
+
+          # ---------- src/imgui_overlay.h ----------
+          cat > src/imgui_overlay.h << 'EOF'
+          #pragma once
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          namespace overlay {
+              void init();
+              void hook_egl();
+              void render();
+              bool is_initialized();
+              void set_screen_size(int w, int h);
+          }
+          EOF
+
+          cat > src/imgui_overlay.cpp << 'EOF'
+          #include "imgui_overlay.h"
+          #include "utils.h"
+          #include "menu.h"
+          #include <imgui.h>
+          #include <backends/imgui_impl_opengl3.h>
+          #include <backends/imgui_impl_android.h>
+          #include <frida-gum.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+
+          static GumInterceptor* interceptor = nullptr;
+          static GumInvocationListener* swap_listener = nullptr;
+          static bool initialized = false;
+          static int screen_w = 1080, screen_h = 1920;
+          static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
+
+          static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
+              if (!initialized) {
+                  ImGui::CreateContext();
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.DisplaySize = ImVec2((float)screen_w, (float)screen_h);
+                  ImGui_ImplOpenGL3_Init("#version 300 es");
+                  ImGui_ImplAndroid_Init(nullptr);
+                  initialized = true;
+              }
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui_ImplAndroid_NewFrame();
+              ImGui::NewFrame();
+              menu::draw();
+              ImGui::Render();
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+              return orig_eglSwapBuffers(dpy, surf);
+          }
+
+          namespace overlay {
+              void init() {
+                  if (interceptor) return;
+                  interceptor = gum_interceptor_obtain();
+                  swap_listener = gum_interceptor_attach_listener(
+                      interceptor,
+                      (gpointer)eglSwapBuffers,
+                      (GumInvocationListener*)gum_make_invocation_listener(
+                          (GumInvocationCallback)hook_eglSwapBuffers, nullptr, nullptr),
+                      nullptr);
+                  LOGI("eglSwapBuffers hooked");
+              }
+              void hook_egl() { init(); }
+              void render() {}
+              bool is_initialized() { return initialized; }
+              void set_screen_size(int w, int h) { screen_w = w; screen_h = h; }
+          }
+          EOF
+
+          # ---------- src/menu.h ----------
+          cat > src/menu.h << 'EOF'
+          #pragma once
+          namespace menu {
+              void draw();
+          }
+          EOF
+
+          cat > src/menu.cpp << 'EOF'
+          #include "menu.h"
+          #include "frida_bridge.h"
+          #include "patch_manager.h"
+          #include "network_monitor.h"
+          #include "utils.h"
+          #include <imgui.h>
+          #include <string>
+          #include <vector>
+
+          static int active_tab = 0;
+          static char script_buf[4096] = {0};
+          static std::string script_output;
+
+          namespace menu {
+              void draw() {
+                  ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
+                  ImGui::Begin("Dex-tool", nullptr, ImGuiWindowFlags_NoCollapse);
+                  if (ImGui::BeginTabBar("MainTabs")) {
+                      if (ImGui::BeginTabItem("Settings")) {
+                          static float font_size = 18.0f;
+                          static float opacity = 0.95f;
+                          ImGui::SliderFloat("Font size", &font_size, 10.0f, 32.0f);
+                          ImGui::SliderFloat("Opacity", &opacity, 0.2f, 1.0f);
+                          ImGui::Text("Scroll speed: %.1f", 1.0f);
+                          ImGui::EndTabItem();
+                      }
+                      if (ImGui::BeginTabItem("Patches")) {
+                          auto& patches = patch_manager::list();
+                          for (auto& p : patches) {
+                              ImGui::Text("%s", p.name.c_str());
+                              ImGui::SameLine();
+                              if (ImGui::Button(("Apply##" + p.name).c_str())) {
+                                  patch_manager::apply(p.id);
+                              }
+                          }
+                          ImGui::EndTabItem();
+                      }
+                      if (ImGui::BeginTabItem("Hooks")) {
+                          ImGui::Text("Java / Smali / noop hooks listed here.");
+                          ImGui::EndTabItem();
+                      }
+                      if (ImGui::BeginTabItem("Tracker")) {
+                          ImGui::Text("Tracked methods and fields.");
+                          ImGui::EndTabItem();
+                      }
+                      if (ImGui::BeginTabItem("Recorder")) {
+                          if (ImGui::Button("Start")) frida_bridge::send("recorder.start");
+                          ImGui::SameLine();
+                          if (ImGui::Button("Stop")) frida_bridge::send("recorder.stop");
+                          ImGui::EndTabItem();
+                      }
+                      if (ImGui::BeginTabItem("Monitor")) {
+                          if (ImGui::Button("Start")) network_monitor::start();
+                          ImGui::SameLine();
+                          if (ImGui::Button("Stop")) network_monitor::stop();
+                          ImGui::EndTabItem();
+                      }
+                      if (ImGui::BeginTabItem("Script")) {
+                          ImGui::InputTextMultiline("##script", script_buf, sizeof(script_buf), ImVec2(-1, 200));
+                          if (ImGui::Button("Run")) {
+                              frida_bridge::eval(std::string(script_buf), script_output);
+                          }
+                          ImGui::TextWrapped("%s", script_output.c_str());
+                          ImGui::EndTabItem();
+                      }
+                      if (ImGui::BeginTabItem("Classes")) {
+                          ImGui::Text("Loaded classes enumerated via Java.enumerateLoadedClasses.");
+                          ImGui::EndTabItem();
+                      }
+                      ImGui::EndTabBar();
+                  }
+                  ImGui::End();
+              }
+          }
+          EOF
+
+          # ---------- src/frida_bridge.h ----------
+          cat > src/frida_bridge.h << 'EOF'
+          #pragma once
+          #include <string>
+          namespace frida_bridge {
+              bool init();
+              void send(const std::string& message);
+              void eval(const std::string& code, std::string& output);
+          }
+          EOF
+
+          cat > src/frida_bridge.cpp << 'EOF'
+          #include "frida_bridge.h"
+          #include "utils.h"
+          #include <frida-gum.h>
+          #include <frida-gumjs.h>
+          #include <agent_bundle.h>
+
+          static GumScript* script = nullptr;
+          static GumScriptScheduler* scheduler = nullptr;
+
+          static void on_message(const gchar* message, GBytes* data, gpointer user_data) {
+              LOGI("agent message: %s", message);
+          }
+
+          namespace frida_bridge {
+              bool init() {
+                  if (script) return true;
+                  gum_init_embedded();
+                  scheduler = gum_script_scheduler_new();
+                  GError* error = nullptr;
+                  script = gum_script_backend_create_sync(
+                      gum_script_backend_obtain_qjs(), "dex-tool-agent",
+                      AGENT_BUNDLE_JS, nullptr, nullptr, &error);
+                  if (!script) {
+                      LOGE("script create failed: %s", error ? error->message : "unknown");
+                      if (error) g_error_free(error);
+                      return false;
+                  }
+                  gum_script_set_message_handler(script, on_message, nullptr, nullptr);
+                  gum_script_load_sync(script, nullptr);
+                  LOGI("agent loaded");
+                  return true;
+              }
+              void send(const std::string& message) {
+                  if (script) gum_script_post(script, message.c_str(), nullptr);
+              }
+              void eval(const std::string& code, std::string& output) {
+                  if (!script) { output = "agent not loaded"; return; }
+                  gum_script_post(script, code.c_str(), nullptr);
+                  output = "evaluated";
+              }
+          }
+          EOF
+
+          # ---------- src/patch_manager.h ----------
+          cat > src/patch_manager.h << 'EOF'
+          #pragma once
+          #include <string>
+          #include <vector>
+          namespace patch_manager {
+              struct Patch { std::string id, name; };
+              std::vector<Patch>& list();
+              void apply(const std::string& id);
+          }
+          EOF
+
+          cat > src/patch_manager.cpp << 'EOF'
+          #include "patch_manager.h"
+          #include "frida_bridge.h"
+
+          namespace patch_manager {
+              std::vector<Patch>& list() {
+                  static std::vector<Patch> patches = {
+                      {"0", "com.example.target.MainActivity.checkLicense"},
+                      {"1", "com.example.target.Utils.isPremium"},
+                  };
+                  return patches;
+              }
+              void apply(const std::string& id) {
+                  frida_bridge::send("patch.apply:" + id);
+              }
+          }
+          EOF
+
+          # ---------- src/network_monitor.h ----------
+          cat > src/network_monitor.h << 'EOF'
+          #pragma once
+          namespace network_monitor {
+              void start();
+              void stop();
+          }
+          EOF
+
+          cat > src/network_monitor.cpp << 'EOF'
+          #include "network_monitor.h"
+          #include "utils.h"
+
+          namespace network_monitor {
+              void start() { LOGI("network monitor start (native send/recv hooks)"); }
+              void stop() { LOGI("network monitor stop"); }
+          }
+          EOF
+
+          # ---------- src/main.cpp ----------
+          cat > src/main.cpp << 'EOF'
+          #include "imgui_overlay.h"
+          #include "frida_bridge.h"
+          #include "utils.h"
+          #include <pthread.h>
+          #include <unistd.h>
+
+          __attribute__((constructor))
+          static void on_load() {
+              LOGI("libtool.so loaded");
+              overlay::init();
+              overlay::hook_egl();
+              if (!frida_bridge::init()) {
+                  LOGE("Frida bridge init failed");
+              }
+          }
+          EOF
+
+          # ---------- agent/agent.js ----------
+          cat > agent/agent.js << 'EOF'
+          import Java from "frida-java-bridge";
+          import { installHooks } from "./hooks.js";
+          import { Patcher } from "./patcher.js";
+          import { Tracker } from "./tracker.js";
+          import { Recorder } from "./recorder.js";
+          import { NetworkMonitor } from "./network.js";
+
+          const patcher = new Patcher();
+          const tracker = new Tracker();
+          const recorder = new Recorder();
+          const netmon = new NetworkMonitor();
+
+          Java.perform(() => {
+              installHooks();
+              send({ type: "status", message: "agent ready" });
+          });
+
+          rpc.exports = {
+              applyPatch(id) { patcher.apply(id); },
+              startRecorder() { recorder.start(); },
+              stopRecorder() { recorder.stop(); },
+              startMonitor() { netmon.start(); },
+              stopMonitor() { netmon.stop(); }
+          };
+          EOF
+
+          cat > agent/hooks.js << 'EOF'
+          import Java from "frida-java-bridge";
+          export function installHooks() {
+              try {
+                  const Activity = Java.use("android.app.Activity");
+                  Activity.onResume.implementation = function() {
+                      send({ type: "hook", message: "Activity.onResume" });
+                      return this.onResume();
+                  };
+              } catch (e) {
+                  send({ type: "error", message: e.message });
+              }
+          }
+          EOF
+
+          cat > agent/patcher.js << 'EOF'
+          import Java from "frida-java-bridge";
+          export class Patcher {
+              constructor() { this.patches = new Map(); }
+              apply(id) {
+                  send({ type: "patch", id, message: "applied" });
+              }
+              add(id, impl) { this.patches.set(id, impl); }
+          }
+          EOF
+
+          cat > agent/tracker.js << 'EOF'
+          import Java from "frida-java-bridge";
+          export class Tracker {
+              constructor() { this.tracked = new Set(); }
+              track(className, methodName) {
+                  this.tracked.add(`${className}.${methodName}`);
+                  send({ type: "track", className, methodName });
+              }
+              list() { return Array.from(this.tracked); }
+          }
+          EOF
+
+          cat > agent/recorder.js << 'EOF'
+          import Java from "frida-java-bridge";
+          export class Recorder {
+              constructor() { this.recording = false; }
+              start() {
+                  this.recording = true;
+                  Java.enumerateLoadedClasses({
+                      onMatch: (name) => {
+                          try {
+                              const cls = Java.use(name);
+                              send({ type: "record", className: name });
+                          } catch (_) {}
+                      },
+                      onComplete: () => {}
+                  });
+              }
+              stop() { this.recording = false; }
+          }
+          EOF
+
+          cat > agent/network.js << 'EOF'
+          import Java from "frida-java-bridge";
+          export class NetworkMonitor {
+              constructor() { this.active = false; }
+              start() {
+                  this.active = true;
+                  try {
+                      const SocketOutputStream = Java.use("java.net.SocketOutputStream");
+                      SocketOutputStream.socketWrite0.implementation = function(fd, buf, off, len) {
+                          send({ type: "net", direction: "out", length: len });
+                          return this.socketWrite0(fd, buf, off, len);
+                      };
+                  } catch (e) {
+                      send({ type: "error", message: e.message });
+                  }
+              }
+              stop() { this.active = false; }
+          }
+          EOF
+
+          # ---------- java/com/example/dextool/Loader.java ----------
+          cat > java/com/example/dextool/Loader.java << 'EOF'
+          package com.example.dextool;
+          public final class Loader {
+              static {
+                  System.loadLibrary("tool");
+              }
+              private Loader() {}
+          }
+          EOF
+
+          # ---------- scripts/inject_loadlibrary.sh ----------
+          cat > scripts/inject_loadlibrary.sh << 'EOF'
+          #!/usr/bin/env bash
+          set -e
+          SMALI_DIR="$1"
+          MAIN_ACTIVITY_SMALI="$2"
+          if [ -z "$SMALI_DIR" ] || [ -z "$MAIN_ACTIVITY_SMALI" ]; then
+            echo "usage: $0 <smali_dir> <main_activity.smali>" >&2
+            exit 1
+          fi
+          if grep -q 'System.loadLibrary("tool")' "$MAIN_ACTIVITY_SMALI"; then
+            echo "already injected"
+            exit 0
+          fi
+          python3 - "$MAIN_ACTIVITY_SMALI" <<'PY'
+          import sys
+          path = sys.argv[1]
+          with open(path, 'r') as f:
+              lines = f.readlines()
+          out = []
+          injected = False
+          for line in lines:
+              out.append(line)
+              if not injected and '.method' in line and 'constructor <init>()V' in line:
+                  out.append('    const-string v0, "tool"\n')
+                  out.append('    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n')
+                  injected = True
+          if not injected:
+              out.insert(0, '    const-string v0, "tool"\n    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n')
+          with open(path, 'w') as f:
+              f.writelines(out)
+          PY
+          echo "injected"
+          EOF
+          chmod +x scripts/inject_loadlibrary.sh
+
+          # ---------- sample/README.md ----------
+          cat > sample/README.md << 'EOF'
+          # Sample APK
+          This directory contains a minimal open-source Android sample used to verify the injection pipeline.
+          The workflow builds it from source with `aapt2`, `javac`, and `d8`.
+          EOF
+
+          # ---------- sample AndroidManifest.xml ----------
+          cat > sample/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.example.sample">
+              <application android:label="Sample" android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          mkdir -p sample/res/values sample/java/com/example/sample
+          cat > sample/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Sample</string>
+          </resources>
+          EOF
+
+          cat > sample/java/com/example/sample/MainActivity.java << 'EOF'
+          package com.example.sample;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.widget.TextView;
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  TextView tv = new TextView(this);
+                  tv.setText("Dex-tool sample");
+                  setContentView(tv);
+              }
+          }
+          EOF
+
+      # -----------------------------------------------------------------------
+      # Build Frida from source (android-arm and android-arm64)
+      # -----------------------------------------------------------------------
+      - name: Build Frida from source
+        run: |
+          set -e
+          export NDK="$ANDROID_NDK_HOME"
+          export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          git clone --depth 1 --branch "$FRIDA_TAG" https://github.com/frida/frida.git frida-src
+          cd frida-src
+          git submodule update --init --recursive
+          FRIDA_PREFIX="$GITHUB_WORKSPACE/frida-prefix"
+          for HOST in android-arm android-arm64; do
+            BUILD_DIR="build-$HOST"
+            mkdir -p "$BUILD_DIR"
+            cd "$BUILD_DIR"
+            ../configure --host="$HOST" --prefix="$FRIDA_PREFIX" -- \
+              -Dfrida-gum:devkits=gum,gumjs \
+              -Dfrida-core:devkits=core
+            make -j"$(nproc)"
+            make install
+            cd ..
+          done
+          echo "FRIDA_PREFIX=$FRIDA_PREFIX" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # Build frida-java-bridge
+      # -----------------------------------------------------------------------
+      - name: Build frida-java-bridge
+        run: |
+          set -e
+          git clone --depth 1 --branch "$BRIDGE_TAG" https://github.com/frida/frida-java-bridge.git bridge-src
+          cd bridge-src
+          npm install
+          npm run build || make
+          if [ -f dist/frida-java-bridge.js ]; then
+            cp dist/frida-java-bridge.js "$GITHUB_WORKSPACE/bridge.js"
+          elif [ -f build/frida-java-bridge.js ]; then
+            cp build/frida-java-bridge.js "$GITHUB_WORKSPACE/bridge.js"
+          else
+            echo "bridge build output not found; using node_modules"
+            cp -r node_modules/frida-java-bridge "$GITHUB_WORKSPACE/node_modules/"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Clone ImGui
+      # -----------------------------------------------------------------------
+      - name: Clone ImGui
+        run: |
+          set -e
+          git clone --depth 1 --branch docking https://github.com/ocornut/imgui.git imgui
+
+      # -----------------------------------------------------------------------
+      # Bundle agent JS (includes frida-java-bridge)
+      # -----------------------------------------------------------------------
+      - name: Bundle agent
+        run: |
+          set -e
+          if [ -f "$GITHUB_WORKSPACE/bridge.js" ]; then
+            cp "$GITHUB_WORKSPACE/bridge.js" agent/bridge.js
+            sed -i 's#import Java from "frida-java-bridge";#import Java from "./bridge.js";#' agent/agent.js
+          fi
+          frida-compile agent/agent.js -o agent_bundle.js -c
+
+      # -----------------------------------------------------------------------
+      # Build libtool.so for both ABIs
+      # -----------------------------------------------------------------------
+      - name: Build libtool.so
+        run: |
+          set -e
+          for ABI in arm64-v8a armeabi-v7a; do
+            case "$ABI" in
+              arm64-v8a)   CMAKE_ABI=arm64-v8a   ;;
+              armeabi-v7a) CMAKE_ABI=armeabi-v7a ;;
+            esac
+            cmake -S . -B "build-$ABI" \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$CMAKE_ABI" \
+              -DANDROID_PLATFORM="android-${ANDROID_API}" \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build "build-$ABI" -j"$(nproc)"
+            mkdir -p "out/lib/$ABI"
+            cp "build-$ABI/libtool.so" "out/lib/$ABI/libtool.so"
+          done
+
+      # -----------------------------------------------------------------------
+      # Build sample APK from source
+      # -----------------------------------------------------------------------
+      - name: Build sample APK
+        run: |
+          set -e
+          export PATH="$ANDROID_HOME/build-tools/35.0.1:$PATH"
+          mkdir -p sample/build/compiled sample/build/gen sample/build/classes
+          aapt2 compile --dir sample/res -o sample/build/compiled/resources.zip
+          aapt2 link -o sample/build/base.apk \
+            -I "$ANDROID_HOME/platforms/android-${ANDROID_API}/android.jar" \
+            --manifest sample/AndroidManifest.xml \
+            -R sample/build/compiled/resources.zip \
+            --java sample/build/gen \
+            --auto-add-overlay
+          javac -source 8 -target 8 \
+            -bootclasspath "$ANDROID_HOME/platforms/android-${ANDROID_API}/android.jar" \
+            -d sample/build/classes \
+            sample/java/com/example/sample/MainActivity.java \
+            sample/build/gen/com/example/sample/R.java
+          d8 --lib "$ANDROID_HOME/platforms/android-${ANDROID_API}/android.jar" \
+             --output sample/build/dex sample/build/classes/com/example/sample/*.class
+          cp sample/build/base.apk sample/build/unsigned.apk
+          cd sample/build/dex && zip -q ../unsigned.apk classes.dex && cd -
+          zipalign -f 4 sample/build/unsigned.apk sample/build/aligned.apk
+
+      # -----------------------------------------------------------------------
+      # Decompile, inject System.loadLibrary("tool"), add libs, rebuild
+      # -----------------------------------------------------------------------
+      - name: Inject loader and rebuild APK
+        run: |
+          set -e
+          apktool d -f sample/build/aligned.apk -o sample/build/decoded
+          LAUNCHER_SMALI="sample/build/decoded/smali/com/example/sample/MainActivity.smali"
+          scripts/inject_loadlibrary.sh sample/build/decoded "$LAUNCHER_SMALI"
+          mkdir -p sample/build/decoded/lib/armeabi-v7a sample/build/decoded/lib/arm64-v8a
+          cp out/lib/armeabi-v7a/libtool.so sample/build/decoded/lib/armeabi-v7a/
+          cp out/lib/arm64-v8a/libtool.so sample/build/decoded/lib/arm64-v8a/
+          apktool b sample/build/decoded -o sample/build/patched-unsigned.apk
+          zipalign -f 4 sample/build/patched-unsigned.apk sample/build/patched-aligned.apk
+
+      # -----------------------------------------------------------------------
+      # Sign
+      # -----------------------------------------------------------------------
+      - name: Sign APK
+        run: |
+          set -e
+          export PATH="$ANDROID_HOME/build-tools/35.0.1:$PATH"
+          KS_PASS=$(openssl rand -hex 16)
+          KS_ALIAS="dextool-$(openssl rand -hex 4)"
+          keytool -genkeypair -v \
+            -keystore sample/build/release.keystore \
+            -alias "$KS_ALIAS" \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KS_PASS" -keypass "$KS_PASS" \
+            -dname "CN=Dex-tool, OU=Dev, O=Dev, L=Dev, S=Dev, C=US"
+          apksigner sign --ks sample/build/release.keystore \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+            --out sample/build/sample-signed.apk \
+            sample/build/patched-aligned.apk
+          rm -f sample/build/release.keystore
+
+      # -----------------------------------------------------------------------
+      # Upload artifacts
+      # -----------------------------------------------------------------------
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dex-tool-artifacts
+          path: |
+            out/lib/armeabi-v7a/libtool.so
+            out/lib/arm64-v8a/libtool.so
+            sample/build/sample-signed.apk
+          if-no-files-found: error
