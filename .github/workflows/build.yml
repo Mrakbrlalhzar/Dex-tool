@@ -673,19 +673,40 @@ jobs:
           with open('libtool/Dobby/common/os_arch_features.h', 'w') as f:
               f.write(content)
           PYEOF
-          # Fix ARM64 ADRP relocation error on Clang 14+
+          # Fix ARM64 ADRP relocation error - rewrite closure_bridge_arm64.asm entirely
           python3 << 'PYEOF'
-          import os, re
-          for root, dirs, files in os.walk('libtool/Dobby'):
-              for f in files:
-                  if f.endswith('.asm'):
-                      path = os.path.join(root, f)
-                      with open(path, 'r') as file:
-                          content = file.read()
-                      content = re.sub(r'adrp\s+(x\d+)\s*,\s*(\S+)@PAGE', r'ldr \1, =\2', content)
-                      content = re.sub(r'add\s+x\d+\s*,\s*x\d+\s*,\s*\S+@PAGEOFF\n?', '', content)
-                      with open(path, 'w') as file:
-                          file.write(content)
+          import os
+          asm_path = 'libtool/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm'
+          if os.path.exists(asm_path):
+              with open(asm_path, 'r') as f:
+                  original = f.read()
+              # Read line by line and replace adrp+add pairs
+              lines = original.split('\n')
+              new_lines = []
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  if 'adrp' in line and '@PAGE' in line:
+                      # Extract register and symbol
+                      stripped = line.strip()
+                      parts = stripped.split(',')
+                      if len(parts) >= 2:
+                          reg = parts[0].replace('adrp', '').strip()
+                          sym = parts[1].replace('@PAGE', '').strip()
+                          new_lines.append('  ldr ' + reg + ', =' + sym)
+                          # Skip the next add line if present
+                          if i + 1 < len(lines) and 'add' in lines[i+1] and '@PAGEOFF' in lines[i+1]:
+                              i += 1
+                      else:
+                          new_lines.append(line)
+                  else:
+                      new_lines.append(line)
+                  i += 1
+              with open(asm_path, 'w') as f:
+                  f.write('\n'.join(new_lines))
+              print("Fixed " + asm_path)
+          else:
+              print("WARNING: " + asm_path + " not found")
           PYEOF
 
       - name: Download ImGui
