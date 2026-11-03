@@ -104,7 +104,7 @@ jobs:
 
           Critical Frida correction:
           The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot.
-          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now strictly search for and flatten ONLY the specific Frida dependency headers (glib, capstone, quickjs, json-glib) to force the compiler to use the correct NDK sysroot headers.
+          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now use find to locate the exact glib-2.0 include directories in the Frida SDK and pass them directly to CMake via environment variables. This completely avoids copying standard headers and ensures #include <glib.h> resolves correctly.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -122,12 +122,13 @@ jobs:
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends)
 
-          # Find GLib include directories in the Frida SDK
-          file(GLOB_RECURSE GLIB_INC_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../frida/*/include/glib-2.0")
-          include_directories(${GLIB_INC_DIRS})
-          # Also find glibconfig.h directories
-          file(GLOB_RECURSE GLIB_CONFIG_INC_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../frida/*/lib/glib-2.0/include")
-          include_directories(${GLIB_CONFIG_INC_DIRS})
+          # Use the GLib include directories found by the workflow
+          if(DEFINED ENV{GLIB_INCLUDE_DIR})
+              include_directories($ENV{GLIB_INCLUDE_DIR})
+          endif()
+          if(DEFINED ENV{GLIB_CONFIG_INCLUDE_DIR})
+              include_directories($ENV{GLIB_CONFIG_INCLUDE_DIR})
+          endif()
 
           file(GLOB IMGUI_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/imgui/*.cpp"
@@ -669,7 +670,19 @@ jobs:
           # 2. Copy frida installed headers
           cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
           
-          # 3. Create wrapper header
+          # 3. Find GLib include directories
+          GLIB_INC="$(find . -type d -name 'glib-2.0' -path '*/include/glib-2.0' | head -n 1 || true)"
+          if [ -n "$GLIB_INC" ]; then
+              echo "Found glib-2.0 include dir: $PWD/$GLIB_INC"
+              echo "GLIB_INCLUDE_DIR=$PWD/$GLIB_INC" >> "$GITHUB_ENV"
+          fi
+          GLIB_CONFIG_INC="$(find . -type d -name 'include' -path '*/lib/glib-2.0/include' | head -n 1 || true)"
+          if [ -n "$GLIB_CONFIG_INC" ]; then
+              echo "Found glibconfig include dir: $PWD/$GLIB_CONFIG_INC"
+              echo "GLIB_CONFIG_INCLUDE_DIR=$PWD/$GLIB_CONFIG_INC" >> "$GITHUB_ENV"
+          fi
+          
+          # 4. Create wrapper header
           cat > ../libtool/include/frida-gumjs.h << 'EOF'
           #ifndef FRIDA_GUMJS_H
           #define FRIDA_GUMJS_H
@@ -706,6 +719,18 @@ jobs:
           find . -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; || true
           
           cp -r dist-arm/include/frida-1.0/* ../libtool/include/ || true
+          
+          # Find GLib include directories for arm
+          GLIB_INC_ARM="$(find . -type d -name 'glib-2.0' -path '*/include/glib-2.0' | grep -v 'arm64' | head -n 1 || true)"
+          if [ -n "$GLIB_INC_ARM" ]; then
+              echo "Found glib-2.0 include dir for arm: $PWD/$GLIB_INC_ARM"
+              echo "GLIB_INCLUDE_DIR=$PWD/$GLIB_INC_ARM" >> "$GITHUB_ENV"
+          fi
+          GLIB_CONFIG_INC_ARM="$(find . -type d -name 'include' -path '*/lib/glib-2.0/include' | grep -v 'arm64' | head -n 1 || true)"
+          if [ -n "$GLIB_CONFIG_INC_ARM" ]; then
+              echo "Found glibconfig include dir for arm: $PWD/$GLIB_CONFIG_INC_ARM"
+              echo "GLIB_CONFIG_INCLUDE_DIR=$PWD/$GLIB_CONFIG_INC_ARM" >> "$GITHUB_ENV"
+          fi
           
           ls -lh ../libtool/libs/armeabi-v7a/
 
