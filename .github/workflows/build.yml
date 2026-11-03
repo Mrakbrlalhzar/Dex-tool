@@ -42,7 +42,13 @@ jobs:
           export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
           yes | sdkmanager --licenses || true
           sdkmanager "platform-tools" "platforms;android-26" "platforms;android-34" "build-tools;35.0.1" "ndk;25.2.9519653"
+          NDK_DIR=$(ls -d $ANDROID_HOME/ndk/25.* 2>/dev/null | head -n 1)
+          if [ -z "$NDK_DIR" ]; then
+            NDK_DIR=$ANDROID_HOME/ndk/25.2.9519653
+          fi
+          export ANDROID_NDK_ROOT=$NDK_DIR
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT" >> $GITHUB_ENV
           echo "PATH=$PATH" >> $GITHUB_ENV
 
       - name: Install frida-compile
@@ -51,6 +57,16 @@ jobs:
 
       - name: Generate all project files
         run: |
+          cat > .gitignore << 'EOF'
+          build/
+          android-sdk/
+          *.o
+          *.so
+          *.apk
+          *.jks
+          node_modules/
+          EOF
+
           cat > README.md << 'EOF'
           # Dex-tool
           A standalone, runtime instrumentation framework for ordinary Android APKs.
@@ -121,10 +137,7 @@ jobs:
           #include "imgui_impl_opengl3.h"
 
           #define LOG_TAG "DexTool"
-          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-          #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
+          
           static void* g_orig_swap = nullptr;
           static bool g_imgui_initialized = false;
           static bool g_imgui_disabled = false;
@@ -133,6 +146,24 @@ jobs:
           static pthread_t g_frida_thread;
           static GumScriptBackend* g_backend = nullptr;
           static GumScript* g_script = nullptr;
+
+          void log_to_file(const char* level, const char* msg) {
+              if (g_files_dir[0] == '\0') return;
+              char path[1024];
+              const char* filename = (strstr(level, "DEBUG") != NULL) ? "dextool-debug.log" : "dextool.log";
+              snprintf(path, sizeof(path), "%s/%s", g_files_dir, filename);
+              int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+              if (fd >= 0) {
+                  char buf[1024];
+                  int len = snprintf(buf, sizeof(buf), "[%s] %s\n", level, msg);
+                  write(fd, buf, len);
+                  close(fd);
+              }
+          }
+
+          #define LOGI(msg) { __android_log_print(ANDROID_LOG_INFO, LOG_TAG, msg); log_to_file("INFO", msg); }
+          #define LOGD(msg) { __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, msg); log_to_file("DEBUG", msg); }
+          #define LOGE(msg) { __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, msg); log_to_file("ERROR", msg); }
 
           void write_jni_marker(const char* stage) {
               if (g_files_dir[0] == '\0') return;
@@ -178,7 +209,7 @@ jobs:
                       GError* error = nullptr;
                       g_script = gum_script_backend_create_sync(g_backend, "agent", js_code, NULL, NULL, &error);
                       if (error) {
-                          LOGE("Failed to create script: %s", error->message);
+                          LOGE("Failed to create script");
                           g_error_free(error);
                       } else {
                           gum_script_set_message_handler(g_script, on_message, NULL, NULL);
@@ -218,42 +249,24 @@ jobs:
                   
                   ImGui::Begin("DexTool Menu");
                   if (ImGui::BeginTabBar("Tabs")) {
-                      if (ImGui::BeginTabItem("Settings")) {
-                          ImGui::Text("Font size, scroll speed, opacity, theme.");
-                          ImGui::EndTabItem();
-                      }
-                      if (ImGui::BeginTabItem("Patches")) {
-                          ImGui::Text("List of patched methods/fields.");
-                          ImGui::EndTabItem();
-                      }
-                      if (ImGui::BeginTabItem("Hooks")) {
-                          ImGui::Text("List of hooked methods.");
-                          ImGui::EndTabItem();
-                      }
-                      if (ImGui::BeginTabItem("Tracker")) {
-                          ImGui::Text("List of tracked methods/fields.");
-                          ImGui::EndTabItem();
-                      }
-                      if (ImGui::BeginTabItem("Recorder")) {
+                      if (ImGui::BeginTabItem("Settings")) { ImGui::Text("Font size, scroll speed, opacity, theme."); ImGui::EndTabItem(); }
+                      if (ImGui::BeginTabItem("Patches")) { ImGui::Text("List of patched methods/fields."); ImGui::EndTabItem(); }
+                      if (ImGui::BeginTabItem("Hooks")) { ImGui::Text("List of hooked methods."); ImGui::EndTabItem(); }
+                      if (ImGui::BeginTabItem("Tracker")) { ImGui::Text("List of tracked methods/fields."); ImGui::EndTabItem(); }
+                      if (ImGui::BeginTabItem("Recorder")) { 
                           if (ImGui::Button("Start Recorder")) {
                               gum_script_post(g_script, "{\"type\":\"rpc_call\",\"method\":\"startRecorder\"}", NULL, NULL, NULL, NULL);
                           }
-                          ImGui::EndTabItem();
+                          ImGui::EndTabItem(); 
                       }
-                      if (ImGui::BeginTabItem("Monitor")) {
+                      if (ImGui::BeginTabItem("Monitor")) { 
                           if (ImGui::Button("Start Monitor")) {
                               gum_script_post(g_script, "{\"type\":\"rpc_call\",\"method\":\"startMonitor\"}", NULL, NULL, NULL, NULL);
                           }
-                          ImGui::EndTabItem();
+                          ImGui::EndTabItem(); 
                       }
-                      if (ImGui::BeginTabItem("Script")) {
-                          ImGui::Text("Arbitrary JS execution.");
-                          ImGui::EndTabItem();
-                      }
-                      if (ImGui::BeginTabItem("Classes")) {
-                          ImGui::Text("Browse loaded classes.");
-                          ImGui::EndTabItem();
-                      }
+                      if (ImGui::BeginTabItem("Script")) { ImGui::Text("Arbitrary JS execution."); ImGui::EndTabItem(); }
+                      if (ImGui::BeginTabItem("Classes")) { ImGui::Text("Browse loaded classes."); ImGui::EndTabItem(); }
                       ImGui::EndTabBar();
                   }
                   ImGui::End();
@@ -293,13 +306,16 @@ jobs:
           #define LOG_TAG "SmaliRuntime"
           #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-          extern "C" JNIEXPORT void JNICALL
-          Java_com_example_dextool_SmaliRuntime_compileSmali(JNIEnv* env, jclass clazz, jstring smaliCode) {
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_example_dextool_SmaliRuntime_compileSmaliNative(JNIEnv* env, jclass clazz, jstring smaliCode) {
               LOGI("Smali runtime stub called. Full reassembly on API 26-28 is infeasible.");
+              return env->NewStringUTF("STUB");
           }
           EOF
 
           cat > libtool/agent.js << 'EOF'
+          import { compileSmali } from './smali_bridge.js';
+
           Java.perform(function() {
               try {
                   var Activity = Java.use("android.app.Activity");
@@ -317,7 +333,8 @@ jobs:
               rpc.exports = {
                   startRecorder: function() { console.log("Recorder started"); },
                   startMonitor: function() { console.log("Monitor started"); },
-                  runScript: function(code) { eval(code); }
+                  runScript: function(code) { eval(code); },
+                  compileSmali: compileSmali
               };
           });
 
@@ -326,9 +343,21 @@ jobs:
                   if (msg.method === 'startRecorder') rpc.exports.startRecorder();
                   else if (msg.method === 'startMonitor') rpc.exports.startMonitor();
                   else if (msg.method === 'runScript') rpc.exports.runScript(msg.args[0]);
+                  else if (msg.method === 'compileSmali') rpc.exports.compileSmali(msg.args[0]);
               }
               recv(onMessage);
           });
+          EOF
+
+          cat > libtool/smali_bridge.js << 'EOF'
+          export function compileSmali(smaliCode) {
+              try {
+                  console.log("[SmaliBridge] Runtime smali reassembly stub called.");
+                  return { success: false, reason: "Full runtime smali reassembly infeasible on API 26-28" };
+              } catch(e) {
+                  return { success: false, reason: e.toString() };
+              }
+          }
           EOF
 
           mkdir -p sample-app/app/src/main/java/com/example/dextool
@@ -336,18 +365,11 @@ jobs:
 
           cat > sample-app/settings.gradle << 'EOF'
           pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
+              repositories { google() mavenCentral() gradlePluginPortal() }
           }
           dependencyResolutionManagement {
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
+              repositories { google() mavenCentral() }
           }
           rootProject.name = "DexToolSample"
           include ':app'
@@ -376,7 +398,6 @@ jobs:
               buildTypes {
                   release {
                       minifyEnabled false
-                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
                   }
               }
               compileOptions {
@@ -565,6 +586,7 @@ jobs:
 
       - name: Build Frida Gum 16.7.19 (arm64-v8a)
         run: |
+          export ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT
           git clone --branch 16.7.19 --depth 1 https://github.com/frida/frida.git
           cd frida
           ./configure --host=android-arm64 --prefix="$PWD/dist-arm64" -- -Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-gum:connectivity=disabled -Dfrida-gum:objc_bridge=disabled -Dfrida-gum:swift_bridge=disabled -Dfrida-gum:java_bridge=enabled
@@ -577,6 +599,7 @@ jobs:
 
       - name: Build Frida Gum 16.7.19 (armeabi-v7a)
         run: |
+          export ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT
           cd frida
           ./configure --host=android-arm --prefix="$PWD/dist-arm" -- -Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-gum:connectivity=disabled -Dfrida-gum:objc_bridge=disabled -Dfrida-gum:swift_bridge=disabled -Dfrida-gum:java_bridge=enabled
           make -j$(nproc)
@@ -594,8 +617,9 @@ jobs:
 
       - name: Download Smali Fat Jar
         run: |
-          mkdir -p libtool/assets
-          wget -O libtool/assets/smali.jar "https://github.com/baksmali/smali/releases/download/v3.0.9/smali-3.0.9-fat.jar" || wget -O libtool/assets/smali.jar "https://github.com/baksmali/smali/releases/download/3.0.9/smali-3.0.9-fat.jar"
+          mkdir -p libtool/assets sample-app/app/src/main/assets
+          wget -O libtool/assets/smali.jar "https://github.com/baksmali/smali/releases/download/3.0.9/smali-3.0.9-fat-release.jar" || wget -O libtool/assets/smali.jar "https://github.com/baksmali/smali/releases/download/3.0.9/smali-3.0.9-fat.jar"
+          cp libtool/assets/smali.jar sample-app/app/src/main/assets/
 
       - name: Bundle Frida Agent
         run: |
@@ -605,13 +629,15 @@ jobs:
 
       - name: Build libtool.so (arm64-v8a)
         run: |
-          cmake -S libtool -B build_arm64 -DCMAKE_TOOLCHAIN_FILE=$ANDROID_HOME/ndk/25.2.9519653/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
+          TOOLCHAIN=$(ls -d $ANDROID_HOME/ndk/25.*/build/cmake/android.toolchain.cmake | head -n 1)
+          cmake -S libtool -B build_arm64 -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
           cmake --build build_arm64 -j$(nproc)
           ls -lh build_arm64/libtool.so
 
       - name: Build libtool.so (armeabi-v7a)
         run: |
-          cmake -S libtool -B build_arm -DCMAKE_TOOLCHAIN_FILE=$ANDROID_HOME/ndk/25.2.9519653/build/cmake/android.toolchain.cmake -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
+          TOOLCHAIN=$(ls -d $ANDROID_HOME/ndk/25.*/build/cmake/android.toolchain.cmake | head -n 1)
+          cmake -S libtool -B build_arm -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
           cmake --build build_arm -j$(nproc)
           ls -lh build_arm/libtool.so
 
