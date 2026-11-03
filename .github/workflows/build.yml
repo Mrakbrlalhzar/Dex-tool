@@ -657,6 +657,12 @@ jobs:
       - name: Download Dobby
         run: |
           git clone --depth 1 https://github.com/jmpews/Dobby.git libtool/Dobby
+          # Patch Dobby master branch to fix compilation errors on Android NDK r25
+          sed -i '1i #include "osbase/osbase.h"' libtool/Dobby/common/os_arch_features.h
+          sed -i '1i #include "source/PlatformUnifiedInterface/platform.h"' libtool/Dobby/common/os_arch_features.h
+          # Fix ARM64 ADRP relocation error on Clang 14+
+          find libtool/Dobby -name "*.asm" -exec sed -i 's/adrp \(x[0-9]*\), \(.*\)@PAGE/ldr \1, =\2/g' {} +
+          find libtool/Dobby -name "*.asm" -exec sed -i '/add \(x[0-9]*\), \1, \(.*\)@PAGEOFF/d' {} +
 
       - name: Download ImGui
         run: |
