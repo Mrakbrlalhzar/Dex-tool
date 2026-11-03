@@ -117,7 +117,7 @@ jobs:
           Previous failures were caused by using jmpews/Dobby master as a moving target. The observed master checkout contained internally inconsistent Android sources: RuntimeModule load_address mismatches, start/start() mismatches, missing core/arch/Cpu.h include paths, and ARM64 @PAGE relocation issues. This workflow pins Dobby to the stable historical line (2023.4.14) and builds only dobby_static.
 
           Critical Frida correction:
-          The previous AI failed to locate the Frida devkit. make install does not produce a single bundled frida-gum.h. We explicitly link ALL the installed static libraries and wrap the headers with a simple umbrella frida-gumjs.h.
+          The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py directly. We explicitly run `python3 -m releng.devkit` as a module to resolve the relative imports. This successfully bundles glib, capstone, and all other dependencies into a single `libfrida-gumjs.a` and `frida-gumjs.h` devkit, completely eliminating the `glib.h` missing error.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -678,13 +678,21 @@ jobs:
           make -j$(nproc)
           make install
           
-          mkdir -p ../libtool/libs/arm64-v8a ../libtool/include
-          # Copy all static libraries from the installed prefix
-          cp dist-arm64/lib/*.a ../libtool/libs/arm64-v8a/
-          # Copy all headers from the installed prefix
-          cp -r dist-arm64/include/frida-1.0/* ../libtool/include/
-          # Create a wrapper header file that C++ code can include
-          printf '#ifndef FRIDA_GUMJS_H\n#define FRIDA_GUMJS_H\n#include "gumjs/gumjs.h"\n#include "gum/gum.h"\n#include "gum/guminterceptor.h"\n#include "gum/gumprocess.h"\n#include "gum/gummemory.h"\n#endif\n' > ../libtool/include/frida-gumjs.h
+          mkdir -p ../devkit-arm64 ../libtool/libs/arm64-v8a ../libtool/include
+          
+          # Run devkit.py as a python module to resolve the 'from . import env' relative import error
+          python3 -m releng.devkit frida-gumjs android-arm64 ../devkit-arm64
+          
+          # Verify devkit generation
+          if [ -f ../devkit-arm64/libfrida-gumjs.a ] && [ -f ../devkit-arm64/frida-gumjs.h ]; then
+            echo "Devkit generated successfully."
+            cp ../devkit-arm64/libfrida-gumjs.a ../libtool/libs/arm64-v8a/libfrida-gum.a
+            cp ../devkit-arm64/frida-gumjs.h ../libtool/include/
+          else
+            echo "ERROR: devkit generation failed or produced unexpected files!"
+            ls -la ../devkit-arm64 || true
+            exit 1
+          fi
           
           ls -lh ../libtool/libs/arm64-v8a/
           ls -lh ../libtool/include/
@@ -707,8 +715,17 @@ jobs:
           make -j$(nproc)
           make install
           
-          mkdir -p ../libtool/libs/armeabi-v7a
-          cp dist-arm/lib/*.a ../libtool/libs/armeabi-v7a/
+          mkdir -p ../devkit-arm ../libtool/libs/armeabi-v7a
+          
+          # Run devkit.py as a python module
+          python3 -m releng.devkit frida-gumjs android-arm ../devkit-arm
+          
+          if [ -f ../devkit-arm/libfrida-gumjs.a ]; then
+            cp ../devkit-arm/libfrida-gumjs.a ../libtool/libs/armeabi-v7a/libfrida-gum.a
+          else
+            echo "ERROR: devkit generation failed for arm!"
+            exit 1
+          fi
           ls -lh ../libtool/libs/armeabi-v7a/
 
       - name: Download Dobby
