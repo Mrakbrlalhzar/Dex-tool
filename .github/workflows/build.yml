@@ -84,7 +84,7 @@ jobs:
           mkdir -p libtool/src libtool/include libtool/libs/arm64-v8a libtool/libs/armeabi-v7a libtool/assets
           
           cat > libtool/CMakeLists.txt << 'EOF'
-          cmake_minimum_required(VERSION 3.10)
+          cmake_minimum_required(VERSION 3.18)
           project(tool)
           set(CMAKE_CXX_STANDARD 17)
 
@@ -385,7 +385,6 @@ jobs:
                   var SmaliClass = classLoader.loadClass("com.android.tools.smali.smali.Smali");
                   console.log("Smali loaded successfully via DexClassLoader!");
                   
-                  // Stubbing actual compilation as runtime smali reassembly is infeasible on API 26-28
                   return { success: false, reason: "Stubbed: Runtime reassembly infeasible on API 26-28" };
               } catch(e) {
                   return { success: false, reason: e.toString() };
@@ -626,9 +625,16 @@ jobs:
           make -j$(nproc)
           make install
           mkdir -p ../libtool/libs/arm64-v8a ../libtool/include
-          find dist-arm64 -name "libfrida-gum*.a" -exec cp {} ../libtool/libs/arm64-v8a/ \;
-          find dist-arm64 -name "frida-gum.h" -exec cp {} ../libtool/include/ \;
-          find dist-arm64 -name "gum*.h" -exec cp {} ../libtool/include/ \;
+          GUM_LIB=$(find . -name "*.a" | grep -i "gum" | head -n 1)
+          if [ -n "$GUM_LIB" ]; then
+            cp "$GUM_LIB" ../libtool/libs/arm64-v8a/libfrida-gum.a
+          else
+            echo "ERROR: Could not find frida-gum static library!"
+            find . -name "*.a"
+            exit 1
+          fi
+          find . -name "frida-gum.h" -exec cp {} ../libtool/include/ \;
+          find . -name "gum*.h" -exec cp {} ../libtool/include/ \;
 
       - name: Build Frida Gum 16.7.19 (armeabi-v7a)
         run: |
@@ -639,7 +645,14 @@ jobs:
           make -j$(nproc)
           make install
           mkdir -p ../libtool/libs/armeabi-v7a
-          find dist-arm -name "libfrida-gum*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \;
+          GUM_LIB=$(find . -name "*.a" | grep -i "gum" | head -n 1)
+          if [ -n "$GUM_LIB" ]; then
+            cp "$GUM_LIB" ../libtool/libs/armeabi-v7a/libfrida-gum.a
+          else
+            echo "ERROR: Could not find frida-gum static library for arm!"
+            find . -name "*.a"
+            exit 1
+          fi
 
       - name: Download Dobby
         run: |
