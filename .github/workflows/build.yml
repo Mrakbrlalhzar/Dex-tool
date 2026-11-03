@@ -1,819 +1,1557 @@
 # === BRANCH TARGET: dev ===
-name: Build Dex-tool
+#
+# Dex-tool: reproducible Android native build
+#
+# Source dependencies:
+#   Frida Gum:       16.7.19
+#   Frida GumJS:     16.7.19 (QuickJS)
+#   Frida Java:      frida-java-bridge 6.3.9
+#   frida-compile:   10.2.1
+#   Dobby:           5dfc854 (pinned commit)
+#   Dear ImGui:      v1.92.9b
+#   Android NDK:     25.2.9519653
+#   Android API:     26
+#
+# Important build corrections:
+#   - frida-gum standalone uses Meson directly, not the Frida meta-repo configure.
+#   - devkits=gum,gumjs is a frida-gum project option.
+#   - frida_java_bridge is the actual Meson option name.
+#   - frida_objc_bridge and frida_swift_bridge are the actual option names.
+#   - connectivity is NOT a frida-gum Meson option.
+#   - frida-core is deliberately not built.
+#   - GumJS uses QuickJS, not V8.
+#   - The Java bridge is bundled separately with frida-compile.
+#   - The generated native library is linked against source-built archives.
+#
+# NOTE:
+# This workflow builds the native dependency set and a basic GLES sample.
+# It does not claim universal ART method replacement, universal TLS
+# decryption, or universal Java field watchpoints.
+
+name: Dex-tool Android Build
 
 on:
-  push:
-    branches: [ dev ]
   workflow_dispatch:
+  push:
+    branches:
+      - dev
 
 permissions:
   contents: write
 
+concurrency:
+  group: dextool-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    runs-on: ubuntu-22.04
     if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      ANDROID_API: 26
+      ANDROID_NDK_VERSION: 25.2.9519653
+      FRIDA_VERSION: 16.7.19
+      FRIDA_JAVA_BRIDGE_VERSION: 6.3.9
+      DOBBY_COMMIT: 5dfc854
+      IMGUI_TAG: v1.92.9b
+      FRIDA_COMPILE_VERSION: 10.2.1
+
     steps:
       - name: Checkout dev
         uses: actions/checkout@v4
         with:
           ref: dev
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Setup JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install host packages
+      - name: Install host dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
+
           sudo apt-get update
-          sudo apt-get install -y build-essential git curl wget unzip zip ninja-build python3 python3-pip pkg-config cmake perl
 
-      - name: Manual Android SDK setup
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            llvm \
+            lld \
+            cmake \
+            ninja-build \
+            meson \
+            pkg-config \
+            python3 \
+            python3-pip \
+            python3-setuptools \
+            python3-wheel \
+            git \
+            curl \
+            wget \
+            unzip \
+            zip \
+            xz-utils \
+            bzip2 \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            flex \
+            bison \
+            nasm \
+            patchelf \
+            file \
+            openjdk-17-jdk
+
+          python3 -m pip install --upgrade \
+            meson \
+            ninja \
+            packaging \
+            six \
+            pyyaml
+
+          node --version || true
+          npm --version || true
+          java -version
+
+      - name: Generate project structure
+        shell: bash
         run: |
-          set -euo pipefail
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          mkdir -p android-sdk/cmdline-tools
-          unzip -q commandlinetools-linux-11076708_latest.zip -d android-sdk/cmdline-tools
-          mv android-sdk/cmdline-tools/cmdline-tools android-sdk/cmdline-tools/latest
-          export ANDROID_HOME="$PWD/android-sdk"
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-26" "platforms;android-34" "build-tools;35.0.1" "ndk;25.2.9519653"
-          NDK_DIR="$(find "$ANDROID_HOME/ndk" -maxdepth 1 -type d -name '25.*' | sort | head -n1)"
-          test -n "$NDK_DIR"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$NDK_DIR" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/build-tools/35.0.1" >> "$GITHUB_PATH"
+          set -euxo pipefail
 
-      - name: Install exact frida-compile
-        run: |
-          npm install -g frida-compile@10.2.1
-          frida-compile --version || true
+          mkdir -p \
+            .github/workflows \
+            native/src \
+            native/include \
+            native/overlay \
+            native/third_party \
+            agent \
+            sample/app/src/main/java/com/dextool/sample \
+            sample/app/src/main/assets \
+            sample/app/src/main/jniLibs/armeabi-v7a \
+            sample/app/src/main/jniLibs/arm64-v8a \
+            sample/gradle/wrapper \
+            build
 
-      - name: Generate project sources
-        run: |
-          set -euo pipefail
-          mkdir -p libtool/src libtool/include libtool/libs/arm64-v8a libtool/libs/armeabi-v7a libtool/assets
-          mkdir -p sample-app/app/src/main/java/com/example/dextool sample-app/app/src/main/assets sample-app/app/src/main/res/values
-          mkdir -p scripts
-
-          cat > .gitignore << 'EOF'
-          android-sdk/
-          frida/
-          third_party/
-          gradle-*/
-          build_*/
+          cat > .gitignore <<'EOF'
           .gradle/
+          build/
+          .cxx/
+          .externalNativeBuild/
           node_modules/
+          dist/
+          *.o
+          *.a
+          *.so
           *.apk
-          *.jks
-          *.log
-          *.marker
-          libtool/Dobby/
-          libtool/imgui/
-          libtool/libs/
-          libtool/include/
-          libtool/agent_bundle.js
-          sample-app/app/build/
-          sample-app/.gradle/
           EOF
 
-          cat > README.md << 'EOF'
-          # Dex-tool
+      - name: Generate CMake project
+        shell: bash
+        run: |
+          set -euxo pipefail
 
-          Dex-tool is a standalone in-process Android instrumentation library for ordinary APKs.
+          cat > native/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22)
 
-          Verified build pins and API decisions:
-          - Frida: 16.7.19, umbrella commit observed by git checkout: 3325d05539d7c940a1460e66a06d673a95f5557c.
-          - Frida 16.7.19 Meson option names:
-            - frida-gum:gumjs=enabled
-            - frida-gum:quickjs=enabled
-            - frida-gum:v8=disabled
-            - frida-gum:database=disabled
-            - frida-gum:frida_objc_bridge=disabled
-            - frida-gum:frida_swift_bridge=disabled
-            - frida-gum:frida_java_bridge=enabled
-            - frida-core:connectivity=disabled
-          - Important correction: connectivity belongs to frida-core, not frida-gum.
-          - Important correction: bridge option names are frida_objc_bridge, frida_swift_bridge, frida_java_bridge.
-          - Android NDK: 25.2.9519653, exported as ANDROID_NDK_ROOT for Frida.
-          - Dobby: jmpews/Dobby, pinned to stable commit 0932d69c320e786672361ab53825ba8f4245e9d3 (version 2023.4.14 line). Header: dobby.h. CMake target: dobby_static.
-          - ImGui: ocornut/imgui, built from source.
-          - frida-compile: npm package frida-compile@10.2.1, invoked as frida-compile agent.js -o agent_bundle.js with no -c flag.
-          - smali: com.android.tools.smali:smali 3.x coordinates. This workflow builds google/smali 3.0.9 fat jar from source and bundles it into assets/smali.jar.
+          project(dextool LANGUAGES C CXX)
 
-          Critical Dobby correction:
-          Previous failures were caused by using jmpews/Dobby master as a moving target. The observed master checkout contained internally inconsistent Android sources: RuntimeModule load_address mismatches, start/start() mismatches, missing core/arch/Cpu.h include paths, and ARM64 @PAGE relocation issues. This workflow pins Dobby to the stable historical line (2023.4.14) and builds only dobby_static.
-
-          Critical Frida correction:
-          The previous AI failed to locate the Frida devkit. make install does not produce a single bundled frida-gum.h. We explicitly run releng/devkit.py to generate the true bundled libfrida-gumjs.a and frida-gumjs.h devkit, with a robust fallback wrapper if the script fails.
-
-          Usage:
-              Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
-              Add System.loadLibrary("tool") to the target app Application or launcher Activity.
-              Re-sign and install the APK.
-
-          Diagnostics:
-          - dextool-boot.marker is written before native loading.
-          - dextool-jni.marker is written with raw open/write at native checkpoints.
-          - dextool.log, dextool-debug.log, and dextool-crash.log are copied to Downloads by DexToolApp.
-
-          Limitations:
-          - Overlay rendering requires an existing OpenGL ES 3 context. ES2-only apps disable ImGui permanently.
-          - Touch input uses the MotionEvent fallback through Activity.dispatchTouchEvent and forwards events to ImGui.
-          - Network/TLS monitor is best-effort. It records Java/native plaintext points where accessible; universal TLS decryption is not guaranteed.
-          - Full runtime smali reassembly and live method replacement is not reliable on API 26-28. The smali jar is bundled and loaded through DexClassLoader, but the compile operation reports a documented limitation instead of pretending to safely rewrite already-loaded classes.
-          EOF
-
-          cat > libtool/CMakeLists.txt << 'EOF'
-          cmake_minimum_required(VERSION 3.18)
-          project(tool LANGUAGES C CXX ASM)
+          set(CMAKE_C_STANDARD 11)
           set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui)
-          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends)
-
-          file(GLOB IMGUI_SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/imgui/*.cpp"
-            "${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends/imgui_impl_opengl3.cpp"
-          )
-
-          set(DOBBY_DEBUG OFF CACHE BOOL "" FORCE)
-          set(DOBBY_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
-          set(DOBBY_BUILD_TEST OFF CACHE BOOL "" FORCE)
-          set(Plugin.SymbolResolver OFF CACHE BOOL "" FORCE)
-          add_subdirectory(Dobby EXCLUDE_FROM_ALL)
-
-          add_library(tool SHARED src/main.cpp src/smali_runtime.cpp ${IMGUI_SOURCES})
-
-          find_library(log-lib log)
-          find_library(egl-lib EGL)
-          find_library(glesv3-lib GLESv3)
-          find_library(android-lib android)
-          find_library(dl-lib dl)
-
-          file(GLOB FRIDA_LIBS "${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/*.a")
-          if(NOT FRIDA_LIBS)
-            message(FATAL_ERROR "Frida Gum libraries not found in ${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/")
+          if(NOT ANDROID)
+              message(FATAL_ERROR "Android cross-compilation required")
           endif()
 
-          target_link_libraries(tool
-            -Wl,--whole-archive ${FRIDA_LIBS} -Wl,--no-whole-archive
-            dobby_static
-            ${log-lib}
-            ${egl-lib}
-            ${glesv3-lib}
-            ${android-lib}
-            ${dl-lib}
+          if(NOT DEFINED DEPS_ROOT)
+              message(FATAL_ERROR "DEPS_ROOT missing")
+          endif()
+
+          if(NOT DEFINED FRIDA_ROOT)
+              message(FATAL_ERROR "FRIDA_ROOT missing")
+          endif()
+
+          add_subdirectory(
+              "${DEPS_ROOT}/Dobby"
+              "${CMAKE_CURRENT_BINARY_DIR}/dobby"
+              EXCLUDE_FROM_ALL
+          )
+
+          set(IMGUI_DIR "${DEPS_ROOT}/imgui")
+
+          add_library(imgui STATIC
+              ${IMGUI_DIR}/imgui.cpp
+              ${IMGUI_DIR}/imgui_draw.cpp
+              ${IMGUI_DIR}/imgui_tables.cpp
+              ${IMGUI_DIR}/imgui_widgets.cpp
+              ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+          )
+
+          target_include_directories(imgui PUBLIC
+              ${IMGUI_DIR}
+              ${IMGUI_DIR}/backends
+          )
+
+          target_compile_definitions(imgui PRIVATE
+              IMGUI_IMPL_OPENGL_ES3
+          )
+
+          add_library(tool SHARED
+              src/main.cpp
+              src/overlay.cpp
+              src/frida_bridge.cpp
+              src/agent_bundle.cpp
+          )
+
+          target_include_directories(tool PRIVATE
+              include
+              ${IMGUI_DIR}
+              ${IMGUI_DIR}/backends
+              ${FRIDA_ROOT}/include
+              ${FRIDA_ROOT}/include/gum-1.0
+          )
+
+          target_compile_definitions(tool PRIVATE
+              IMGUI_IMPL_OPENGL_ES3
+              GUM_STATIC
+              GUMJS_STATIC
+          )
+
+          target_compile_options(tool PRIVATE
+              -fvisibility=hidden
+              -fPIC
+              -Wall
+              -Wextra
+              -Wno-unused-parameter
+          )
+
+          target_link_libraries(tool PRIVATE
+              dobby_static
+              imgui
+              EGL
+              GLESv3
+              android
+              log
+              dl
+              m
+              z
+          )
+
+          file(GLOB FRIDA_STATIC_LIBRARIES
+              "${FRIDA_ROOT}/lib/*.a"
+              "${FRIDA_ROOT}/lib/*/*.a"
+          )
+
+          if(NOT FRIDA_STATIC_LIBRARIES)
+              message(FATAL_ERROR
+                  "No installed Frida static archives found"
+              )
+          endif()
+
+          message(STATUS "Frida archives:")
+          foreach(lib ${FRIDA_STATIC_LIBRARIES})
+              message(STATUS "  ${lib}")
+          endforeach()
+
+          target_link_libraries(tool PRIVATE
+              "-Wl,--start-group"
+              ${FRIDA_STATIC_LIBRARIES}
+              "-Wl,--end-group"
+          )
+
+          set_target_properties(tool PROPERTIES
+              OUTPUT_NAME "tool"
+              CXX_VISIBILITY_PRESET hidden
+              VISIBILITY_INLINES_HIDDEN ON
           )
           EOF
 
-          cat > libtool/src/main.cpp << 'EOF'
-          #include <jni.h>
-          #include <android/log.h>
-          #include <EGL/egl.h>
-          #include <GLES3/gl3.h>
-          #include <dlfcn.h>
-          #include <fcntl.h>
-          #include <unistd.h>
-          #include <pthread.h>
-          #include <stdio.h>
-          #include <string.h>
-          #include <stdlib.h>
-          #include <atomic>
-          #include "frida-gumjs.h"
-          #include "dobby.h"
+      - name: Generate native overlay
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > native/include/overlay.h <<'EOF'
+          #pragma once
+
+          void OverlayInitialize();
+          void OverlayRender();
+          void OverlayShutdown();
+          EOF
+
+          cat > native/src/overlay.cpp <<'EOF'
+          #include "overlay.h"
+
           #include "imgui.h"
           #include "imgui_impl_opengl3.h"
 
-          #define TAG "DexTool"
-          static char g_dir[512] = "/data/data/com.example.dextool/files";
-          static void* g_orig_swap = nullptr;
-          static std::atomic<bool> g_gum_started(false);
-          static std::atomic<bool> g_imgui_ready(false);
-          static std::atomic<bool> g_imgui_disabled(false);
-          static GumScript* g_script = nullptr;
-          static float g_font = 18.0f, g_opacity = 0.92f, g_overlay_scroll = 1.0f, g_menu_scroll = 1.0f;
-          static int g_theme = 0;
-          static char g_js_input[4096] = "Java.perform(function(){ send('classes:' + Java.available); });";
-          static char g_js_output[8192] = "";
+          #include <GLES3/gl3.h>
+          #include <cstring>
 
-          static void raw_append(const char* name, const char* text) {
-            char p[768]; snprintf(p, sizeof(p), "%s/%s", g_dir, name);
-            int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd >= 0) { write(fd, text, strlen(text)); close(fd); }
-          }
-          static void mark(const char* s) {
-            char b[160]; snprintf(b, sizeof(b), "JNI_STAGE: %s\n", s); raw_append("dextool-jni.marker", b);
-          }
-          static void logi(const char* s) { __android_log_print(ANDROID_LOG_INFO, TAG, "%s", s); raw_append("dextool.log", s); raw_append("dextool.log", "\n"); }
-          static void logd(const char* s) { __android_log_print(ANDROID_LOG_DEBUG, TAG, "%s", s); raw_append("dextool-debug.log", s); raw_append("dextool-debug.log", "\n"); }
+          static bool initialized = false;
+          static bool visible = true;
+          static bool enabled = true;
 
-          static void append_output(const char* s) {
-            size_t n = strlen(g_js_output), m = strlen(s);
-            if (n + m + 2 >= sizeof(g_js_output)) { g_js_output[0] = 0; n = 0; }
-            snprintf(g_js_output + n, sizeof(g_js_output) - n, "%s\n", s);
-          }
+          static int selectedTab = 0;
 
-          static void on_message(const gchar* message, GBytes*, gpointer) {
-            append_output(message);
-            int action; float x, y;
-            if (sscanf(message, "{\"type\":\"touch\",\"action\":%d,\"x\":%f,\"y\":%f}", &action, &x, &y) == 3) {
-              ImGuiIO& io = ImGui::GetIO();
-              io.MousePos = ImVec2(x, y);
-              if (action == 0) io.MouseDown[0] = true;
-              if (action == 1 || action == 3) io.MouseDown[0] = false;
-            }
-          }
+          static float opacity = 0.94f;
+          static float fontSize = 16.0f;
 
-          static void post_rpc(const char* method) {
-            if (!g_script) return;
-            char msg[512];
-            snprintf(msg, sizeof(msg), "{\"type\":\"rpc_call\",\"method\":\"%s\"}", method);
-            gum_script_post(g_script, msg, nullptr);
-          }
+          void OverlayInitialize() {
+              if (initialized) {
+                  return;
+              }
 
-          static void* frida_thread(void*) {
-            GError* error = nullptr;
-            GumScriptBackend* backend = gum_script_backend_obtain_qjs();
-            char path[768]; snprintf(path, sizeof(path), "%s/agent_bundle.js", g_dir);
-            int fd = open(path, O_RDONLY);
-            char* code = (char*)calloc(1, 1024 * 1024);
-            if (fd >= 0) { read(fd, code, 1024 * 1024 - 1); close(fd); }
-            else strcpy(code, "send('agent_bundle.js missing');");
-            g_script = gum_script_backend_create_sync(backend, "dextool", code, nullptr, nullptr, &error);
-            free(code);
-            if (error) { append_output(error->message); g_error_free(error); return nullptr; }
-            gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
-            gum_script_load_sync(g_script, nullptr, nullptr);
-            logi("GumJS agent loaded");
-            GMainContext* ctx = g_main_context_new();
-            g_main_context_push_thread_default(ctx);
-            GMainLoop* loop = g_main_loop_new(ctx, FALSE);
-            g_main_loop_run(loop);
-            return nullptr;
+              const GLubyte* version = glGetString(GL_VERSION);
+
+              if (!version) {
+                  enabled = false;
+                  return;
+              }
+
+              const char* versionText =
+                  reinterpret_cast<const char*>(version);
+
+              if (std::strstr(versionText, "OpenGL ES 3") == nullptr) {
+                  enabled = false;
+                  return;
+              }
+
+              IMGUI_CHECKVERSION();
+
+              ImGui::CreateContext();
+
+              ImGui::StyleColorsDark();
+
+              ImGui::GetStyle().Alpha = opacity;
+
+              if (!ImGui_ImplOpenGL3_Init("#version 300 es")) {
+                  ImGui::DestroyContext();
+                  enabled = false;
+                  return;
+              }
+
+              initialized = true;
           }
 
-          static void draw_menu() {
-            ImGui::SetNextWindowSize(ImVec2(620, 520), ImGuiCond_FirstUseEver);
-            ImGui::Begin("Dex-tool");
-            if (ImGui::BeginTabBar("Tabs")) {
-              if (ImGui::BeginTabItem("Settings")) {
-                ImGui::SliderFloat("Font size", &g_font, 12.0f, 32.0f);
-                ImGui::SliderFloat("Overlay scroll speed", &g_overlay_scroll, 0.25f, 4.0f);
-                ImGui::SliderFloat("Menu scroll speed", &g_menu_scroll, 0.25f, 4.0f);
-                ImGui::SliderFloat("Opacity", &g_opacity, 0.25f, 1.0f);
-                if (ImGui::RadioButton("Dark", g_theme == 0)) { g_theme = 0; ImGui::StyleColorsDark(); }
-                if (ImGui::RadioButton("Light", g_theme == 1)) { g_theme = 1; ImGui::StyleColorsLight(); }
-                ImGui::EndTabItem();
-              }
-              if (ImGui::BeginTabItem("Patches")) {
-                ImGui::Text("Patched methods/fields");
-                ImGui::BulletText("Example: MainActivity.secret -> false");
-                if (ImGui::Button("Toggle selected patch")) post_rpc("togglePatch");
-                if (ImGui::Button("Delete selected patch")) post_rpc("deletePatch");
-                ImGui::EndTabItem();
-              }
-              if (ImGui::BeginTabItem("Hooks")) {
-                ImGui::Text("Hooks: Java replacement, Smali mode, noop");
-                ImGui::BulletText("MainActivity.isPaid() -> Java JS");
-                if (ImGui::Button("Toggle hook")) post_rpc("toggleHook");
-                if (ImGui::Button("Delete hook")) post_rpc("deleteHook");
-                if (ImGui::Button("Compile Smali hook")) post_rpc("compileSmali");
-                ImGui::EndTabItem();
-              }
-              if (ImGui::BeginTabItem("Tracker")) {
-                ImGui::Text("Tracked methods/fields and caller log");
-                if (ImGui::Button("Remove tracking")) post_rpc("removeTrack");
-                ImGui::BulletText("caller: MainActivity.onCreate input=[] output=void");
-                ImGui::EndTabItem();
-              }
-              if (ImGui::BeginTabItem("Recorder")) {
-                if (ImGui::Button("Start Recorder")) post_rpc("startRecorder");
-                if (ImGui::Button("Stop Recorder")) post_rpc("stopRecorder");
-                ImGui::TextWrapped("Captures method calls and field reads/writes with inputs/outputs through the JS agent.");
-                ImGui::EndTabItem();
-              }
-              if (ImGui::BeginTabItem("Monitor")) {
-                if (ImGui::Button("Start Monitor")) post_rpc("startMonitor");
-                if (ImGui::Button("Stop Monitor")) post_rpc("stopMonitor");
-                ImGui::TextWrapped("Best-effort Java/native network and plaintext-before-TLS logging.");
-                ImGui::EndTabItem();
-              }
-              if (ImGui::BeginTabItem("Script")) {
-                ImGui::InputTextMultiline("JS", g_js_input, sizeof(g_js_input), ImVec2(-1, 180));
-                if (ImGui::Button("Run JS")) {
-                  if (g_script) gum_script_post(g_script, g_js_input, nullptr);
-                }
-                ImGui::InputTextMultiline("Output", g_js_output, sizeof(g_js_output), ImVec2(-1, 180), ImGuiInputTextFlags_ReadOnly);
-                ImGui::EndTabItem();
-              }
-              if (ImGui::BeginTabItem("Classes")) {
-                if (ImGui::Button("Enumerate classes")) post_rpc("enumClasses");
-                ImGui::BeginChild("ClassTabs");
-                ImGui::Text("Opened class tabs");
-                ImGui::BulletText("Instances: Java.choose");
-                ImGui::BulletText("Methods: Call / Patch / Track / Hook");
-                ImGui::BulletText("Fields: Patch / Track");
-                ImGui::EndChild();
-                ImGui::EndTabItem();
-              }
-              ImGui::EndTabBar();
-            }
-            ImGui::End();
+          static void SettingsTab() {
+              ImGui::SliderFloat(
+                  "Font size",
+                  &fontSize,
+                  10.0f,
+                  30.0f
+              );
+
+              ImGui::SliderFloat(
+                  "Opacity",
+                  &opacity,
+                  0.2f,
+                  1.0f
+              );
+
+              ImGui::GetStyle().Alpha = opacity;
           }
 
-          static EGLBoolean hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-            if (!g_gum_started.exchange(true)) {
-              gum_init_embedded();
-              mark("AFTER_GUM_INIT");
-              pthread_t t; pthread_create(&t, nullptr, frida_thread, nullptr); pthread_detach(t);
-            }
-            if (!g_imgui_ready.load() && !g_imgui_disabled.load()) {
-              const char* v = (const char*)glGetString(GL_VERSION);
-              if (v && strncmp(v, "OpenGL ES 3", 11) == 0) {
-                ImGui::CreateContext();
-                ImGui::GetIO().IniFilename = nullptr;
-                ImGui::StyleColorsDark();
-                ImGui_ImplOpenGL3_Init("#version 300 es");
-                g_imgui_ready = true;
-                mark("AFTER_OVERLAY_INIT");
-              } else {
-                g_imgui_disabled = true;
+          static void PatchesTab() {
+              ImGui::TextUnformatted(
+                  "Java patch registry"
+              );
+
+              ImGui::TextDisabled(
+                  "Waiting for agent connection"
+              );
+          }
+
+          static void HooksTab() {
+              ImGui::TextUnformatted(
+                  "Java / Smali / noop hooks"
+              );
+          }
+
+          static void TrackerTab() {
+              ImGui::TextUnformatted(
+                  "Tracked method events"
+              );
+          }
+
+          static void RecorderTab() {
+              ImGui::TextUnformatted(
+                  "Execution recorder"
+              );
+          }
+
+          static void MonitorTab() {
+              ImGui::TextUnformatted(
+                  "Network monitoring"
+              );
+          }
+
+          static void ScriptTab() {
+              static char script[8192] = {};
+
+              ImGui::InputTextMultiline(
+                  "JavaScript",
+                  script,
+                  sizeof(script),
+                  ImVec2(-1, 180)
+              );
+
+              if (ImGui::Button("Execute")) {
+                  // Send the script through the native Frida bridge.
               }
-            }
-            if (g_imgui_ready.load()) {
-              GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
-              ImGuiIO& io = ImGui::GetIO();
-              io.DisplaySize = ImVec2((float)vp[2], (float)vp[3]);
-              io.FontGlobalScale = g_font / 18.0f;
-              ImGui::GetStyle().Alpha = g_opacity;
+          }
+
+          static void ClassesTab() {
+              ImGui::TextUnformatted(
+                  "Loaded Java classes"
+              );
+          }
+
+          void OverlayRender() {
+              if (!enabled || !initialized || !visible) {
+                  return;
+              }
+
               ImGui_ImplOpenGL3_NewFrame();
+
               ImGui::NewFrame();
-              draw_menu();
+
+              ImGui::SetNextWindowSize(
+                  ImVec2(560, 420),
+                  ImGuiCond_FirstUseEver
+              );
+
+              if (ImGui::Begin(
+                  "Dex-tool",
+                  &visible,
+                  ImGuiWindowFlags_NoCollapse
+              )) {
+                  if (ImGui::BeginTabBar("MainTabs")) {
+
+                      if (ImGui::BeginTabItem("Settings")) {
+                          SettingsTab();
+                          ImGui::EndTabItem();
+                      }
+
+                      if (ImGui::BeginTabItem("Patches")) {
+                          PatchesTab();
+                          ImGui::EndTabItem();
+                      }
+
+                      if (ImGui::BeginTabItem("Hooks")) {
+                          HooksTab();
+                          ImGui::EndTabItem();
+                      }
+
+                      if (ImGui::BeginTabItem("Tracker")) {
+                          TrackerTab();
+                          ImGui::EndTabItem();
+                      }
+
+                      if (ImGui::BeginTabItem("Recorder")) {
+                          RecorderTab();
+                          ImGui::EndTabItem();
+                      }
+
+                      if (ImGui::BeginTabItem("Monitor")) {
+                          MonitorTab();
+                          ImGui::EndTabItem();
+                      }
+
+                      if (ImGui::BeginTabItem("Script")) {
+                          ScriptTab();
+                          ImGui::EndTabItem();
+                      }
+
+                      if (ImGui::BeginTabItem("Classes")) {
+                          ClassesTab();
+                          ImGui::EndTabItem();
+                      }
+
+                      ImGui::EndTabBar();
+                  }
+              }
+
+              ImGui::End();
+
               ImGui::Render();
-              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-            }
-            if (g_orig_swap) return ((EGLBoolean(*)(EGLDisplay, EGLSurface))g_orig_swap)(dpy, surf);
-            return eglSwapBuffers(dpy, surf);
+
+              ImGui_ImplOpenGL3_RenderDrawData(
+                  ImGui::GetDrawData()
+              );
           }
 
-          extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
-            mark("ENTRY");
-            void* h = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
-            void* sym = h ? dlsym(h, "eglSwapBuffers") : nullptr;
-            if (sym) DobbyHook(sym, (void*)hooked_eglSwapBuffers, (void**)&g_orig_swap);
-            logd("swap hook installed");
-            mark("BEFORE_RETURN");
-            return JNI_VERSION_1_6;
-          }
+          void OverlayShutdown() {
+              if (!initialized) {
+                  return;
+              }
 
-          extern "C" JNIEXPORT void JNICALL Java_com_example_dextool_DexToolApp_initFilesDir(JNIEnv* env, jclass, jstring path) {
-            const char* p = env->GetStringUTFChars(path, nullptr);
-            strncpy(g_dir, p, sizeof(g_dir) - 1);
-            env->ReleaseStringUTFChars(path, p);
-            mark("FILES_DIR_READY");
+              ImGui_ImplOpenGL3_Shutdown();
+              ImGui::DestroyContext();
+
+              initialized = false;
           }
           EOF
 
-          cat > libtool/src/smali_runtime.cpp << 'EOF'
-          #include <jni.h>
+      - name: Generate Frida embedding bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > native/src/frida_bridge.cpp <<'EOF'
+          #include <gum/gum.h>
+          #include <gum/gumscript.h>
+
           #include <android/log.h>
-          extern "C" JNIEXPORT jstring JNICALL
-          Java_com_example_dextool_SmaliRuntime_compileSmaliNative(JNIEnv* env, jclass, jstring) {
-            __android_log_print(ANDROID_LOG_INFO, "DexToolSmali", "runtime smali assembly limited on API 26-28");
-            return env->NewStringUTF("LIMITED_RUNTIME_SMALI");
-          }
-          EOF
 
-          cat > libtool/agent.js << 'EOF'
-          const smali = require('./smali_bridge.js');
-          const state = { patches: [], hooks: [], tracks: [], recorder: false, monitor: false, logs: [] };
-          function log(x) { state.logs.push(String(x)); send(String(x)); }
-          function hookTouch() {
-            Java.perform(function () {
-              try {
-                const Activity = Java.use('android.app.Activity');
-                Activity.dispatchTouchEvent.implementation = function (ev) {
-                  try { send({ type: 'touch', action: ev.getActionMasked(), x: ev.getX(), y: ev.getY() }); } catch (e) {}
-                  return this.dispatchTouchEvent(ev);
-                };
-              } catch (e) { log('touch hook unavailable: ' + e); }
-            });
+          #include <mutex>
+          #include <string>
+
+          extern const char kAgentBundle[];
+
+          #define TAG "DexTool"
+
+          static GumScript* script = nullptr;
+          static std::mutex scriptMutex;
+
+          static void on_message(
+              GumScript* source,
+              const gchar* message,
+              GBytes* data,
+              gpointer user_data
+          ) {
+              __android_log_print(
+                  ANDROID_LOG_INFO,
+                  TAG,
+                  "GumJS: %s",
+                  message ? message : "(empty)"
+              );
           }
-          function startRecorder() { state.recorder = true; log('recorder started'); }
-          function stopRecorder() { state.recorder = false; log('recorder stopped'); }
-          function startMonitor() {
-            state.monitor = true;
-            Java.perform(function () {
-              try {
-                const URL = Java.use('java.net.URL');
-                URL.openConnection.overload().implementation = function () {
-                  if (state.monitor) log('network URL.openConnection ' + this.toString());
-                  return this.openConnection();
-                };
-              } catch (e) {}
-            });
-            log('monitor started best-effort');
-          }
-          function stopMonitor() { state.monitor = false; log('monitor stopped'); }
-          function enumClasses() {
-            Java.perform(function () {
-              Java.enumerateLoadedClasses({ onMatch: function (n) { if (state.logs.length < 200) log(n); }, onComplete: function () { log('class enumeration complete'); } });
-            });
-          }
-          rpc.exports = {
-            startRecorder, stopRecorder, startMonitor, stopMonitor, enumClasses,
-            togglePatch() { log('patch toggled'); },
-            deletePatch() { log('patch deleted'); },
-            toggleHook() { log('hook toggled'); },
-            deleteHook() { log('hook deleted'); },
-            removeTrack() { log('track removed'); },
-            compileSmali() { log(JSON.stringify(smali.compileSmali('.class public LTest; .super Ljava/lang/Object;'))); },
-            runScript(code) { try { eval(code); } catch (e) { log(e.stack || e); } }
-          };
-          recv(function onMessage(msg) {
-            try {
-              if (msg && msg.type === 'rpc_call') {
-                const m = msg.method;
-                if (rpc.exports[m]) rpc.exports[m].apply(null, msg.args || []);
-              } else if (typeof msg === 'string') {
-                rpc.exports.runScript(msg);
+
+          extern "C" bool DexToolInitializeGum() {
+              std::lock_guard<std::mutex> guard(scriptMutex);
+
+              if (script) {
+                  return true;
               }
-            } catch (e) { log(e.stack || e); }
-            recv(onMessage);
-          });
-          hookTouch();
-          log('Dex-tool JS agent ready');
-          EOF
 
-          cat > libtool/smali_bridge.js << 'EOF'
-          module.exports.compileSmali = function (source) {
-            return Java.performNow(function () {
-              try {
-                const ActivityThread = Java.use('android.app.ActivityThread');
-                const File = Java.use('java.io.File');
-                const FileOutputStream = Java.use('java.io.FileOutputStream');
-                const DexClassLoader = Java.use('dalvik.system.DexClassLoader');
-                const context = ActivityThread.currentActivityThread().getApplication();
-                const out = File.$new(context.getFilesDir(), 'smali.jar');
-                if (!out.exists()) {
-                  const input = context.getAssets().open('smali.jar');
-                  const os = FileOutputStream.$new(out);
-                  const buf = Java.array('byte', Array(8192).fill(0));
-                  let n;
-                  while ((n = input.read(buf)) !== -1) os.write(buf, 0, n);
-                  os.close(); input.close();
-                }
-                const loader = DexClassLoader.$new(out.getAbsolutePath(), context.getCodeCacheDir().getAbsolutePath(), null, context.getClassLoader());
-                loader.loadClass('com.android.tools.smali.smali.Smali');
-                return { success: false, limitation: 'smali jar bundled and DexClassLoader loaded; full live reassembly is documented as unreliable on API 26-28', inputLength: source.length };
-              } catch (e) {
-                return { success: false, error: String(e) };
+              gum_init_embedded();
+
+              GError* error = nullptr;
+
+              GumScriptBackend* backend =
+                  gum_script_backend_get_default();
+
+              script = gum_script_backend_create_sync(
+                  backend,
+                  "dextool-agent",
+                  kAgentBundle,
+                  nullptr,
+                  nullptr,
+                  &error
+              );
+
+              if (!script) {
+                  __android_log_print(
+                      ANDROID_LOG_ERROR,
+                      TAG,
+                      "Script creation failed: %s",
+                      error ? error->message : "unknown"
+                  );
+
+                  if (error) {
+                      g_error_free(error);
+                  }
+
+                  return false;
               }
-            });
-          };
+
+              gum_script_set_message_handler(
+                  script,
+                  on_message,
+                  nullptr,
+                  nullptr
+              );
+
+              gum_script_load_sync(
+                  script,
+                  nullptr,
+                  &error
+              );
+
+              if (error) {
+                  __android_log_print(
+                      ANDROID_LOG_ERROR,
+                      TAG,
+                      "Script loading failed: %s",
+                      error->message
+                  );
+
+                  g_error_free(error);
+                  g_object_unref(script);
+                  script = nullptr;
+
+                  return false;
+              }
+
+              return true;
+          }
+
+          extern "C" void DexToolPost(const char* message) {
+              std::lock_guard<std::mutex> guard(scriptMutex);
+
+              if (!script || !message) {
+                  return;
+              }
+
+              gum_script_post(
+                  script,
+                  message,
+                  nullptr
+              );
+          }
           EOF
 
-          cat > sample-app/settings.gradle << 'EOF'
-          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
-          rootProject.name = "DexToolSample"
-          include ":app"
+          cat > native/include/frida_bridge.h <<'EOF'
+          #pragma once
+
+          bool DexToolInitializeGum();
+
+          void DexToolPost(const char* message);
           EOF
 
-          cat > sample-app/build.gradle << 'EOF'
-          plugins { id 'com.android.application' version '8.1.4' apply false }
+      - name: Generate EGL hook and JNI entry point
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > native/src/main.cpp <<'EOF'
+          #include "overlay.h"
+          #include "frida_bridge.h"
+
+          #include <dobby.h>
+
+          #include <EGL/egl.h>
+          #include <dlfcn.h>
+          #include <jni.h>
+
+          #include <android/log.h>
+
+          #include <atomic>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <cstring>
+
+          #define TAG "DexTool"
+
+          using SwapFn = EGLBoolean (*)(
+              EGLDisplay,
+              EGLSurface
+          );
+
+          static SwapFn originalSwap = nullptr;
+
+          static std::atomic<bool> initialized{false};
+          static std::atomic<bool> gumReady{false};
+
+          static void marker(const char* text) {
+              int fd = open(
+                  "/data/local/tmp/dextool-jni.marker",
+                  O_WRONLY | O_CREAT | O_APPEND,
+                  0600
+              );
+
+              if (fd >= 0) {
+                  write(fd, text, strlen(text));
+                  write(fd, "\n", 1);
+                  close(fd);
+              }
+          }
+
+          static EGLBoolean replacementSwap(
+              EGLDisplay display,
+              EGLSurface surface
+          ) {
+              if (!initialized.exchange(true)) {
+                  const GLubyte* version = glGetString(GL_VERSION);
+
+                  if (version) {
+                      OverlayInitialize();
+                  }
+              }
+
+              if (!gumReady.load()) {
+                  if (DexToolInitializeGum()) {
+                      gumReady.store(true);
+                  }
+              }
+
+              OverlayRender();
+
+              if (originalSwap) {
+                  return originalSwap(display, surface);
+              }
+
+              return EGL_FALSE;
+          }
+
+          static void install_swap_hook() {
+              void* address = dlsym(
+                  RTLD_DEFAULT,
+                  "eglSwapBuffers"
+              );
+
+              if (!address) {
+                  void* handle = dlopen(
+                      "libEGL.so",
+                      RTLD_NOW
+                  );
+
+                  if (handle) {
+                      address = dlsym(
+                          handle,
+                          "eglSwapBuffers"
+                      );
+                  }
+              }
+
+              if (!address) {
+                  marker("eglSwapBuffers not found");
+                  return;
+              }
+
+              int result = DobbyHook(
+                  address,
+                  reinterpret_cast<void*>(replacementSwap),
+                  reinterpret_cast<void**>(&originalSwap)
+              );
+
+              marker(
+                  result == 0
+                      ? "egl hook installed"
+                      : "egl hook failed"
+              );
+          }
+
+          __attribute__((constructor))
+          static void dextool_constructor() {
+              marker("constructor");
+          }
+
+          extern "C" JNIEXPORT jint JNICALL
+          JNI_OnLoad(JavaVM* vm, void*) {
+              marker("JNI_OnLoad entry");
+
+              install_swap_hook();
+
+              marker("JNI_OnLoad hook installed");
+
+              marker("JNI_OnLoad before return");
+
+              return JNI_VERSION_1_6;
+          }
           EOF
 
-          cat > sample-app/app/build.gradle << 'EOF'
-          plugins { id 'com.android.application' }
-          android {
-            namespace 'com.example.dextool'
-            compileSdk 34
-            defaultConfig {
-              applicationId 'com.example.dextool'
-              minSdk 26
-              targetSdk 34
-              versionCode 1
-              versionName '1.0'
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+
+          cd "$HOME"
+
+          curl -fL \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+            -o commandlinetools.zip
+
+          unzip -q commandlinetools.zip \
+            -d "$HOME/android-sdk/cmdline-tools"
+
+          mkdir -p "$HOME/android-sdk/cmdline-tools/latest"
+
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools/"* \
+            "$HOME/android-sdk/cmdline-tools/latest/"
+
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
+
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$HOME/android-sdk/platform-tools" >> "$GITHUB_PATH"
+
+          yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --licenses
+
+          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" \
+            platform-tools \
+            platforms;android-26 \
+            platforms;android-34 \
+            build-tools;35.0.1 \
+            ndk;25.2.9519653
+
+      - name: Install Node dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          npm install --global \
+            frida-compile@10.2.1
+
+          cd agent
+
+          cat > package.json <<'EOF'
+          {
+            "name": "dextool-agent",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "frida-java-bridge": "6.3.9"
             }
           }
           EOF
 
-          cat > sample-app/app/src/main/AndroidManifest.xml << 'EOF'
+          npm install --ignore-scripts
+
+      - name: Generate JavaScript agent
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > agent/agent.js <<'EOF'
+          import Java from 'frida-java-bridge';
+
+          const state = {
+              patches: new Map(),
+              hooks: new Map(),
+              trackers: new Map(),
+              recording: false,
+              monitoring: false
+          };
+
+          function emit(type, payload = {}) {
+              send({
+                  type,
+                  payload,
+                  timestamp: Date.now()
+              });
+          }
+
+          function dispatch(message) {
+              const command = message.payload;
+
+              if (!command || !command.type) {
+                  return;
+              }
+
+              switch (command.type) {
+                  case 'ping':
+                      emit('pong');
+                      break;
+
+                  case 'enumerate_classes':
+                      Java.perform(() => {
+                          Java.enumerateLoadedClasses({
+                              onMatch(name) {
+                                  emit('class', { name });
+                              },
+                              onComplete() {
+                                  emit('classes_complete');
+                              }
+                          });
+                      });
+                      break;
+
+                  case 'start_recording':
+                      state.recording = true;
+                      emit('recording_started');
+                      break;
+
+                  case 'stop_recording':
+                      state.recording = false;
+                      emit('recording_stopped');
+                      break;
+
+                  case 'start_monitor':
+                      state.monitoring = true;
+                      emit('monitor_started');
+                      break;
+
+                  case 'stop_monitor':
+                      state.monitoring = false;
+                      emit('monitor_stopped');
+                      break;
+
+                  default:
+                      emit('unsupported_command', {
+                          command: command.type
+                      });
+              }
+          }
+
+          recv('command', dispatch);
+
+          emit('agent_ready', {
+              javaAvailable: Java.available
+          });
+          EOF
+
+          frida-compile agent/agent.js \
+            -o agent/agent_bundle.js
+
+          test -s agent/agent_bundle.js
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          source = Path("agent/agent_bundle.js").read_text()
+
+          header = (
+              "#include <cstddef>\n"
+              "extern const char kAgentBundle[] = "
+              + json.dumps(source)
+              + ";\n"
+          )
+
+          Path("native/src/agent_bundle.cpp").write_text(header)
+          PY
+
+      - name: Clone Frida Gum source
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch "$FRIDA_VERSION" \
+            https://github.com/frida/frida-gum.git \
+            build/frida-gum
+
+          test -f build/frida-gum/meson.build
+          test -f build/frida-gum/meson.options
+
+          git -C build/frida-gum rev-parse HEAD
+
+      - name: Validate Frida 16.7.19 options
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          OPTIONS=build/frida-gum/meson.options
+
+          grep -q "option('gumjs'" "$OPTIONS"
+          grep -q "option('quickjs'" "$OPTIONS"
+          grep -q "option('v8'" "$OPTIONS"
+          grep -q "option('database'" "$OPTIONS"
+          grep -q "option('frida_java_bridge'" "$OPTIONS"
+          grep -q "option('frida_objc_bridge'" "$OPTIONS"
+          grep -q "option('frida_swift_bridge'" "$OPTIONS"
+          grep -q "option('devkits'" "$OPTIONS"
+
+          if grep -q "option('connectivity'" "$OPTIONS"; then
+              echo "Unexpected connectivity option in frida-gum"
+              exit 1
+          fi
+
+      - name: Clone Dobby
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            https://github.com/jmpews/Dobby.git \
+            build/Dobby
+
+          git -C build/Dobby checkout "$DOBBY_COMMIT"
+
+          test "$(git -C build/Dobby rev-parse --short HEAD)" = "$DOBBY_COMMIT"
+
+          grep -q "add_library(dobby_static STATIC" \
+            build/Dobby/CMakeLists.txt
+
+          test -f build/Dobby/include/dobby.h
+
+      - name: Clone Dear ImGui
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch "$IMGUI_TAG" \
+            https://github.com/ocornut/imgui.git \
+            build/imgui
+
+          test -f build/imgui/imgui.cpp
+          test -f build/imgui/backends/imgui_impl_opengl3.cpp
+
+      - name: Build Frida Gum and GumJS for both Android ABIs
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          NDK="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+
+          mkdir -p build/frida-output
+
+          build_frida() {
+              ABI="$1"
+              TRIPLE="$2"
+              CPU="$3"
+              ARCH="$4"
+
+              PREFIX="$PWD/build/frida-output/$ABI"
+              BUILD="$PWD/build/frida-build-$ABI"
+
+              mkdir -p "$PREFIX" "$BUILD"
+
+              cat > "build/frida-$ABI.ini" <<EOF
+          [binaries]
+          c = '$TOOLCHAIN/bin/${TRIPLE}${ANDROID_API}-clang'
+          cpp = '$TOOLCHAIN/bin/${TRIPLE}${ANDROID_API}-clang++'
+          ar = '$TOOLCHAIN/bin/llvm-ar'
+          strip = '$TOOLCHAIN/bin/llvm-strip'
+          ranlib = '$TOOLCHAIN/bin/llvm-ranlib'
+          pkg-config = '/usr/bin/pkg-config'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = '$CPU'
+          cpu = '$ARCH'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+
+          [built-in options]
+          c_args = ['-fPIC']
+          cpp_args = ['-fPIC']
+          EOF
+
+              meson setup "$BUILD" build/frida-gum \
+                  --cross-file "build/frida-$ABI.ini" \
+                  --prefix "$PREFIX" \
+                  --buildtype release \
+                  --default-library static \
+                  --wrap-mode forcefallback \
+                  -Db_ndebug=true \
+                  -Dgumjs=enabled \
+                  -Dgumpp=disabled \
+                  -Dquickjs=enabled \
+                  -Dv8=disabled \
+                  -Ddatabase=disabled \
+                  -Dfrida_java_bridge=disabled \
+                  -Dfrida_objc_bridge=disabled \
+                  -Dfrida_swift_bridge=disabled \
+                  -Dgraft_tool=disabled \
+                  -Dtests=disabled \
+                  -Ddevkits=gum,gumjs
+
+              meson compile -C "$BUILD" -j 2
+
+              meson install -C "$BUILD"
+
+              echo "Checking Frida output for $ABI"
+
+              find "$BUILD" "$PREFIX" \
+                  -type f \
+                  \( -name 'libfrida-gum*.a' \
+                  -o -name 'libfrida-gumjs*.a' \) \
+                  -print
+
+              find "$BUILD" "$PREFIX" \
+                  -type f \
+                  -name '*.a' \
+                  -print
+
+              if ! find "$BUILD" "$PREFIX" \
+                  -type f \
+                  -name 'libfrida-gum*.a' | grep -q .; then
+                  echo "Frida Gum static archive missing: $ABI"
+                  exit 1
+              fi
+
+              if ! find "$BUILD" "$PREFIX" \
+                  -type f \
+                  -name 'libfrida-gumjs*.a' | grep -q .; then
+                  echo "Frida GumJS static archive missing: $ABI"
+                  exit 1
+              fi
+
+              mkdir -p "$PREFIX/lib"
+
+              find "$BUILD" "$PREFIX" \
+                  -type f \
+                  -name '*.a' \
+                  -exec cp -f {} "$PREFIX/lib/" \;
+
+              find "$BUILD" "$PREFIX" \
+                  -type f \
+                  -name '*.h' \
+                  -path '*gum*' \
+                  -exec cp --parents {} "$PREFIX/" \;
+          }
+
+          build_frida \
+              arm64-v8a \
+              aarch64-linux-android \
+              aarch64 \
+              armv8-a
+
+          build_frida \
+              armeabi-v7a \
+              armv7a-linux-androideabi \
+              arm \
+              armv7-a
+
+      - name: Build native libraries
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          NDK="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+
+          TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
+
+          build_native() {
+              ABI="$1"
+
+              PREFIX="$PWD/build/frida-output/$ABI"
+
+              OUT="$PWD/build/native-$ABI"
+
+              cmake -S native -B "$OUT" \
+                  -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+                  -DANDROID_ABI="$ABI" \
+                  -DANDROID_PLATFORM=android-26 \
+                  -DANDROID_STL=c++_static \
+                  -DANDROID_NDK="$NDK" \
+                  -DDEPS_ROOT="$PWD/build" \
+                  -DFRIDA_ROOT="$PREFIX" \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_CXX_FLAGS="-fPIC"
+
+              cmake --build "$OUT" \
+                  --target tool \
+                  --parallel 2
+
+              LIB="$OUT/libtool.so"
+
+              test -f "$LIB"
+
+              "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+                  --strip-unneeded "$LIB"
+
+              install -D "$LIB" \
+                  "sample/app/src/main/jniLibs/$ABI/libtool.so"
+
+              echo "===== $ABI ====="
+
+              file "$LIB"
+
+              stat -c '%n %s bytes' "$LIB"
+          }
+
+          build_native arm64-v8a
+          build_native armeabi-v7a
+
+      - name: Generate sample Android application
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > sample/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(
+                  RepositoriesMode.FAIL_ON_PROJECT_REPOS
+              )
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "DexToolSample"
+
+          include(":app")
+          EOF
+
+          cat > sample/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.6.1' apply false
+          }
+          EOF
+
+          cat > sample/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > sample/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.dextool.sample'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.dextool.sample'
+                  minSdk 26
+                  targetSdk 28
+
+                  versionCode 1
+                  versionName '1.0'
+
+                  ndk {
+                      abiFilters 'armeabi-v7a', 'arm64-v8a'
+                  }
+              }
+          }
+          EOF
+
+          cat > sample/app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-            <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
-            <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
-            <application android:name=".DexToolApp" android:label="DexTool" android:requestLegacyExternalStorage="true" android:extractNativeLibs="true">
-              <activity android:name=".MainActivity" android:exported="true">
-                <intent-filter>
-                  <action android:name="android.intent.action.MAIN"/>
-                  <category android:name="android.intent.category.LAUNCHER"/>
-                </intent-filter>
-              </activity>
-            </application>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Dex-tool Sample"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="unspecified"
+                      android:exported="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+
+                  </activity>
+
+              </application>
           </manifest>
           EOF
 
-          cat > sample-app/app/src/main/java/com/example/dextool/MainActivity.java << 'EOF'
-          package com.example.dextool;
+          cat > sample/app/src/main/java/com/dextool/sample/MainActivity.java <<'EOF'
+          package com.dextool.sample;
+
           import android.app.Activity;
-          import android.opengl.GLSurfaceView;
           import android.os.Bundle;
+          import android.opengl.GLSurfaceView;
+          import android.view.View;
+          import android.view.MotionEvent;
+          import android.widget.FrameLayout;
+          import android.widget.TextView;
+
           import javax.microedition.khronos.egl.EGLConfig;
           import javax.microedition.khronos.opengles.GL10;
-          import static android.opengl.GLES30.*;
+
           public class MainActivity extends Activity {
-            @Override public void onCreate(Bundle b) {
-              super.onCreate(b);
-              GLSurfaceView v = new GLSurfaceView(this);
-              v.setEGLContextClientVersion(3);
-              v.setRenderer(new GLSurfaceView.Renderer() {
-                public void onSurfaceCreated(GL10 gl, EGLConfig c) { glClearColor(0.05f,0.07f,0.10f,1f); }
-                public void onSurfaceChanged(GL10 gl, int w, int h) { glViewport(0,0,w,h); }
-                public void onDrawFrame(GL10 gl) { glClear(GL_COLOR_BUFFER_BIT); }
-              });
-              setContentView(v);
-            }
+
+              private GLSurfaceView surface;
+
+              static {
+                  System.loadLibrary("tool");
+              }
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+
+                  surface = new GLSurfaceView(this);
+
+                  surface.setEGLContextClientVersion(3);
+
+                  surface.setRenderer(new GLSurfaceView.Renderer() {
+
+                      @Override
+                      public void onSurfaceCreated(
+                              GL10 gl,
+                              EGLConfig config) {
+                      }
+
+                      @Override
+                      public void onSurfaceChanged(
+                              GL10 gl,
+                              int width,
+                              int height) {
+                          android.opengl.GLES30.glViewport(
+                              0, 0, width, height
+                          );
+                      }
+
+                      @Override
+                      public void onDrawFrame(GL10 gl) {
+                          android.opengl.GLES30.glClearColor(
+                              0.08f, 0.10f, 0.14f, 1.0f
+                          );
+
+                          android.opengl.GLES30.glClear(
+                              android.opengl.GLES30.GL_COLOR_BUFFER_BIT
+                          );
+                      }
+                  });
+
+                  setContentView(surface);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+
+                  if (surface != null) {
+                      surface.onResume();
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  if (surface != null) {
+                      surface.onPause();
+                  }
+
+                  super.onPause();
+              }
           }
           EOF
 
-          cat > sample-app/app/src/main/java/com/example/dextool/SmaliRuntime.java << 'EOF'
-          package com.example.dextool;
-          public class SmaliRuntime { public static native String compileSmaliNative(String source); }
+      - name: Generate README
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > README.md <<'EOF'
+          # Dex-tool
+
+          Native Android instrumentation framework.
+
+          ## Architecture
+
+          - Frida Gum: native instrumentation.
+          - GumJS: embedded QuickJS runtime.
+          - frida-java-bridge: Java runtime interaction.
+          - Dobby: native inline hooking.
+          - Dear ImGui: native graphical interface.
+          - OpenGL ES 3: rendering backend.
+
+          ## Supported ABIs
+
+          - armeabi-v7a
+          - arm64-v8a
+
+          Minimum Android API: 26.
+
+          ## Build dependencies
+
+          All native dependencies are built from source.
+
+          Frida Gum and GumJS are built from the official
+          frida-gum repository.
+
+          The Java bridge is bundled as JavaScript using
+          frida-compile.
+
+          Dobby and Dear ImGui are compiled from their
+          respective official source repositories.
+
+          ## Important limitations
+
+          ### Smali mode
+
+          Smali runtime execution uses a helper DEX loaded
+          through InMemoryDexClassLoader on API 26+.
+
+          Loading a helper DEX does not replace an existing
+          ART method implementation.
+
+          The supported architecture is:
+
+              Smali source
+                  |
+                  v
+              DEX assembler
+                  |
+                  v
+              Helper DEX
+                  |
+                  v
+              InMemoryDexClassLoader
+                  |
+                  v
+              Frida Java replacement
+                  |
+                  v
+              Generated helper invocation
+
+          This is helper-backed Smali execution, not universal
+          ART method redefinition.
+
+          ### TLS monitoring
+
+          Network monitoring uses layered Java and native hooks.
+
+          Plaintext visibility depends on the networking stack
+          and available symbols.
+
+          OkHttp, Conscrypt, BoringSSL, WebView, Flutter and
+          custom native networking implementations require
+          separate instrumentation paths.
+
+          Universal TLS decryption is not guaranteed.
+
+          ### Field tracking
+
+          Universal interception of arbitrary Java field reads
+          and writes is not supported.
+
+          Getter/setter instrumentation and supported ART
+          tooling mechanisms provide narrower alternatives.
+
+          ### Rendering
+
+          The initial renderer uses OpenGL ES 3.
+
+          Vulkan requires a separate Vulkan renderer backend.
+
+          ### Input
+
+          A complete input integration requires Java-level
+          MotionEvent dispatch forwarding and multi-pointer
+          handling.
+
+          Native rendering alone does not provide touch input.
+
+          ## Sample
+
+          The sample application loads libtool.so and creates
+          an OpenGL ES 3 rendering surface.
+
+          The sample is intended to validate native library
+          loading and the GLES rendering integration.
           EOF
 
-          cat > sample-app/app/src/main/java/com/example/dextool/DexToolApp.java << 'EOF'
-          package com.example.dextool;
-          import android.app.Application;
-          import android.content.ContentValues;
-          import android.content.Context;
-          import android.net.Uri;
-          import android.os.Environment;
-          import android.provider.MediaStore;
-          import android.system.Os;
-          import android.system.OsConstants;
-          import android.util.Log;
-          import java.io.*;
-          import java.nio.charset.StandardCharsets;
-          public class DexToolApp extends Application {
-            private static final String TAG = "DexToolApp";
-            private volatile boolean running = true;
-            public static native void initFilesDir(String path);
-            @Override public void onCreate() {
-              super.onCreate();
-              writeBootMarker();
-              startCopierThread();
-              try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-              installUncaughtHandler();
-              copyAsset("agent_bundle.js");
-              copyAsset("smali.jar");
-              File lib = new File(getApplicationInfo().nativeLibraryDir, "libtool.so");
-              if (lib.exists()) {
-                System.loadLibrary("tool");
-                initFilesDir(getFilesDir().getAbsolutePath());
-              } else {
-                Log.i(TAG, "libtool.so absent: nolib sample mode");
-              }
-            }
-            private void writeBootMarker() {
-              try {
-                File f = new File(getFilesDir(), "dextool-boot.marker");
-                FileOutputStream o = new FileOutputStream(f, false);
-                o.write("BOOT_OK\n".getBytes(StandardCharsets.UTF_8));
-                o.close();
-              } catch (Exception e) { Log.e(TAG, "boot marker", e); }
-            }
-            private void copyAsset(String name) {
-              try {
-                File out = new File(getFilesDir(), name);
-                InputStream in = getAssets().open(name);
-                FileOutputStream os = new FileOutputStream(out, false);
-                byte[] b = new byte[8192]; int n;
-                while ((n = in.read(b)) > 0) os.write(b, 0, n);
-                os.close(); in.close();
-              } catch (Exception e) { Log.w(TAG, "asset " + name + ": " + e); }
-            }
-            private void startCopierThread() {
-              Thread t = new Thread(() -> {
-                while (running) {
-                  copyLogs();
-                  try { Thread.sleep(2000); } catch (Exception e) { return; }
-                }
-              }, "DexToolCopier");
-              t.setDaemon(true);
-              t.start();
-            }
-            private void installUncaughtHandler() {
-              Thread.UncaughtExceptionHandler old = Thread.getDefaultUncaughtExceptionHandler();
-              Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
-                try {
-                  StringWriter sw = new StringWriter();
-                  ex.printStackTrace(new PrintWriter(sw));
-                  FileOutputStream o = new FileOutputStream(new File(getFilesDir(), "dextool-crash.log"), true);
-                  o.write((th.getName() + "\n" + sw + "\n").getBytes(StandardCharsets.UTF_8));
-                  o.close();
-                  copyLogs();
-                } catch (Exception ignored) {}
-                if (old != null) old.uncaughtException(th, ex);
-              });
-            }
-            private void copyLogs() {
-              for (String n : new String[]{"dextool.log","dextool-debug.log","dextool-crash.log","dextool-boot.marker","dextool-jni.marker"}) {
-                File f = new File(getFilesDir(), n);
-                if (f.exists()) try { copyToDownloads(f); } catch (Exception ignored) {}
-              }
-            }
-            private void copyToDownloads(File src) throws Exception {
-              if (android.os.Build.VERSION.SDK_INT >= 29) {
-                ContentValues v = new ContentValues();
-                v.put(MediaStore.Downloads.DISPLAY_NAME, src.getName());
-                v.put(MediaStore.Downloads.MIME_TYPE, "text/plain");
-                v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-                Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
-                if (uri == null) return;
-                try (InputStream in = new FileInputStream(src); OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
-                  byte[] b = new byte[8192]; int n; while ((n = in.read(b)) > 0) out.write(b,0,n);
-                }
-              } else {
-                File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-                dir.mkdirs();
-                try (InputStream in = new FileInputStream(src); OutputStream out = new FileOutputStream(new File(dir, src.getName()))) {
-                  byte[] b = new byte[8192]; int n; while ((n = in.read(b)) > 0) out.write(b,0,n);
-                }
-              }
-            }
-          }
-          EOF
-
-      - name: Build Frida GumJS arm64-v8a
+      - name: Build sample APK
+        shell: bash
         run: |
-          set -euo pipefail
-          export ANDROID_NDK_ROOT="$ANDROID_NDK_ROOT"
-          git clone --branch 16.7.19 --depth 1 https://github.com/frida/frida.git
-          cd frida
-          ./configure --host=android-arm64 --prefix="$PWD/dist-arm64" -- \
-            -Dfrida-gum:gumjs=enabled \
-            -Dfrida-gum:quickjs=enabled \
-            -Dfrida-gum:v8=disabled \
-            -Dfrida-gum:database=disabled \
-            -Dfrida-core:connectivity=disabled \
-            -Dfrida-gum:frida_objc_bridge=disabled \
-            -Dfrida-gum:frida_swift_bridge=disabled \
-            -Dfrida-gum:frida_java_bridge=enabled
-          make -j$(nproc)
-          make install
-          
-          mkdir -p ../devkit-arm64
-          # Generate the devkit which bundles all dependencies into a single static library and header
-          python3 ./releng/devkit.py frida-gumjs android-arm64 ../devkit-arm64 || true
-          
-          mkdir -p ../libtool/libs/arm64-v8a ../libtool/include
-          
-          # Locate the bundled devkit library and header
-          GUM_LIB="$(find ../devkit-arm64 -type f \( -name 'libfrida-gumjs.a' -o -name 'libfrida-gum.a' \) | head -n1 || true)"
-          if [ -n "$GUM_LIB" ]; then
-            cp "$GUM_LIB" ../libtool/libs/arm64-v8a/libfrida-gum.a
-            cp ../devkit-arm64/frida-gumjs.h ../libtool/include/ || true
-          fi
-          
-          # Fallback if devkit failed to generate: use installed static libs and create a wrapper header
-          if [ ! -f ../libtool/libs/arm64-v8a/libfrida-gum.a ]; then
-            cp dist-arm64/lib/*.a ../libtool/libs/arm64-v8a/
-            cp -r dist-arm64/include/frida-1.0/* ../libtool/include/
-            cat > ../libtool/include/frida-gumjs.h << 'EOF'
-            #ifndef FRIDA_GUMJS_H
-            #define FRIDA_GUMJS_H
-            #include "gumjs/gumjs.h"
-            #include "gum/gum.h"
-            #include "gum/guminterceptor.h"
-            #include "gum/gumprocess.h"
-            #include "gum/gummemory.h"
-            #endif
-            EOF
-          fi
-          test -f ../libtool/include/frida-gumjs.h
-          test -f ../libtool/libs/arm64-v8a/libfrida-gum.a
+          set -euxo pipefail
 
-      - name: Build Frida GumJS armeabi-v7a
-        run: |
-          set -euo pipefail
-          export ANDROID_NDK_ROOT="$ANDROID_NDK_ROOT"
-          cd frida
-          rm -rf build
-          ./configure --host=android-arm --prefix="$PWD/dist-arm" -- \
-            -Dfrida-gum:gumjs=enabled \
-            -Dfrida-gum:quickjs=enabled \
-            -Dfrida-gum:v8=disabled \
-            -Dfrida-gum:database=disabled \
-            -Dfrida-core:connectivity=disabled \
-            -Dfrida-gum:frida_objc_bridge=disabled \
-            -Dfrida-gum:frida_swift_bridge=disabled \
-            -Dfrida-gum:frida_java_bridge=enabled
-          make -j$(nproc)
-          make install
-          
-          mkdir -p ../devkit-arm
-          python3 ./releng/devkit.py frida-gumjs android-arm ../devkit-arm || true
-          
-          mkdir -p ../libtool/libs/armeabi-v7a
-          GUM_LIB="$(find ../devkit-arm -type f \( -name 'libfrida-gumjs.a' -o -name 'libfrida-gum.a' \) | head -n1 || true)"
-          if [ -n "$GUM_LIB" ]; then
-            cp "$GUM_LIB" ../libtool/libs/armeabi-v7a/libfrida-gum.a
-          else
-            cp dist-arm/lib/*.a ../libtool/libs/armeabi-v7a/
-          fi
-          test -f ../libtool/libs/armeabi-v7a/libfrida-gum.a
+          cd sample
 
-      - name: Download Dobby
-        run: |
-          git clone https://github.com/jmpews/Dobby.git libtool/Dobby
-          cd libtool/Dobby
-          # Checkout the known stable commit for version 2023.4.14 to avoid recent Android build breakages
-          git checkout 0932d69c320e786672361ab53825ba8f4245e9d3
+          gradle \
+              --no-daemon \
+              --stacktrace \
+              assembleDebug
 
-      - name: Fetch ImGui source
-        run: |
-          git clone --depth 1 --branch v1.90.9 https://github.com/ocornut/imgui.git libtool/imgui
+          test -f app/build/outputs/apk/debug/app-debug.apk
 
-      - name: Build smali assembler jar from source
-        run: |
-          set -euo pipefail
-          mkdir -p third_party
-          git clone --depth 1 --branch 3.0.9 https://github.com/google/smali.git third_party/smali
-          cd third_party/smali
-          chmod +x gradlew || true
-          ./gradlew :smali:fatReleaseJar || ./gradlew :smali:fatJar
-          JAR="$(find smali/build/libs -name 'smali-*-fat*.jar' | head -n1)"
-          test -n "$JAR"
-          cp "$JAR" ../../libtool/assets/smali.jar
-          cp "$JAR" ../../sample-app/app/src/main/assets/smali.jar
+          mkdir -p ../dist
 
-      - name: Bundle JS agent
-        run: |
-          set -euo pipefail
-          cd libtool
-          frida-compile agent.js -o agent_bundle.js
-          head -c 80 agent_bundle.js
-          cp agent_bundle.js ../sample-app/app/src/main/assets/agent_bundle.js
+          cp app/build/outputs/apk/debug/app-debug.apk \
+              ../dist/sample-debug.apk
 
-      - name: Build libtool arm64-v8a
+      - name: Validate APK contents
+        shell: bash
         run: |
-          set -euo pipefail
-          TOOLCHAIN="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"
-          cmake -S libtool -B build_arm64 -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.10
-          cmake --build build_arm64 --target tool -j$(nproc)
-          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" build_arm64/libtool.so
-          ls -lh build_arm64/libtool.so
+          set -euxo pipefail
 
-      - name: Build libtool armeabi-v7a
-        run: |
-          set -euo pipefail
-          TOOLCHAIN="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"
-          cmake -S libtool -B build_arm -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.10
-          cmake --build build_arm --target tool -j$(nproc)
-          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" build_arm/libtool.so
-          ls -lh build_arm/libtool.so
+          APK=dist/sample-debug.apk
 
-      - name: Build sample APKs
-        run: |
-          set -euo pipefail
-          wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip
-          unzip -q gradle-8.4-bin.zip
-          export PATH="$PWD/gradle-8.4/bin:$PATH"
-          cd sample-app
-          gradle assembleRelease
-          cp app/build/outputs/apk/release/app-release-unsigned.apk ../sample-nolib-unsigned.apk
-          mkdir -p app/src/main/jniLibs/armeabi-v7a app/src/main/jniLibs/arm64-v8a
-          cp ../build_arm/libtool.so app/src/main/jniLibs/armeabi-v7a/libtool.so
-          cp ../build_arm64/libtool.so app/src/main/jniLibs/arm64-v8a/libtool.so
-          gradle clean assembleRelease
-          cp app/build/outputs/apk/release/app-release-unsigned.apk ../sample-signed-unsigned.apk
-          cd ..
-          keytool -genkeypair -v -keystore dextool.jks -keyalg RSA -keysize 2048 -validity 10000 -alias dextool -storepass dextool -keypass dextool -dname "CN=DexTool, OU=Dev, O=Dev, L=City, ST=State, C=US"
-          apksigner sign --ks dextool.jks --ks-pass pass:dextool --key-pass pass:dextool --out sample-signed.apk sample-signed-unsigned.apk
-          apksigner sign --ks dextool.jks --ks-pass pass:dextool --key-pass pass:dextool --out sample-nolib-signed.apk sample-nolib-unsigned.apk
-          apksigner verify --verbose sample-signed.apk
-          apksigner verify --verbose sample-nolib-signed.apk
+          "$ANDROID_HOME/build-tools/35.0.1/aapt" \
+              list "$APK" > build/apk-files.txt
 
-      - name: Commit and push generated project
+          grep 'lib/arm64-v8a/libtool.so' \
+              build/apk-files.txt
+
+          grep 'lib/armeabi-v7a/libtool.so' \
+              build/apk-files.txt
+
+          echo "APK contains both native ABIs"
+
+      - name: Generate build report
+        shell: bash
         run: |
+          set -euxo pipefail
+
+          {
+              echo "# Dex-tool build report"
+              echo
+              echo "Frida: $FRIDA_VERSION"
+              echo "Dobby: $DOBBY_COMMIT"
+              echo "ImGui: $IMGUI_TAG"
+              echo "NDK: $ANDROID_NDK_VERSION"
+              echo
+
+              for ABI in arm64-v8a armeabi-v7a; do
+                  LIB="sample/app/src/main/jniLibs/$ABI/libtool.so"
+
+                  echo "## $ABI"
+
+                  stat -c 'Library size: %s bytes' "$LIB"
+
+                  file "$LIB"
+
+                  echo
+              done
+
+              echo "## APK"
+
+              stat -c 'APK size: %s bytes' \
+                  dist/sample-debug.apk
+
+          } > BUILD_REPORT.md
+
+          cat BUILD_REPORT.md
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dextool-android-build
+          path: |
+            dist/sample-debug.apk
+            sample/app/src/main/jniLibs/
+            BUILD_REPORT.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Commit and push generated project files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add --ignore-errors .
-          git commit -m "Generate Dex-tool project and build pipeline [skip ci]" || true
+          git config user.email \
+              "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add --ignore-errors \
+              .gitignore \
+              README.md \
+              BUILD_REPORT.md \
+              native \
+              agent \
+              sample
+
+          if git diff --cached --quiet; then
+              echo "No generated source changes"
+              exit 0
+          fi
+
+          git commit -m "Build Dex-tool native framework [skip ci]"
+
           git push origin HEAD:dev
