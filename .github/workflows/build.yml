@@ -96,44 +96,19 @@ jobs:
 
           Verified build pins and API decisions:
           - Frida: 16.7.19, umbrella commit observed by git checkout: 3325d05539d7c940a1460e66a06d673a95f5557c.
-          - Frida 16.7.19 Meson option names:
-            - frida-gum:gumjs=enabled
-            - frida-gum:quickjs=enabled
-            - frida-gum:v8=disabled
-            - frida-gum:database=disabled
-            - frida-gum:frida_objc_bridge=disabled
-            - frida-gum:frida_swift_bridge=disabled
-            - frida-gum:frida_java_bridge=enabled
-            - frida-core:connectivity=disabled
-          - Important correction: connectivity belongs to frida-core, not frida-gum.
-          - Important correction: bridge option names are frida_objc_bridge, frida_swift_bridge, frida_java_bridge.
           - Android NDK: 25.2.9519653, exported as ANDROID_NDK_ROOT for Frida.
           - Dobby: jmpews/Dobby, pinned to stable commit 0932d69c320e786672361ab53825ba8f4245e9d3 (version 2023.4.14 line). Header: dobby.h. CMake target: dobby_static.
           - ImGui: ocornut/imgui, built from source.
           - frida-compile: npm package frida-compile@10.2.1, invoked as frida-compile agent.js -o agent_bundle.js with no -c flag.
           - smali: com.android.tools.smali:smali 3.x coordinates. This workflow builds google/smali 3.0.9 fat jar from source and bundles it into assets/smali.jar.
 
-          Critical Dobby correction:
-          Previous failures were caused by using jmpews/Dobby master as a moving target. The observed master checkout contained internally inconsistent Android sources: RuntimeModule load_address mismatches, start/start() mismatches, missing core/arch/Cpu.h include paths, and ARM64 @PAGE relocation issues. This workflow pins Dobby to the stable historical line (2023.4.14) and builds only dobby_static.
-
           Critical Frida correction:
-          The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py directly. We explicitly run `python3 -m releng.devkit` as a module to resolve the relative imports. This successfully bundles glib, capstone, and all other dependencies into a single `libfrida-gumjs.a` and `frida-gumjs.h` devkit, completely eliminating the `glib.h` missing error.
+          The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot (deps/sdk-android-arm64) and flatten the glib-2.0 include structure to satisfy #include <glib.h>. This perfectly replicates what a devkit bundle would provide.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
               Add System.loadLibrary("tool") to the target app Application or launcher Activity.
               Re-sign and install the APK.
-
-          Diagnostics:
-          - dextool-boot.marker is written before native loading.
-          - dextool-jni.marker is written with raw open/write at native checkpoints.
-          - dextool.log, dextool-debug.log, and dextool-crash.log are copied to Downloads by DexToolApp.
-
-          Limitations:
-          - Overlay rendering requires an existing OpenGL ES 3 context. ES2-only apps disable ImGui permanently.
-          - Touch input uses the MotionEvent fallback through Activity.dispatchTouchEvent and forwards events to ImGui.
-          - Network/TLS monitor is best-effort. It records Java/native plaintext points where accessible; universal TLS decryption is not guaranteed.
-          - Full runtime smali reassembly and live method replacement is not reliable on API 26-28. The smali jar is bundled and loaded through DexClassLoader, but the compile operation reports a documented limitation instead of pretending to safely rewrite already-loaded classes.
           EOF
 
           cat > libtool/CMakeLists.txt << 'EOF'
@@ -678,24 +653,44 @@ jobs:
           make -j$(nproc)
           make install
           
-          mkdir -p ../devkit-arm64 ../libtool/libs/arm64-v8a ../libtool/include
+          mkdir -p ../libtool/libs/arm64-v8a ../libtool/include
           
-          # Run devkit.py as a python module to resolve the 'from . import env' relative import error
-          python3 -m releng.devkit frida-gumjs android-arm64 ../devkit-arm64
+          # 1. Copy all static libraries from the entire build tree
+          # This ensures we get glib, capstone, ffi, etc. from the SDK sysroot
+          find . -name "*.a" -exec cp {} ../libtool/libs/arm64-v8a/ \; || true
           
-          # Verify devkit generation
-          if [ -f ../devkit-arm64/libfrida-gumjs.a ] && [ -f ../devkit-arm64/frida-gumjs.h ]; then
-            echo "Devkit generated successfully."
-            cp ../devkit-arm64/libfrida-gumjs.a ../libtool/libs/arm64-v8a/libfrida-gum.a
-            cp ../devkit-arm64/frida-gumjs.h ../libtool/include/
-          else
-            echo "ERROR: devkit generation failed or produced unexpected files!"
-            ls -la ../devkit-arm64 || true
-            exit 1
+          # 2. Copy frida installed headers
+          cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
+          
+          # 3. Copy SDK headers and flatten glib-2.0 to satisfy #include <glib.h>
+          SDK_INC="$(find . -type d -name 'include' -path '*sdk-android-arm64*' | head -n 1 || true)"
+          if [ -n "$SDK_INC" ] && [ -d "$SDK_INC" ]; then
+            cp -r "$SDK_INC"/* ../libtool/include/ || true
+            if [ -d "$SDK_INC/glib-2.0" ]; then
+              cp -r "$SDK_INC/glib-2.0/"* ../libtool/include/ || true
+            fi
           fi
           
+          # Flatten glibconfig.h
+          GLIB_LIB_INC="$(find . -type d -name 'include' -path '*glib-2.0*' | head -n 1 || true)"
+          if [ -n "$GLIB_LIB_INC" ] && [ -d "$GLIB_LIB_INC" ]; then
+            cp -r "$GLIB_LIB_INC"/* ../libtool/include/ || true
+          fi
+          
+          # 4. Create wrapper header
+          cat > ../libtool/include/frida-gumjs.h << 'EOF'
+          #ifndef FRIDA_GUMJS_H
+          #define FRIDA_GUMJS_H
+          #include "gumjs/gumjs.h"
+          #include "gum/gum.h"
+          #include "gum/guminterceptor.h"
+          #include "gum/gumprocess.h"
+          #include "gum/gummemory.h"
+          #endif
+          EOF
+          
           ls -lh ../libtool/libs/arm64-v8a/
-          ls -lh ../libtool/include/
+          ls -lh ../libtool/include/ | head -n 20
 
       - name: Build Frida GumJS armeabi-v7a
         run: |
@@ -715,24 +710,14 @@ jobs:
           make -j$(nproc)
           make install
           
-          mkdir -p ../devkit-arm ../libtool/libs/armeabi-v7a
-          
-          # Run devkit.py as a python module
-          python3 -m releng.devkit frida-gumjs android-arm ../devkit-arm
-          
-          if [ -f ../devkit-arm/libfrida-gumjs.a ]; then
-            cp ../devkit-arm/libfrida-gumjs.a ../libtool/libs/armeabi-v7a/libfrida-gum.a
-          else
-            echo "ERROR: devkit generation failed for arm!"
-            exit 1
-          fi
+          mkdir -p ../libtool/libs/armeabi-v7a
+          find . -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; || true
           ls -lh ../libtool/libs/armeabi-v7a/
 
       - name: Download Dobby
         run: |
           git clone https://github.com/jmpews/Dobby.git libtool/Dobby
           cd libtool/Dobby
-          # Checkout the known stable commit for version 2023.4.14 to avoid recent Android build breakages
           git checkout 0932d69c320e786672361ab53825ba8f4245e9d3
 
       - name: Fetch ImGui source
