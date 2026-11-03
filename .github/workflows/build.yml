@@ -122,6 +122,13 @@ jobs:
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends)
 
+          # Find GLib include directories in the Frida SDK
+          file(GLOB_RECURSE GLIB_INC_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../frida/*/include/glib-2.0")
+          include_directories(${GLIB_INC_DIRS})
+          # Also find glibconfig.h directories
+          file(GLOB_RECURSE GLIB_CONFIG_INC_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../frida/*/lib/glib-2.0/include")
+          include_directories(${GLIB_CONFIG_INC_DIRS})
+
           file(GLOB IMGUI_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/imgui/*.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends/imgui_impl_opengl3.cpp"
@@ -662,15 +669,7 @@ jobs:
           # 2. Copy frida installed headers
           cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
           
-          # 3. Find and flatten ONLY the specific dependency headers to avoid copying sysroot standard headers
-          for header in glib.h glibconfig.h json-glib.h quickjs.h capstone.h; do
-              find . -name "$header" -print0 | xargs -0 -r -I {} dirname {} | sort -u | while read -r d; do
-                  echo "Copying $header headers from $d"
-                  cp -r "$d"/* ../libtool/include/ || true
-              done
-          done
-          
-          # 4. Create wrapper header
+          # 3. Create wrapper header
           cat > ../libtool/include/frida-gumjs.h << 'EOF'
           #ifndef FRIDA_GUMJS_H
           #define FRIDA_GUMJS_H
@@ -707,13 +706,6 @@ jobs:
           find . -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; || true
           
           cp -r dist-arm/include/frida-1.0/* ../libtool/include/ || true
-          
-          for header in glib.h glibconfig.h json-glib.h quickjs.h capstone.h; do
-              find . -name "$header" -print0 | xargs -0 -r -I {} dirname {} | sort -u | while read -r d; do
-                  echo "Copying $header headers from $d"
-                  cp -r "$d"/* ../libtool/include/ || true
-              done
-          done
           
           ls -lh ../libtool/libs/armeabi-v7a/
 
