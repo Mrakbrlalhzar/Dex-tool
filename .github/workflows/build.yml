@@ -314,7 +314,7 @@ jobs:
           EOF
 
           cat > libtool/agent.js << 'EOF'
-          import { compileSmali } from './smali_bridge.js';
+          const smaliBridge = require('./smali_bridge.js');
 
           Java.perform(function() {
               try {
@@ -334,7 +334,7 @@ jobs:
                   startRecorder: function() { console.log("Recorder started"); },
                   startMonitor: function() { console.log("Monitor started"); },
                   runScript: function(code) { eval(code); },
-                  compileSmali: compileSmali
+                  compileSmali: smaliBridge.compileSmali
               };
           });
 
@@ -350,10 +350,43 @@ jobs:
           EOF
 
           cat > libtool/smali_bridge.js << 'EOF'
-          export function compileSmali(smaliCode) {
+          module.exports.compileSmali = function(smaliCode) {
               try {
-                  console.log("[SmaliBridge] Runtime smali reassembly stub called.");
-                  return { success: false, reason: "Full runtime smali reassembly infeasible on API 26-28" };
+                  console.log("[SmaliBridge] Runtime smali reassembly called.");
+                  
+                  var Context = Java.use("android.content.Context");
+                  var File = Java.use("java.io.File");
+                  var FileOutputStream = Java.use("java.io.FileOutputStream");
+                  var DexClassLoader = Java.use("dalvik.system.DexClassLoader");
+                  
+                  var activityThread = Java.use("android.app.ActivityThread").currentActivityThread();
+                  var context = activityThread.getApplication();
+                  
+                  var assetManager = context.getAssets();
+                  var inputStream = assetManager.open("smali.jar");
+                  var outFile = new File(context.getFilesDir(), "smali.jar");
+                  var outputStream = FileOutputStream.$new(outFile);
+                  
+                  var buf = Java.array('byte', new Array(8192).fill(0));
+                  var len;
+                  while ((len = inputStream.read(buf)) != -1) {
+                      outputStream.write(buf, 0, len);
+                  }
+                  inputStream.close();
+                  outputStream.close();
+                  
+                  var classLoader = DexClassLoader.$new(
+                      outFile.getAbsolutePath(), 
+                      context.getCodeCacheDir().getAbsolutePath(), 
+                      null, 
+                      context.getClassLoader()
+                  );
+                  
+                  var SmaliClass = classLoader.loadClass("com.android.tools.smali.smali.Smali");
+                  console.log("Smali loaded successfully via DexClassLoader!");
+                  
+                  // Stubbing actual compilation as runtime smali reassembly is infeasible on API 26-28
+                  return { success: false, reason: "Stubbed: Runtime reassembly infeasible on API 26-28" };
               } catch(e) {
                   return { success: false, reason: e.toString() };
               }
@@ -589,7 +622,7 @@ jobs:
           export ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT
           git clone --branch 16.7.19 --depth 1 https://github.com/frida/frida.git
           cd frida
-          ./configure --host=android-arm64 --prefix="$PWD/dist-arm64" -- -Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-gum:connectivity=disabled -Dfrida-gum:objc_bridge=disabled -Dfrida-gum:swift_bridge=disabled -Dfrida-gum:java_bridge=enabled
+          ./configure --host=android-arm64 --prefix="$PWD/dist-arm64" -- -Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-core:connectivity=disabled -Dfrida-gum:frida_objc_bridge=disabled -Dfrida-gum:frida_swift_bridge=disabled -Dfrida-gum:frida_java_bridge=enabled
           make -j$(nproc)
           make install
           mkdir -p ../libtool/libs/arm64-v8a ../libtool/include
@@ -601,7 +634,7 @@ jobs:
         run: |
           export ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT
           cd frida
-          ./configure --host=android-arm --prefix="$PWD/dist-arm" -- -Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-gum:connectivity=disabled -Dfrida-gum:objc_bridge=disabled -Dfrida-gum:swift_bridge=disabled -Dfrida-gum:java_bridge=enabled
+          ./configure --host=android-arm --prefix="$PWD/dist-arm" -- -Dfrida-gum:v8=disabled -Dfrida-gum:database=disabled -Dfrida-core:connectivity=disabled -Dfrida-gum:frida_objc_bridge=disabled -Dfrida-gum:frida_swift_bridge=disabled -Dfrida-gum:frida_java_bridge=enabled
           make -j$(nproc)
           make install
           mkdir -p ../libtool/libs/armeabi-v7a
