@@ -663,9 +663,30 @@ jobs:
       - name: Download Dobby
         run: |
           git clone --depth 1 https://github.com/jmpews/Dobby.git libtool/Dobby
-          # Fix ARM64 ADRP relocation error on Clang 14+ using perl for robust regex
-          find libtool/Dobby -name "*.asm" -exec perl -i -pe 's/adrp\s+(x\d+),\s*(\S+)@PAGE/ldr $1, =$2/g' {} +
-          find libtool/Dobby -name "*.asm" -exec perl -i -pe 's/add\s+(x\d+),\s*x\d+,\s*\S+@PAGEOFF//g' {} +
+          # Fix OSMemory undeclared error by using mprotect directly
+          python3 << 'PYEOF'
+          with open('libtool/Dobby/common/os_arch_features.h', 'r') as f:
+              content = f.read()
+          content = content.replace('OSMemory::PageSize()', '4096')
+          content = content.replace('!OSMemory::SetPermission(page, 4096, kReadExecute)', '(mprotect(page, 4096, PROT_READ | PROT_EXEC) != 0)')
+          content = '#include <sys/mman.h>\n' + content
+          with open('libtool/Dobby/common/os_arch_features.h', 'w') as f:
+              f.write(content)
+          PYEOF
+          # Fix ARM64 ADRP relocation error on Clang 14+
+          python3 << 'PYEOF'
+          import os, re
+          for root, dirs, files in os.walk('libtool/Dobby'):
+              for f in files:
+                  if f.endswith('.asm'):
+                      path = os.path.join(root, f)
+                      with open(path, 'r') as file:
+                          content = file.read()
+                      content = re.sub(r'adrp\s+(x\d+)\s*,\s*(\S+)@PAGE', r'ldr \1, =\2', content)
+                      content = re.sub(r'add\s+x\d+\s*,\s*x\d+\s*,\s*\S+@PAGEOFF\n?', '', content)
+                      with open(path, 'w') as file:
+                          file.write(content)
+          PYEOF
 
       - name: Download ImGui
         run: |
