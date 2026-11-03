@@ -103,9 +103,8 @@ jobs:
           - smali: com.android.tools.smali:smali 3.x coordinates. This workflow builds google/smali 3.0.9 fat jar from source and bundles it into assets/smali.jar.
 
           Critical Frida correction:
-          The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot (deps/sdk-android-arm64) and flatten the glib-2.0 include structure to satisfy #include <glib.h>. This perfectly replicates what a devkit bundle would provide.
-
-          CRITICAL FIX: Flattening the SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now strictly remove any standard C headers from our include directory to force the compiler to use the correct NDK sysroot headers.
+          The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot.
+          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now strictly search for and flatten ONLY the specific Frida dependency headers (glib, capstone, quickjs, json-glib) to force the compiler to use the correct NDK sysroot headers.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -663,43 +662,13 @@ jobs:
           # 2. Copy frida installed headers
           cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
           
-          # 3. Copy SDK headers and flatten dependencies
-          SDK_INC="$(find . -type d -name 'include' -path '*sdk-android-arm64*' | head -n 1 || true)"
-          if [ -n "$SDK_INC" ] && [ -d "$SDK_INC" ]; then
-              find "$SDK_INC" -mindepth 1 -maxdepth 1 -type d | while read -r d; do
-                  cp -r "$d" ../libtool/include/ || true
+          # 3. Find and flatten ONLY the specific dependency headers to avoid copying sysroot standard headers
+          for header in glib.h glibconfig.h json-glib.h quickjs.h capstone.h; do
+              find . -name "$header" -print0 | xargs -0 -r -I {} dirname {} | sort -u | while read -r d; do
+                  echo "Copying $header headers from $d"
                   cp -r "$d"/* ../libtool/include/ || true
               done
-          fi
-          
-          # CRITICAL FIX: Remove standard headers that cause conflicts with NDK sysroot
-          rm -f ../libtool/include/stdbool.h
-          rm -f ../libtool/include/stddef.h
-          rm -f ../libtool/include/stdint.h
-          rm -f ../libtool/include/stdarg.h
-          rm -f ../libtool/include/limits.h
-          rm -f ../libtool/include/stdalign.h
-          rm -f ../libtool/include/stdnoreturn.h
-          rm -f ../libtool/include/stdatomic.h
-          rm -f ../libtool/include/ctype.h
-          rm -f ../libtool/include/errno.h
-          rm -f ../libtool/include/float.h
-          rm -f ../libtool/include/inttypes.h
-          rm -f ../libtool/include/iso646.h
-          rm -f ../libtool/include/locale.h
-          rm -f ../libtool/include/math.h
-          rm -f ../libtool/include/setjmp.h
-          rm -f ../libtool/include/signal.h
-          rm -f ../libtool/include/stdio.h
-          rm -f ../libtool/include/stdlib.h
-          rm -f ../libtool/include/string.h
-          rm -f ../libtool/include/tgmath.h
-          rm -f ../libtool/include/time.h
-          rm -f ../libtool/include/uchar.h
-          rm -f ../libtool/include/wchar.h
-          rm -f ../libtool/include/wctype.h
-          rm -f ../libtool/include/assert.h
-          rm -f ../libtool/include/fenv.h
+          done
           
           # 4. Create wrapper header
           cat > ../libtool/include/frida-gumjs.h << 'EOF'
@@ -737,20 +706,14 @@ jobs:
           mkdir -p ../libtool/libs/armeabi-v7a
           find . -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; || true
           
-          SDK_INC_ARM="$(find . -type d -name 'include' -path '*sdk-android-arm*' | grep -v 'arm64' | head -n 1 || true)"
-          if [ -n "$SDK_INC_ARM" ] && [ -d "$SDK_INC_ARM" ]; then
-              find "$SDK_INC_ARM" -mindepth 1 -maxdepth 1 -type d | while read -r d; do
-                  cp -r "$d" ../libtool/include/ || true
+          cp -r dist-arm/include/frida-1.0/* ../libtool/include/ || true
+          
+          for header in glib.h glibconfig.h json-glib.h quickjs.h capstone.h; do
+              find . -name "$header" -print0 | xargs -0 -r -I {} dirname {} | sort -u | while read -r d; do
+                  echo "Copying $header headers from $d"
                   cp -r "$d"/* ../libtool/include/ || true
               done
-          fi
-          
-          rm -f ../libtool/include/stdbool.h ../libtool/include/stddef.h ../libtool/include/stdint.h ../libtool/include/stdarg.h ../libtool/include/limits.h
-          rm -f ../libtool/include/stdalign.h ../libtool/include/stdnoreturn.h ../libtool/include/stdatomic.h ../libtool/include/ctype.h ../libtool/include/errno.h
-          rm -f ../libtool/include/float.h ../libtool/include/inttypes.h ../libtool/include/iso646.h ../libtool/include/locale.h ../libtool/include/math.h
-          rm -f ../libtool/include/setjmp.h ../libtool/include/signal.h ../libtool/include/stdio.h ../libtool/include/stdlib.h ../libtool/include/string.h
-          rm -f ../libtool/include/tgmath.h ../libtool/include/time.h ../libtool/include/uchar.h ../libtool/include/wchar.h ../libtool/include/wctype.h
-          rm -f ../libtool/include/assert.h ../libtool/include/fenv.h
+          done
           
           ls -lh ../libtool/libs/armeabi-v7a/
 
