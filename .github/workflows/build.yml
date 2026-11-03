@@ -12,21 +12,18 @@
 #   Android NDK:     25.2.9519653
 #   Android API:     26
 #
-# Important build corrections:
-#   - frida-gum standalone uses Meson directly, not the Frida meta-repo configure.
-#   - devkits=gum,gumjs is a frida-gum project option.
-#   - frida_java_bridge is the actual Meson option name.
-#   - frida_objc_bridge and frida_swift_bridge are the actual option names.
-#   - connectivity is NOT a frida-gum Meson option.
+# Important:
+#   - Java 17 is required by Android SDK command-line tools.
+#   - Gradle 8.7 is used with Android Gradle Plugin 8.6.1.
+#   - frida-gum standalone uses Meson directly.
+#   - GumJS uses QuickJS.
 #   - frida-core is deliberately not built.
-#   - GumJS uses QuickJS, not V8.
 #   - The Java bridge is bundled separately with frida-compile.
-#   - The generated native library is linked against source-built archives.
 #
-# NOTE:
-# This workflow builds the native dependency set and a basic GLES sample.
-# It does not claim universal ART method replacement, universal TLS
-# decryption, or universal Java field watchpoints.
+# Limitations:
+#   This workflow builds a basic GLES sample and native dependencies.
+#   It does not implement universal ART method replacement,
+#   universal TLS decryption, or universal Java field watchpoints.
 
 name: Dex-tool Android Build
 
@@ -57,6 +54,7 @@ jobs:
       DOBBY_COMMIT: 5dfc854
       IMGUI_TAG: v1.92.9b
       FRIDA_COMPILE_VERSION: 10.2.1
+      GRADLE_VERSION: 8.7
 
     steps:
       - name: Checkout dev
@@ -65,6 +63,28 @@ jobs:
           ref: dev
           fetch-depth: 0
           persist-credentials: true
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Verify Java
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          java -version
+          javac -version
+
+          JAVA_MAJOR="$(java -version 2>&1 | sed -n '1s/.*version "\([0-9]*\).*/\1/p')"
+
+          if [ "$JAVA_MAJOR" != "17" ]; then
+              echo "Java 17 is required, found: $JAVA_MAJOR"
+              exit 1
+          fi
 
       - name: Install host dependencies
         shell: bash
@@ -101,8 +121,7 @@ jobs:
             bison \
             nasm \
             patchelf \
-            file \
-            openjdk-17-jdk
+            file
 
           python3 -m pip install --upgrade \
             meson \
@@ -111,9 +130,28 @@ jobs:
             six \
             pyyaml
 
-          node --version || true
-          npm --version || true
+          node --version
+          npm --version
           java -version
+
+      - name: Install Gradle
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          GRADLE_DIR="$HOME/gradle"
+
+          mkdir -p "$GRADLE_DIR"
+
+          curl -fL \
+            "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
+            -o "$HOME/gradle.zip"
+
+          unzip -q "$HOME/gradle.zip" -d "$GRADLE_DIR"
+
+          echo "$GRADLE_DIR/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+
+          "$GRADLE_DIR/gradle-${GRADLE_VERSION}/bin/gradle" --version
 
       - name: Generate project structure
         shell: bash
@@ -253,6 +291,7 @@ jobs:
           endif()
 
           message(STATUS "Frida archives:")
+
           foreach(lib ${FRIDA_STATIC_LIBRARIES})
               message(STATUS "  ${lib}")
           endforeach()
@@ -295,8 +334,6 @@ jobs:
           static bool initialized = false;
           static bool visible = true;
           static bool enabled = true;
-
-          static int selectedTab = 0;
 
           static float opacity = 0.94f;
           static float fontSize = 16.0f;
@@ -357,9 +394,7 @@ jobs:
           }
 
           static void PatchesTab() {
-              ImGui::TextUnformatted(
-                  "Java patch registry"
-              );
+              ImGui::TextUnformatted("Java patch registry");
 
               ImGui::TextDisabled(
                   "Waiting for agent connection"
@@ -367,27 +402,19 @@ jobs:
           }
 
           static void HooksTab() {
-              ImGui::TextUnformatted(
-                  "Java / Smali / noop hooks"
-              );
+              ImGui::TextUnformatted("Java / Smali / noop hooks");
           }
 
           static void TrackerTab() {
-              ImGui::TextUnformatted(
-                  "Tracked method events"
-              );
+              ImGui::TextUnformatted("Tracked method events");
           }
 
           static void RecorderTab() {
-              ImGui::TextUnformatted(
-                  "Execution recorder"
-              );
+              ImGui::TextUnformatted("Execution recorder");
           }
 
           static void MonitorTab() {
-              ImGui::TextUnformatted(
-                  "Network monitoring"
-              );
+              ImGui::TextUnformatted("Network monitoring");
           }
 
           static void ScriptTab() {
@@ -401,14 +428,12 @@ jobs:
               );
 
               if (ImGui::Button("Execute")) {
-                  // Send the script through the native Frida bridge.
+                  // Script execution requires native bridge dispatch.
               }
           }
 
           static void ClassesTab() {
-              ImGui::TextUnformatted(
-                  "Loaded Java classes"
-              );
+              ImGui::TextUnformatted("Loaded Java classes");
           }
 
           void OverlayRender() {
@@ -509,7 +534,6 @@ jobs:
           #include <android/log.h>
 
           #include <mutex>
-          #include <string>
 
           extern const char kAgentBundle[];
 
@@ -636,6 +660,7 @@ jobs:
           #include <dobby.h>
 
           #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
           #include <dlfcn.h>
           #include <jni.h>
 
@@ -761,7 +786,9 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          SDK_ROOT="$HOME/android-sdk"
+
+          mkdir -p "$SDK_ROOT/cmdline-tools"
 
           cd "$HOME"
 
@@ -770,27 +797,39 @@ jobs:
             -o commandlinetools.zip
 
           unzip -q commandlinetools.zip \
-            -d "$HOME/android-sdk/cmdline-tools"
+            -d "$SDK_ROOT/cmdline-tools"
 
-          mkdir -p "$HOME/android-sdk/cmdline-tools/latest"
+          mkdir -p "$SDK_ROOT/cmdline-tools/latest"
 
-          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools/"* \
-            "$HOME/android-sdk/cmdline-tools/latest/"
+          mv "$SDK_ROOT/cmdline-tools/cmdline-tools/"* \
+            "$SDK_ROOT/cmdline-tools/latest/"
 
-          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
 
-          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$HOME/android-sdk/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-          yes | "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --licenses
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
 
-          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" \
-            platform-tools \
-            platforms;android-26 \
-            platforms;android-34 \
-            build-tools;35.0.1 \
-            ndk;25.2.9519653
+          java -version
+
+          # Disable pipefail only for this pipeline.
+          # sdkmanager remains the last command, so its exit code is preserved.
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses
+          set -o pipefail
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-26" \
+            "platforms;android-34" \
+            "build-tools;35.0.1" \
+            "ndk;25.2.9519653"
+
+          test -d "$SDK_ROOT/platforms/android-26"
+          test -d "$SDK_ROOT/platforms/android-34"
+          test -d "$SDK_ROOT/ndk/25.2.9519653"
 
       - name: Install Node dependencies
         shell: bash
@@ -798,7 +837,7 @@ jobs:
           set -euxo pipefail
 
           npm install --global \
-            frida-compile@10.2.1
+            "frida-compile@${FRIDA_COMPILE_VERSION}"
 
           cd agent
 
@@ -1255,10 +1294,6 @@ jobs:
           import android.app.Activity;
           import android.os.Bundle;
           import android.opengl.GLSurfaceView;
-          import android.view.View;
-          import android.view.MotionEvent;
-          import android.widget.FrameLayout;
-          import android.widget.TextView;
 
           import javax.microedition.khronos.egl.EGLConfig;
           import javax.microedition.khronos.opengles.GL10;
@@ -1381,38 +1416,12 @@ jobs:
           Loading a helper DEX does not replace an existing
           ART method implementation.
 
-          The supported architecture is:
-
-              Smali source
-                  |
-                  v
-              DEX assembler
-                  |
-                  v
-              Helper DEX
-                  |
-                  v
-              InMemoryDexClassLoader
-                  |
-                  v
-              Frida Java replacement
-                  |
-                  v
-              Generated helper invocation
-
-          This is helper-backed Smali execution, not universal
-          ART method redefinition.
-
           ### TLS monitoring
 
           Network monitoring uses layered Java and native hooks.
 
           Plaintext visibility depends on the networking stack
           and available symbols.
-
-          OkHttp, Conscrypt, BoringSSL, WebView, Flutter and
-          custom native networking implementations require
-          separate instrumentation paths.
 
           Universal TLS decryption is not guaranteed.
 
@@ -1421,8 +1430,8 @@ jobs:
           Universal interception of arbitrary Java field reads
           and writes is not supported.
 
-          Getter/setter instrumentation and supported ART
-          tooling mechanisms provide narrower alternatives.
+          Getter/setter instrumentation provides narrower
+          alternatives.
 
           ### Rendering
 
@@ -1443,8 +1452,8 @@ jobs:
           The sample application loads libtool.so and creates
           an OpenGL ES 3 rendering surface.
 
-          The sample is intended to validate native library
-          loading and the GLES rendering integration.
+          The sample validates native library loading and the
+          GLES rendering integration.
           EOF
 
       - name: Build sample APK
