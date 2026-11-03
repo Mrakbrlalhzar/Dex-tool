@@ -108,13 +108,16 @@ jobs:
           - Important correction: connectivity belongs to frida-core, not frida-gum.
           - Important correction: bridge option names are frida_objc_bridge, frida_swift_bridge, frida_java_bridge.
           - Android NDK: 25.2.9519653, exported as ANDROID_NDK_ROOT for Frida.
-          - Dobby: jmpews/Dobby, stable 2023.4.14 tag when available; otherwise a full SHA from the 2023-04-14 historical line is selected. Header: dobby.h. CMake target: dobby_static.
+          - Dobby: jmpews/Dobby, pinned to stable commit 0932d69c320e786672361ab53825ba8f4245e9d3 (version 2023.4.14 line). Header: dobby.h. CMake target: dobby_static.
           - ImGui: ocornut/imgui, built from source.
           - frida-compile: npm package frida-compile@10.2.1, invoked as frida-compile agent.js -o agent_bundle.js with no -c flag.
           - smali: com.android.tools.smali:smali 3.x coordinates. This workflow builds google/smali 3.0.9 fat jar from source and bundles it into assets/smali.jar.
 
           Critical Dobby correction:
-          Previous failures were caused by using jmpews/Dobby master as a moving target. The observed master checkout contained internally inconsistent Android sources: RuntimeModule load_address mismatches, start/start() mismatches, missing core/arch/Cpu.h include paths, and ARM64 @PAGE relocation issues. This workflow pins Dobby to the stable historical line and builds only dobby_static, not the shared dobby target.
+          Previous failures were caused by using jmpews/Dobby master as a moving target. The observed master checkout contained internally inconsistent Android sources: RuntimeModule load_address mismatches, start/start() mismatches, missing core/arch/Cpu.h include paths, and ARM64 @PAGE relocation issues. This workflow pins Dobby to the stable historical line (2023.4.14) and builds only dobby_static.
+
+          Critical Frida correction:
+          The previous AI failed to locate the Frida devkit. make install does not produce a single bundled frida-gum.h. We explicitly run releng/devkit.py to generate the true bundled libfrida-gumjs.a and frida-gumjs.h devkit, with a robust fallback wrapper if the script fails.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -162,13 +165,13 @@ jobs:
           find_library(android-lib android)
           find_library(dl-lib dl)
 
-          set(FRIDA_GUM_LIB ${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/libfrida-gum.a)
-          if(NOT EXISTS ${FRIDA_GUM_LIB})
-            message(FATAL_ERROR "Frida GumJS static library not found at ${FRIDA_GUM_LIB}")
+          file(GLOB FRIDA_LIBS "${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/*.a")
+          if(NOT FRIDA_LIBS)
+            message(FATAL_ERROR "Frida Gum libraries not found in ${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/")
           endif()
 
           target_link_libraries(tool
-            -Wl,--whole-archive ${FRIDA_GUM_LIB} -Wl,--no-whole-archive
+            -Wl,--whole-archive ${FRIDA_LIBS} -Wl,--no-whole-archive
             dobby_static
             ${log-lib}
             ${egl-lib}
@@ -674,14 +677,37 @@ jobs:
             -Dfrida-gum:frida_java_bridge=enabled
           make -j$(nproc)
           make install
-          mkdir -p ../libtool/libs/arm64-v8a ../libtool/include ../libtool/devkit-arm64
-          find . -name "frida-gum*devkit*.tar.*" -exec tar -xf {} -C ../libtool/devkit-arm64 \; || true
-          GUM_LIB="$(find ../libtool/devkit-arm64 . -type f \( -name 'libfrida-gumjs.a' -o -name 'libfrida-gum.a' \) | sort | grep -E 'gumjs|frida-gum' | head -n1 || true)"
-          test -n "$GUM_LIB"
-          cp "$GUM_LIB" ../libtool/libs/arm64-v8a/libfrida-gum.a
-          find ../libtool/devkit-arm64 . -name "frida-gumjs.h" -exec cp {} ../libtool/include/ \; || true
-          find ../libtool/devkit-arm64 . -name "frida-gum.h" -exec cp {} ../libtool/include/ \; || true
+          
+          mkdir -p ../devkit-arm64
+          # Generate the devkit which bundles all dependencies into a single static library and header
+          python3 ./releng/devkit.py frida-gumjs android-arm64 ../devkit-arm64 || true
+          
+          mkdir -p ../libtool/libs/arm64-v8a ../libtool/include
+          
+          # Locate the bundled devkit library and header
+          GUM_LIB="$(find ../devkit-arm64 -type f \( -name 'libfrida-gumjs.a' -o -name 'libfrida-gum.a' \) | head -n1 || true)"
+          if [ -n "$GUM_LIB" ]; then
+            cp "$GUM_LIB" ../libtool/libs/arm64-v8a/libfrida-gum.a
+            cp ../devkit-arm64/frida-gumjs.h ../libtool/include/ || true
+          fi
+          
+          # Fallback if devkit failed to generate: use installed static libs and create a wrapper header
+          if [ ! -f ../libtool/libs/arm64-v8a/libfrida-gum.a ]; then
+            cp dist-arm64/lib/*.a ../libtool/libs/arm64-v8a/
+            cp -r dist-arm64/include/frida-1.0/* ../libtool/include/
+            cat > ../libtool/include/frida-gumjs.h << 'EOF'
+            #ifndef FRIDA_GUMJS_H
+            #define FRIDA_GUMJS_H
+            #include "gumjs/gumjs.h"
+            #include "gum/gum.h"
+            #include "gum/guminterceptor.h"
+            #include "gum/gumprocess.h"
+            #include "gum/gummemory.h"
+            #endif
+            EOF
+          fi
           test -f ../libtool/include/frida-gumjs.h
+          test -f ../libtool/libs/arm64-v8a/libfrida-gum.a
 
       - name: Build Frida GumJS armeabi-v7a
         run: |
@@ -700,58 +726,25 @@ jobs:
             -Dfrida-gum:frida_java_bridge=enabled
           make -j$(nproc)
           make install
-          mkdir -p ../libtool/libs/armeabi-v7a ../libtool/devkit-arm
-          find . -name "frida-gum*devkit*.tar.*" -exec tar -xf {} -C ../libtool/devkit-arm \; || true
-          GUM_LIB="$(find ../libtool/devkit-arm . -type f \( -name 'libfrida-gumjs.a' -o -name 'libfrida-gum.a' \) | sort | grep -E 'gumjs|frida-gum' | head -n1 || true)"
-          test -n "$GUM_LIB"
-          cp "$GUM_LIB" ../libtool/libs/armeabi-v7a/libfrida-gum.a
-
-      - name: Fetch stable Dobby source
-        run: |
-          set -euo pipefail
-          git clone --depth 1 https://github.com/jmpews/Dobby.git libtool/Dobby
-          cd libtool/Dobby
-          git fetch --tags --depth 1 origin || true
-          if git rev-parse -q --verify "refs/tags/2023.4.14" >/dev/null; then
-            git checkout --detach "2023.4.14"
+          
+          mkdir -p ../devkit-arm
+          python3 ./releng/devkit.py frida-gumjs android-arm ../devkit-arm || true
+          
+          mkdir -p ../libtool/libs/armeabi-v7a
+          GUM_LIB="$(find ../devkit-arm -type f \( -name 'libfrida-gumjs.a' -o -name 'libfrida-gum.a' \) | head -n1 || true)"
+          if [ -n "$GUM_LIB" ]; then
+            cp "$GUM_LIB" ../libtool/libs/armeabi-v7a/libfrida-gum.a
           else
-            SHA="$(git rev-list -n 1 --before='2023-04-14T23:59:59Z' HEAD || git rev-list -n 1 HEAD)"
-            git checkout --detach "$SHA"
+            cp dist-arm/lib/*.a ../libtool/libs/armeabi-v7a/
           fi
-          echo "Dobby full commit: $(git rev-parse HEAD)"
-          cd ../..
-          python3 << 'PYEOF'
-          from pathlib import Path
-          import re
-          root = Path('libtool/Dobby')
-          f = root / 'common/os_arch_features.h'
-          if f.exists():
-              s = f.read_text()
-              if 'OSMemory::PageSize()' in s:
-                  s = '#include <sys/mman.h>\n#include <unistd.h>\n' + s
-                  s = s.replace('OSMemory::PageSize()', 'sysconf(_SC_PAGESIZE)')
-                  s = s.replace('!OSMemory::SetPermission(page, sysconf(_SC_PAGESIZE), kReadExecute)', '(mprotect(page, sysconf(_SC_PAGESIZE), PROT_READ | PROT_EXEC) != 0)')
-                  f.write_text(s)
-          for p in root.rglob('*.asm'):
-              s = p.read_text(errors='ignore')
-              lines = s.splitlines()
-              out = []
-              i = 0
-              while i < len(lines):
-                  line = lines[i]
-                  if 'adrp' in line and '@PAGE' in line:
-                      m = re.search(r'adrp\s+(x\d+)\s*,\s*([A-Za-z0-9_.$]+)@PAGE', line)
-                      if m:
-                          out.append('  ldr %s, =%s' % (m.group(1), m.group(2)))
-                          if i + 1 < len(lines) and '@PAGEOFF' in lines[i+1]:
-                              i += 1
-                      else:
-                          out.append(line)
-                  elif '@PAGEOFF' not in line:
-                      out.append(line)
-                  i += 1
-              p.write_text('\n'.join(out) + '\n')
-          PYEOF
+          test -f ../libtool/libs/armeabi-v7a/libfrida-gum.a
+
+      - name: Download Dobby
+        run: |
+          git clone https://github.com/jmpews/Dobby.git libtool/Dobby
+          cd libtool/Dobby
+          # Checkout the known stable commit for version 2023.4.14 to avoid recent Android build breakages
+          git checkout 0932d69c320e786672361ab53825ba8f4245e9d3
 
       - name: Fetch ImGui source
         run: |
