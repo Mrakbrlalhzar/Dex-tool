@@ -715,11 +715,23 @@ jobs:
           cat > ../libtool/include/frida-gumjs.h << 'EOF'
           #ifndef FRIDA_GUMJS_H
           #define FRIDA_GUMJS_H
-          #include "gumjs/gumjs.h"
           #include "gum/gum.h"
           #include "gum/guminterceptor.h"
           #include "gum/gumprocess.h"
           #include "gum/gummemory.h"
+          #include "gumjs/gumjs.h"
+          #include "gumjs/gumscript.h"
+          #include "gumjs/gumscriptbackend.h"
+          #include "gumjs/gumscriptscheduler.h"
+          #include "gumjs/gumquickscriptbackend.h"
+          
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          GumScriptBackend * gum_script_backend_obtain_qjs (void);
+          #ifdef __cplusplus
+          }
+          #endif
           #endif
           EOF
           
