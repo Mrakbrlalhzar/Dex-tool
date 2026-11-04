@@ -105,6 +105,7 @@ jobs:
           Critical Frida correction:
           The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot.
           CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now use find to locate the exact glib-2.0 include directories in the Frida SDK and pass them directly to CMake via environment variables. This completely avoids copying standard headers and ensures #include <glib.h> resolves correctly.
+          CAPSTONE FIX: The previous workflow copied only dist/include/frida-1.0/*, which missed capstone.h (a transitive dependency of guminterceptor.h). We now copy the entire dist/include/ tree so capstone and any other Frida SDK headers are available, and add libtool/include/capstone to the CMake include path.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -119,6 +120,7 @@ jobs:
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include/capstone)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends)
 
@@ -667,8 +669,8 @@ jobs:
           # 1. Copy all static libraries
           find . -name "*.a" -exec cp {} ../libtool/libs/arm64-v8a/ \; || true
           
-          # 2. Copy frida installed headers
-          cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
+          # 2. Copy the ENTIRE include tree (fixes capstone.h and other transitive SDK headers)
+          cp -r dist-arm64/include/* ../libtool/include/ || true
           
           # 3. Find GLib include directories
           GLIB_INC="$(find . -type d -name 'glib-2.0' -path '*/include/glib-2.0' | head -n 1 || true)"
@@ -718,7 +720,8 @@ jobs:
           mkdir -p ../libtool/libs/armeabi-v7a
           find . -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; || true
           
-          cp -r dist-arm/include/frida-1.0/* ../libtool/include/ || true
+          # Copy the ENTIRE include tree again (should already be there, but just in case)
+          cp -r dist-arm/include/* ../libtool/include/ || true
           
           # Find GLib include directories for arm
           GLIB_INC_ARM="$(find . -type d -name 'glib-2.0' -path '*/include/glib-2.0' | grep -v 'arm64' | head -n 1 || true)"
