@@ -104,8 +104,7 @@ jobs:
 
           Critical Frida correction:
           The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot.
-          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now use find to locate the exact glib-2.0 include directories in the Frida SDK and pass them directly to CMake via environment variables. This completely avoids copying standard headers and ensures #include <glib.h> resolves correctly.
-          CAPSTONE FIX: The previous workflow copied only dist/include/frida-1.0/*, which missed capstone.h (a transitive dependency of guminterceptor.h). We now copy the entire dist/include/ tree so capstone and any other Frida SDK headers are available, and add libtool/include/capstone to the CMake include path.
+          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now use find to locate ALL the dependency include directories in the Frida SDK sysroot (excluding usr/include and include/c++) and pass them directly to CMake via environment variables. This completely avoids copying standard headers and ensures #include <glib.h>, #include <capstone.h>, etc. resolve correctly.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -120,16 +119,13 @@ jobs:
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include/capstone)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends)
 
-          # Use the GLib include directories found by the workflow
-          if(DEFINED ENV{GLIB_INCLUDE_DIR})
-              include_directories($ENV{GLIB_INCLUDE_DIR})
-          endif()
-          if(DEFINED ENV{GLIB_CONFIG_INCLUDE_DIR})
-              include_directories($ENV{GLIB_CONFIG_INCLUDE_DIR})
+          # Use the SDK include directories found by the workflow
+          if(DEFINED ENV{SDK_INCLUDE_DIRS})
+              string(REPLACE "\n" ";" SDK_INCLUDE_DIRS_LIST "$ENV{SDK_INCLUDE_DIRS}")
+              include_directories(${SDK_INCLUDE_DIRS_LIST})
           endif()
 
           file(GLOB IMGUI_SOURCES
@@ -669,19 +665,17 @@ jobs:
           # 1. Copy all static libraries
           find . -name "*.a" -exec cp {} ../libtool/libs/arm64-v8a/ \; || true
           
-          # 2. Copy the ENTIRE include tree (fixes capstone.h and other transitive SDK headers)
-          cp -r dist-arm64/include/* ../libtool/include/ || true
+          # 2. Copy frida installed headers
+          cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
           
-          # 3. Find GLib include directories
-          GLIB_INC="$(find . -type d -name 'glib-2.0' -path '*/include/glib-2.0' | head -n 1 || true)"
-          if [ -n "$GLIB_INC" ]; then
-              echo "Found glib-2.0 include dir: $PWD/$GLIB_INC"
-              echo "GLIB_INCLUDE_DIR=$PWD/$GLIB_INC" >> "$GITHUB_ENV"
-          fi
-          GLIB_CONFIG_INC="$(find . -type d -name 'include' -path '*/lib/glib-2.0/include' | head -n 1 || true)"
-          if [ -n "$GLIB_CONFIG_INC" ]; then
-              echo "Found glibconfig include dir: $PWD/$GLIB_CONFIG_INC"
-              echo "GLIB_CONFIG_INCLUDE_DIR=$PWD/$GLIB_CONFIG_INC" >> "$GITHUB_ENV"
+          # 3. Find all include directories in the SDK sysroot
+          SDK_INC_DIRS="$(find . -type d -name 'include' -path '*sdk-android-arm64*' | grep -v 'usr/include' | grep -v 'include/c++' | sort -u || true)"
+          if [ -n "$SDK_INC_DIRS" ]; then
+              echo "Found SDK include dirs:"
+              echo "$SDK_INC_DIRS"
+              echo "SDK_INCLUDE_DIRS<<EOF" >> "$GITHUB_ENV"
+              echo "$SDK_INC_DIRS" >> "$GITHUB_ENV"
+              echo "EOF" >> "$GITHUB_ENV"
           fi
           
           # 4. Create wrapper header
@@ -720,19 +714,16 @@ jobs:
           mkdir -p ../libtool/libs/armeabi-v7a
           find . -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; || true
           
-          # Copy the ENTIRE include tree again (should already be there, but just in case)
-          cp -r dist-arm/include/* ../libtool/include/ || true
+          cp -r dist-arm/include/frida-1.0/* ../libtool/include/ || true
           
-          # Find GLib include directories for arm
-          GLIB_INC_ARM="$(find . -type d -name 'glib-2.0' -path '*/include/glib-2.0' | grep -v 'arm64' | head -n 1 || true)"
-          if [ -n "$GLIB_INC_ARM" ]; then
-              echo "Found glib-2.0 include dir for arm: $PWD/$GLIB_INC_ARM"
-              echo "GLIB_INCLUDE_DIR=$PWD/$GLIB_INC_ARM" >> "$GITHUB_ENV"
-          fi
-          GLIB_CONFIG_INC_ARM="$(find . -type d -name 'include' -path '*/lib/glib-2.0/include' | grep -v 'arm64' | head -n 1 || true)"
-          if [ -n "$GLIB_CONFIG_INC_ARM" ]; then
-              echo "Found glibconfig include dir for arm: $PWD/$GLIB_CONFIG_INC_ARM"
-              echo "GLIB_CONFIG_INCLUDE_DIR=$PWD/$GLIB_CONFIG_INC_ARM" >> "$GITHUB_ENV"
+          # Find all include directories in the SDK sysroot for arm
+          SDK_INC_DIRS_ARM="$(find . -type d -name 'include' -path '*sdk-android-arm*' | grep -v 'arm64' | grep -v 'usr/include' | grep -v 'include/c++' | sort -u || true)"
+          if [ -n "$SDK_INC_DIRS_ARM" ]; then
+              echo "Found SDK include dirs for arm:"
+              echo "$SDK_INC_DIRS_ARM"
+              echo "SDK_INCLUDE_DIRS<<EOF" >> "$GITHUB_ENV"
+              echo "$SDK_INC_DIRS_ARM" >> "$GITHUB_ENV"
+              echo "EOF" >> "$GITHUB_ENV"
           fi
           
           ls -lh ../libtool/libs/armeabi-v7a/
