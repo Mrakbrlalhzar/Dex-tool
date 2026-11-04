@@ -104,7 +104,7 @@ jobs:
 
           Critical Frida correction:
           The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot.
-          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now use pkg-config to get the exact include flags for all dependencies (glib, capstone, quickjs, json-glib, etc.) from the Frida build tree and pass them directly to CMake via environment variables. This completely avoids copying standard headers and ensures #include <glib.h>, #include <capstone.h>, etc. resolve correctly.
+          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now add the exact Frida SDK include directories directly to the CMake include directories. This completely avoids copying standard headers and ensures #include <glib.h>, #include <capstone.h>, etc. resolve correctly.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -122,11 +122,19 @@ jobs:
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends)
 
-          # Use the dependency include flags found by pkg-config
-          if(DEFINED ENV{DEP_CFLAGS})
-              string(REPLACE " " ";" DEP_CFLAGS_LIST "$ENV{DEP_CFLAGS}")
-              target_compile_options(tool PRIVATE ${DEP_CFLAGS_LIST})
-          endif()
+          # Add the Frida SDK include directories directly
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/glib-2.0)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/lib/glib-2.0/include)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/glib-2.0)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/lib/glib-2.0/include)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/glib-2.0)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/lib/glib-2.0/include)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/glib-2.0)
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/lib/glib-2.0/include)
 
           file(GLOB IMGUI_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/imgui/*.cpp"
@@ -668,19 +676,7 @@ jobs:
           # 2. Copy frida installed headers
           cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
           
-          # 3. Use pkg-config to get the include flags for all dependencies
-          export PKG_CONFIG_PATH="$PWD/dist-arm64/lib/pkgconfig"
-          export PKG_CONFIG_LIBDIR="$PWD/dist-arm64/lib/pkgconfig"
-          PKG_CONFIG_BIN="deps/toolchain-linux-x86_64/bin/pkg-config"
-          if [ ! -f "$PKG_CONFIG_BIN" ]; then
-              PKG_CONFIG_BIN="pkg-config"
-          fi
-          DEP_CFLAGS="$($PKG_CONFIG_BIN --cflags glib-2.0 gobject-2.0 capstone json-glib-1.0 quickjs libffi openssl libunwind libdwarf minizip 2>/dev/null || true)"
-          if [ -n "$DEP_CFLAGS" ]; then
-              echo "DEP_CFLAGS=$DEP_CFLAGS" >> "$GITHUB_ENV"
-          fi
-          
-          # 4. Create wrapper header
+          # 3. Create wrapper header
           cat > ../libtool/include/frida-gumjs.h << 'EOF'
           #ifndef FRIDA_GUMJS_H
           #define FRIDA_GUMJS_H
@@ -717,18 +713,6 @@ jobs:
           find . -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; || true
           
           cp -r dist-arm/include/frida-1.0/* ../libtool/include/ || true
-          
-          # Use pkg-config to get the include flags for all dependencies for arm
-          export PKG_CONFIG_PATH="$PWD/dist-arm/lib/pkgconfig"
-          export PKG_CONFIG_LIBDIR="$PWD/dist-arm/lib/pkgconfig"
-          PKG_CONFIG_BIN="deps/toolchain-linux-x86_64/bin/pkg-config"
-          if [ ! -f "$PKG_CONFIG_BIN" ]; then
-              PKG_CONFIG_BIN="pkg-config"
-          fi
-          DEP_CFLAGS_ARM="$($PKG_CONFIG_BIN --cflags glib-2.0 gobject-2.0 capstone json-glib-1.0 quickjs libffi openssl libunwind libdwarf minizip 2>/dev/null || true)"
-          if [ -n "$DEP_CFLAGS_ARM" ]; then
-              echo "DEP_CFLAGS=$DEP_CFLAGS_ARM" >> "$GITHUB_ENV"
-          fi
           
           ls -lh ../libtool/libs/armeabi-v7a/
 
