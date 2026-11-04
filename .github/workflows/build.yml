@@ -723,7 +723,6 @@ jobs:
           #include "gumjs/gumscript.h"
           #include "gumjs/gumscriptbackend.h"
           #include "gumjs/gumscriptscheduler.h"
-          #include "gumjs/gumquickscriptbackend.h"
           
           #ifdef __cplusplus
           extern "C" {
