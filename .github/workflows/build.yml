@@ -104,7 +104,7 @@ jobs:
 
           Critical Frida correction:
           The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot.
-          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now use find to locate ALL the dependency include directories in the Frida SDK sysroot (excluding usr/include and include/c++) and pass them directly to CMake via environment variables. This completely avoids copying standard headers and ensures #include <glib.h>, #include <capstone.h>, etc. resolve correctly.
+          CRITICAL FIX: Flattening the entire SDK include directory brought in standard headers like stdbool.h and stddef.h which overrode the NDK's standard headers, causing catastrophic macro expansion failures (_Bool not defined). We now use find to locate the EXACT dependency headers (glib.h, capstone.h, glibconfig.h, quickjs.h, json-glib.h, ffi.h, ssl.h, unwind.h, dwarf.h, mz.h) inside the Frida build tree and pass their parent directories directly to CMake via environment variables. This completely avoids copying standard headers and ensures #include <glib.h>, #include <capstone.h>, etc. resolve correctly.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -122,10 +122,10 @@ jobs:
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends)
 
-          # Use the SDK include directories found by the workflow
-          if(DEFINED ENV{SDK_INCLUDE_DIRS})
-              string(REPLACE "\n" ";" SDK_INCLUDE_DIRS_LIST "$ENV{SDK_INCLUDE_DIRS}")
-              include_directories(${SDK_INCLUDE_DIRS_LIST})
+          # Use the dependency include directories found by the workflow
+          if(DEFINED ENV{DEP_INCLUDE_DIRS})
+              string(REPLACE " " ";" DEP_INCLUDE_DIRS_LIST "$ENV{DEP_INCLUDE_DIRS}")
+              include_directories(${DEP_INCLUDE_DIRS_LIST})
           endif()
 
           file(GLOB IMGUI_SOURCES
@@ -668,14 +668,18 @@ jobs:
           # 2. Copy frida installed headers
           cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
           
-          # 3. Find all include directories in the SDK sysroot
-          SDK_INC_DIRS="$(find . -type d -name 'include' -path '*sdk-android-arm64*' | grep -v 'usr/include' | grep -v 'include/c++' | sort -u || true)"
-          if [ -n "$SDK_INC_DIRS" ]; then
-              echo "Found SDK include dirs:"
-              echo "$SDK_INC_DIRS"
-              echo "SDK_INCLUDE_DIRS<<EOF" >> "$GITHUB_ENV"
-              echo "$SDK_INC_DIRS" >> "$GITHUB_ENV"
-              echo "EOF" >> "$GITHUB_ENV"
+          # 3. Find all dependency include directories by locating their main headers
+          DEP_INCLUDE_DIRS=""
+          for header in glib.h capstone.h glibconfig.h quickjs.h json-glib.h ffi.h ssl.h unwind.h dwarf.h mz.h; do
+              HEADER_PATH="$(find . -name "$header" | head -n 1 || true)"
+              if [ -n "$HEADER_PATH" ]; then
+                  HEADER_DIR="$(dirname "$HEADER_PATH")"
+                  echo "Found $header at $HEADER_PATH"
+                  DEP_INCLUDE_DIRS="$DEP_INCLUDE_DIRS $PWD/$HEADER_DIR"
+              fi
+          done
+          if [ -n "$DEP_INCLUDE_DIRS" ]; then
+              echo "DEP_INCLUDE_DIRS=$DEP_INCLUDE_DIRS" >> "$GITHUB_ENV"
           fi
           
           # 4. Create wrapper header
@@ -716,14 +720,18 @@ jobs:
           
           cp -r dist-arm/include/frida-1.0/* ../libtool/include/ || true
           
-          # Find all include directories in the SDK sysroot for arm
-          SDK_INC_DIRS_ARM="$(find . -type d -name 'include' -path '*sdk-android-arm*' | grep -v 'arm64' | grep -v 'usr/include' | grep -v 'include/c++' | sort -u || true)"
-          if [ -n "$SDK_INC_DIRS_ARM" ]; then
-              echo "Found SDK include dirs for arm:"
-              echo "$SDK_INC_DIRS_ARM"
-              echo "SDK_INCLUDE_DIRS<<EOF" >> "$GITHUB_ENV"
-              echo "$SDK_INC_DIRS_ARM" >> "$GITHUB_ENV"
-              echo "EOF" >> "$GITHUB_ENV"
+          # Find all dependency include directories for arm
+          DEP_INCLUDE_DIRS_ARM=""
+          for header in glib.h capstone.h glibconfig.h quickjs.h json-glib.h ffi.h ssl.h unwind.h dwarf.h mz.h; do
+              HEADER_PATH="$(find . -name "$header" | grep -v 'arm64' | head -n 1 || true)"
+              if [ -n "$HEADER_PATH" ]; then
+                  HEADER_DIR="$(dirname "$HEADER_PATH")"
+                  echo "Found $header at $HEADER_PATH"
+                  DEP_INCLUDE_DIRS_ARM="$DEP_INCLUDE_DIRS_ARM $PWD/$HEADER_DIR"
+              fi
+          done
+          if [ -n "$DEP_INCLUDE_DIRS_ARM" ]; then
+              echo "DEP_INCLUDE_DIRS=$DEP_INCLUDE_DIRS_ARM" >> "$GITHUB_ENV"
           fi
           
           ls -lh ../libtool/libs/armeabi-v7a/
