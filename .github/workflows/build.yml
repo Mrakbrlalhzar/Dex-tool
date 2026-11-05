@@ -178,22 +178,23 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/"
 
       # ── Dobby ─────────────────────────────────────────────────
-      # FIX: Dobby's ARM64 .asm files use macOS Mach-O @PAGE/@PAGEOFF
-      # relocations which clang on Linux ELF rejects.
+      # FIX: The official jmpews/Dobby master branch is currently broken for Android.
+      # We use the actively maintained fork by chiteroman which fixes the OSMemory
+      # and load_address compilation errors.
       - name: Cache Dobby
         id: cache-dobby
         uses: actions/cache@v4
         with:
           path: deps/dobby
-          key: dobby-master-elf-patch-v4
+          key: dobby-chiteroman-v1
 
       - name: Build Dobby for both ABIs
         if: "${{ steps.cache-dobby.outputs.cache-hit != 'true' }}"
         run: |
-          git clone --depth 1 https://github.com/jmpews/Dobby.git dobby-src
+          # Use chiteroman's maintained fork which fixes Android/Linux build errors
+          git clone --depth 1 https://github.com/chiteroman/Dobby.git dobby-src
 
-          # ── Patch macOS Mach-O relocations to Linux ELF syntax ──
-          # FIX: Added () to the regex character class to match the cdecl(...) macro wrapper.
+          # ── Patch macOS Mach-O relocations to Linux ELF syntax (if still present) ──
           while IFS= read -r -d '' f; do
             sed -i -E 's/([a-zA-Z0-9_()]+)@PAGEOFF/:lo12:\1/g' "$f"
             sed -i -E 's/([a-zA-Z0-9_()]+)@PAGE\b/\1/g' "$f"
