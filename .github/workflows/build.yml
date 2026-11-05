@@ -176,21 +176,20 @@ jobs:
           cp "$GUMHDR" "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/frida-gumjs.h"
           ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/"
 
-      # ── Dobby ─────────────────────────────────────────────────
-      # 使用 LSPosed/Dobby 替代原 chiteroman/Dobby (原仓库已不可公开访问)
+      # ── Dobby (LSPosed/Dobby) ─────────────────────────────────
       - name: Cache Dobby
         id: cache-dobby
         uses: actions/cache@v4
         with:
           path: deps/dobby
-          key: dobby-lsposed-v1
+          key: dobby-lsposed-v2
 
       - name: Build Dobby for both ABIs
         if: "${{ steps.cache-dobby.outputs.cache-hit != 'true' }}"
         run: |
           git clone --depth 1 https://github.com/LSPosed/Dobby.git dobby-src
 
-          # ── Patch macOS Mach-O relocations to Linux ELF syntax (best-effort) ──
+          # Best-effort: patch lingering Mach-O relocations to ELF syntax
           while IFS= read -r -d '' f; do
             sed -i -E 's/([a-zA-Z0-9_()]+)@PAGEOFF/:lo12:\1/g' "$f"
             sed -i -E 's/([a-zA-Z0-9_()]+)@PAGE\b/\1/g' "$f"
@@ -208,8 +207,9 @@ jobs:
               -DANDROID_PLATFORM=android-26 \
               -DCMAKE_BUILD_TYPE=Release \
               -DDOBBY_DEBUG=OFF \
+              -DDOBBY_GENERATE_SHARED=OFF \
               -GNinja
-            ninja -C "dobby-src/build-$ABI" -j"$(nproc)" dobby_static
+            ninja -C "dobby-src/build-$ABI" -j"$(nproc)" dobby
             mkdir -p "deps/dobby/$ABI"
             cp "dobby-src/build-$ABI/libdobby.a" "deps/dobby/$ABI/"
             echo "Dobby $ABI: $(ls -lh deps/dobby/$ABI/libdobby.a)"
@@ -1759,10 +1759,8 @@ jobs:
           
           ## Build notes
           
-              Dobby is sourced from LSPosed/Dobby, which provides a stable
-              Android/Linux build. The workflow still attempts to patch any
-              lingering macOS @PAGE/@PAGEOFF Mach-O relocations to ELF lo12
-              syntax as a best-effort safeguard.
+              Dobby is sourced from LSPosed/Dobby. The CMake target is "dobby",
+              and DOBBY_GENERATE_SHARED=OFF is required to produce libdobby.a.
           DXTRDME
           cat > .gitignore << 'DXTGI'
           build-arm64/
@@ -1816,7 +1814,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "chore: Dex-tool scaffold — LSPosed/Dobby + full source [skip ci]"
+            git commit -m "chore: Dex-tool scaffold — fix Dobby target name [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
