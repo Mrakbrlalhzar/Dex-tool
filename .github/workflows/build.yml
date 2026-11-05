@@ -67,7 +67,7 @@ jobs:
             "build-tools;35.0.1" \
             "ndk;25.2.9519653"
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools"           >> "$GITHUB_PATH"
           echo "NDK check: $(ls "$ANDROID_NDK_ROOT/build/cmake/")"
 
       - name: Install Gradle 8.5
@@ -85,17 +85,19 @@ jobs:
           mkdir -p ~/.android
           keytool -genkey -v \
             -keystore ~/.android/debug.keystore \
-            -storepass android -alias androiddebugkey -keypass android \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
             -dname "CN=Android Debug,O=Android,C=US" \
             -keyalg RSA -keysize 2048 -validity 10000 2>/dev/null || true
 
-      # ── Cache + Build frida-gum 16.7.19 arm64-v8a ─────────────
+      # ── frida-gum 16.7.19 arm64-v8a ───────────────────────────
       - name: Cache frida-gum arm64-v8a
         id: cache-frida-arm64
         uses: actions/cache@v4
         with:
           path: deps/frida-gum/arm64-v8a
-          key: frida-gum-16.7.19-arm64-v8a-v2
+          key: frida-gum-16.7.19-arm64-v3
 
       - name: Build frida-gum 16.7.19 arm64-v8a
         if: "${{ steps.cache-frida-arm64.outputs.cache-hit != 'true' }}"
@@ -121,19 +123,27 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a"
           GUMLIB="$(find . "$FRIDA_PFX" -name 'libfrida-gumjs.a' 2>/dev/null | head -1)"
           GUMHDR="$(find . "$FRIDA_PFX" -name 'frida-gumjs.h'   2>/dev/null | head -1)"
-          [ -z "$GUMLIB" ] && { echo "ERROR: libfrida-gumjs.a not found"; find . -name "*.a" | head -20; exit 1; }
-          [ -z "$GUMHDR" ] && { echo "ERROR: frida-gumjs.h not found";   find . -name "*.h" | head -20; exit 1; }
+          [ -z "$GUMLIB" ] && {
+            echo "ERROR: libfrida-gumjs.a not found"
+            find . -name "*.a" | head -20
+            exit 1
+          }
+          [ -z "$GUMHDR" ] && {
+            echo "ERROR: frida-gumjs.h not found"
+            find . -name "*.h" | head -20
+            exit 1
+          }
           cp "$GUMLIB" "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/libfrida-gumjs.a"
           cp "$GUMHDR" "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/frida-gumjs.h"
           ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/"
 
-      # ── Cache + Build frida-gum 16.7.19 armeabi-v7a ───────────
+      # ── frida-gum 16.7.19 armeabi-v7a ─────────────────────────
       - name: Cache frida-gum armeabi-v7a
         id: cache-frida-arm
         uses: actions/cache@v4
         with:
           path: deps/frida-gum/armeabi-v7a
-          key: frida-gum-16.7.19-armeabi-v7a-v2
+          key: frida-gum-16.7.19-armeabi-v7a-v3
 
       - name: Build frida-gum 16.7.19 armeabi-v7a
         if: "${{ steps.cache-frida-arm.outputs.cache-hit != 'true' }}"
@@ -162,26 +172,37 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a"
           GUMLIB="$(find . "$FRIDA_PFX" -name 'libfrida-gumjs.a' 2>/dev/null | head -1)"
           GUMHDR="$(find . "$FRIDA_PFX" -name 'frida-gumjs.h'   2>/dev/null | head -1)"
-          [ -z "$GUMLIB" ] && { echo "ERROR: libfrida-gumjs.a not found"; exit 1; }
-          [ -z "$GUMHDR" ] && { echo "ERROR: frida-gumjs.h not found";   exit 1; }
+          [ -z "$GUMLIB" ] && { echo "ERROR: armeabi-v7a lib not found"; exit 1; }
           cp "$GUMLIB" "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/libfrida-gumjs.a"
           cp "$GUMHDR" "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/frida-gumjs.h"
           ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/"
 
-      # ── Cache + Build Dobby both ABIs ──────────────────────────
+      # ── Dobby ─────────────────────────────────────────────────
+      # FIX: Dobby's ARM64 .asm files use macOS Mach-O @PAGE/@PAGEOFF
+      # relocations which clang on Linux ELF rejects.
       - name: Cache Dobby
         id: cache-dobby
         uses: actions/cache@v4
         with:
           path: deps/dobby
-          key: dobby-master-v2
+          key: dobby-master-elf-patch-v3
 
       - name: Build Dobby for both ABIs
         if: "${{ steps.cache-dobby.outputs.cache-hit != 'true' }}"
         run: |
           git clone --depth 1 https://github.com/jmpews/Dobby.git dobby-src
+
+          # ── Patch macOS Mach-O relocations to Linux ELF syntax ──
+          while IFS= read -r -d '' f; do
+            sed -i -E 's/([A-Za-z_][A-Za-z0-9_]*)@PAGEOFF/:lo12:\1/g' "$f"
+            sed -i 's/@PAGE\b//g' "$f"
+          done < <(find dobby-src -name "*.asm" -print0 2>/dev/null)
+
+          echo "Dobby ASM files patched for ELF."
+
           mkdir -p deps/dobby
           cp -r dobby-src/include deps/dobby/
+
           for ABI in arm64-v8a armeabi-v7a; do
             cmake -S dobby-src -B "dobby-src/build-$ABI" \
               -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
@@ -189,7 +210,6 @@ jobs:
               -DANDROID_PLATFORM=android-26 \
               -DCMAKE_BUILD_TYPE=Release \
               -DDOBBY_DEBUG=OFF \
-              -DDOBBY_GENERATE_SHARED=OFF \
               -GNinja
             ninja -C "dobby-src/build-$ABI" -j"$(nproc)" dobby_static
             mkdir -p "deps/dobby/$ABI"
@@ -206,17 +226,21 @@ jobs:
       - name: Download smali 3.0.7 fat jar
         run: |
           mkdir -p deps/smali
-          GOOG="https://maven.google.com/com/android/tools/smali"
+          BASE="https://dl.google.com/dl/android/maven2/com/android/tools/smali"
           SMVER="3.0.7"
           for art in smali smali-dexlib2 smali-util; do
-            wget -q "$GOOG/$art/$SMVER/$art-$SMVER.jar" -O "deps/smali/$art.jar"
+            wget -q "$BASE/$art/$SMVER/$art-$SMVER.jar" -O "deps/smali/$art.jar"
           done
-          wget -q "https://repo1.maven.org/maven2/com/beust/jcommander/1.72/jcommander-1.72.jar" \
+          wget -q \
+            "https://repo1.maven.org/maven2/com/beust/jcommander/1.72/jcommander-1.72.jar" \
             -O deps/smali/jcommander.jar
-          wget -q "https://repo1.maven.org/maven2/com/google/guava/guava/30.1.1-android/guava-30.1.1-android.jar" \
+          wget -q \
+            "https://repo1.maven.org/maven2/com/google/guava/guava/30.1.1-android/guava-30.1.1-android.jar" \
             -O deps/smali/guava.jar
           MERGE="$(mktemp -d)"
-          for j in deps/smali/*.jar; do unzip -nqo "$j" -d "$MERGE" 2>/dev/null || true; done
+          for j in deps/smali/*.jar; do
+            unzip -nqo "$j" -d "$MERGE" 2>/dev/null || true
+          done
           jar cf deps/smali/smali-fat.jar -C "$MERGE" .
           ls -lh deps/smali/smali-fat.jar
 
@@ -232,7 +256,7 @@ jobs:
             .github/workflows
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE CMakeLists.txt
+      # CMakeLists.txt
       # ═══════════════════════════════════════════════════════════
       - name: Generate CMakeLists.txt
         run: |
@@ -252,10 +276,10 @@ jobs:
           set_target_properties(dobby_static PROPERTIES
               IMPORTED_LOCATION "${DOBBY_DIR}/${ANDROID_ABI}/libdobby.a")
           
-          find_library(lib_egl    EGL)
-          find_library(lib_gles   GLESv3)
-          find_library(lib_log    log)
-          find_library(lib_dl     dl)
+          find_library(lib_egl     EGL)
+          find_library(lib_gles    GLESv3)
+          find_library(lib_log     log)
+          find_library(lib_dl      dl)
           find_library(lib_android android)
           
           set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/imgui")
@@ -295,7 +319,7 @@ jobs:
           DXTCMK
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE logger.h
+      # logger.h
       # ═══════════════════════════════════════════════════════════
       - name: Generate logger.h
         run: |
@@ -313,7 +337,7 @@ jobs:
           DXTLOGH
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE logger.cpp
+      # logger.cpp
       # ═══════════════════════════════════════════════════════════
       - name: Generate logger.cpp
         run: |
@@ -353,9 +377,11 @@ jobs:
           void logger_init(const char* base_dir) {
               mkdir(base_dir, 0755);
               char p[640];
-              snprintf(p, sizeof(p), "%s/dextool.log",       base_dir); g_info_fp  = fopen(p,"a");
-              snprintf(p, sizeof(p), "%s/dextool-debug.log",  base_dir); g_debug_fp = fopen(p,"a");
-              snprintf(p, sizeof(p), "%s/dextool-crash.log",  base_dir);
+              snprintf(p, sizeof(p), "%s/dextool.log",      base_dir);
+              g_info_fp  = fopen(p, "a");
+              snprintf(p, sizeof(p), "%s/dextool-debug.log", base_dir);
+              g_debug_fp = fopen(p, "a");
+              snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
               g_crash_fd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
               signal(SIGSEGV, crash_sig);
               signal(SIGABRT, crash_sig);
@@ -387,7 +413,7 @@ jobs:
           DXTLOGC
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE overlay.h
+      # overlay.h
       # ═══════════════════════════════════════════════════════════
       - name: Generate overlay.h
         run: |
@@ -401,7 +427,7 @@ jobs:
           DXTOVLH
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE overlay.cpp
+      # overlay.cpp
       # ═══════════════════════════════════════════════════════════
       - name: Generate overlay.cpp
         run: |
@@ -423,11 +449,11 @@ jobs:
           #include <atomic>
           
           typedef EGLBoolean (*fn_swap)(EGLDisplay, EGLSurface);
-          static fn_swap g_orig_swap = nullptr;
-          static std::atomic<bool> g_gum_inited{false};
-          static std::atomic<bool> g_imgui_up{false};
-          static bool g_imgui_failed = false;
-          static JavaVM* g_jvm = nullptr;
+          static fn_swap              g_orig_swap    = nullptr;
+          static std::atomic<bool>    g_gum_inited  {false};
+          static std::atomic<bool>    g_imgui_up    {false};
+          static bool                 g_imgui_failed = false;
+          static JavaVM*              g_jvm          = nullptr;
           
           struct Touch {
               std::atomic<float> x{0}, y{0};
@@ -436,8 +462,10 @@ jobs:
           static Touch g_touch;
           
           void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
+          
           void overlay_on_touch(float x, float y, bool p) {
-              g_touch.x=x; g_touch.y=y; g_touch.pressed=p; g_touch.dirty=true;
+              g_touch.x = x; g_touch.y = y;
+              g_touch.pressed = p; g_touch.dirty = true;
           }
           
           static void* frida_thread(void*) {
@@ -446,36 +474,38 @@ jobs:
           }
           
           static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
-              EGLint w=1080, h=1920;
+              EGLint w = 1080, h = 1920;
               eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
               const GLubyte* ver = glGetString(GL_VERSION);
               if (!ver || !strstr((const char*)ver, "OpenGL ES 3")) {
-                  LOGE("ImGui disabled: not ES3 (ver=%s)", ver?(const char*)ver:"null");
+                  LOGE("ImGui disabled: not ES3 (ver=%s)", ver ? (const char*)ver : "null");
                   g_imgui_failed = true;
                   return;
               }
               ImGui::CreateContext();
-              ImGuiIO& io = ImGui::GetIO();
-              io.DisplaySize  = ImVec2((float)w,(float)h);
-              io.DeltaTime    = 1.0f/60.0f;
-              io.IniFilename  = nullptr;
+              ImGuiIO& io   = ImGui::GetIO();
+              io.DisplaySize = ImVec2((float)w, (float)h);
+              io.DeltaTime   = 1.0f / 60.0f;
+              io.IniFilename = nullptr;
               io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
               ImGui::StyleColorsDark();
               ImGui::GetStyle().WindowRounding = 6.0f;
               ImGui_ImplOpenGL3_Init("#version 300 es");
               menu_init();
               g_imgui_up = true;
-              LOGI("ImGui up (%dx%d)", w, h);
+              LOGI("ImGui up (%dx%d ES3)", w, h);
           }
           
-          // CRITICAL: calls g_orig_swap — never recurses into eglSwapBuffers symbol
+          // CRITICAL: calls g_orig_swap — NEVER recurses into eglSwapBuffers symbol.
+          // gum_init_embedded() is deferred here (GL thread, valid EGL context).
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
               if (!g_gum_inited.exchange(true)) {
                   gum_init_embedded();
                   log_info("[overlay] gum_init_embedded done");
                   pthread_t ft;
-                  pthread_attr_t a; pthread_attr_init(&a);
+                  pthread_attr_t a;
+                  pthread_attr_init(&a);
                   pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
                   pthread_create(&ft, &a, frida_thread, nullptr);
                   pthread_attr_destroy(&a);
@@ -503,14 +533,14 @@ jobs:
               void* sym = dlsym(egl, "eglSwapBuffers");
               if (!sym) { LOGE("dlsym eglSwapBuffers failed"); return false; }
               int r = DobbyHook(sym, (void*)my_swap, (void**)&g_orig_swap);
-              if (r!=0) { LOGE("DobbyHook failed: %d", r); return false; }
-              LOGI("eglSwapBuffers hooked");
+              if (r != 0) { LOGE("DobbyHook failed: %d", r); return false; }
+              LOGI("eglSwapBuffers hooked OK");
               return true;
           }
           DXTOVLC
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE touch.h + touch.cpp
+      # touch.h + touch.cpp
       # ═══════════════════════════════════════════════════════════
       - name: Generate touch.h and touch.cpp
         run: |
@@ -551,12 +581,12 @@ jobs:
               if (!sym) { LOGE("touch: AInputQueue_getEvent not found"); return; }
               int r = DobbyHook(sym, (void*)my_getEvent, (void**)&g_orig_get);
               if (r != 0) LOGE("touch: DobbyHook failed: %d", r);
-              else        LOGI("touch: hook installed");
+              else        LOGI("touch: AInputQueue_getEvent hooked");
           }
           DXTTCH
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE frida_bridge.h + frida_bridge.cpp
+      # frida_bridge.h
       # ═══════════════════════════════════════════════════════════
       - name: Generate frida_bridge.h
         run: |
@@ -571,6 +601,9 @@ jobs:
           void frida_set_message_callback(MsgCallback cb);
           DXTFBH
 
+      # ═══════════════════════════════════════════════════════════
+      # frida_bridge.cpp  (includes agent_bundle_embed.h generated later)
+      # ═══════════════════════════════════════════════════════════
       - name: Generate frida_bridge.cpp
         run: |
           cat > src/frida_bridge.cpp << 'DXTFBC'
@@ -593,13 +626,16 @@ jobs:
           }
           
           void frida_bridge_start(JavaVM*) {
-              log_info("[frida_bridge] starting");
+              log_info("[frida_bridge] starting GumJS");
               g_ctx  = g_main_context_new();
               g_loop = g_main_loop_new(g_ctx, FALSE);
               g_main_context_push_thread_default(g_ctx);
           
               g_backend = gum_script_backend_obtain_qjs();
-              if (!g_backend) { log_crash_raw("[frida_bridge] no QJS backend\n"); return; }
+              if (!g_backend) {
+                  log_crash_raw("[frida_bridge] FATAL: no QJS backend\n");
+                  return;
+              }
           
               GError* err = nullptr;
               g_script = gum_script_backend_create_sync(
@@ -607,18 +643,19 @@ jobs:
                              g_agent_js, nullptr, nullptr, &err);
               if (!g_script || err) {
                   char m[512];
-                  snprintf(m, sizeof(m), "[frida_bridge] create: %s\n",
+                  snprintf(m, sizeof(m), "[frida_bridge] create failed: %s\n",
                            err ? err->message : "(null)");
                   log_crash_raw(m);
                   if (err) g_error_free(err);
                   return;
               }
               gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
+          
               err = nullptr;
               gum_script_load_sync(g_script, nullptr, &err);
               if (err) {
                   char m[512];
-                  snprintf(m, sizeof(m), "[frida_bridge] load: %s\n", err->message);
+                  snprintf(m, sizeof(m), "[frida_bridge] load failed: %s\n", err->message);
                   log_crash_raw(m);
                   g_error_free(err);
                   return;
@@ -638,7 +675,7 @@ jobs:
           DXTFBC
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE smali_runtime.h + smali_runtime.cpp
+      # smali_runtime.h + smali_runtime.cpp
       # ═══════════════════════════════════════════════════════════
       - name: Generate smali_runtime.h and smali_runtime.cpp
         run: |
@@ -646,8 +683,8 @@ jobs:
           #pragma once
           #include <string>
           #include <vector>
-          // Compile smali source -> DEX bytes via InMemoryDexClassLoader (API 26+).
-          // smali-fat.jar must be in APK assets/. Returns "" on success, error on fail.
+          // Compile smali source to DEX via InMemoryDexClassLoader (API 26+).
+          // smali-fat.jar must be in APK assets/. Returns "" on success, else error.
           std::string smali_compile(const std::string& src,
                                     const std::string& class_name,
                                     std::vector<uint8_t>& dex_out);
@@ -665,22 +702,24 @@ jobs:
           
           extern JavaVM* g_jvm_global;
           
-          static bool    s_ready    = false;
-          static jclass  s_main_cls = nullptr;
+          static bool   s_ready    = false;
+          static jclass s_main_cls = nullptr;
           
           static std::string extract_jar(JNIEnv* env) {
               jclass   act = env->FindClass("android/app/ActivityThread");
-              jobject  app = env->CallStaticObjectMethod(
-                  act, env->GetStaticMethodID(act,"currentApplication","()Landroid/app/Application;"));
+              jobject  app = env->CallStaticObjectMethod(act,
+                  env->GetStaticMethodID(act, "currentApplication",
+                                         "()Landroid/app/Application;"));
               jobject  am  = env->CallObjectMethod(app,
                   env->GetMethodID(env->FindClass("android/content/Context"),
-                                   "getAssets","()Landroid/content/res/AssetManager;"));
+                                   "getAssets",
+                                   "()Landroid/content/res/AssetManager;"));
               jstring  fds = (jstring)env->CallObjectMethod(app,
                   env->GetMethodID(env->FindClass("android/content/Context"),
-                                   "getFilesDir","()Ljava/io/File;"));
+                                   "getFilesDir", "()Ljava/io/File;"));
               fds = (jstring)env->CallObjectMethod(fds,
                   env->GetMethodID(env->FindClass("java/io/File"),
-                                   "getAbsolutePath","()Ljava/lang/String;"));
+                                   "getAbsolutePath", "()Ljava/lang/String;"));
               const char* fdp = env->GetStringUTFChars(fds, nullptr);
               char jar[512];
               snprintf(jar, sizeof(jar), "%s/smali-fat.jar", fdp);
@@ -689,10 +728,11 @@ jobs:
               AAssetManager* amgr = AAssetManager_fromJava(env, am);
               AAsset* a = AAssetManager_open(amgr, "smali-fat.jar", AASSET_MODE_BUFFER);
               if (!a) return "";
-              FILE* f = fopen(jar,"wb");
+              FILE* f = fopen(jar, "wb");
               if (!f) { AAsset_close(a); return ""; }
               fwrite(AAsset_getBuffer(a), 1, (size_t)AAsset_getLength(a), f);
-              fclose(f); AAsset_close(a);
+              fclose(f);
+              AAsset_close(a);
               return std::string(jar);
           }
           
@@ -700,19 +740,24 @@ jobs:
               if (s_ready) return true;
               std::string jar = extract_jar(env);
               if (jar.empty()) return false;
-              jclass cl  = env->FindClass("java/lang/ClassLoader");
-              jobject sc = env->CallStaticObjectMethod(cl,
-                  env->GetStaticMethodID(cl,"getSystemClassLoader","()Ljava/lang/ClassLoader;"));
-              jclass dcl = env->FindClass("dalvik/system/PathClassLoader");
-              jstring js = env->NewStringUTF(jar.c_str());
-              jobject lo = env->NewObject(dcl,
-                  env->GetMethodID(dcl,"<init>","(Ljava/lang/String;Ljava/lang/ClassLoader;)V"),
-                  js, sc);
+              jclass   cl  = env->FindClass("java/lang/ClassLoader");
+              jobject  sc  = env->CallStaticObjectMethod(cl,
+                  env->GetStaticMethodID(cl, "getSystemClassLoader",
+                                         "()Ljava/lang/ClassLoader;"));
+              jclass   dcl = env->FindClass("dalvik/system/PathClassLoader");
+              jstring  js  = env->NewStringUTF(jar.c_str());
+              jobject  lo  = env->NewObject(dcl,
+                  env->GetMethodID(dcl, "<init>",
+                      "(Ljava/lang/String;Ljava/lang/ClassLoader;)V"), js, sc);
               if (!lo) return false;
-              jstring cn = env->NewStringUTF("com.android.tools.smali.smali.Main");
-              s_main_cls = (jclass)env->CallObjectMethod(lo,
-                  env->GetMethodID(cl,"loadClass","(Ljava/lang/String;)Ljava/lang/Class;"), cn);
-              if (!s_main_cls || env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+              jstring  cn  = env->NewStringUTF("com.android.tools.smali.smali.Main");
+              s_main_cls   = (jclass)env->CallObjectMethod(lo,
+                  env->GetMethodID(cl, "loadClass",
+                      "(Ljava/lang/String;)Ljava/lang/Class;"), cn);
+              if (!s_main_cls || env->ExceptionCheck()) {
+                  env->ExceptionClear();
+                  return false;
+              }
               s_main_cls = (jclass)env->NewGlobalRef(s_main_cls);
               s_ready = true;
               return true;
@@ -726,33 +771,38 @@ jobs:
               g_jvm_global->AttachCurrentThread(&env, nullptr);
               if (!ensure_ready(env)) return "smali not ready";
               char tmp[] = "/data/local/tmp/dxt-XXXXXX";
-              if (!mkdtemp(tmp)) return "mkdtemp";
-              std::string sf = std::string(tmp)+"/"+cname+".smali";
-              std::string df = std::string(tmp)+"/out.dex";
-              FILE* f = fopen(sf.c_str(),"w");
-              if (!f) return "fopen";
-              fwrite(src.c_str(),1,src.size(),f); fclose(f);
-              jclass sc  = env->FindClass("java/lang/String");
-              jmethodID m = env->GetStaticMethodID(s_main_cls,"main","([Ljava/lang/String;)V");
-              if (!m) return "no main";
-              jobjectArray a = env->NewObjectArray(4,sc,nullptr);
-              env->SetObjectArrayElement(a,0,env->NewStringUTF("assemble"));
-              env->SetObjectArrayElement(a,1,env->NewStringUTF("-o"));
-              env->SetObjectArrayElement(a,2,env->NewStringUTF(df.c_str()));
-              env->SetObjectArrayElement(a,3,env->NewStringUTF(sf.c_str()));
-              env->CallStaticVoidMethod(s_main_cls,m,a);
+              if (!mkdtemp(tmp)) return "mkdtemp failed";
+              std::string sf = std::string(tmp) + "/" + cname + ".smali";
+              std::string df = std::string(tmp) + "/out.dex";
+              FILE* f = fopen(sf.c_str(), "w");
+              if (!f) return "fopen failed";
+              fwrite(src.c_str(), 1, src.size(), f);
+              fclose(f);
+              jclass       sc = env->FindClass("java/lang/String");
+              jmethodID    m  = env->GetStaticMethodID(s_main_cls, "main",
+                                                        "([Ljava/lang/String;)V");
+              if (!m) return "no main method";
+              jobjectArray a  = env->NewObjectArray(4, sc, nullptr);
+              env->SetObjectArrayElement(a, 0, env->NewStringUTF("assemble"));
+              env->SetObjectArrayElement(a, 1, env->NewStringUTF("-o"));
+              env->SetObjectArrayElement(a, 2, env->NewStringUTF(df.c_str()));
+              env->SetObjectArrayElement(a, 3, env->NewStringUTF(sf.c_str()));
+              env->CallStaticVoidMethod(s_main_cls, m, a);
               if (env->ExceptionCheck()) { env->ExceptionClear(); return "smali threw"; }
-              FILE* df2 = fopen(df.c_str(),"rb");
+              FILE* df2 = fopen(df.c_str(), "rb");
               if (!df2) return "no dex output";
-              fseek(df2,0,SEEK_END); long sz=ftell(df2); rewind(df2);
+              fseek(df2, 0, SEEK_END);
+              long sz = ftell(df2);
+              rewind(df2);
               out.resize((size_t)sz);
-              fread(out.data(),1,(size_t)sz,df2); fclose(df2);
+              fread(out.data(), 1, (size_t)sz, df2);
+              fclose(df2);
               return "";
           }
           DXTSRC
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE menu.h + menu.cpp
+      # menu.h
       # ═══════════════════════════════════════════════════════════
       - name: Generate menu.h
         run: |
@@ -762,6 +812,9 @@ jobs:
           void menu_draw();
           DXTMNH
 
+      # ═══════════════════════════════════════════════════════════
+      # menu.cpp
+      # ═══════════════════════════════════════════════════════════
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
@@ -778,26 +831,27 @@ jobs:
           static int   s_theme   = 0;
           static bool  s_visible = true;
           
-          struct PatchEntry  { std::string name, value; bool enabled=true; };
-          struct HookEntry   { std::string name, code;  bool enabled=true; int mode=0; };
+          struct PatchEntry  { std::string name, value; bool enabled = true; };
+          struct HookEntry   { std::string name, code;  bool enabled = true; int mode = 0; };
           struct TrackerEntry{ std::string name; std::vector<std::string> log; };
-          struct ClassWin    { std::string cname; bool open=true;
-                               std::vector<std::string> methods, fields; };
+          struct ClassWin    { std::string cname; std::vector<std::string> methods, fields; };
           
           static std::vector<PatchEntry>   s_patches;
           static std::vector<HookEntry>    s_hooks;
           static std::vector<TrackerEntry> s_trackers;
           static std::vector<ClassWin>     s_classes;
           
-          static bool s_rec_on=false, s_mon_on=false;
+          static bool s_rec_on = false, s_mon_on = false;
           static std::vector<std::string> s_rec_log, s_mon_log, s_script_out;
           
-          static char s_pname[256]={}, s_pval[512]={};
-          static char s_hname[256]={}, s_hcode[2048]={};
-          static int  s_hmode=0;
-          static char s_tname[256]={};
-          static char s_script[8192]="// Frida JS\n";
-          static char s_cname[256]={};
+          static char s_pname[256]  = {};
+          static char s_pval[512]   = {};
+          static char s_hname[256]  = {};
+          static char s_hcode[2048] = {};
+          static int  s_hmode       = 0;
+          static char s_tname[256]  = {};
+          static char s_script[8192]= "// Frida JS\n";
+          static char s_cname[256]  = {};
           
           static void post_rpc(const char* fn, const char* args) {
               char buf[4096];
@@ -807,7 +861,7 @@ jobs:
           }
           
           static void apply_theme() {
-              switch(s_theme){
+              switch (s_theme) {
                   case 0: ImGui::StyleColorsDark();    break;
                   case 1: ImGui::StyleColorsLight();   break;
                   case 2: ImGui::StyleColorsClassic(); break;
@@ -817,46 +871,49 @@ jobs:
           
           void menu_init() {
               apply_theme();
-              frida_set_message_callback([](const std::string& j){
+              frida_set_message_callback([](const std::string& j) {
                   s_script_out.push_back(j);
               });
           }
           
           static void tab_settings() {
-              if(ImGui::SliderFloat("Font",    &s_font_sz, 8,32)){}
-              if(ImGui::SliderFloat("Opacity", &s_opacity, .3f,1.f)) apply_theme();
-              const char* th[]={"Dark","Light","Classic"};
-              if(ImGui::Combo("Theme",&s_theme,th,3)) apply_theme();
-              ImGui::Checkbox("Visible",&s_visible);
+              if (ImGui::SliderFloat("Font",    &s_font_sz, 8, 32)) {}
+              if (ImGui::SliderFloat("Opacity", &s_opacity, .3f, 1.f)) apply_theme();
+              const char* th[] = {"Dark","Light","Classic"};
+              if (ImGui::Combo("Theme", &s_theme, th, 3)) apply_theme();
+              ImGui::Checkbox("Visible", &s_visible);
           }
           
           static void tab_patches() {
-              ImGui::InputText("Name##pn", s_pname, sizeof(s_pname));
-              ImGui::InputText("Value##pv",s_pval,  sizeof(s_pval));
-              if(ImGui::Button("Add Patch") && s_pname[0]) {
+              ImGui::InputText("Name##pn",  s_pname, sizeof(s_pname));
+              ImGui::InputText("Value##pv", s_pval,  sizeof(s_pval));
+              if (ImGui::Button("Add Patch") && s_pname[0]) {
                   char a[1024];
-                  snprintf(a,sizeof(a),"{\"name\":\"%s\",\"value\":\"%s\"}",s_pname,s_pval);
-                  post_rpc("addPatch",a);
-                  s_patches.push_back({s_pname,s_pval,true});
-                  s_pname[0]=s_pval[0]=0;
+                  snprintf(a, sizeof(a),
+                           "{\"name\":\"%s\",\"value\":\"%s\"}", s_pname, s_pval);
+                  post_rpc("addPatch", a);
+                  s_patches.push_back({s_pname, s_pval, true});
+                  s_pname[0] = s_pval[0] = 0;
               }
               ImGui::Separator();
-              for(int i=0;i<(int)s_patches.size();i++){
+              for (int i = 0; i < (int)s_patches.size(); i++) {
                   ImGui::PushID(i);
-                  auto& p=s_patches[i];
-                  if(ImGui::Checkbox("##e",&p.enabled)){
-                      char a[256]; snprintf(a,sizeof(a),
-                          "{\"name\":\"%s\",\"enabled\":%s}",
-                          p.name.c_str(),p.enabled?"true":"false");
-                      post_rpc("setPatchEnabled",a);
+                  auto& p = s_patches[i];
+                  if (ImGui::Checkbox("##e", &p.enabled)) {
+                      char a[256];
+                      snprintf(a, sizeof(a),
+                               "{\"name\":\"%s\",\"enabled\":%s}",
+                               p.name.c_str(), p.enabled ? "true" : "false");
+                      post_rpc("setPatchEnabled", a);
                   }
                   ImGui::SameLine();
-                  ImGui::Text("%s=%s",p.name.c_str(),p.value.c_str());
+                  ImGui::Text("%s=%s", p.name.c_str(), p.value.c_str());
                   ImGui::SameLine();
-                  if(ImGui::SmallButton("X")){
-                      char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",p.name.c_str());
-                      post_rpc("removePatch",a);
-                      s_patches.erase(s_patches.begin()+i);
+                  if (ImGui::SmallButton("X")) {
+                      char a[256];
+                      snprintf(a, sizeof(a), "{\"name\":\"%s\"}", p.name.c_str());
+                      post_rpc("removePatch", a);
+                      s_patches.erase(s_patches.begin() + i);
                       ImGui::PopID(); break;
                   }
                   ImGui::PopID();
@@ -864,35 +921,39 @@ jobs:
           }
           
           static void tab_hooks() {
-              const char* modes[]={"Java","Smali","noop"};
-              ImGui::InputText("Method##hn",s_hname,sizeof(s_hname));
-              ImGui::Combo("Mode",&s_hmode,modes,3);
-              ImGui::InputTextMultiline("Code##hc",s_hcode,sizeof(s_hcode),ImVec2(-1,80));
-              if(ImGui::Button("Add Hook") && s_hname[0]){
+              const char* modes[] = {"Java","Smali","noop"};
+              ImGui::InputText("Method##hn", s_hname, sizeof(s_hname));
+              ImGui::Combo("Mode", &s_hmode, modes, 3);
+              ImGui::InputTextMultiline("Code##hc", s_hcode, sizeof(s_hcode),
+                                         ImVec2(-1, 80));
+              if (ImGui::Button("Add Hook") && s_hname[0]) {
                   char a[2048];
-                  snprintf(a,sizeof(a),"{\"name\":\"%s\",\"mode\":\"%s\",\"code\":\"%s\"}",
-                           s_hname,modes[s_hmode],s_hcode);
-                  post_rpc("addHook",a);
-                  s_hooks.push_back({s_hname,s_hcode,true,s_hmode});
-                  s_hname[0]=s_hcode[0]=0;
+                  snprintf(a, sizeof(a),
+                           "{\"name\":\"%s\",\"mode\":\"%s\",\"code\":\"%s\"}",
+                           s_hname, modes[s_hmode], s_hcode);
+                  post_rpc("addHook", a);
+                  s_hooks.push_back({s_hname, s_hcode, true, s_hmode});
+                  s_hname[0] = s_hcode[0] = 0;
               }
               ImGui::Separator();
-              for(int i=0;i<(int)s_hooks.size();i++){
+              for (int i = 0; i < (int)s_hooks.size(); i++) {
                   ImGui::PushID(i);
-                  auto& h=s_hooks[i];
-                  if(ImGui::Checkbox("##he",&h.enabled)){
-                      char a[256]; snprintf(a,sizeof(a),
-                          "{\"name\":\"%s\",\"enabled\":%s}",
-                          h.name.c_str(),h.enabled?"true":"false");
-                      post_rpc("setHookEnabled",a);
+                  auto& h = s_hooks[i];
+                  if (ImGui::Checkbox("##he", &h.enabled)) {
+                      char a[256];
+                      snprintf(a, sizeof(a),
+                               "{\"name\":\"%s\",\"enabled\":%s}",
+                               h.name.c_str(), h.enabled ? "true" : "false");
+                      post_rpc("setHookEnabled", a);
                   }
                   ImGui::SameLine();
-                  ImGui::Text("[%s] %s",modes[h.mode],h.name.c_str());
+                  ImGui::Text("[%s] %s", modes[h.mode], h.name.c_str());
                   ImGui::SameLine();
-                  if(ImGui::SmallButton("X")){
-                      char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",h.name.c_str());
-                      post_rpc("removeHook",a);
-                      s_hooks.erase(s_hooks.begin()+i);
+                  if (ImGui::SmallButton("X")) {
+                      char a[256];
+                      snprintf(a, sizeof(a), "{\"name\":\"%s\"}", h.name.c_str());
+                      post_rpc("removeHook", a);
+                      s_hooks.erase(s_hooks.begin() + i);
                       ImGui::PopID(); break;
                   }
                   ImGui::PopID();
@@ -900,23 +961,25 @@ jobs:
           }
           
           static void tab_tracker() {
-              ImGui::InputText("Method##tn",s_tname,sizeof(s_tname));
-              if(ImGui::Button("Track") && s_tname[0]){
-                  char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",s_tname);
-                  post_rpc("addTracker",a);
-                  s_trackers.push_back({s_tname,{}});
-                  s_tname[0]=0;
+              ImGui::InputText("Method##tn", s_tname, sizeof(s_tname));
+              if (ImGui::Button("Track") && s_tname[0]) {
+                  char a[256];
+                  snprintf(a, sizeof(a), "{\"name\":\"%s\"}", s_tname);
+                  post_rpc("addTracker", a);
+                  s_trackers.push_back({s_tname, {}});
+                  s_tname[0] = 0;
               }
               ImGui::Separator();
-              for(int i=0;i<(int)s_trackers.size();i++){
+              for (int i = 0; i < (int)s_trackers.size(); i++) {
                   ImGui::PushID(i);
-                  auto& t=s_trackers[i];
-                  if(ImGui::CollapsingHeader(t.name.c_str())){
-                      for(auto& l:t.log) ImGui::TextUnformatted(l.c_str());
-                      if(ImGui::SmallButton("Remove")){
-                          char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",t.name.c_str());
-                          post_rpc("removeTracker",a);
-                          s_trackers.erase(s_trackers.begin()+i);
+                  auto& t = s_trackers[i];
+                  if (ImGui::CollapsingHeader(t.name.c_str())) {
+                      for (auto& l : t.log) ImGui::TextUnformatted(l.c_str());
+                      if (ImGui::SmallButton("Remove")) {
+                          char a[256];
+                          snprintf(a, sizeof(a), "{\"name\":\"%s\"}", t.name.c_str());
+                          post_rpc("removeTracker", a);
+                          s_trackers.erase(s_trackers.begin() + i);
                           ImGui::PopID(); break;
                       }
                   }
@@ -925,94 +988,114 @@ jobs:
           }
           
           static void tab_recorder() {
-              if(!s_rec_on){
-                  if(ImGui::Button("Start")){
-                      s_rec_on=true; s_rec_log.clear();
-                      post_rpc("startRecorder","{}");
+              if (!s_rec_on) {
+                  if (ImGui::Button("Start")) {
+                      s_rec_on = true; s_rec_log.clear();
+                      post_rpc("startRecorder", "{}");
                   }
               } else {
-                  if(ImGui::Button("Stop")){ s_rec_on=false; post_rpc("stopRecorder","{}"); }
+                  if (ImGui::Button("Stop")) {
+                      s_rec_on = false;
+                      post_rpc("stopRecorder", "{}");
+                  }
                   ImGui::SameLine();
-                  ImGui::TextColored(ImVec4(0,1,0,1),"REC");
+                  ImGui::TextColored(ImVec4(0,1,0,1), "REC");
               }
               ImGui::Separator();
-              ImGui::BeginChild("rl",ImVec2(0,180),true);
-              for(auto& l:s_rec_log) ImGui::TextUnformatted(l.c_str());
+              ImGui::BeginChild("rl", ImVec2(0, 180), true);
+              for (auto& l : s_rec_log) ImGui::TextUnformatted(l.c_str());
               ImGui::SetScrollHereY(1.f);
               ImGui::EndChild();
           }
           
           static void tab_monitor() {
               ImGui::TextDisabled("(best-effort: Java HTTP + SSLContext.init)");
-              if(!s_mon_on){
-                  if(ImGui::Button("Start")){
-                      s_mon_on=true; s_mon_log.clear();
-                      post_rpc("startMonitor","{}");
+              if (!s_mon_on) {
+                  if (ImGui::Button("Start")) {
+                      s_mon_on = true; s_mon_log.clear();
+                      post_rpc("startMonitor", "{}");
                   }
               } else {
-                  if(ImGui::Button("Stop")){ s_mon_on=false; post_rpc("stopMonitor","{}"); }
+                  if (ImGui::Button("Stop")) {
+                      s_mon_on = false;
+                      post_rpc("stopMonitor", "{}");
+                  }
                   ImGui::SameLine();
-                  ImGui::TextColored(ImVec4(0,1,0,1),"MON");
+                  ImGui::TextColored(ImVec4(0,1,0,1), "MON");
               }
               ImGui::Separator();
-              ImGui::BeginChild("ml",ImVec2(0,180),true);
-              for(auto& l:s_mon_log) ImGui::TextUnformatted(l.c_str());
+              ImGui::BeginChild("ml", ImVec2(0, 180), true);
+              for (auto& l : s_mon_log) ImGui::TextUnformatted(l.c_str());
               ImGui::SetScrollHereY(1.f);
               ImGui::EndChild();
           }
           
           static void tab_script() {
-              ImGui::InputTextMultiline("##sc",s_script,sizeof(s_script),ImVec2(-1,140));
-              if(ImGui::Button("Run")){
+              ImGui::InputTextMultiline("##sc", s_script, sizeof(s_script),
+                                         ImVec2(-1, 140));
+              if (ImGui::Button("Run")) {
                   s_script_out.clear();
-                  char a[8256]; snprintf(a,sizeof(a),"{\"src\":\"%s\"}",s_script);
-                  post_rpc("evalScript",a);
+                  char a[8256];
+                  snprintf(a, sizeof(a), "{\"src\":\"%s\"}", s_script);
+                  post_rpc("evalScript", a);
               }
               ImGui::SameLine();
-              if(ImGui::Button("Clear")) s_script_out.clear();
+              if (ImGui::Button("Clear")) s_script_out.clear();
               ImGui::Separator();
-              ImGui::BeginChild("so",ImVec2(0,120),true);
-              for(auto& l:s_script_out) ImGui::TextUnformatted(l.c_str());
+              ImGui::BeginChild("so", ImVec2(0, 120), true);
+              for (auto& l : s_script_out) ImGui::TextUnformatted(l.c_str());
               ImGui::EndChild();
           }
           
           static void tab_classes() {
-              ImGui::InputText("Class##cn",s_cname,sizeof(s_cname));
+              ImGui::InputText("Class##cn", s_cname, sizeof(s_cname));
               ImGui::SameLine();
-              if(ImGui::Button("Open") && s_cname[0]){
-                  char a[256]; snprintf(a,sizeof(a),"{\"class\":\"%s\"}",s_cname);
-                  post_rpc("openClass",a);
-                  s_classes.push_back({s_cname,true,{},{}});
-                  s_cname[0]=0;
+              if (ImGui::Button("Open") && s_cname[0]) {
+                  char a[256];
+                  snprintf(a, sizeof(a), "{\"class\":\"%s\"}", s_cname);
+                  post_rpc("openClass", a);
+                  s_classes.push_back({s_cname, {}, {}});
+                  s_cname[0] = 0;
               }
-              for(int i=0;i<(int)s_classes.size();i++){
+              for (int i = 0; i < (int)s_classes.size(); i++) {
                   ImGui::PushID(i);
-                  auto& c=s_classes[i];
-                  if(ImGui::CollapsingHeader(c.cname.c_str())){
-                      if(ImGui::Button("Instances")){
-                          char a[256]; snprintf(a,sizeof(a),"{\"class\":\"%s\"}",c.cname.c_str());
-                          post_rpc("listInstances",a);
+                  auto& c = s_classes[i];
+                  if (ImGui::CollapsingHeader(c.cname.c_str())) {
+                      if (ImGui::Button("List Instances")) {
+                          char a[256];
+                          snprintf(a, sizeof(a), "{\"class\":\"%s\"}", c.cname.c_str());
+                          post_rpc("listInstances", a);
                       }
-                      for(auto& m:c.methods){
-                          ImGui::BulletText("%s",m.c_str()); ImGui::SameLine();
-                          if(ImGui::SmallButton("Hook")){
-                              char a[256]; snprintf(a,sizeof(a),
-                                  "{\"class\":\"%s\",\"method\":\"%s\"}",c.cname.c_str(),m.c_str());
-                              post_rpc("hookMethod",a);
+                      ImGui::Text("Methods:");
+                      for (auto& m : c.methods) {
+                          ImGui::BulletText("%s", m.c_str());
+                          ImGui::SameLine();
+                          if (ImGui::SmallButton("Hook")) {
+                              char a[256];
+                              snprintf(a, sizeof(a),
+                                       "{\"class\":\"%s\",\"method\":\"%s\"}",
+                                       c.cname.c_str(), m.c_str());
+                              post_rpc("hookMethod", a);
                           }
                           ImGui::SameLine();
-                          if(ImGui::SmallButton("Track")){
-                              char a[256]; snprintf(a,sizeof(a),
-                                  "{\"class\":\"%s\",\"method\":\"%s\"}",c.cname.c_str(),m.c_str());
-                              post_rpc("trackMethod",a);
+                          if (ImGui::SmallButton("Track")) {
+                              char a[256];
+                              snprintf(a, sizeof(a),
+                                       "{\"class\":\"%s\",\"method\":\"%s\"}",
+                                       c.cname.c_str(), m.c_str());
+                              post_rpc("trackMethod", a);
                           }
                       }
-                      for(auto& f:c.fields){
-                          ImGui::BulletText("%s",f.c_str()); ImGui::SameLine();
-                          if(ImGui::SmallButton("Patch")){
-                              char a[256]; snprintf(a,sizeof(a),
-                                  "{\"class\":\"%s\",\"field\":\"%s\"}",c.cname.c_str(),f.c_str());
-                              post_rpc("patchField",a);
+                      ImGui::Text("Fields:");
+                      for (auto& f : c.fields) {
+                          ImGui::BulletText("%s", f.c_str());
+                          ImGui::SameLine();
+                          if (ImGui::SmallButton("Patch")) {
+                              char a[256];
+                              snprintf(a, sizeof(a),
+                                       "{\"class\":\"%s\",\"field\":\"%s\"}",
+                                       c.cname.c_str(), f.c_str());
+                              post_rpc("patchField", a);
                           }
                       }
                   }
@@ -1021,21 +1104,21 @@ jobs:
           }
           
           void menu_draw() {
-              if(!s_visible) return;
+              if (!s_visible) return;
               ImGuiIO& io = ImGui::GetIO();
-              ImGui::SetNextWindowPos(ImVec2(20,20),ImGuiCond_Once);
-              ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x*.75f,500),ImGuiCond_Once);
+              ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
+              ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * .75f, 500), ImGuiCond_Once);
               ImGui::SetNextWindowBgAlpha(s_opacity);
-              ImGui::Begin("Dex-tool v1.0",&s_visible,ImGuiWindowFlags_NoCollapse);
-              if(ImGui::BeginTabBar("tb")){
-                  if(ImGui::BeginTabItem("Settings")) { tab_settings(); ImGui::EndTabItem(); }
-                  if(ImGui::BeginTabItem("Patches"))  { tab_patches();  ImGui::EndTabItem(); }
-                  if(ImGui::BeginTabItem("Hooks"))    { tab_hooks();    ImGui::EndTabItem(); }
-                  if(ImGui::BeginTabItem("Tracker"))  { tab_tracker();  ImGui::EndTabItem(); }
-                  if(ImGui::BeginTabItem("Recorder")) { tab_recorder(); ImGui::EndTabItem(); }
-                  if(ImGui::BeginTabItem("Monitor"))  { tab_monitor();  ImGui::EndTabItem(); }
-                  if(ImGui::BeginTabItem("Script"))   { tab_script();   ImGui::EndTabItem(); }
-                  if(ImGui::BeginTabItem("Classes"))  { tab_classes();  ImGui::EndTabItem(); }
+              ImGui::Begin("Dex-tool v1.0", &s_visible, ImGuiWindowFlags_NoCollapse);
+              if (ImGui::BeginTabBar("tb")) {
+                  if (ImGui::BeginTabItem("Settings")) { tab_settings(); ImGui::EndTabItem(); }
+                  if (ImGui::BeginTabItem("Patches"))  { tab_patches();  ImGui::EndTabItem(); }
+                  if (ImGui::BeginTabItem("Hooks"))    { tab_hooks();    ImGui::EndTabItem(); }
+                  if (ImGui::BeginTabItem("Tracker"))  { tab_tracker();  ImGui::EndTabItem(); }
+                  if (ImGui::BeginTabItem("Recorder")) { tab_recorder(); ImGui::EndTabItem(); }
+                  if (ImGui::BeginTabItem("Monitor"))  { tab_monitor();  ImGui::EndTabItem(); }
+                  if (ImGui::BeginTabItem("Script"))   { tab_script();   ImGui::EndTabItem(); }
+                  if (ImGui::BeginTabItem("Classes"))  { tab_classes();  ImGui::EndTabItem(); }
                   ImGui::EndTabBar();
               }
               ImGui::End();
@@ -1043,7 +1126,7 @@ jobs:
           DXTMNC
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE main.cpp
+      # main.cpp
       # ═══════════════════════════════════════════════════════════
       - name: Generate main.cpp
         run: |
@@ -1069,14 +1152,15 @@ jobs:
               close(fd);
           }
           
-          // JNI_OnLoad ordering (from known-pitfalls):
-          //   1. Store JVM
-          //   2. Write entry marker (raw I/O, no gum)
+          // JNI_OnLoad ordering (see known-pitfalls in README):
+          //   1. Store JVM pointer
+          //   2. Write entry marker (raw I/O — no gum)
           //   3. logger_init (raw I/O only)
-          //   4. install_swap_hook() via Dobby
-          //   5. Write done marker
-          //   gum_init_embedded() fires LATER in overlay.cpp on GL thread
-          //   so a valid EGL context exists when it's called.
+          //   4. overlay_set_java_vm
+          //   5. install_swap_hook() via Dobby
+          //   6. Write done markers
+          // gum_init_embedded() fires LATER in overlay.cpp on the GL thread,
+          // ensuring a valid EGL context exists when it is called.
           extern "C" JNIEXPORT jint JNICALL
           JNI_OnLoad(JavaVM* vm, void*) {
               g_jvm_global = vm;
@@ -1103,7 +1187,7 @@ jobs:
           DXTMAIN
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE agent.js + embed as C array in agent_bundle_embed.h
+      # agent.js  +  embed as agent_bundle_embed.h
       # ═══════════════════════════════════════════════════════════
       - name: Generate agent.js
         run: |
@@ -1121,6 +1205,7 @@ jobs:
           }
           
           rpc.exports = {
+          
               addPatch: function(name, value) {
                   try {
                       Java.perform(function() {
@@ -1133,9 +1218,12 @@ jobs:
                           var t = f.getType().getName();
                           if (t==='int'||t==='long'||t==='short'||t==='byte')
                               f.set(null, parseInt(value));
-                          else if (t==='boolean') f.set(null, value==='true');
-                          else if (t==='float'||t==='double') f.set(null, parseFloat(value));
-                          else f.set(null, value);
+                          else if (t==='boolean')
+                              f.set(null, value === 'true');
+                          else if (t==='float'||t==='double')
+                              f.set(null, parseFloat(value));
+                          else
+                              f.set(null, value);
                           patches[name] = { value: value, enabled: true };
                           sendMsg('patchApplied', { name: name });
                       });
@@ -1165,7 +1253,7 @@ jobs:
                                   return null;
                               };
                           } else if (mode === 'Java') {
-                              var fn = new Function('Java','send','args', code);
+                              var fn = new Function('Java', 'send', 'args', code);
                               jcls[method].implementation = function() {
                                   return fn(Java, send, Array.from(arguments));
                               };
@@ -1181,7 +1269,7 @@ jobs:
               removeHook: function(name) {
                   try {
                       Java.perform(function() {
-                          var parts=name.split('.'); var m=parts.pop();
+                          var parts = name.split('.'); var m = parts.pop();
                           Java.use(parts.join('.'))[m].implementation = null;
                           delete hooks[name];
                           sendMsg('hookRemoved', { name: name });
@@ -1197,122 +1285,117 @@ jobs:
               addTracker: function(name) {
                   try {
                       Java.perform(function() {
-                          var parts=name.split('.'); var m=parts.pop();
-                          var jcls=Java.use(parts.join('.'));
+                          var parts = name.split('.'); var m = parts.pop();
+                          var jcls  = Java.use(parts.join('.'));
                           jcls[m].implementation = function() {
-                              var args=Array.from(arguments).map(String);
+                              var args = Array.from(arguments).map(String);
                               var ret;
-                              try { ret=this[m].apply(this,arguments); } catch(e){ ret=null; }
-                              sendMsg('trackerEvent',{name:name,args:args,ret:String(ret)});
+                              try { ret = this[m].apply(this, arguments); } catch(e) { ret = null; }
+                              sendMsg('trackerEvent', { name: name, args: args, ret: String(ret) });
                               return ret;
                           };
-                          trackers[name]=true;
-                          sendMsg('trackerAdded',{name:name});
+                          trackers[name] = true;
+                          sendMsg('trackerAdded', { name: name });
                       });
-                  } catch(e){ sendMsg('error',{fn:'addTracker',msg:e.message}); }
+                  } catch(e) { sendMsg('error', { fn: 'addTracker', msg: e.message }); }
               },
           
               removeTracker: function(name) {
                   try {
                       Java.perform(function() {
-                          var parts=name.split('.'); var m=parts.pop();
-                          Java.use(parts.join('.'))[m].implementation=null;
+                          var parts = name.split('.'); var m = parts.pop();
+                          Java.use(parts.join('.'))[m].implementation = null;
                           delete trackers[name];
-                          sendMsg('trackerRemoved',{name:name});
+                          sendMsg('trackerRemoved', { name: name });
                       });
-                  } catch(e){ sendMsg('error',{fn:'removeTracker',msg:e.message}); }
+                  } catch(e) { sendMsg('error', { fn: 'removeTracker', msg: e.message }); }
               },
           
               startRecorder: function() {
-                  recOn=true;
+                  recOn = true;
                   Java.perform(function() {
                       Java.enumerateLoadedClassesSync().forEach(function(cls) {
                           try {
-                              var jcls=Java.use(cls);
+                              var jcls = Java.use(cls);
                               jcls.class.getDeclaredMethods().forEach(function(md) {
-                                  var mn=md.getName();
+                                  var mn = md.getName();
                                   try {
                                       jcls[mn].overloads.forEach(function(ovl) {
-                                          ovl.implementation=function() {
-                                              if (!recOn){ ovl.implementation=null; return this[mn].apply(this,arguments); }
-                                              sendMsg('recorded',{cls:cls,method:mn,args:Array.from(arguments).map(String)});
-                                              return this[mn].apply(this,arguments);
+                                          ovl.implementation = function() {
+                                              if (!recOn) { ovl.implementation = null; return this[mn].apply(this, arguments); }
+                                              sendMsg('recorded', { cls: cls, method: mn, args: Array.from(arguments).map(String) });
+                                              return this[mn].apply(this, arguments);
                                           };
                                       });
-                                  } catch(ignored){}
+                                  } catch(ignored) {}
                               });
-                          } catch(ignored){}
+                          } catch(ignored) {}
                       });
                   });
-                  sendMsg('recorderStarted',{});
+                  sendMsg('recorderStarted', {});
               },
           
-              stopRecorder: function() { recOn=false; sendMsg('recorderStopped',{}); },
+              stopRecorder: function() { recOn = false; sendMsg('recorderStopped', {}); },
           
               startMonitor: function() {
-                  monOn=true;
+                  monOn = true;
                   Java.perform(function() {
                       try {
-                          var SSLCtx=Java.use('javax.net.ssl.SSLContext');
+                          var SSLCtx = Java.use('javax.net.ssl.SSLContext');
                           SSLCtx.init.overload(
                               '[Ljavax.net.ssl.KeyManager;',
                               '[Ljavax.net.ssl.TrustManager;',
                               'java.security.SecureRandom'
-                          ).implementation=function(km,tm,sr) {
-                              sendMsg('sslInit',{note:'SSLContext.init intercepted'});
-                              return this.init(km,tm,sr);
+                          ).implementation = function(km, tm, sr) {
+                              sendMsg('sslInit', { note: 'SSLContext.init intercepted' });
+                              return this.init(km, tm, sr);
                           };
-                      } catch(e){}
-                      try {
-                          var OkHttp=Java.use('okhttp3.OkHttpClient');
-                          sendMsg('monitorInfo',{note:'OkHttp detected'});
-                      } catch(e){}
+                      } catch(e) {}
+                      try { Java.use('okhttp3.OkHttpClient'); sendMsg('monitorInfo', { note: 'OkHttp detected' }); } catch(e) {}
                   });
-                  sendMsg('monitorStarted',{});
+                  sendMsg('monitorStarted', {});
               },
           
-              stopMonitor: function() { monOn=false; sendMsg('monitorStopped',{}); },
+              stopMonitor: function() { monOn = false; sendMsg('monitorStopped', {}); },
           
               evalScript: function(src) {
-                  try {
-                      var r=eval(src);
-                      sendMsg('scriptResult',{result:String(r)});
-                  } catch(e){ sendMsg('scriptError',{msg:e.message}); }
+                  try { sendMsg('scriptResult', { result: String(eval(src)) }); }
+                  catch(e) { sendMsg('scriptError', { msg: e.message }); }
               },
           
               openClass: function(className) {
                   try {
                       Java.perform(function() {
-                          var jcls=Java.use(className);
-                          sendMsg('classInfo',{
-                              class: className,
-                              methods: jcls.class.getDeclaredMethods().map(function(m){return m.getName();}),
-                              fields:  jcls.class.getDeclaredFields().map(function(f){return f.getName();})
+                          var jcls = Java.use(className);
+                          sendMsg('classInfo', {
+                              class:   className,
+                              methods: jcls.class.getDeclaredMethods().map(function(m) { return m.getName(); }),
+                              fields:  jcls.class.getDeclaredFields().map(function(f)  { return f.getName(); })
                           });
                       });
-                  } catch(e){ sendMsg('error',{fn:'openClass',msg:e.message}); }
+                  } catch(e) { sendMsg('error', { fn: 'openClass', msg: e.message }); }
               },
           
               listInstances: function(className) {
                   try {
                       Java.perform(function() {
-                          var list=[];
-                          Java.choose(className,{
-                              onMatch:    function(i){ list.push(String(i)); if(list.length>=20)return 'stop'; },
-                              onComplete: function(){ sendMsg('instanceList',{class:className,instances:list}); }
+                          var list = [];
+                          Java.choose(className, {
+                              onMatch:    function(i) { list.push(String(i)); if (list.length >= 20) return 'stop'; },
+                              onComplete: function()  { sendMsg('instanceList', { class: className, instances: list }); }
                           });
                       });
-                  } catch(e){ sendMsg('error',{fn:'listInstances',msg:e.message}); }
+                  } catch(e) { sendMsg('error', { fn: 'listInstances', msg: e.message }); }
               },
           
-              hookMethod:  function(cls,m){ this.addHook(cls+'.'+m,'noop',''); },
-              trackMethod: function(cls,m){ this.addTracker(cls+'.'+m); },
-              patchField:  function(cls,f){ sendMsg('info',{msg:'patchField: '+cls+'.'+f}); }
+              hookMethod:  function(cls, m) { this.addHook(cls + '.' + m, 'noop', ''); },
+              trackMethod: function(cls, m) { this.addTracker(cls + '.' + m); },
+              patchField:  function(cls, f) { sendMsg('info', { msg: 'patchField: ' + cls + '.' + f }); }
           };
           
           recv(function onMsg(msg) {
-              if (msg && msg.type==='rpc' && rpc.exports[msg.fn]) {
-                  var a=msg.args||{};
+              if (msg && msg.type === 'rpc' && rpc.exports[msg.fn]) {
+                  var a = msg.args || {};
                   rpc.exports[msg.fn].apply(rpc.exports, Object.values(a));
               }
               recv(onMsg);
@@ -1324,16 +1407,16 @@ jobs:
       - name: Embed agent.js as C array
         run: |
           cat > /tmp/gen_embed.js << 'DXTNJS'
-          const fs   = require('fs');
-          const data = fs.readFileSync('agent/agent.js');
+          const fs    = require('fs');
+          const data  = fs.readFileSync('agent/agent.js');
           const bytes = Array.from(data);
-          let out = '// Auto-generated from agent/agent.js — do not edit manually\n';
+          let out = '// Auto-generated from agent/agent.js\n';
           out += '#pragma once\n#include <stddef.h>\n\n';
           out += 'static const char g_agent_js[] = {\n';
           let line = '';
           for (let i = 0; i < bytes.length; i++) {
-              line += '0x' + bytes[i].toString(16).padStart(2,'0') + ',';
-              if ((i+1) % 16 === 0) { out += '    ' + line + '\n'; line = ''; }
+              line += '0x' + bytes[i].toString(16).padStart(2, '0') + ',';
+              if ((i + 1) % 16 === 0) { out += '    ' + line + '\n'; line = ''; }
           }
           if (line) out += '    ' + line + '\n';
           out += '    0x00\n};\n';
@@ -1344,7 +1427,7 @@ jobs:
           node /tmp/gen_embed.js
 
       # ═══════════════════════════════════════════════════════════
-      # BUILD libtool.so for both ABIs
+      # BUILD libtool.so  arm64-v8a + armeabi-v7a
       # ═══════════════════════════════════════════════════════════
       - name: Build libtool.so arm64-v8a
         run: |
@@ -1356,7 +1439,8 @@ jobs:
             -GNinja
           ninja -C build-arm64 -j"$(nproc)" tool
           STRIP="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          "$STRIP" --strip-unneeded build-arm64/libtool.so -o out/lib/arm64-v8a/libtool.so
+          "$STRIP" --strip-unneeded build-arm64/libtool.so \
+                   -o out/lib/arm64-v8a/libtool.so
           echo "arm64 size: $(du -sh out/lib/arm64-v8a/libtool.so)"
 
       - name: Build libtool.so armeabi-v7a
@@ -1369,11 +1453,12 @@ jobs:
             -GNinja
           ninja -C build-arm -j"$(nproc)" tool
           STRIP="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          "$STRIP" --strip-unneeded build-arm/libtool.so -o out/lib/armeabi-v7a/libtool.so
+          "$STRIP" --strip-unneeded build-arm/libtool.so \
+                   -o out/lib/armeabi-v7a/libtool.so
           echo "armeabi-v7a size: $(du -sh out/lib/armeabi-v7a/libtool.so)"
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE Sample App Java sources
+      # SAMPLE APP — Java sources
       # ═══════════════════════════════════════════════════════════
       - name: Generate DexToolApp.java
         run: |
@@ -1383,15 +1468,16 @@ jobs:
           import android.app.Application;
           import android.util.Log;
           import java.io.File;
+          import java.io.FileInputStream;
           import java.io.FileOutputStream;
           import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
           
           /**
-           * DexToolApp — Application subclass that loads libtool.so.
-           *
-           * ORDERING (from known-pitfalls):
-           *   1. writeBootMarker()       before loadLibrary
-           *   2. startCopierThread()     BEFORE loadLibrary so logs flush on crash
+           * Ordering (from known-pitfalls):
+           *   1. writeBootMarker()
+           *   2. startCopierThread()   <- BEFORE loadLibrary so logs flush on crash
            *   3. Thread.sleep(500)
            *   4. installUncaughtHandler()
            *   5. System.loadLibrary("tool")
@@ -1440,25 +1526,28 @@ jobs:
           
               private void copyLogs() throws IOException {
                   String[] names = {"dextool.log","dextool-debug.log","dextool-crash.log"};
-                  File dst = new File(DL);
-                  dst.mkdirs();
+                  new File(DL).mkdirs();
                   for (String n : names) {
                       File s = new File(getFilesDir(), "dextool-logs/" + n);
                       if (!s.exists()) continue;
-                      File d = new File(dst, n);
-                      try (java.io.InputStream is  = new java.io.FileInputStream(s);
-                           java.io.OutputStream os = new FileOutputStream(d, true)) {
-                          byte[] buf = new byte[8192]; int len;
+                      File d = new File(DL, n);
+                      try (InputStream  is = new FileInputStream(s);
+                           OutputStream os = new FileOutputStream(d, true)) {
+                          byte[] buf = new byte[8192];
+                          int len;
                           while ((len = is.read(buf)) != -1) os.write(buf, 0, len);
                       }
                   }
               }
           
               private void installUncaughtHandler() {
-                  Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+                  Thread.UncaughtExceptionHandler prev =
+                      Thread.getDefaultUncaughtExceptionHandler();
                   Thread.setDefaultUncaughtExceptionHandler((thr, ex) -> {
-                      try (FileOutputStream f = new FileOutputStream(DL+"/dextool-crash.log",true)) {
-                          f.write(("JAVA_CRASH thr=" + thr.getName() + " " + ex + "\n").getBytes());
+                      try (FileOutputStream f =
+                               new FileOutputStream(DL + "/dextool-crash.log", true)) {
+                          f.write(("JAVA_CRASH thr=" + thr.getName()
+                                    + " " + ex + "\n").getBytes());
                       } catch (IOException ignored) {}
                       if (prev != null) prev.uncaughtException(thr, ex);
                   });
@@ -1499,7 +1588,7 @@ jobs:
           DXTMAINAJ
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE Sample App Gradle + Manifest
+      # SAMPLE APP — Manifest + Gradle
       # ═══════════════════════════════════════════════════════════
       - name: Generate Android Manifest and resources
         run: |
@@ -1583,7 +1672,6 @@ jobs:
               implementation 'androidx.appcompat:appcompat:1.6.1'
           }
           DXTAPPB
-          # local.properties for SDK path
           echo "sdk.dir=$ANDROID_HOME" > sample-app/local.properties
 
       # ═══════════════════════════════════════════════════════════
@@ -1616,9 +1704,9 @@ jobs:
           echo "sample-nolib-signed.apk: $(du -sh "$GITHUB_WORKSPACE/sample-nolib-signed.apk")"
 
       # ═══════════════════════════════════════════════════════════
-      # GENERATE README.md
+      # README + .gitignore
       # ═══════════════════════════════════════════════════════════
-      - name: Generate README.md
+      - name: Generate README.md and .gitignore
         run: |
           cat > README.md << 'DXTRDME'
           # Dex-tool
@@ -1632,7 +1720,7 @@ jobs:
               1. Take any target APK.
               2. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
               3. Inject System.loadLibrary("tool") into the launcher Activity smali
-                 or Application subclass onCreate().
+                 or into an Application subclass onCreate().
               4. Copy smali-fat.jar into the APK assets/.
               5. Re-sign and install.
           
@@ -1640,18 +1728,18 @@ jobs:
           
               libtool.so
                 JNI_OnLoad
-                  write boot marker (raw I/O)
+                  write boot marker (raw I/O, no gum)
                   logger_init()
                   install_swap_hook() via Dobby
                 eglSwapBuffers replacement (GL thread, first call only)
-                  gum_init_embedded()           <- FIRST gum call, context valid
-                  spawn frida pthread           <- GumJS / QuickJS agent
+                  gum_init_embedded()      <- FIRST gum call, valid EGL context
+                  spawn frida pthread      <- GumJS / QuickJS agent
                   touch_install_hooks()
-                  imgui_init()                  <- guarded: ES3 only
+                  imgui_init()             <- guarded: OpenGL ES 3 only
                 per-frame
-                  inject touch events into ImGui
+                  inject touch into ImGui
                   ImGui::NewFrame / menu_draw / Render
-                  g_orig_swap()                 <- never recurses
+                  g_orig_swap()            <- never recurses into eglSwapBuffers symbol
           
           ## Menu Tabs
           
@@ -1660,11 +1748,11 @@ jobs:
               Hooks     hook methods: Java JS replacement, Smali recompile, noop
               Tracker   log method calls with args and return values
               Recorder  capture all Java method calls while active
-              Monitor   network interception best-effort (SSLContext.init + OkHttp)
+              Monitor   network interception best-effort (SSLContext.init)
               Script    run arbitrary Frida JS in the embedded QuickJS runtime
               Classes   browse loaded classes, fields, methods, instances
           
-          ## Diagnostic files written to /sdcard/Download/
+          ## Diagnostic files in /sdcard/Download/
           
               dextool-boot.marker   DexToolApp.onCreate BEFORE loadLibrary
               dextool-jni.marker    JNI_OnLoad at 4 checkpoints
@@ -1684,18 +1772,21 @@ jobs:
               Smali hook mode uses InMemoryDexClassLoader (API 26+ only).
               Re-loading the same class name requires a fresh ClassLoader instance.
           
-              Network monitor is best-effort. It hooks Java SSLContext.init and OkHttp.
+              Network monitor is best-effort. It hooks Java SSLContext.init.
               Native BoringSSL interception is not included in this release.
           
-              ImGui overlay requires OpenGL ES 3.0+. ES 2.x targets degrade gracefully
-              (gum_init_embedded and the Frida agent still run; only the overlay is off).
+              ImGui overlay requires OpenGL ES 3.0+. ES 2.x targets degrade
+              gracefully (Frida agent still runs; only the overlay is off).
           
-              gum_init_embedded is deferred to the first eglSwapBuffers call so a valid
-              EGL context exists when it fires, preventing early-init crashes.
+              gum_init_embedded() is deferred to the first eglSwapBuffers call
+              so a valid EGL context exists when it fires, preventing early crashes.
+          
+          ## Build notes
+          
+              Dobby ARM64 asm patch: Dobby master uses macOS @PAGE/@PAGEOFF Mach-O
+              relocations in closure_bridge_arm64.asm. The workflow patches all .asm
+              files to ELF lo12 syntax (adrp sym / add :lo12:sym) before building.
           DXTRDME
-
-      - name: Generate .gitignore
-        run: |
           cat > .gitignore << 'DXTGI'
           build-arm64/
           build-arm/
@@ -1729,7 +1820,7 @@ jobs:
             sample-nolib-signed.apk
 
       # ═══════════════════════════════════════════════════════════
-      # COMMIT AND PUSH ALL GENERATED SOURCES TO dev
+      # COMMIT AND PUSH TO dev
       # ═══════════════════════════════════════════════════════════
       - name: Commit and push generated sources to dev
         run: |
@@ -1748,7 +1839,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "chore: Dex-tool scaffold — full source generated by CI [skip ci]"
+            git commit -m "chore: Dex-tool scaffold — Dobby ELF patch + full source [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
