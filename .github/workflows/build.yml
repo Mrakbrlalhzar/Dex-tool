@@ -94,25 +94,23 @@ jobs:
 
           Dex-tool is a standalone in-process Android instrumentation library for ordinary APKs.
 
-          Verified build pins and API decisions:
-          - Frida: 16.7.19, umbrella commit observed by git checkout: 3325d05539d7c940a1460e66a06d673a95f5557c.
-          - Android NDK: 25.2.9519653, exported as ANDROID_NDK_ROOT for Frida.
-          - Dobby: jmpews/Dobby, pinned to stable commit 0932d69c320e786672361ab53825ba8f4245e9d3 (version 2023.4.14 line). Header: dobby.h. CMake target: dobby_static.
-          - ImGui: ocornut/imgui, built from source.
-          - frida-compile: npm package frida-compile@10.2.1, invoked as frida-compile agent.js -o agent_bundle.js with no -c flag.
-          - smali: com.android.tools.smali:smali 3.x coordinates. This workflow builds google/smali 3.0.9 fat jar from source and bundles it into assets/smali.jar.
+          Build methodology:
+          - Frida 16.7.19 is built from source, then its official devkit generation script
+            (releng/devkit.py) is invoked as a Python module to produce the amalgamated
+            libfrida-gumjs.a and frida-gumjs.h. This single archive contains ALL transitive
+            dependencies (glib, gobject, gio, gvdb, capstone, quickjs, json-glib, minizip,
+            libffi, openssl, libtcc, libunwind, libdwarf, lzma, z) pre-linked with correct
+            symbol visibility. No manual dependency hunting is needed.
+          - Dobby: jmpews/Dobby, pinned to stable commit 0932d69c320e786672361ab53825ba8f4245e9d3.
+          - ImGui: ocornut/imgui v1.90.9, built from source.
+          - frida-compile: npm package frida-compile@10.2.1, invoked without -c flag.
+          - smali: google/smali 3.0.9 fat jar built from source.
 
-          Critical Frida correction:
-          The previous AI failed to locate the Frida devkit and hit an ImportError when running devkit.py. We completely bypass devkit.py. Instead, we manually extract all static libraries (.a) and headers from the Frida SDK sysroot.
-          CRITICAL FIX: Meson creates "thin archives" for static libraries, which only contain references to object files. When we copy these archives to a different directory, the object files are missing, causing linker errors. We now use llvm-ar to extract the object files from the thin archives and re-create them as regular archives. This ensures the linker can find all the object files.
-          CRITICAL FIX 2: The previous find command copied ALL .a files, including those built for the BUILD machine (linux-x86_64). This caused "incompatible with aarch64linux" linker errors. We now ONLY copy .a files from the target architecture directories (dist-arm64/lib and deps/sdk-android-arm64/lib).
-          CRITICAL FIX 3: Copying ALL .a files from dist-arm64/lib caused duplicate symbol errors because libfrida-core-1.0.a and libfrida-base-1.0.a contain the same symbols. We now ONLY copy the libfrida-gum*.a libraries from dist-arm64/lib, and then copy all the SDK libraries. This avoids the duplicate symbol errors.
-          CRITICAL FIX 4: Using -Wl,--whole-archive on ALL libraries caused undefined symbol errors because it forced the linker to include object files from libraries like libgio-2.0.a and liblwip.a that have unresolved dependencies. We now use -Wl,--whole-archive on the Frida Gum libraries AND the GLib libraries (libglib-2.0.a, libgobject-2.0.a, libgio-2.0.a, libgmodule-2.0.a, libgthread-2.0.a, libgvdb.a), and link the other libraries normally. This resolves the hidden symbol errors in GLib while avoiding the unresolved dependencies in other libraries.
-
-          Usage:
-              Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
-              Add System.loadLibrary("tool") to the target app Application or launcher Activity.
-              Re-sign and install the APK.
+          Limitations:
+          - Overlay requires OpenGL ES 3+. ES2-only apps disable ImGui permanently.
+          - Touch input uses MotionEvent fallback via Activity.dispatchTouchEvent.
+          - Network/TLS monitor is best-effort.
+          - Full runtime smali reassembly is not reliable on API 26-28.
           EOF
 
           cat > libtool/CMakeLists.txt << 'EOF'
@@ -124,55 +122,6 @@ jobs:
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui)
           include_directories(${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends)
-
-          # Find ONLY the specific dependency include directories we need from the Frida SDK sysroots
-          # This avoids including directories like lwip, sys, net, etc. that contain system headers
-          file(GLOB SDK_INCLUDE_DIRS
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/glib-2.0"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/capstone"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/quickjs"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/json-glib-1.0"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/libffi"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/openssl"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/libunwind"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/libdwarf"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/include/minizip"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm64/lib/glib-2.0/include"
-            
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/glib-2.0"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/capstone"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/quickjs"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/json-glib-1.0"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/libffi"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/openssl"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/libunwind"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/libdwarf"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/include/minizip"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/deps/sdk-android-arm/lib/glib-2.0/include"
-            
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/glib-2.0"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/capstone"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/quickjs"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/json-glib-1.0"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/libffi"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/openssl"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/libunwind"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/libdwarf"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/include/minizip"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm64/lib/glib-2.0/include"
-            
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/glib-2.0"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/capstone"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/quickjs"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/json-glib-1.0"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/libffi"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/openssl"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/libunwind"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/libdwarf"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/include/minizip"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../frida/build/sdk-android-arm/lib/glib-2.0/include"
-          )
-          include_directories(${SDK_INCLUDE_DIRS})
 
           file(GLOB IMGUI_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/imgui/*.cpp"
@@ -193,28 +142,13 @@ jobs:
           find_library(android-lib android)
           find_library(dl-lib dl)
 
-          file(GLOB FRIDA_LIBS "${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/*.a")
-          if(NOT FRIDA_LIBS)
-            message(FATAL_ERROR "Frida Gum libraries not found in ${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/")
+          set(FRIDA_GUMJS_LIB ${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/libfrida-gumjs.a)
+          if(NOT EXISTS ${FRIDA_GUMJS_LIB})
+            message(FATAL_ERROR "Frida GumJS devkit not found at ${FRIDA_GUMJS_LIB}")
           endif()
 
-          # Separate the Frida Gum libraries and GLib libraries from the other libraries
-          set(FRIDA_GUM_LIBS "")
-          set(GLIB_LIBS "")
-          set(OTHER_LIBS "")
-          foreach(lib ${FRIDA_LIBS})
-              if(lib MATCHES "libfrida-gum.*\\.a$")
-                  list(APPEND FRIDA_GUM_LIBS "${lib}")
-              elseif(lib MATCHES "libglib-2.0\\.a$" OR lib MATCHES "libgobject-2.0\\.a$" OR lib MATCHES "libgio-2.0\\.a$" OR lib MATCHES "libgmodule-2.0\\.a$" OR lib MATCHES "libgthread-2.0\\.a$" OR lib MATCHES "libgvdb\\.a$")
-                  list(APPEND GLIB_LIBS "${lib}")
-              else()
-                  list(APPEND OTHER_LIBS "${lib}")
-              endif()
-          endforeach()
-
           target_link_libraries(tool
-            -Wl,--whole-archive ${FRIDA_GUM_LIBS} ${GLIB_LIBS} -Wl,--no-whole-archive
-            ${OTHER_LIBS}
+            -Wl,--whole-archive ${FRIDA_GUMJS_LIB} -Wl,--no-whole-archive
             dobby_static
             ${log-lib}
             ${egl-lib}
@@ -608,8 +542,6 @@ jobs:
           import android.net.Uri;
           import android.os.Environment;
           import android.provider.MediaStore;
-          import android.system.Os;
-          import android.system.OsConstants;
           import android.util.Log;
           import java.io.*;
           import java.nio.charset.StandardCharsets;
@@ -703,7 +635,7 @@ jobs:
           }
           EOF
 
-      - name: Build Frida GumJS arm64-v8a
+      - name: Build Frida and generate GumJS devkit arm64-v8a
         run: |
           set -euo pipefail
           export ANDROID_NDK_ROOT="$ANDROID_NDK_ROOT"
@@ -721,60 +653,25 @@ jobs:
           make -j$(nproc)
           make install
           
+          # Generate the official GumJS devkit - this bundles ALL dependencies into one .a and one .h
+          echo "=== Generating frida-gumjs devkit for android-arm64 ==="
+          python3 -m releng.devkit frida-gumjs android-arm64 ../devkit-arm64 2>&1
+          echo "=== Devkit generation exit code: $? ==="
+          
+          # Verify devkit output
+          ls -la ../devkit-arm64/
+          test -f ../devkit-arm64/libfrida-gumjs.a || { echo "ERROR: libfrida-gumjs.a not found"; exit 1; }
+          test -f ../devkit-arm64/frida-gumjs.h || { echo "ERROR: frida-gumjs.h not found"; exit 1; }
+          
+          # Copy devkit to libtool
           mkdir -p ../libtool/libs/arm64-v8a ../libtool/include
-          
-          # 1. Copy ONLY the gum libraries from the installed prefix to avoid duplicate symbols
-          find dist-arm64/lib -name "libfrida-gum*.a" -exec cp {} ../libtool/libs/arm64-v8a/ \; || true
-          # 2. Copy all SDK libraries
-          find deps/sdk-android-arm64/lib -name "*.a" -exec cp {} ../libtool/libs/arm64-v8a/ \; 2>/dev/null || true
-          find build/sdk-android-arm64/lib -name "*.a" -exec cp {} ../libtool/libs/arm64-v8a/ \; 2>/dev/null || true
-          
-          # 3. Convert thin archives to regular archives
-          AR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-          LIB_DIR="$PWD/../libtool/libs/arm64-v8a"
-          for a in "$LIB_DIR"/*.a; do
-              if [ -f "$a" ]; then
-                  echo "Converting $a to regular archive"
-                  EXTRACT_DIR="$(mktemp -d)"
-                  cd "$EXTRACT_DIR"
-                  "$AR" x "$a" || true
-                  rm -f "$a"
-                  "$AR" rcs "$a" *.o 2>/dev/null || true
-                  cd -
-                  rm -rf "$EXTRACT_DIR"
-              fi
-          done
-          
-          # 4. Copy frida installed headers
-          cp -r dist-arm64/include/frida-1.0/* ../libtool/include/ || true
-          
-          # 5. Create wrapper header
-          cat > ../libtool/include/frida-gumjs.h << 'EOF'
-          #ifndef FRIDA_GUMJS_H
-          #define FRIDA_GUMJS_H
-          #include "gum/gum.h"
-          #include "gum/guminterceptor.h"
-          #include "gum/gumprocess.h"
-          #include "gum/gummemory.h"
-          #include "gumjs/gumjs.h"
-          #include "gumjs/gumscript.h"
-          #include "gumjs/gumscriptbackend.h"
-          #include "gumjs/gumscriptscheduler.h"
-          
-          #ifdef __cplusplus
-          extern "C" {
-          #endif
-          GumScriptBackend * gum_script_backend_obtain_qjs (void);
-          #ifdef __cplusplus
-          }
-          #endif
-          #endif
-          EOF
+          cp ../devkit-arm64/libfrida-gumjs.a ../libtool/libs/arm64-v8a/libfrida-gumjs.a
+          cp ../devkit-arm64/frida-gumjs.h ../libtool/include/frida-gumjs.h
           
           ls -lh ../libtool/libs/arm64-v8a/
-          ls -lh ../libtool/include/ | head -n 20
+          ls -lh ../libtool/include/frida-gumjs.h
 
-      - name: Build Frida GumJS armeabi-v7a
+      - name: Build Frida and generate GumJS devkit armeabi-v7a
         run: |
           set -euo pipefail
           export ANDROID_NDK_ROOT="$ANDROID_NDK_ROOT"
@@ -792,31 +689,18 @@ jobs:
           make -j$(nproc)
           make install
           
+          # Generate the official GumJS devkit for arm
+          echo "=== Generating frida-gumjs devkit for android-arm ==="
+          python3 -m releng.devkit frida-gumjs android-arm ../devkit-arm 2>&1
+          echo "=== Devkit generation exit code: $? ==="
+          
+          # Verify devkit output
+          ls -la ../devkit-arm/
+          test -f ../devkit-arm/libfrida-gumjs.a || { echo "ERROR: libfrida-gumjs.a not found for arm"; exit 1; }
+          
+          # Copy devkit to libtool
           mkdir -p ../libtool/libs/armeabi-v7a
-          
-          # Copy ONLY the gum libraries from the installed prefix to avoid duplicate symbols
-          find dist-arm/lib -name "libfrida-gum*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; || true
-          # Copy all SDK libraries
-          find deps/sdk-android-arm/lib -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; 2>/dev/null || true
-          find build/sdk-android-arm/lib -name "*.a" -exec cp {} ../libtool/libs/armeabi-v7a/ \; 2>/dev/null || true
-          
-          # Convert thin archives to regular archives
-          AR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-          LIB_DIR="$PWD/../libtool/libs/armeabi-v7a"
-          for a in "$LIB_DIR"/*.a; do
-              if [ -f "$a" ]; then
-                  echo "Converting $a to regular archive"
-                  EXTRACT_DIR="$(mktemp -d)"
-                  cd "$EXTRACT_DIR"
-                  "$AR" x "$a" || true
-                  rm -f "$a"
-                  "$AR" rcs "$a" *.o 2>/dev/null || true
-                  cd -
-                  rm -rf "$EXTRACT_DIR"
-              fi
-          done
-          
-          cp -r dist-arm/include/frida-1.0/* ../libtool/include/ || true
+          cp ../devkit-arm/libfrida-gumjs.a ../libtool/libs/armeabi-v7a/libfrida-gumjs.a
           
           ls -lh ../libtool/libs/armeabi-v7a/
 
@@ -855,7 +739,7 @@ jobs:
         run: |
           set -euo pipefail
           TOOLCHAIN="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"
-          cmake -S libtool -B build_arm64 -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.10
+          cmake -S libtool -B build_arm64 -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
           cmake --build build_arm64 --target tool -j$(nproc)
           "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" build_arm64/libtool.so
           ls -lh build_arm64/libtool.so
@@ -864,7 +748,7 @@ jobs:
         run: |
           set -euo pipefail
           TOOLCHAIN="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"
-          cmake -S libtool -B build_arm -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.10
+          cmake -S libtool -B build_arm -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
           cmake --build build_arm --target tool -j$(nproc)
           "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" build_arm/libtool.so
           ls -lh build_arm/libtool.so
