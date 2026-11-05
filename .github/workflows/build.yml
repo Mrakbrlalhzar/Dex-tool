@@ -107,7 +107,7 @@ jobs:
           CRITICAL FIX: Meson creates "thin archives" for static libraries, which only contain references to object files. When we copy these archives to a different directory, the object files are missing, causing linker errors. We now use llvm-ar to extract the object files from the thin archives and re-create them as regular archives. This ensures the linker can find all the object files.
           CRITICAL FIX 2: The previous find command copied ALL .a files, including those built for the BUILD machine (linux-x86_64). This caused "incompatible with aarch64linux" linker errors. We now ONLY copy .a files from the target architecture directories (dist-arm64/lib and deps/sdk-android-arm64/lib).
           CRITICAL FIX 3: Copying ALL .a files from dist-arm64/lib caused duplicate symbol errors because libfrida-core-1.0.a and libfrida-base-1.0.a contain the same symbols. We now ONLY copy the libfrida-gum*.a libraries from dist-arm64/lib, and then copy all the SDK libraries. This avoids the duplicate symbol errors.
-          CRITICAL FIX 4: Using -Wl,--whole-archive on ALL libraries caused undefined symbol errors because it forced the linker to include object files from libraries like liblwip.a that have unresolved dependencies. We now only use -Wl,--whole-archive on the Frida Gum libraries and the GLib libraries, and link the other libraries normally.
+          CRITICAL FIX 4: Using -Wl,--whole-archive on ALL libraries caused undefined symbol errors because it forced the linker to include object files from libraries like liblwip.a that have unresolved dependencies. We now use -Wl,--whole-archive on all libraries EXCEPT liblwip.a. This ensures that hidden symbols in GLib (like gvdb_table_free) are resolved, while avoiding the unresolved dependencies in lwip.
 
           Usage:
               Put libtool.so into lib/armeabi-v7a/ and lib/arm64-v8a/.
@@ -198,23 +198,21 @@ jobs:
             message(FATAL_ERROR "Frida Gum libraries not found in ${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/")
           endif()
 
-          # Separate the libraries into Frida Gum libraries, GLib libraries, and other libraries
-          set(FRIDA_GUM_LIBS "")
-          set(GLIB_LIBS "")
-          set(OTHER_LIBS "")
+          # Separate the libraries into whole-archive and normal
+          # We use --whole-archive for all libraries EXCEPT liblwip.a to resolve hidden symbols in GLib
+          set(WHOLE_ARCHIVE_LIBS "")
+          set(NORMAL_LIBS "")
           foreach(lib ${FRIDA_LIBS})
-              if(lib MATCHES "libfrida-gum.*\\.a$")
-                  list(APPEND FRIDA_GUM_LIBS "${lib}")
-              elseif(lib MATCHES "libglib-2.0\\.a$" OR lib MATCHES "libgobject-2.0\\.a$" OR lib MATCHES "libgio-2.0\\.a$" OR lib MATCHES "libgmodule-2.0\\.a$" OR lib MATCHES "libgthread-2.0\\.a$" OR lib MATCHES "libgvdb\\.a$")
-                  list(APPEND GLIB_LIBS "${lib}")
+              if(lib MATCHES "liblwip\\.a$")
+                  list(APPEND NORMAL_LIBS "${lib}")
               else()
-                  list(APPEND OTHER_LIBS "${lib}")
+                  list(APPEND WHOLE_ARCHIVE_LIBS "${lib}")
               endif()
           endforeach()
 
           target_link_libraries(tool
-            -Wl,--whole-archive ${FRIDA_GUM_LIBS} ${GLIB_LIBS} -Wl,--no-whole-archive
-            ${OTHER_LIBS}
+            -Wl,--whole-archive ${WHOLE_ARCHIVE_LIBS} -Wl,--no-whole-archive
+            ${NORMAL_LIBS}
             dobby_static
             ${log-lib}
             ${egl-lib}
