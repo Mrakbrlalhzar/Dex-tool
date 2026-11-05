@@ -527,7 +527,9 @@ jobs:
               if (!egl) { LOGE("dlopen libEGL.so: %s", dlerror()); return false; }
               void* sym = dlsym(egl, "eglSwapBuffers");
               if (!sym) { LOGE("dlsym eglSwapBuffers failed"); return false; }
-              int r = DobbyHook(sym, (void*)my_swap, (void**)&g_orig_swap);
+              int r = DobbyHook(sym,
+                                reinterpret_cast<dobby_dummy_func_t>(my_swap),
+                                reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap));
               if (r != 0) { LOGE("DobbyHook failed: %d", r); return false; }
               LOGI("eglSwapBuffers hooked OK");
               return true;
@@ -574,7 +576,9 @@ jobs:
               if (!lib) { LOGE("touch: dlopen libandroid.so failed"); return; }
               void* sym = dlsym(lib, "AInputQueue_getEvent");
               if (!sym) { LOGE("touch: AInputQueue_getEvent not found"); return; }
-              int r = DobbyHook(sym, (void*)my_getEvent, (void**)&g_orig_get);
+              int r = DobbyHook(sym,
+                                reinterpret_cast<dobby_dummy_func_t>(my_getEvent),
+                                reinterpret_cast<dobby_dummy_func_t*>(&g_orig_get));
               if (r != 0) LOGE("touch: DobbyHook failed: %d", r);
               else        LOGI("touch: AInputQueue_getEvent hooked");
           }
@@ -1761,6 +1765,8 @@ jobs:
           
               Dobby is sourced from LSPosed/Dobby. The CMake target is "dobby",
               and DOBBY_GENERATE_SHARED=OFF is required to produce libdobby.a.
+              DobbyHook calls use reinterpret_cast<dobby_dummy_func_t> to match
+              LSPosed/Dobby's strict function-pointer signature.
           DXTRDME
           cat > .gitignore << 'DXTGI'
           build-arm64/
@@ -1814,7 +1820,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "chore: Dex-tool scaffold — fix Dobby target name [skip ci]"
+            git commit -m "chore: Dex-tool scaffold — DobbyHook cast fix [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
