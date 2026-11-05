@@ -11,7 +11,6 @@ permissions:
 
 jobs:
   build:
-    # Null-safe check for workflow_dispatch where head_commit might be null
     if: "${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}"
     runs-on: ubuntu-22.04
     timeout-minutes: 360
@@ -178,23 +177,20 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/"
 
       # ── Dobby ─────────────────────────────────────────────────
-      # FIX: The official jmpews/Dobby master branch is currently broken for Android.
-      # We use the actively maintained fork by chiteroman which fixes the OSMemory
-      # and load_address compilation errors.
+      # 使用 LSPosed/Dobby 替代原 chiteroman/Dobby (原仓库已不可公开访问)
       - name: Cache Dobby
         id: cache-dobby
         uses: actions/cache@v4
         with:
           path: deps/dobby
-          key: dobby-chiteroman-v1
+          key: dobby-lsposed-v1
 
       - name: Build Dobby for both ABIs
         if: "${{ steps.cache-dobby.outputs.cache-hit != 'true' }}"
         run: |
-          # Use chiteroman's maintained fork which fixes Android/Linux build errors
-          git clone --depth 1 https://github.com/chiteroman/Dobby.git dobby-src
+          git clone --depth 1 https://github.com/LSPosed/Dobby.git dobby-src
 
-          # ── Patch macOS Mach-O relocations to Linux ELF syntax (if still present) ──
+          # ── Patch macOS Mach-O relocations to Linux ELF syntax (best-effort) ──
           while IFS= read -r -d '' f; do
             sed -i -E 's/([a-zA-Z0-9_()]+)@PAGEOFF/:lo12:\1/g' "$f"
             sed -i -E 's/([a-zA-Z0-9_()]+)@PAGE\b/\1/g' "$f"
@@ -292,7 +288,6 @@ jobs:
               ${IMGUI_DIR}/imgui_widgets.cpp
               ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp)
           
-          # No PREFIX override: default lib prefix yields libtool.so
           add_library(tool SHARED
               src/main.cpp
               src/logger.cpp
@@ -499,8 +494,6 @@ jobs:
               LOGI("ImGui up (%dx%d ES3)", w, h);
           }
           
-          // CRITICAL: calls g_orig_swap — NEVER recurses into eglSwapBuffers symbol.
-          // gum_init_embedded() is deferred here (GL thread, valid EGL context).
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
               if (!g_gum_inited.exchange(true)) {
                   gum_init_embedded();
@@ -604,7 +597,7 @@ jobs:
           DXTFBH
 
       # ═══════════════════════════════════════════════════════════
-      # frida_bridge.cpp  (includes agent_bundle_embed.h generated later)
+      # frida_bridge.cpp
       # ═══════════════════════════════════════════════════════════
       - name: Generate frida_bridge.cpp
         run: |
@@ -685,8 +678,6 @@ jobs:
           #pragma once
           #include <string>
           #include <vector>
-          // Compile smali source to DEX via InMemoryDexClassLoader (API 26+).
-          // smali-fat.jar must be in APK assets/. Returns "" on success, else error.
           std::string smali_compile(const std::string& src,
                                     const std::string& class_name,
                                     std::vector<uint8_t>& dex_out);
@@ -1154,15 +1145,6 @@ jobs:
               close(fd);
           }
           
-          // JNI_OnLoad ordering (see known-pitfalls in README):
-          //   1. Store JVM pointer
-          //   2. Write entry marker (raw I/O — no gum)
-          //   3. logger_init (raw I/O only)
-          //   4. overlay_set_java_vm
-          //   5. install_swap_hook() via Dobby
-          //   6. Write done markers
-          // gum_init_embedded() fires LATER in overlay.cpp on the GL thread,
-          // ensuring a valid EGL context exists when it is called.
           extern "C" JNIEXPORT jint JNICALL
           JNI_OnLoad(JavaVM* vm, void*) {
               g_jvm_global = vm;
@@ -1189,7 +1171,7 @@ jobs:
           DXTMAIN
 
       # ═══════════════════════════════════════════════════════════
-      # agent.js  +  embed as agent_bundle_embed.h
+      # agent.js
       # ═══════════════════════════════════════════════════════════
       - name: Generate agent.js
         run: |
@@ -1476,14 +1458,6 @@ jobs:
           import java.io.InputStream;
           import java.io.OutputStream;
           
-          /**
-           * Ordering (from known-pitfalls):
-           *   1. writeBootMarker()
-           *   2. startCopierThread()   <- BEFORE loadLibrary so logs flush on crash
-           *   3. Thread.sleep(500)
-           *   4. installUncaughtHandler()
-           *   5. System.loadLibrary("tool")
-           */
           public class DexToolApp extends Application {
               private static final String TAG = "DexToolApp";
               private static final String DL  = "/sdcard/Download";
@@ -1765,7 +1739,7 @@ jobs:
           ## Components
           
               frida-gum 16.7.19   QuickJS / GumJS scripting runtime
-              Dobby               inline function hook framework
+              Dobby               inline function hook framework (LSPosed/Dobby)
               ImGui 1.90.4        immediate-mode overlay GUI
               smali 3.0.7         runtime .smali to DEX assembler (bundled JAR)
           
@@ -1785,9 +1759,10 @@ jobs:
           
           ## Build notes
           
-              Dobby ARM64 asm patch: Dobby master uses macOS @PAGE/@PAGEOFF Mach-O
-              relocations in closure_bridge_arm64.asm. The workflow patches all .asm
-              files to ELF lo12 syntax (adrp sym / add :lo12:sym) before building.
+              Dobby is sourced from LSPosed/Dobby, which provides a stable
+              Android/Linux build. The workflow still attempts to patch any
+              lingering macOS @PAGE/@PAGEOFF Mach-O relocations to ELF lo12
+              syntax as a best-effort safeguard.
           DXTRDME
           cat > .gitignore << 'DXTGI'
           build-arm64/
@@ -1841,7 +1816,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "chore: Dex-tool scaffold — Dobby ELF patch + full source [skip ci]"
+            git commit -m "chore: Dex-tool scaffold — LSPosed/Dobby + full source [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
