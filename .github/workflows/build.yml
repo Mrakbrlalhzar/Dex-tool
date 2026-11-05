@@ -189,7 +189,6 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/LSPosed/Dobby.git dobby-src
 
-          # Best-effort: patch lingering Mach-O relocations to ELF syntax
           while IFS= read -r -d '' f; do
             sed -i -E 's/([a-zA-Z0-9_()]+)@PAGEOFF/:lo12:\1/g' "$f"
             sed -i -E 's/([a-zA-Z0-9_()]+)@PAGE\b/\1/g' "$f"
@@ -620,7 +619,7 @@ jobs:
           static std::mutex        g_pmtx;
           static MsgCallback       g_cb;
           
-          static void on_message(GumScript*, const gchar* msg, GBytes*, gpointer) {
+          static void on_message(const gchar* msg, GBytes*, gpointer) {
               if (g_cb && msg) g_cb(std::string(msg));
           }
           
@@ -650,15 +649,7 @@ jobs:
               }
               gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
           
-              err = nullptr;
-              gum_script_load_sync(g_script, nullptr, &err);
-              if (err) {
-                  char m[512];
-                  snprintf(m, sizeof(m), "[frida_bridge] load failed: %s\n", err->message);
-                  log_crash_raw(m);
-                  g_error_free(err);
-                  return;
-              }
+              gum_script_load_sync(g_script, nullptr);
               log_info("[frida_bridge] agent running");
               g_main_loop_run(g_loop);
               log_info("[frida_bridge] loop exited");
@@ -1767,6 +1758,8 @@ jobs:
               and DOBBY_GENERATE_SHARED=OFF is required to produce libdobby.a.
               DobbyHook calls use reinterpret_cast<dobby_dummy_func_t> to match
               LSPosed/Dobby's strict function-pointer signature.
+              frida-gum 16.7.19's GumScriptMessageHandler takes (const char*, GBytes*, void*)
+              without the GumScript* parameter, and gum_script_load_sync takes 2 arguments.
           DXTRDME
           cat > .gitignore << 'DXTGI'
           build-arm64/
@@ -1820,7 +1813,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "chore: Dex-tool scaffold — DobbyHook cast fix [skip ci]"
+            git commit -m "chore: Dex-tool scaffold — fix frida-gum API signature [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
