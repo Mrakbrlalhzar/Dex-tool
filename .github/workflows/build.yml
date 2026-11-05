@@ -1594,6 +1594,11 @@ jobs:
 
       - name: Generate Gradle build files
         run: |
+          cat > sample-app/gradle.properties << 'DXTGRADP'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          DXTGRADP
           cat > sample-app/settings.gradle << 'DXTSETS'
           rootProject.name = "DexToolSample"
           include ':app'
@@ -1760,6 +1765,8 @@ jobs:
               LSPosed/Dobby's strict function-pointer signature.
               frida-gum 16.7.19's GumScriptMessageHandler takes (const char*, GBytes*, void*)
               without the GumScript* parameter, and gum_script_load_sync takes 2 arguments.
+              The sample app enables android.useAndroidX and android.enableJetifier
+              in gradle.properties to satisfy its AppCompat dependency.
           DXTRDME
           cat > .gitignore << 'DXTGI'
           build-arm64/
@@ -1813,7 +1820,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "chore: Dex-tool scaffold — fix frida-gum API signature [skip ci]"
+            git commit -m "chore: Dex-tool scaffold — enable AndroidX for sample app [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
