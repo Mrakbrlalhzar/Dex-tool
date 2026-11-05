@@ -1,0 +1,10 @@
+build-arm64/
+build-arm/
+frida-gum-src/
+frida-dist-arm/
+frida-dist-arm64/
+dobby-src/
+imgui/
+out/
+*.zip
+*.tar.*
