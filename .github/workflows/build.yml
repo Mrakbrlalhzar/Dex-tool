@@ -1,7 +1,46 @@
-# === BRANCH TARGET: dev ===
-# (continued)
-      run: |
-        cat > src/overlay.cpp << 'OVLCEOF'
+    # === BRANCH TARGET: dev ===
+name: Build Dex-tool
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+# [skip ci] on commit prevents loops from the push-to-dev step
+
+env:
+  ANDROID_API: android-26
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # ═══════════════════════════════════════════════════════════
+      # NOTE: steps 1..12 (checkout, NDK setup, Frida/ImGui/Dobby
+      # downloads, CMakeLists.txt, logger.h/cpp, deps/smali)
+      # are expected to be in the earlier part of the workflow
+      # (the file this was continued from).
+      # ═══════════════════════════════════════════════════════════
+
+      - name: Alias NDK path for CMake
+        run: echo "ANDROID_NDK_ROOT=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+
+      # ═══════════════════════════════════════════════════════════
+      # 13. GENERATE — overlay.h / overlay.cpp
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate overlay.h and overlay.cpp
+        run: |
+          cat > src/overlay.h << 'OVLHEOF'
+#pragma once
+#include <jni.h>
+
+void overlay_set_java_vm(JavaVM* vm);
+void overlay_on_touch(float x, float y, bool pressed);
+bool install_swap_hook();
+OVLHEOF
+
+          cat > src/overlay.cpp << 'OVLCEOF'
 #include "overlay.h"
 #include "logger.h"
 #include "menu.h"
@@ -138,14 +177,14 @@ bool install_swap_hook() {
     return true;
 }
 OVLCEOF
-        echo "overlay generated."
+          echo "overlay generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 14. GENERATE — touch.h / touch.cpp
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate touch.h and touch.cpp
-      run: |
-        cat > src/touch.h << 'THEOF'
+      # ═══════════════════════════════════════════════════════════
+      # 14. GENERATE — touch.h / touch.cpp
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate touch.h and touch.cpp
+        run: |
+          cat > src/touch.h << 'THEOF'
 #pragma once
 // Install hooks for touch input forwarding to ImGui.
 // Primary: hook libinput.so  (android_input_event_*)
@@ -153,7 +192,7 @@ OVLCEOF
 void touch_install_hooks();
 THEOF
 
-        cat > src/touch.cpp << 'TCEOF'
+          cat > src/touch.cpp << 'TCEOF'
 #include "touch.h"
 #include "overlay.h"
 #include "logger.h"
@@ -201,14 +240,14 @@ void touch_install_hooks() {
         LOGI("touch: AInputQueue_getEvent hooked");
 }
 TCEOF
-        echo "touch generated."
+          echo "touch generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 15. GENERATE — frida_bridge.h / frida_bridge.cpp
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate frida_bridge.h and frida_bridge.cpp
-      run: |
-        cat > src/frida_bridge.h << 'FBHEOF'
+      # ═══════════════════════════════════════════════════════════
+      # 15. GENERATE — frida_bridge.h / frida_bridge.cpp
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate frida_bridge.h and frida_bridge.cpp
+        run: |
+          cat > src/frida_bridge.h << 'FBHEOF'
 #pragma once
 #include <jni.h>
 #include <string>
@@ -226,7 +265,7 @@ using MsgCallback = std::function<void(const std::string& json)>;
 void frida_set_message_callback(MsgCallback cb);
 FBHEOF
 
-        cat > src/frida_bridge.cpp << 'FBCEOF'
+          cat > src/frida_bridge.cpp << 'FBCEOF'
 #include "frida_bridge.h"
 #include "logger.h"
 #include "frida-gumjs.h"
@@ -319,16 +358,18 @@ void frida_set_message_callback(MsgCallback cb) {
     g_msg_cb = cb;
 }
 FBCEOF
-        echo "frida_bridge generated."
+          echo "frida_bridge generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 16. GENERATE — smali_runtime.h / smali_runtime.cpp
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate smali_runtime.h and smali_runtime.cpp
-      run: |
-        cat > src/smali_runtime.h << 'SRHEOF'
+      # ═══════════════════════════════════════════════════════════
+      # 16. GENERATE — smali_runtime.h / smali_runtime.cpp
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate smali_runtime.h and smali_runtime.cpp
+        run: |
+          cat > src/smali_runtime.h << 'SRHEOF'
 #pragma once
 #include <string>
+#include <vector>
+#include <cstdint>
 // Compile smali source to a DEX byte array via InMemoryDexClassLoader.
 // Requires smali-fat.jar in APK assets/ and JNI env on current thread.
 // Returns empty string on success, error message on failure.
@@ -338,7 +379,7 @@ std::string smali_compile(const std::string& smali_src,
                           std::vector<uint8_t>& dex_out);
 SRHEOF
 
-        cat > src/smali_runtime.cpp << 'SRCEOF'
+          cat > src/smali_runtime.cpp << 'SRCEOF'
 #include "smali_runtime.h"
 #include "logger.h"
 #include <jni.h>
@@ -497,20 +538,20 @@ std::string smali_compile(const std::string& smali_src,
     return "";  // success
 }
 SRCEOF
-        echo "smali_runtime generated."
+          echo "smali_runtime generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 17. GENERATE — menu.h / menu.cpp  (full tab UI)
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate menu.h and menu.cpp
-      run: |
-        cat > src/menu.h << 'MNUHEOF'
+      # ═══════════════════════════════════════════════════════════
+      # 17. GENERATE — menu.h / menu.cpp  (full tab UI)
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate menu.h and menu.cpp
+        run: |
+          cat > src/menu.h << 'MNUHEOF'
 #pragma once
 void menu_init();
 void menu_draw();
 MNUHEOF
 
-        cat > src/menu.cpp << 'MNUCEOF'
+          cat > src/menu.cpp << 'MNUCEOF'
 #include "menu.h"
 #include "frida_bridge.h"
 #include "logger.h"
@@ -910,14 +951,14 @@ void menu_draw() {
     ImGui::End();
 }
 MNUCEOF
-        echo "menu generated."
+          echo "menu generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 18. GENERATE — main.cpp  (JNI_OnLoad)
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate main.cpp
-      run: |
-        cat > src/main.cpp << 'MAINCEOF'
+      # ═══════════════════════════════════════════════════════════
+      # 18. GENERATE — main.cpp  (JNI_OnLoad)
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate main.cpp
+        run: |
+          cat > src/main.cpp << 'MAINCEOF'
 #include "logger.h"
 #include "overlay.h"
 #include "frida_bridge.h"
@@ -991,17 +1032,17 @@ JNI_OnLoad(JavaVM* vm, void*) {
     return JNI_VERSION_1_6;
 }
 MAINCEOF
-        echo "main.cpp generated."
+          echo "main.cpp generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 19. GENERATE — agent_js_embed.h (placeholder; real embed below)
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate JS agent bundle and embed as C array
-      run: |
-        # Agent JS — plain JS for GumJS/QuickJS (no bundler needed)
-        # frida-java-bridge is bundled into QuickJS by frida-gum when
-        # built with gumjs=enabled, so Java.* is globally available.
-        cat > agent/agent.js << 'AGENTEOF'
+      # ═══════════════════════════════════════════════════════════
+      # 19. GENERATE — JS agent bundle and embed as C array
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate JS agent bundle and embed as C array
+        run: |
+          # Agent JS — plain JS for GumJS/QuickJS (no bundler needed)
+          # frida-java-bridge is bundled into QuickJS by frida-gum when
+          # built with gumjs=enabled, so Java.* is globally available.
+          cat > agent/agent.js << 'AGENTEOF'
 // Dex-tool GumJS Agent — plain JavaScript for QuickJS runtime
 // Java.* is provided by frida-java-bridge bundled into frida-gum's GumJS.
 'use strict';
@@ -1304,15 +1345,15 @@ recv(function onMessage(msg) {
 send(JSON.stringify({ type: 'ready', msg: 'Dex-tool agent loaded' }));
 AGENTEOF
 
-        # Escape the JS file into a C char array
-        node - << 'NODESCRIPT'
+          # Escape the JS file into a C array
+          node - << 'NODESCRIPT'
 const fs = require('fs');
 const src = fs.readFileSync('agent/agent.js');
 const bytes = Array.from(src);
 let out = '// Auto-generated — do not edit\n';
 out += '#pragma once\n';
 out += '#include <stddef.h>\n\n';
-out += 'const char g_agent_js[] = {\n';
+out += 'extern const char g_agent_js[] = {\n';
 let line = '';
 for (let i = 0; i < bytes.length; i++) {
     line += '0x' + bytes[i].toString(16).padStart(2, '0') + ',';
@@ -1320,71 +1361,71 @@ for (let i = 0; i < bytes.length; i++) {
 }
 if (line) out += '    ' + line + '\n';
 out += '    0x00\n};\n';
-out += 'const size_t g_agent_js_size = ' + bytes.length + ';\n';
+out += 'extern const size_t g_agent_js_size = ' + bytes.length + ';\n';
 fs.writeFileSync('src/agent_bundle_embed.h', out);
 console.log('agent_bundle_embed.h generated (' + bytes.length + ' bytes)');
 NODESCRIPT
 
-        # Include it from frida_bridge.cpp via the header
-        # (already declared as extern in frida_bridge.cpp; include the header)
-        echo '#include "agent_bundle_embed.h"' >> src/frida_bridge.cpp
-        echo "agent embedded."
+          # Include it from frida_bridge.cpp (definitions match the
+          # extern declarations already present at the top of that file).
+          echo '#include "agent_bundle_embed.h"' >> src/frida_bridge.cpp
+          echo "agent embedded."
 
-    # ═══════════════════════════════════════════════════════════
-    # 20. IMGUI BACKEND — copy imgui_impl_opengl3 to imgui/backends
-    #    (already in source, just verify)
-    # ═══════════════════════════════════════════════════════════
-    - name: Verify ImGui backends
-      run: |
-        ls imgui/backends/imgui_impl_opengl3.cpp || \
-          { echo "FATAL: imgui backends missing"; exit 1; }
-        echo "ImGui backends: OK"
+      # ═══════════════════════════════════════════════════════════
+      # 20. IMGUI BACKEND — copy imgui_impl_opengl3 to imgui/backends
+      #    (already in source, just verify)
+      # ═══════════════════════════════════════════════════════════
+      - name: Verify ImGui backends
+        run: |
+          ls imgui/backends/imgui_impl_opengl3.cpp || \
+            { echo "FATAL: imgui backends missing"; exit 1; }
+          echo "ImGui backends: OK"
 
-    # ═══════════════════════════════════════════════════════════
-    # 21. BUILD libtool.so — arm64-v8a
-    # ═══════════════════════════════════════════════════════════
-    - name: CMake build arm64-v8a
-      run: |
-        mkdir -p build-arm64
-        cmake -S . -B build-arm64 \
-          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
-          -DANDROID_ABI=arm64-v8a \
-          -DANDROID_PLATFORM=android-26 \
-          -DCMAKE_BUILD_TYPE=Release \
-          -GNinja
-        ninja -C build-arm64 -j$(nproc) tool
-        mkdir -p out/lib/arm64-v8a
-        "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
-          --strip-unneeded \
-          build-arm64/libtool.so \
-          -o out/lib/arm64-v8a/libtool.so
-        ls -lh out/lib/arm64-v8a/libtool.so
-        echo "arm64 size: $(du -sh out/lib/arm64-v8a/libtool.so)"
+      # ═══════════════════════════════════════════════════════════
+      # 21. BUILD libtool.so — arm64-v8a
+      # ═══════════════════════════════════════════════════════════
+      - name: CMake build arm64-v8a
+        run: |
+          mkdir -p build-arm64
+          cmake -S . -B build-arm64 \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -GNinja
+          ninja -C build-arm64 -j$(nproc) tool
+          mkdir -p out/lib/arm64-v8a
+          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            --strip-unneeded \
+            build-arm64/libtool.so \
+            -o out/lib/arm64-v8a/libtool.so
+          ls -lh out/lib/arm64-v8a/libtool.so
+          echo "arm64 size: $(du -sh out/lib/arm64-v8a/libtool.so)"
 
-    - name: CMake build armeabi-v7a
-      run: |
-        mkdir -p build-arm
-        cmake -S . -B build-arm \
-          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
-          -DANDROID_ABI=armeabi-v7a \
-          -DANDROID_PLATFORM=android-26 \
-          -DCMAKE_BUILD_TYPE=Release \
-          -GNinja
-        ninja -C build-arm -j$(nproc) tool
-        mkdir -p out/lib/armeabi-v7a
-        "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
-          --strip-unneeded \
-          build-arm/libtool.so \
-          -o out/lib/armeabi-v7a/libtool.so
-        ls -lh out/lib/armeabi-v7a/libtool.so
-        echo "armeabi-v7a size: $(du -sh out/lib/armeabi-v7a/libtool.so)"
+      - name: CMake build armeabi-v7a
+        run: |
+          mkdir -p build-arm
+          cmake -S . -B build-arm \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -GNinja
+          ninja -C build-arm -j$(nproc) tool
+          mkdir -p out/lib/armeabi-v7a
+          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            --strip-unneeded \
+            build-arm/libtool.so \
+            -o out/lib/armeabi-v7a/libtool.so
+          ls -lh out/lib/armeabi-v7a/libtool.so
+          echo "armeabi-v7a size: $(du -sh out/lib/armeabi-v7a/libtool.so)"
 
-    # ═══════════════════════════════════════════════════════════
-    # 22. GENERATE SAMPLE APP — Java sources
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate DexToolApp.java
-      run: |
-        cat > sample-app/app/src/main/java/com/dextool/app/DexToolApp.java << 'APPJAVA'
+      # ═══════════════════════════════════════════════════════════
+      # 22. GENERATE SAMPLE APP — Java sources
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate DexToolApp.java
+        run: |
+          cat > sample-app/app/src/main/java/com/dextool/app/DexToolApp.java << 'APPJAVA'
 package com.dextool.app;
 
 import android.app.Application;
@@ -1465,10 +1506,6 @@ public class DexToolApp extends Application {
     }
 
     private void copyLogsToDownloads() {
-        // On API 29+ use direct FileOutputStream to public Downloads
-        // (no ContentValues needed for plain file copy when we already
-        //  have WRITE_EXTERNAL_STORAGE or manage files; for API 29+
-        //  writes to /sdcard/Download still work for existing files)
         String[] logs = { "dextool.log", "dextool-debug.log", "dextool-crash.log" };
         File srcDir = new File(getFilesDir(), "dextool-logs");
         File dstDir = new File(LOG_DIR);
@@ -1503,11 +1540,11 @@ public class DexToolApp extends Application {
     }
 }
 APPJAVA
-        echo "DexToolApp.java generated."
+          echo "DexToolApp.java generated."
 
-    - name: Generate MainActivity.java
-      run: |
-        cat > sample-app/app/src/main/java/com/dextool/app/MainActivity.java << 'MAINACTJAVA'
+      - name: Generate MainActivity.java
+        run: |
+          cat > sample-app/app/src/main/java/com/dextool/app/MainActivity.java << 'MAINACTJAVA'
 package com.dextool.app;
 
 import android.app.Activity;
@@ -1537,14 +1574,14 @@ public class MainActivity extends Activity {
     @Override protected void onPause()  { super.onPause();  mGLView.onPause();  }
 }
 MAINACTJAVA
-        echo "MainActivity.java generated."
+          echo "MainActivity.java generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 23. GENERATE SAMPLE APP — res, manifest, gradle files
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate Android manifests and resources
-      run: |
-        cat > sample-app/app/src/main/AndroidManifest.xml << 'MANIFEST'
+      # ═══════════════════════════════════════════════════════════
+      # 23. GENERATE SAMPLE APP — res, manifest, gradle files
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate Android manifests and resources
+        run: |
+          cat > sample-app/app/src/main/AndroidManifest.xml << 'MANIFEST'
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.dextool.app">
@@ -1567,24 +1604,22 @@ MAINACTJAVA
 </manifest>
 MANIFEST
 
-        cat > sample-app/app/src/main/res/values/strings.xml << 'STRINGS'
+          cat > sample-app/app/src/main/res/values/strings.xml << 'STRINGS'
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">DexTool Sample</string>
 </resources>
 STRINGS
-        echo "Manifest and resources generated."
+          echo "Manifest and resources generated."
 
-    - name: Generate Gradle build files
-      run: |
-        # settings.gradle
-        cat > sample-app/settings.gradle << 'SETTINGS'
+      - name: Generate Gradle build files
+        run: |
+          cat > sample-app/settings.gradle << 'SETTINGS'
 rootProject.name = "DexToolSample"
 include ':app'
 SETTINGS
 
-        # root build.gradle
-        cat > sample-app/build.gradle << 'ROOTBUILD'
+          cat > sample-app/build.gradle << 'ROOTBUILD'
 buildscript {
     repositories { google(); mavenCentral() }
     dependencies {
@@ -1594,8 +1629,7 @@ buildscript {
 allprojects { repositories { google(); mavenCentral() } }
 ROOTBUILD
 
-        # app/build.gradle
-        cat > sample-app/app/build.gradle << 'APPBUILD'
+          cat > sample-app/app/build.gradle << 'APPBUILD'
 plugins {
     id 'com.android.application'
 }
@@ -1629,52 +1663,52 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
 }
 APPBUILD
-        echo "Gradle files generated."
+          echo "Gradle files generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 24. BUILD SAMPLE APKs
-    # ═══════════════════════════════════════════════════════════
-    - name: Copy libtool.so into sample app jniLibs
-      run: |
-        cp out/lib/arm64-v8a/libtool.so \
-           sample-app/app/src/main/jniLibs/arm64-v8a/libtool.so
-        cp out/lib/armeabi-v7a/libtool.so \
-           sample-app/app/src/main/jniLibs/armeabi-v7a/libtool.so
-        # Copy smali fat jar to assets
-        cp deps/smali/smali-fat.jar \
-           sample-app/app/src/main/assets/smali-fat.jar
-        echo "JNI libs and assets copied."
+      # ═══════════════════════════════════════════════════════════
+      # 24. BUILD SAMPLE APKs
+      # ═══════════════════════════════════════════════════════════
+      - name: Copy libtool.so into sample app jniLibs
+        run: |
+          cp out/lib/arm64-v8a/libtool.so \
+             sample-app/app/src/main/jniLibs/arm64-v8a/libtool.so
+          cp out/lib/armeabi-v7a/libtool.so \
+             sample-app/app/src/main/jniLibs/armeabi-v7a/libtool.so
+          # Copy smali fat jar to assets
+          cp deps/smali/smali-fat.jar \
+             sample-app/app/src/main/assets/smali-fat.jar
+          echo "JNI libs and assets copied."
 
-    - name: Build sample-signed.apk (with libtool.so)
-      run: |
-        cd sample-app
-        gradle assembleRelease --no-daemon -q
-        cp app/build/outputs/apk/release/app-release.apk \
-           "$GITHUB_WORKSPACE/sample-signed.apk"
-        ls -lh "$GITHUB_WORKSPACE/sample-signed.apk"
+      - name: Build sample-signed.apk (with libtool.so)
+        run: |
+          cd sample-app
+          gradle assembleRelease --no-daemon -q
+          cp app/build/outputs/apk/release/app-release.apk \
+             "$GITHUB_WORKSPACE/sample-signed.apk"
+          ls -lh "$GITHUB_WORKSPACE/sample-signed.apk"
 
-    - name: Build sample-nolib-signed.apk (without libtool.so)
-      run: |
-        # Remove libs and rebuild
-        rm -f sample-app/app/src/main/jniLibs/arm64-v8a/libtool.so
-        rm -f sample-app/app/src/main/jniLibs/armeabi-v7a/libtool.so
+      - name: Build sample-nolib-signed.apk (without libtool.so)
+        run: |
+          # Remove libs and rebuild
+          rm -f sample-app/app/src/main/jniLibs/arm64-v8a/libtool.so
+          rm -f sample-app/app/src/main/jniLibs/armeabi-v7a/libtool.so
 
-        # Patch DexToolApp.java to skip loadLibrary for nolib variant
-        sed -i 's/System.loadLibrary("tool");//' \
-          sample-app/app/src/main/java/com/dextool/app/DexToolApp.java
+          # Patch DexToolApp.java to skip loadLibrary for nolib variant
+          sed -i 's/System.loadLibrary("tool");//' \
+            sample-app/app/src/main/java/com/dextool/app/DexToolApp.java
 
-        cd sample-app
-        gradle assembleRelease --no-daemon -q
-        cp app/build/outputs/apk/release/app-release.apk \
-           "$GITHUB_WORKSPACE/sample-nolib-signed.apk"
-        ls -lh "$GITHUB_WORKSPACE/sample-nolib-signed.apk"
+          cd sample-app
+          gradle assembleRelease --no-daemon -q
+          cp app/build/outputs/apk/release/app-release.apk \
+             "$GITHUB_WORKSPACE/sample-nolib-signed.apk"
+          ls -lh "$GITHUB_WORKSPACE/sample-nolib-signed.apk"
 
-    # ═══════════════════════════════════════════════════════════
-    # 25. GENERATE README
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate README.md
-      run: |
-        cat > README.md << 'READMEEOF'
+      # ═══════════════════════════════════════════════════════════
+      # 25. GENERATE README
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate README.md
+        run: |
+          cat > README.md << 'READMEEOF'
 # Dex-tool
 
 Standalone runtime instrumentation framework for Android APKs.
@@ -1750,14 +1784,14 @@ Ships as a single native shared library: libtool.so (armeabi-v7a + arm64-v8a).
 
     Android 8.0 (API 26), armeabi-v7a or arm64-v8a, OpenGL ES 3.0
 READMEEOF
-        echo "README generated."
+          echo "README generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 26. GENERATE .gitignore
-    # ═══════════════════════════════════════════════════════════
-    - name: Generate .gitignore
-      run: |
-        cat > .gitignore << 'GITIGNEOF'
+      # ═══════════════════════════════════════════════════════════
+      # 26. GENERATE .gitignore
+      # ═══════════════════════════════════════════════════════════
+      - name: Generate .gitignore
+        run: |
+          cat > .gitignore << 'GITIGNEOF'
 # Build artifacts
 build-arm64/
 build-arm/
@@ -1770,51 +1804,51 @@ imgui/
 *.tar.*
 /tmp/
 GITIGNEOF
-        echo ".gitignore generated."
+          echo ".gitignore generated."
 
-    # ═══════════════════════════════════════════════════════════
-    # 27. UPLOAD ARTIFACTS
-    # ═══════════════════════════════════════════════════════════
-    - name: Upload libtool.so artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: libtool-so
-        path: |
-          out/lib/arm64-v8a/libtool.so
-          out/lib/armeabi-v7a/libtool.so
+      # ═══════════════════════════════════════════════════════════
+      # 27. UPLOAD ARTIFACTS
+      # ═══════════════════════════════════════════════════════════
+      - name: Upload libtool.so artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtool-so
+          path: |
+            out/lib/arm64-v8a/libtool.so
+            out/lib/armeabi-v7a/libtool.so
 
-    - name: Upload APK artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: apks
-        path: |
-          sample-signed.apk
-          sample-nolib-signed.apk
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: |
+            sample-signed.apk
+            sample-nolib-signed.apk
 
-    # ═══════════════════════════════════════════════════════════
-    # 28. COMMIT AND PUSH TO dev BRANCH
-    # ═══════════════════════════════════════════════════════════
-    - name: Commit and push all generated files to dev
-      run: |
-        # Switch to dev branch (create if missing)
-        git fetch origin dev || true
-        git checkout -B dev origin/dev 2>/dev/null || git checkout -B dev
+      # ═══════════════════════════════════════════════════════════
+      # 28. COMMIT AND PUSH TO dev BRANCH
+      # ═══════════════════════════════════════════════════════════
+      - name: Commit and push all generated files to dev
+        run: |
+          # Switch to dev branch (create if missing)
+          git fetch origin dev || true
+          git checkout -B dev origin/dev 2>/dev/null || git checkout -B dev
 
-        # Stage only source/project files, not build outputs or cloned repos
-        git add --ignore-errors \
-          CMakeLists.txt \
-          src/ \
-          agent/ \
-          sample-app/ \
-          README.md \
-          .gitignore \
-          .github/workflows/build.yml
+          # Stage only source/project files, not build outputs or cloned repos
+          git add --ignore-errors \
+            CMakeLists.txt \
+            src/ \
+            agent/ \
+            sample-app/ \
+            README.md \
+            .gitignore \
+            .github/workflows/build.yml
 
-        # Only commit if there are changes
-        if git diff --cached --quiet; then
-          echo "No changes to commit."
-        else
-          git commit -m "chore: initial Dex-tool scaffold from CI [skip ci]"
-          git push origin HEAD:dev
-          echo "Pushed to dev."
-        fi
+          # Only commit if there are changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: initial Dex-tool scaffold from CI [skip ci]"
+            git push origin HEAD:dev
+            echo "Pushed to dev."
+          fi
