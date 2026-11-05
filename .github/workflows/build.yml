@@ -11,19 +11,20 @@ permissions:
 
 jobs:
   build:
-    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    # Null-safe check for workflow_dispatch where head_commit might be null
+    if: "${{ !contains(github.event.head_commit.message || '', '[skip ci]') }}"
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     env:
-      ANDROID_HOME: ${{ github.workspace }}/android-sdk
-      ANDROID_NDK_ROOT: ${{ github.workspace }}/android-sdk/ndk/25.2.9519653
+      ANDROID_HOME: "${{ github.workspace }}/android-sdk"
+      ANDROID_NDK_ROOT: "${{ github.workspace }}/android-sdk/ndk/25.2.9519653"
 
     steps:
       - name: Checkout dev branch
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: "${{ secrets.GITHUB_TOKEN }}"
           fetch-depth: 0
 
       - name: Configure git identity
@@ -97,7 +98,7 @@ jobs:
           key: frida-gum-16.7.19-arm64-v8a-v2
 
       - name: Build frida-gum 16.7.19 arm64-v8a
-        if: steps.cache-frida-arm64.outputs.cache-hit != 'true'
+        if: "${{ steps.cache-frida-arm64.outputs.cache-hit != 'true' }}"
         run: |
           git clone --recurse-submodules --depth 1 --branch 16.7.19 \
             https://github.com/frida/frida-gum.git frida-gum-src
@@ -135,7 +136,7 @@ jobs:
           key: frida-gum-16.7.19-armeabi-v7a-v2
 
       - name: Build frida-gum 16.7.19 armeabi-v7a
-        if: steps.cache-frida-arm.outputs.cache-hit != 'true'
+        if: "${{ steps.cache-frida-arm.outputs.cache-hit != 'true' }}"
         run: |
           if [ ! -d frida-gum-src ]; then
             git clone --recurse-submodules --depth 1 --branch 16.7.19 \
@@ -176,7 +177,7 @@ jobs:
           key: dobby-master-v2
 
       - name: Build Dobby for both ABIs
-        if: steps.cache-dobby.outputs.cache-hit != 'true'
+        if: "${{ steps.cache-dobby.outputs.cache-hit != 'true' }}"
         run: |
           git clone --depth 1 https://github.com/jmpews/Dobby.git dobby-src
           mkdir -p deps/dobby
