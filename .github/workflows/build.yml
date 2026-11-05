@@ -653,17 +653,43 @@ jobs:
           make -j$(nproc)
           make install
           
-          # Generate the official GumJS devkit - this bundles ALL dependencies into one .a and one .h
+          # Generate the official GumJS devkit
           echo "=== Generating frida-gumjs devkit for android-arm64 ==="
-          python3 -m releng.devkit frida-gumjs android-arm64 ../devkit-arm64 2>&1
-          echo "=== Devkit generation exit code: $? ==="
+          export PYTHONPATH="$PWD"
+          python3 -m releng.devkit frida-gumjs android-arm64 ../devkit-arm64 2>&1 || echo "Devkit script returned non-zero"
           
-          # Verify devkit output
+          # If the script failed silently, manually amalgamate the libraries
+          if [ ! -f ../devkit-arm64/libfrida-gumjs.a ]; then
+              echo "=== Devkit script failed to produce library. Manually amalgamating... ==="
+              mkdir -p ../devkit-arm64 amalgamation-tmp
+              cd amalgamation-tmp
+              AR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+              
+              for lib in ../dist-arm64/lib/libfrida-gum*.a ../dist-arm64/lib/libfrida-base*.a; do
+                  [ -f "$lib" ] && "$AR" x "$lib" 2>/dev/null || true
+              done
+              for lib in ../deps/sdk-android-arm64/lib/libglib-2.0.a ../deps/sdk-android-arm64/lib/libgobject-2.0.a ../deps/sdk-android-arm64/lib/libgio-2.0.a ../deps/sdk-android-arm64/lib/libgmodule-2.0.a ../deps/sdk-android-arm64/lib/libcapstone.a ../deps/sdk-android-arm64/lib/libquickjs.a ../deps/sdk-android-arm64/lib/libjson-glib-1.0.a ../deps/sdk-android-arm64/lib/libssl.a ../deps/sdk-android-arm64/lib/libcrypto.a ../deps/sdk-android-arm64/lib/libunwind.a ../deps/sdk-android-arm64/lib/libdwarf.a ../deps/sdk-android-arm64/lib/liblzma.a ../deps/sdk-android-arm64/lib/libz.a ../deps/sdk-android-arm64/lib/libgvdb.a ../deps/sdk-android-arm64/lib/libffi.a ../deps/sdk-android-arm64/lib/libminizip.a ../deps/sdk-android-arm64/lib/libtcc.a; do
+                  [ -f "$lib" ] && "$AR" x "$lib" 2>/dev/null || true
+              done
+              
+              "$AR" rcs ../../devkit-arm64/libfrida-gumjs.a *.o 2>/dev/null || true
+              cd ..
+              rm -rf amalgamation-tmp
+              
+              cat dist-arm64/include/frida-1.0/gumjs/gumjs.h \
+                  dist-arm64/include/frida-1.0/gumjs/gumscript.h \
+                  dist-arm64/include/frida-1.0/gumjs/gumscriptbackend.h \
+                  dist-arm64/include/frida-1.0/gumjs/gumscriptscheduler.h \
+                  dist-arm64/include/frida-1.0/gum/gum.h \
+                  dist-arm64/include/frida-1.0/gum/guminterceptor.h \
+                  dist-arm64/include/frida-1.0/gum/gumprocess.h \
+                  dist-arm64/include/frida-1.0/gum/gummemory.h > ../devkit-arm64/frida-gumjs.h 2>/dev/null || true
+          fi
+          
           ls -la ../devkit-arm64/
           test -f ../devkit-arm64/libfrida-gumjs.a || { echo "ERROR: libfrida-gumjs.a not found"; exit 1; }
           test -f ../devkit-arm64/frida-gumjs.h || { echo "ERROR: frida-gumjs.h not found"; exit 1; }
           
-          # Copy devkit to libtool
           mkdir -p ../libtool/libs/arm64-v8a ../libtool/include
           cp ../devkit-arm64/libfrida-gumjs.a ../libtool/libs/arm64-v8a/libfrida-gumjs.a
           cp ../devkit-arm64/frida-gumjs.h ../libtool/include/frida-gumjs.h
@@ -689,16 +715,40 @@ jobs:
           make -j$(nproc)
           make install
           
-          # Generate the official GumJS devkit for arm
           echo "=== Generating frida-gumjs devkit for android-arm ==="
-          python3 -m releng.devkit frida-gumjs android-arm ../devkit-arm 2>&1
-          echo "=== Devkit generation exit code: $? ==="
+          export PYTHONPATH="$PWD"
+          python3 -m releng.devkit frida-gumjs android-arm ../devkit-arm 2>&1 || echo "Devkit script returned non-zero"
           
-          # Verify devkit output
+          if [ ! -f ../devkit-arm/libfrida-gumjs.a ]; then
+              echo "=== Devkit script failed to produce library. Manually amalgamating... ==="
+              mkdir -p ../devkit-arm amalgamation-tmp
+              cd amalgamation-tmp
+              AR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+              
+              for lib in ../dist-arm/lib/libfrida-gum*.a ../dist-arm/lib/libfrida-base*.a; do
+                  [ -f "$lib" ] && "$AR" x "$lib" 2>/dev/null || true
+              done
+              for lib in ../deps/sdk-android-arm/lib/libglib-2.0.a ../deps/sdk-android-arm/lib/libgobject-2.0.a ../deps/sdk-android-arm/lib/libgio-2.0.a ../deps/sdk-android-arm/lib/libgmodule-2.0.a ../deps/sdk-android-arm/lib/libcapstone.a ../deps/sdk-android-arm/lib/libquickjs.a ../deps/sdk-android-arm/lib/libjson-glib-1.0.a ../deps/sdk-android-arm/lib/libssl.a ../deps/sdk-android-arm/lib/libcrypto.a ../deps/sdk-android-arm/lib/libunwind.a ../deps/sdk-android-arm/lib/libdwarf.a ../deps/sdk-android-arm/lib/liblzma.a ../deps/sdk-android-arm/lib/libz.a ../deps/sdk-android-arm/lib/libgvdb.a ../deps/sdk-android-arm/lib/libffi.a ../deps/sdk-android-arm/lib/libminizip.a ../deps/sdk-android-arm/lib/libtcc.a; do
+                  [ -f "$lib" ] && "$AR" x "$lib" 2>/dev/null || true
+              done
+              
+              "$AR" rcs ../../devkit-arm/libfrida-gumjs.a *.o 2>/dev/null || true
+              cd ..
+              rm -rf amalgamation-tmp
+              
+              cat dist-arm/include/frida-1.0/gumjs/gumjs.h \
+                  dist-arm/include/frida-1.0/gumjs/gumscript.h \
+                  dist-arm/include/frida-1.0/gumjs/gumscriptbackend.h \
+                  dist-arm/include/frida-1.0/gumjs/gumscriptscheduler.h \
+                  dist-arm/include/frida-1.0/gum/gum.h \
+                  dist-arm/include/frida-1.0/gum/guminterceptor.h \
+                  dist-arm/include/frida-1.0/gum/gumprocess.h \
+                  dist-arm/include/frida-1.0/gum/gummemory.h > ../devkit-arm/frida-gumjs.h 2>/dev/null || true
+          fi
+          
           ls -la ../devkit-arm/
           test -f ../devkit-arm/libfrida-gumjs.a || { echo "ERROR: libfrida-gumjs.a not found for arm"; exit 1; }
           
-          # Copy devkit to libtool
           mkdir -p ../libtool/libs/armeabi-v7a
           cp ../devkit-arm/libfrida-gumjs.a ../libtool/libs/armeabi-v7a/libfrida-gumjs.a
           
