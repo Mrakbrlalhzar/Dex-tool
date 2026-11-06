@@ -117,7 +117,6 @@ jobs:
           [ -z "$GUMHDR" ] && { echo "ERROR: frida-gumjs.h not found";   exit 1; }
           cp "$GUMLIB" "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/libfrida-gumjs.a"
           cp "$GUMHDR" "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/frida-gumjs.h"
-          ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/"
 
       - name: Cache frida-gum armeabi-v7a
         id: cache-frida-arm
@@ -149,7 +148,6 @@ jobs:
           [ -z "$GUMLIB" ] && { echo "ERROR: armeabi-v7a lib not found"; exit 1; }
           cp "$GUMLIB" "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/libfrida-gumjs.a"
           cp "$GUMHDR" "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/frida-gumjs.h"
-          ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/"
 
       - name: Cache Dobby
         id: cache-dobby
@@ -358,12 +356,6 @@ jobs:
           }
           DXTLOGC
 
-      # ═══════════════════════════════════════════════════════════
-      # FIX overlay.h:
-      # - Removed all JNIEXPORT/NativeFunction symbols
-      # - Added overlay_on_char() and overlay_on_backspace()
-      # - Touch/keyboard now routed via JSON messages (no NativeFunction)
-      # ═══════════════════════════════════════════════════════════
       - name: Generate overlay.h
         run: |
           cat > src/overlay.h << 'DXTOVLH'
@@ -372,21 +364,19 @@ jobs:
           #include <jni.h>
           bool install_swap_hook();
           void overlay_set_java_vm(JavaVM* vm);
-          // Called from frida_bridge on_message callback (GumJS thread)
+          void overlay_start(JavaVM* vm);
           void overlay_on_touch(float x, float y, bool pressed);
-          void overlay_on_char(int codepoint);
-          void overlay_on_backspace();
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          JNIEXPORT void dextool_on_touch(float x, float y, int action);
+          JNIEXPORT void dextool_add_char(int codepoint);
+          JNIEXPORT void dextool_backspace();
+          #ifdef __cplusplus
+          }
+          #endif
           DXTOVLH
 
-      # ═══════════════════════════════════════════════════════════
-      # FIX overlay.cpp:
-      # - Removed all JNIEXPORT symbols (crash root cause was
-      #   NativeFunction with float params crashing libffi)
-      # - Added overlay_on_char / overlay_on_backspace
-      # - Both eglSwapBuffers and eglSwapBuffersWithDamageKHR hooked
-      # - glBindFramebuffer(0) before ImGui render
-      # - EGL context change detection for pause/resume
-      # ═══════════════════════════════════════════════════════════
       - name: Generate overlay.cpp
         run: |
           cat > src/overlay.cpp << 'DXTOVLC'
@@ -420,14 +410,12 @@ jobs:
           static JavaVM*           g_jvm          = nullptr;
           static EGLContext        g_egl_ctx      = EGL_NO_CONTEXT;
           
-          // Touch state (lock-free atomics — written from GumJS thread, read on GL thread)
           struct Touch {
               std::atomic<float> x{0}, y{0};
               std::atomic<bool> pressed{false}, dirty{false};
           };
           static Touch g_touch;
           
-          // Keyboard state (mutex-protected — written from GumJS thread, read on GL thread)
           static std::mutex            g_char_mtx;
           static std::vector<unsigned> g_pending_chars;
           static bool                  g_pending_bs    = false;
@@ -435,19 +423,21 @@ jobs:
           
           void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
           
-          // Called from frida_bridge on_message (GumJS thread) — thread safe via atomics
           void overlay_on_touch(float x, float y, bool p) {
               g_touch.x = x; g_touch.y = y;
               g_touch.pressed = p; g_touch.dirty = true;
           }
           
-          // Called from frida_bridge on_message (GumJS thread) — mutex protected
-          void overlay_on_char(int cp) {
+          extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
+              overlay_on_touch(x, y, action == 0 || action == 2);
+          }
+          
+          extern "C" JNIEXPORT void dextool_add_char(int cp) {
               std::lock_guard<std::mutex> lk(g_char_mtx);
               g_pending_chars.push_back((unsigned)cp);
           }
           
-          void overlay_on_backspace() {
+          extern "C" JNIEXPORT void dextool_backspace() {
               std::lock_guard<std::mutex> lk(g_char_mtx);
               g_pending_bs = true;
           }
@@ -455,6 +445,21 @@ jobs:
           static void* frida_thread(void*) {
               frida_bridge_start(g_jvm);
               return nullptr;
+          }
+
+          void overlay_start(JavaVM*) {
+              if (g_gum_inited.exchange(true)) return;
+              gum_init_embedded();
+              log_info("[overlay] gum_init_embedded done");
+              pthread_t ft;
+              pthread_attr_t a;
+              pthread_attr_init(&a);
+              pthread_attr_setstacksize(&a, 8 * 1024 * 1024);
+              pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+              pthread_create(&ft, &a, frida_thread, nullptr);
+              pthread_attr_destroy(&a);
+              touch_install_hooks();
+              log_info("[overlay] touch hooks installed, frida thread started");
           }
           
           static void imgui_shutdown() {
@@ -467,16 +472,20 @@ jobs:
           }
           
           static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
-              if (eglGetCurrentContext() == EGL_NO_CONTEXT) return;
+              EGLContext ctx = eglGetCurrentContext();
+              if (ctx == EGL_NO_CONTEXT) return;
+          
               EGLint w = 1080, h = 1920;
               eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+          
               const GLubyte* ver = glGetString(GL_VERSION);
               if (!ver || !strstr((const char*)ver, "OpenGL ES")) {
                   LOGE("[overlay] not OpenGL ES: %s", ver ? (const char*)ver : "null");
                   g_imgui_failed = true;
                   return;
               }
+          
               LOGI("[overlay] GL: %s (%dx%d)", (const char*)ver, w, h);
               ImGui::CreateContext();
               ImGuiIO& io   = ImGui::GetIO();
@@ -492,30 +501,18 @@ jobs:
               LOGI("[overlay] ImGui up OK (%dx%d)", w, h);
           }
           
-          // Called on GL thread on every swap
           static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
               EGLContext ctx = eglGetCurrentContext();
           
-              if (!g_gum_inited.exchange(true)) {
+              if (ctx != EGL_NO_CONTEXT && ctx != g_egl_ctx) {
+                  if (g_egl_ctx != EGL_NO_CONTEXT) {
+                      LOGI("[overlay] EGL context changed, re-init ImGui");
+                      imgui_shutdown();
+                  }
                   g_egl_ctx = ctx;
-                  gum_init_embedded();
-                  log_info("[overlay] gum_init_embedded done");
-                  // Spawn frida thread with 4MB stack to avoid stack overflow
-                  pthread_t ft;
-                  pthread_attr_t a; pthread_attr_init(&a);
-                  pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-                  pthread_attr_setstacksize(&a, 4 * 1024 * 1024);
-                  pthread_create(&ft, &a, frida_thread, nullptr);
-                  pthread_attr_destroy(&a);
-                  touch_install_hooks();
-                  imgui_init(dpy, surf);
-              } else if (ctx != EGL_NO_CONTEXT && ctx != g_egl_ctx) {
-                  LOGI("[overlay] EGL context changed, re-init ImGui");
-                  g_egl_ctx = ctx;
-                  imgui_shutdown();
                   imgui_init(dpy, surf);
               }
-          
+
               if (!g_imgui_up.load() || g_imgui_failed) return;
           
               ImGuiIO& io = ImGui::GetIO();
@@ -526,13 +523,11 @@ jobs:
                   io.DisplaySize = ImVec2((float)w, (float)h);
               }
           
-              // Inject touch (from JSON message via on_message)
               if (g_touch.dirty.exchange(false)) {
                   io.MousePos     = ImVec2(g_touch.x.load(), g_touch.y.load());
                   io.MouseDown[0] = g_touch.pressed.load();
               }
           
-              // Inject keyboard input (from JSON message via on_message)
               {
                   std::lock_guard<std::mutex> lk(g_char_mtx);
                   for (unsigned cp : g_pending_chars) io.AddInputCharacter(cp);
@@ -544,7 +539,6 @@ jobs:
                   }
               }
           
-              // Tell agent when ImGui wants keyboard
               bool want_kbd = io.WantCaptureKeyboard;
               if (want_kbd != g_want_kbd_prev) {
                   g_want_kbd_prev = want_kbd;
@@ -553,7 +547,6 @@ jobs:
                       "{\"type\":\"hideKeyboard\"}");
               }
           
-              // Bind default FBO so we render to screen (not any app FBO)
               glBindFramebuffer(GL_FRAMEBUFFER, 0);
               ImGui_ImplOpenGL3_NewFrame();
               ImGui::NewFrame();
@@ -562,7 +555,6 @@ jobs:
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
           }
           
-          // CRITICAL: g_orig_swap — NEVER recurses into eglSwapBuffers symbol
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
               overlay_tick(dpy, surf);
               return g_orig_swap(dpy, surf);
@@ -578,7 +570,6 @@ jobs:
               void* egl = dlopen("libEGL.so", RTLD_NOW);
               if (!egl) { LOGE("dlopen libEGL.so: %s", dlerror()); return false; }
               bool ok = false;
-          
               void* sym = dlsym(egl, "eglSwapBuffers");
               if (sym) {
                   int r = DobbyHook(sym,
@@ -587,8 +578,6 @@ jobs:
                   if (r == 0) { LOGI("eglSwapBuffers hooked OK"); ok = true; }
                   else LOGE("DobbyHook eglSwapBuffers: %d", r);
               }
-          
-              // Also hook eglSwapBuffersWithDamageKHR (used by many apps)
               void* sym_dmg = dlsym(egl, "eglSwapBuffersWithDamageKHR");
               if (!sym_dmg) {
                   typedef void* (*PFN)(const char*);
@@ -615,7 +604,7 @@ jobs:
           #pragma once
           void touch_install_hooks();
           DXTTHH
-                    cat > src/touch.cpp << 'DXTTCH'
+          cat > src/touch.cpp << 'DXTTCH'
           #include "touch.h"
           #include "overlay.h"
           #include "logger.h"
@@ -650,10 +639,10 @@ jobs:
                   reinterpret_cast<dobby_dummy_func_t>(my_getEvent),
                   reinterpret_cast<dobby_dummy_func_t*>(&g_orig_get));
               if (r == 0) LOGI("touch: AInputQueue_getEvent hooked (NativeActivity)");
-              else        LOGD("touch: hook failed %d (OK for Java apps)", r);
+              else        LOGD("touch: DobbyHook AInputQueue_getEvent: %d", r);
           }
           DXTTCH
-          
+
       - name: Generate frida_bridge.h
         run: |
           cat > src/frida_bridge.h << 'DXTFBH'
@@ -667,33 +656,16 @@ jobs:
           void frida_set_message_callback(MsgCallback cb);
           DXTFBH
 
-      # ═══════════════════════════════════════════════════════════
-      # FIX frida_bridge.cpp:
-      # ROOT CAUSE FIX: on_message now routes touch/char/backspace
-      # messages directly to overlay instead of using NativeFunction
-      # in JS (which crashed libffi with float params on Android).
-      #
-      # Architecture:
-      #   JS send({type:'touch',x,y,action}) → on_message → overlay_on_touch()
-      #   JS send({type:'char',cp}) → on_message → overlay_on_char()
-      #   JS send({type:'backspace'}) → on_message → overlay_on_backspace()
-      #   C++ frida_post({type:'showKeyboard'}) → JS recv → IME shown
-      #
-      # Added checkpoint logs for crash diagnosis.
-      # Increased frida thread stack to 4MB.
-      # ═══════════════════════════════════════════════════════════
       - name: Generate frida_bridge.cpp
         run: |
           cat > src/frida_bridge.cpp << 'DXTFBC'
           #include "frida_bridge.h"
-          #include "overlay.h"
           #include "logger.h"
           #include "frida-gumjs.h"
           #include "agent_bundle_embed.h"
           #include <mutex>
           #include <string>
-          #include <cstdlib>
-          #include <cstring>
+          #include <cstdio>
           
           static GumScriptBackend* g_backend = nullptr;
           static GumScript*        g_script  = nullptr;
@@ -702,97 +674,41 @@ jobs:
           static std::mutex        g_pmtx;
           static MsgCallback       g_cb;
           
-          // ── Simple JSON value extractors ────────────────────────────────
-          static float jfloat(const char* s, const char* key, float def = 0.f) {
-              char k[64];
-              snprintf(k, sizeof(k), "\"%s\":", key);
-              const char* p = strstr(s, k);
-              if (!p) return def;
-              p += strlen(k);
-              while (*p == ' ') p++;
-              char* end;
-              float v = strtof(p, &end);
-              return (end != p) ? v : def;
-          }
-          
-          static int jint(const char* s, const char* key, int def = 0) {
-              char k[64];
-              snprintf(k, sizeof(k), "\"%s\":", key);
-              const char* p = strstr(s, k);
-              if (!p) return def;
-              p += strlen(k);
-              while (*p == ' ') p++;
-              char* end;
-              long v = strtol(p, &end, 10);
-              return (end != p) ? (int)v : def;
-          }
-          
-          // ── Message handler ──────────────────────────────────────────────
-          // Runs on GumJS thread.
-          // IMPORTANT: Touch/keyboard messages are handled HERE in C++
-          // (NOT via NativeFunction in JS) to avoid libffi float param crash.
           static void on_message(const gchar* msg, GBytes*, gpointer) {
-              if (!msg) return;
-          
-              // Route touch events (sent by Activity.dispatchTouchEvent hook in agent)
-              if (strstr(msg, "\"type\":\"touch\"")) {
-                  float x = jfloat(msg, "x");
-                  float y = jfloat(msg, "y");
-                  int   a = jint(msg, "action");
-                  overlay_on_touch(x, y, a == 0 || a == 2);
-                  return;
+              MsgCallback local;
+              {
+                  std::lock_guard<std::mutex> lk(g_pmtx);
+                  local = g_cb;
               }
-          
-              // Route keyboard char (sent by TextWatcher hook in agent)
-              if (strstr(msg, "\"type\":\"char\"")) {
-                  int cp = jint(msg, "cp");
-                  if (cp > 0) overlay_on_char(cp);
-                  return;
-              }
-          
-              // Route backspace (sent by TextWatcher hook in agent)
-              if (strstr(msg, "\"type\":\"backspace\"")) {
-                  overlay_on_backspace();
-                  return;
-              }
-          
-              // All other messages go to menu callback
-              if (g_cb) g_cb(std::string(msg));
+              if (local && msg) local(std::string(msg));
           }
           
           void frida_bridge_start(JavaVM*) {
-              log_info("[frida_bridge] step1: ctx");
+              log_info("[frida_bridge] starting GumJS");
               g_ctx  = g_main_context_new();
               g_loop = g_main_loop_new(g_ctx, FALSE);
               g_main_context_push_thread_default(g_ctx);
-          
-              log_info("[frida_bridge] step2: backend");
               g_backend = gum_script_backend_obtain_qjs();
               if (!g_backend) {
                   log_crash_raw("[frida_bridge] FATAL: no QJS backend\n");
                   return;
               }
-          
-              log_info("[frida_bridge] step3: create_sync");
+              log_info("[frida_bridge] QJS backend obtained");
               GError* err = nullptr;
               g_script = gum_script_backend_create_sync(
                              g_backend, "dextool-agent",
                              g_agent_js, nullptr, nullptr, &err);
               if (!g_script || err) {
                   char m[512];
-                  snprintf(m, sizeof(m), "[frida_bridge] create_sync failed: %s\n",
+                  snprintf(m, sizeof(m), "[frida_bridge] create: %s\n",
                            err ? err->message : "(null)");
                   log_crash_raw(m);
                   if (err) g_error_free(err);
                   return;
               }
-          
-              log_info("[frida_bridge] step4: set_message_handler");
+              log_info("[frida_bridge] script created, loading agent");
               gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
-          
-              log_info("[frida_bridge] step5: load_sync");
               gum_script_load_sync(g_script, nullptr);
-          
               log_info("[frida_bridge] agent running");
               g_main_loop_run(g_loop);
               log_info("[frida_bridge] loop exited");
@@ -804,9 +720,12 @@ jobs:
               gum_script_post(g_script, json.c_str(), nullptr);
           }
           
-          void frida_set_message_callback(MsgCallback cb) { g_cb = cb; }
+          void frida_set_message_callback(MsgCallback cb) {
+              std::lock_guard<std::mutex> lk(g_pmtx);
+              g_cb = cb;
+          }
           DXTFBC
-          
+
       - name: Generate smali_runtime.h and smali_runtime.cpp
         run: |
           cat > src/smali_runtime.h << 'DXTSRH'
@@ -817,7 +736,7 @@ jobs:
                                     const std::string& class_name,
                                     std::vector<uint8_t>& dex_out);
           DXTSRH
-                    cat > src/smali_runtime.cpp << 'DXTSRC'
+          cat > src/smali_runtime.cpp << 'DXTSRC'
           #include "smali_runtime.h"
           #include "logger.h"
           #include <jni.h>
@@ -921,7 +840,7 @@ jobs:
           void menu_init();
           void menu_draw();
           DXTMNH
-          
+
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
@@ -936,8 +855,8 @@ jobs:
           #include <pthread.h>
           
           static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-          #define MLK()  pthread_mutex_lock(&g_mtx)
-          #define MULK() pthread_mutex_unlock(&g_mtx)
+          #define MLK()   pthread_mutex_lock(&g_mtx)
+          #define MULK()  pthread_mutex_unlock(&g_mtx)
           
           static float s_font_scale = 1.0f;
           static float s_opacity    = 0.92f;
@@ -953,7 +872,7 @@ jobs:
           static std::vector<HookEntry>    s_hooks;
           static std::vector<TrackerEntry> s_trackers;
           static std::vector<ClassWin>     s_classes;
-          static bool s_rec_on=false, s_mon_on=false;
+          static bool s_rec_on = false, s_mon_on = false;
           static std::vector<std::string> s_rec_log, s_mon_log, s_script_out;
           
           static char s_pname[256]={}, s_pval[512]={};
@@ -965,27 +884,33 @@ jobs:
           
           static void post_rpc(const char* fn, const char* args) {
               char buf[4096];
-              snprintf(buf,sizeof(buf),
-                       "{\"type\":\"rpc\",\"fn\":\"%s\",\"args\":%s}",fn,args);
+              snprintf(buf, sizeof(buf),
+                       "{\"type\":\"rpc\",\"fn\":\"%s\",\"args\":%s}", fn, args);
               frida_post(std::string(buf));
           }
           
           static std::string jstr(const std::string& j, const char* key) {
-              std::string k=std::string("\"")+key+"\":\"";
-              auto p=j.find(k); if(p==std::string::npos) return "";
-              p+=k.size(); auto e=j.find('"',p);
-              return (e!=std::string::npos)?j.substr(p,e-p):"";
+              std::string k = std::string("\"")+key+"\":\"";
+              auto p = j.find(k);
+              if (p == std::string::npos) return "";
+              p += k.size();
+              auto e = j.find('"', p);
+              return (e!=std::string::npos) ? j.substr(p,e-p) : "";
           }
           
           static std::vector<std::string> jarr(const std::string& j, const char* key) {
               std::vector<std::string> r;
-              std::string k=std::string("\"")+key+"\":[";
-              auto p=j.find(k); if(p==std::string::npos) return r;
-              p+=k.size(); auto e=j.find(']',p); if(e==std::string::npos) return r;
-              std::string seg=j.substr(p,e-p); size_t i=0;
+              std::string k = std::string("\"")+key+"\":[";
+              auto p = j.find(k);
+              if (p==std::string::npos) return r;
+              p += k.size();
+              auto e = j.find(']',p);
+              if (e==std::string::npos) return r;
+              std::string seg = j.substr(p,e-p);
+              size_t i=0;
               while(i<seg.size()){
-                  auto s=seg.find('"',i); if(s==std::string::npos) break; s++;
-                  auto f=seg.find('"',s); if(f==std::string::npos) break;
+                  auto s=seg.find('"',i); if(s==std::string::npos)break; s++;
+                  auto f=seg.find('"',s); if(f==std::string::npos)break;
                   r.push_back(seg.substr(s,f-s)); i=f+1;
               }
               return r;
@@ -1005,7 +930,7 @@ jobs:
               apply_theme();
               frida_set_message_callback([](const std::string& j){
                   MLK();
-                  if(j.find("\"classInfo\"")!=std::string::npos){
+                  if (j.find("\"classInfo\"")!=std::string::npos) {
                       auto cls=jstr(j,"class");
                       auto mths=jarr(j,"methods");
                       auto flds=jarr(j,"fields");
@@ -1013,7 +938,8 @@ jobs:
                           if(cw.cname==cls){ cw.methods=mths; cw.fields=flds; break; }
                       }
                   } else if(j.find("\"trackerEvent\"")!=std::string::npos){
-                      auto name=jstr(j,"name"); auto ret=jstr(j,"ret");
+                      auto name=jstr(j,"name");
+                      auto ret=jstr(j,"ret");
                       for(auto& t:s_trackers){
                           if(t.name==name){
                               t.log.push_back(ret.empty()?j:ret);
@@ -1292,6 +1218,7 @@ jobs:
               log_info("[JNI_OnLoad] entry");
               write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=logger_ready");
               overlay_set_java_vm(vm);
+              overlay_start(vm);
               if (!install_swap_hook())
                   log_crash_raw("[JNI_OnLoad] FATAL: install_swap_hook failed\n");
               write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=hooks_installed");
@@ -1300,15 +1227,7 @@ jobs:
               return JNI_VERSION_1_6;
           }
           DXTMAIN
-          
-      # ═══════════════════════════════════════════════════════════
-      # FIX agent.js — ROOT CAUSE FIX:
-      # Removed ALL NativeFunction calls (libffi float params = SIGSEGV).
-      # Touch: Activity.dispatchTouchEvent → send({type:'touch',...})
-      # Keyboard: EditText TextWatcher → send({type:'char',...})
-      # C++ on_message routes these to overlay_on_touch/char/backspace.
-      # showKeyboard/hideKeyboard: C++ frida_post → JS recv → IME.
-      # ═══════════════════════════════════════════════════════════
+
       - name: Generate agent.js
         run: |
           cat > agent/agent.js << 'DXTAGNT'
@@ -1321,7 +1240,7 @@ jobs:
               send(JSON.stringify({ type: type, payload: payload }));
           }
           
-          // Touch offset: ActionBar / status bar height correction
+          // Touch offset
           var gOffX=0, gOffY=0;
           
           function updateOffset(activity) {
@@ -1335,19 +1254,28 @@ jobs:
               } catch(e) {}
           }
           
-          // Keyboard bridge state
+          // Keyboard bridge
           var gET=null, gIMM=null, gClearing=false;
+          var gAddChar=null, gBackspace=null;
           
           function setupKeyboardBridge(activity) {
+              try {
+                  var sym1 = Module.findExportByName('libtool.so','dextool_add_char');
+                  var sym2 = Module.findExportByName('libtool.so','dextool_backspace');
+                  if (!sym1||!sym2) return;
+                  gAddChar   = new NativeFunction(sym1,'void',['int']);
+                  gBackspace = new NativeFunction(sym2,'void',[]);
+              } catch(e) { return; }
+          
               Java.scheduleOnMainThread(function() {
                   try {
-                      var ET     = Java.use('android.widget.EditText');
-                      var FL     = Java.use('android.widget.FrameLayout');
-                      var LP     = Java.use('android.widget.FrameLayout$LayoutParams');
-                      var TW     = Java.use('android.text.TextWatcher');
+                      var ET  = Java.use('android.widget.EditText');
+                      var FL  = Java.use('android.widget.FrameLayout');
+                      var LP  = Java.use('android.widget.FrameLayout$LayoutParams');
+                      var TW  = Java.use('android.text.TextWatcher');
                       var IMMCls = Java.use('android.view.inputmethod.InputMethodManager');
-                      var Editable= Java.use('android.text.Editable');
-                      var CS     = Java.use('java.lang.CharSequence');
+                      var Editable = Java.use('android.text.Editable');
+                      var CS = Java.use('java.lang.CharSequence');
           
                       var et = ET.$new(activity);
                       et.setAlpha(0.0);
@@ -1356,37 +1284,29 @@ jobs:
                       var params = LP.$new(1,1);
                       Java.cast(activity.getWindow().getDecorView(), FL).addView(et, params);
           
-                      // TextWatcher: forward typed text to C++ via send() — NO NativeFunction
                       var WatcherCls = Java.registerClass({
                           name: 'com.dextool.app.DxtoolKbd_'+Date.now(),
                           implements: [TW],
                           methods: {
-                              beforeTextChanged: function(s,st,c,af){},
+                              beforeTextChanged: function(s,st,c,a){},
                               onTextChanged: function(s,st,before,count) {
                                   if (gClearing) return;
                                   try {
-                                      if (count > before) {
-                                          var txt = Java.cast(s, CS).toString();
+                                      if (count>before) {
+                                          var txt = Java.cast(s,CS).toString();
                                           var added = txt.substring(st+before, st+count);
-                                          for (var i=0; i<added.length; i++) {
-                                              // Send char as JSON — no NativeFunction needed
-                                              send(JSON.stringify({
-                                                  type: 'char',
-                                                  cp:   added.charCodeAt(i)
-                                              }));
-                                          }
-                                      } else if (before > count) {
-                                          for (var i=0; i<before-count; i++) {
-                                              send(JSON.stringify({ type: 'backspace' }));
-                                          }
+                                          for (var i=0;i<added.length;i++)
+                                              gAddChar(added.charCodeAt(i));
+                                      } else if (before>count) {
+                                          for (var i=0;i<before-count;i++) gBackspace();
                                       }
                                   } catch(e2) {}
                               },
                               afterTextChanged: function(e) {
                                   if (!gClearing) {
-                                      gClearing = true;
-                                      try { Java.cast(e, Editable).clear(); } catch(e2){}
-                                      gClearing = false;
+                                      gClearing=true;
+                                      try { Java.cast(e,Editable).clear(); } catch(e2){}
+                                      gClearing=false;
                                   }
                               }
                           }
@@ -1394,16 +1314,18 @@ jobs:
                       et.addTextChangedListener(WatcherCls.$new());
                       gET  = et;
                       gIMM = Java.cast(activity.getSystemService('input_method'), IMMCls);
-                      sendMsg('info', { msg: 'Keyboard bridge OK' });
-                  } catch(e) {
-                      sendMsg('warn', { msg: 'setupKeyboardBridge: '+e.message });
-                  }
+                      sendMsg('info',{msg:'Keyboard bridge OK'});
+                  } catch(e) { sendMsg('warn',{msg:'setupKeyboardBridge: '+e.message}); }
               });
           }
           
-          // Touch hook — uses send() to pass coordinates to C++ (no NativeFunction / no float libffi)
+          // Touch hook
           function installTouchHook() {
               try {
+                  var sym = Module.findExportByName('libtool.so','dextool_on_touch');
+                  if (!sym) { sendMsg('warn',{msg:'dextool_on_touch not found'}); return; }
+                  var nativeTouch = new NativeFunction(sym,'void',['float','float','int']);
+          
                   Java.perform(function() {
                       var Activity = Java.use('android.app.Activity');
           
@@ -1415,28 +1337,20 @@ jobs:
                           return this.onWindowFocusChanged(has);
                       };
           
-                      // Send touch as JSON message — C++ on_message routes to overlay_on_touch()
                       Activity.dispatchTouchEvent.implementation = function(ev) {
                           try {
-                              send(JSON.stringify({
-                                  type:   'touch',
-                                  x:      ev.getX() - gOffX,
-                                  y:      ev.getY() - gOffY,
-                                  action: ev.getAction() & 0xff
-                              }));
-                          } catch(e2) {}
+                              nativeTouch(ev.getX()-gOffX, ev.getY()-gOffY,
+                                          ev.getAction()&0xff);
+                          } catch(e2){}
                           return this.dispatchTouchEvent(ev);
                       };
-                      sendMsg('info', { msg: 'Touch hook installed' });
+                      sendMsg('info',{msg:'Touch hook installed'});
                   });
-              } catch(e) {
-                  sendMsg('error', { fn: 'installTouchHook', msg: e.message });
-              }
+              } catch(e) { sendMsg('error',{fn:'installTouchHook',msg:e.message}); }
           }
           
           installTouchHook();
           
-          // RPC exports
           rpc.exports = {
               addPatch: function(name,value) {
                   try {
@@ -1456,8 +1370,8 @@ jobs:
                       });
                   } catch(e){ sendMsg('error',{fn:'addPatch',msg:e.message}); }
               },
-              removePatch:    function(n){ delete patches[n]; sendMsg('patchRemoved',{name:n}); },
-              setPatchEnabled:function(n,en){ if(patches[n])patches[n].enabled=en; sendMsg('patchUpdated',{name:n,enabled:en}); },
+              removePatch: function(name){ delete patches[name]; sendMsg('patchRemoved',{name:name}); },
+              setPatchEnabled: function(name,en){ if(patches[name])patches[name].enabled=en; sendMsg('patchUpdated',{name:name,enabled:en}); },
           
               addHook: function(name,mode,code) {
                   try {
@@ -1490,7 +1404,7 @@ jobs:
                       });
                   } catch(e){ sendMsg('error',{fn:'removeHook',msg:e.message}); }
               },
-              setHookEnabled: function(n,en){ if(hooks[n])hooks[n].enabled=en; sendMsg('hookUpdated',{name:n,enabled:en}); },
+              setHookEnabled: function(name,en){ if(hooks[name])hooks[name].enabled=en; sendMsg('hookUpdated',{name:name,enabled:en}); },
           
               addTracker: function(name) {
                   try {
@@ -1599,7 +1513,6 @@ jobs:
           
           recv(function onMsg(msg){
               if(!msg){ recv(onMsg); return; }
-          
               if(msg.type==='rpc'&&rpc.exports[msg.fn]){
                   var a=msg.args||{};
                   rpc.exports[msg.fn].apply(rpc.exports,Object.values(a));
@@ -1617,13 +1530,12 @@ jobs:
                       }catch(e){}
                   });
               }
-          
               recv(onMsg);
           });
           
           sendMsg('ready',{msg:'Dex-tool agent loaded'});
           DXTAGNT
-          
+
       - name: Embed agent.js as C array
         run: |
           cat > /tmp/gen_embed.js << 'DXTNJS'
@@ -1644,7 +1556,7 @@ jobs:
           fs.writeFileSync('src/agent_bundle_embed.h', out);
           console.log('agent_bundle_embed.h: '+bytes.length+' bytes');
           DXTNJS
-                    node /tmp/gen_embed.js
+          node /tmp/gen_embed.js
 
       - name: Build libtool.so arm64-v8a
         run: |
@@ -1754,7 +1666,7 @@ jobs:
               }
           }
           DXTAPPJ
-          
+
       - name: Generate MainActivity.java
         run: |
           cat > sample-app/app/src/main/java/com/dextool/app/MainActivity.java << 'DXTMAINAJ'
@@ -1786,13 +1698,12 @@ jobs:
               @Override protected void onPause()  { super.onPause();  mGLView.onPause();  }
           }
           DXTMAINAJ
-          
+
       - name: Generate Android Manifest and resources
         run: |
           cat > sample-app/app/src/main/AndroidManifest.xml << 'DXTMNFST'
           <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-              package="com.dextool.app">
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
               <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
               <uses-permission android:name="android.permission.INTERNET"/>
@@ -1810,13 +1721,13 @@ jobs:
               </application>
           </manifest>
           DXTMNFST
-                    cat > sample-app/app/src/main/res/values/strings.xml << 'DXTSTRS'
+          cat > sample-app/app/src/main/res/values/strings.xml << 'DXTSTRS'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">DexTool Sample</string>
           </resources>
           DXTSTRS
-          
+
       - name: Generate Gradle build files
         run: |
           cat > sample-app/gradle.properties << 'DXTGRADP'
@@ -1824,18 +1735,18 @@ jobs:
           android.enableJetifier=true
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           DXTGRADP
-                    cat > sample-app/settings.gradle << 'DXTSETS'
+          cat > sample-app/settings.gradle << 'DXTSETS'
           rootProject.name = "DexToolSample"
           include ':app'
           DXTSETS
-                    cat > sample-app/build.gradle << 'DXTROOTB'
+          cat > sample-app/build.gradle << 'DXTROOTB'
           buildscript {
               repositories { google(); mavenCentral() }
               dependencies { classpath 'com.android.tools.build:gradle:8.1.4' }
           }
           allprojects { repositories { google(); mavenCentral() } }
           DXTROOTB
-                    cat > sample-app/app/build.gradle << 'DXTAPPB'
+          cat > sample-app/app/build.gradle << 'DXTAPPB'
           plugins { id 'com.android.application' }
           android {
               namespace          'com.dextool.app'
@@ -1873,9 +1784,9 @@ jobs:
               implementation 'androidx.appcompat:appcompat:1.6.1'
           }
           DXTAPPB
-                    echo "sdk.dir=$ANDROID_HOME" > sample-app/local.properties
-          
-      - name: Build sample-signed.apk
+          echo "sdk.dir=$ANDROID_HOME" > sample-app/local.properties
+
+      - name: Build sample-signed.apk (with libtool.so)
         run: |
           cp out/lib/arm64-v8a/libtool.so \
              sample-app/app/src/main/jniLibs/arm64-v8a/libtool.so
@@ -1889,7 +1800,7 @@ jobs:
              "$GITHUB_WORKSPACE/sample-signed.apk"
           echo "sample-signed.apk: $(du -sh "$GITHUB_WORKSPACE/sample-signed.apk")"
 
-      - name: Build sample-nolib-signed.apk
+      - name: Build sample-nolib-signed.apk (without libtool.so)
         run: |
           rm -f sample-app/app/src/main/jniLibs/arm64-v8a/libtool.so
           rm -f sample-app/app/src/main/jniLibs/armeabi-v7a/libtool.so
@@ -1909,39 +1820,50 @@ jobs:
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
           
-          ## Root cause fix in this version
+          ## Fixes in this version
           
-              SIGSEGV (signal 11) after "[frida_bridge] starting GumJS" was caused by
-              NativeFunction with float parameters crashing libffi inside frida-gum 16.x
-              on Android ARM. The fix removes ALL NativeFunction usage from agent.js.
+              1. Touch offset: Activity.dispatchTouchEvent coordinates are
+                 corrected by the content-view y-offset measured in
+                 onWindowFocusChanged (removes ActionBar shift).
           
-              New architecture (zero NativeFunction):
-                Touch: Activity.dispatchTouchEvent hook sends JSON {type:'touch',x,y,action}
-                       via Frida send(). C++ on_message() routes to overlay_on_touch().
-                Keyboard: EditText TextWatcher sends {type:'char',cp} and {type:'backspace'}
-                          via Frida send(). C++ on_message() routes to overlay_on_char/backspace().
-                Keyboard show/hide: C++ frida_post({type:'showKeyboard'}) to agent recv().
-                                    Agent calls gIMM.showSoftInput() on main thread.
+              2. Keyboard: invisible EditText + TextWatcher bridge. When ImGui
+                 sets WantCaptureKeyboard, the agent posts showKeyboard to the
+                 C++ layer, which calls frida_post back to the GumJS agent,
+                 which shows the IME on the main thread. Characters arrive via
+                 TextWatcher -> dextool_add_char NativeFunction -> ImGui
+                 AddInputCharacter on the GL thread.
           
-          ## Checkpoint logging added to frida_bridge_start
+              3. Font size: FontGlobalScale is updated immediately when the
+                 slider changes value.
           
-              Look for "step1" through "step5" in dextool.log to pinpoint any future crash.
+              4. Classes tab: JSON response from openClass is parsed in the
+                 message callback and stored in ClassWin.methods/fields under
+                 mutex. CollapsingHeader now shows method/field counts.
+          
+              5. Menu in injected APKs: eglSwapBuffersWithDamageKHR is now
+                 also hooked (many apps use this instead of eglSwapBuffers).
+                 glBindFramebuffer(0) is called before ImGui render to ensure
+                 we draw to the default framebuffer.
+          
+              6. Thread safety: menu data structures are protected with a
+                 pthread_mutex (message callback = GumJS thread, draw = GL thread).
           
           ## Usage
           
               1. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
-              2. Inject System.loadLibrary("tool") into Application.onCreate().
+              2. Inject System.loadLibrary("tool") into Application.onCreate()
+                 or the launcher Activity.
               3. Copy smali-fat.jar into assets/.
               4. Re-sign and install.
           
           ## Components
           
               frida-gum 16.7.19   QuickJS / GumJS scripting runtime
-              Dobby (LSPosed)     inline hook framework
-              ImGui 1.90.4        immediate-mode overlay GUI (ES2 mode, #version 100)
+              Dobby (LSPosed)     inline function hook framework
+              ImGui 1.90.4        immediate-mode overlay GUI (ES2 mode)
               smali 3.0.7         runtime .smali to DEX assembler (bundled JAR)
           DXTRDME
-                    cat > .gitignore << 'DXTGI'
+          cat > .gitignore << 'DXTGI'
           build-arm64/
           build-arm/
           frida-gum-src/
@@ -1953,7 +1875,7 @@ jobs:
           *.zip
           *.tar.*
           DXTGI
-          
+
       - name: Upload libtool.so artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -1985,7 +1907,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix: remove NativeFunction float params (SIGSEGV root cause) [skip ci]"
+            git commit -m "fix: touch-offset+keyboard+font+classes+swapDMG+mutex [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
