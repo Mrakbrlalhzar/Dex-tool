@@ -5,118 +5,7 @@
 #include <string>
 #include <vector>
 #include <cstdio>
-#include <cstring>
 
-// ── Minimal JSON extractors (flat object, string / array-of-string) ─
-static std::string j_str(const std::string& j, const std::string& key) {
-    std::string n = "\"" + key + "\":\"";
-    size_t p = j.find(n);
-    if (p == std::string::npos) return "";
-    p += n.size();
-    std::string out;
-    while (p < j.size() && j[p] != '"') {
-        if (j[p] == '\\' && p + 1 < j.size()) {
-            char c = j[p+1];
-            switch (c) {
-                case 'n': out += '\n'; break;
-                case 't': out += '\t'; break;
-                case 'r': out += '\r'; break;
-                case '"': out += '"';  break;
-                case '\\': out += '\\'; break;
-                case '/': out += '/';  break;
-                case 'u': {
-                    if (p + 5 < j.size()) {
-                        unsigned cp = 0;
-                        for (int k = 0; k < 4; k++) {
-                            char h = j[p+2+k];
-                            cp <<= 4;
-                            if (h >= '0' && h <= '9') cp |= h - '0';
-                            else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10;
-                            else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10;
-                        }
-                        if (cp < 0x80) out += (char)cp;
-                        else if (cp < 0x800) {
-                            out += (char)(0xC0 | (cp >> 6));
-                            out += (char)(0x80 | (cp & 0x3F));
-                        } else {
-                            out += (char)(0xE0 | (cp >> 12));
-                            out += (char)(0x80 | ((cp >> 6) & 0x3F));
-                            out += (char)(0x80 | (cp & 0x3F));
-                        }
-                        p += 4;
-                    }
-                    break;
-                }
-                default: out += c; break;
-            }
-            p += 2;
-        } else out += j[p++];
-    }
-    return out;
-}
-
-static std::vector<std::string> j_arr(const std::string& j, const std::string& key) {
-    std::vector<std::string> out;
-    std::string n = "\"" + key + "\":[";
-    size_t p = j.find(n);
-    if (p == std::string::npos) return out;
-    p += n.size();
-    size_t e = j.find(']', p);
-    if (e == std::string::npos) return out;
-    std::string seg = j.substr(p, e - p);
-    size_t i = 0;
-    while (i < seg.size()) {
-        while (i < seg.size() && seg[i] != '"') i++;
-        if (i >= seg.size()) break;
-        i++;
-        std::string val;
-        while (i < seg.size() && seg[i] != '"') {
-            if (seg[i] == '\\' && i + 1 < seg.size()) {
-                char c = seg[i+1];
-                switch (c) {
-                    case 'n': val += '\n'; break;
-                    case 't': val += '\t'; break;
-                    case 'r': val += '\r'; break;
-                    case '"': val += '"';  break;
-                    case '\\': val += '\\'; break;
-                    case '/': val += '/';  break;
-                    case 'u': {
-                        if (i + 5 < seg.size()) {
-                            unsigned cp = 0;
-                            for (int k = 0; k < 4; k++) {
-                                char h = seg[i+2+k];
-                                cp <<= 4;
-                                if (h >= '0' && h <= '9') cp |= h - '0';
-                                else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10;
-                                else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10;
-                            }
-                            if (cp < 0x80) val += (char)cp;
-                            else if (cp < 0x800) {
-                                val += (char)(0xC0 | (cp >> 6));
-                                val += (char)(0x80 | (cp & 0x3F));
-                            } else {
-                                val += (char)(0xE0 | (cp >> 12));
-                                val += (char)(0x80 | ((cp >> 6) & 0x3F));
-                                val += (char)(0x80 | (cp & 0x3F));
-                            }
-                            i += 4;
-                        }
-                        break;
-                    }
-                    default: val += c; break;
-                }
-                i += 2;
-            } else val += seg[i++];
-        }
-        i++;
-        out.push_back(val);
-        while (i < seg.size() && seg[i] != ',') i++;
-        if (i < seg.size()) i++;
-    }
-    return out;
-}
-
-// ── UI state (GL thread only after menu_init) ──────────────
 static float s_opacity = 0.92f;
 static float s_font_sz = 14.f;
 static int   s_theme   = 0;
@@ -125,7 +14,7 @@ static bool  s_visible = true;
 struct PatchEntry  { std::string name, value; bool enabled = true; };
 struct HookEntry   { std::string name, code;  bool enabled = true; int mode = 0; };
 struct TrackerEntry{ std::string name; std::vector<std::string> log; };
-struct ClassWin    { std::string cname; std::vector<std::string> methods, fields; bool loaded = false; };
+struct ClassWin    { std::string cname; std::vector<std::string> methods, fields; };
 
 static std::vector<PatchEntry>   s_patches;
 static std::vector<HookEntry>    s_hooks;
@@ -152,84 +41,23 @@ static void post_rpc(const char* fn, const char* args) {
 }
 
 static void apply_theme() {
-    if (!ImGui::GetCurrentContext()) return;
     switch (s_theme) {
         case 0: ImGui::StyleColorsDark();    break;
         case 1: ImGui::StyleColorsLight();   break;
         case 2: ImGui::StyleColorsClassic(); break;
     }
     ImGui::GetStyle().Alpha = s_opacity;
-    ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
-}
-
-// GL thread only.
-static void handle_message(const std::string& j) {
-    std::string type = j_str(j, "type");
-    if (type.empty()) return;
-    if (type == "classInfo") {
-        std::string cls = j_str(j, "class");
-        auto methods = j_arr(j, "methods");
-        auto fields  = j_arr(j, "fields");
-        for (auto& c : s_classes) {
-            if (c.cname == cls) {
-                c.methods = std::move(methods);
-                c.fields  = std::move(fields);
-                c.loaded  = true;
-                break;
-            }
-        }
-    } else if (type == "instanceList") {
-        std::string cls = j_str(j, "class");
-        auto list = j_arr(j, "instances");
-        for (auto& c : s_classes) {
-            if (c.cname == cls) {
-                for (auto& s : list) c.methods.push_back("instance: " + s);
-                break;
-            }
-        }
-    } else if (type == "trackerEvent") {
-        std::string name = j_str(j, "name");
-        auto args = j_arr(j, "args");
-        std::string line = "[" + name + "]";
-        for (auto& a : args) line += " " + a;
-        for (auto& t : s_trackers)
-            if (t.name == name) t.log.push_back(line);
-    } else if (type == "recorded") {
-        s_rec_log.push_back(j_str(j, "cls") + "." + j_str(j, "method"));
-    } else if (type == "scriptResult" || type == "scriptError") {
-        s_script_out.push_back(j_str(j, "result").empty()
-            ? j_str(j, "msg") : j_str(j, "result"));
-    } else if (type == "sslInit" || type == "monitorInfo") {
-        s_mon_log.push_back(j_str(j, "note"));
-    } else if (type == "error") {
-        s_script_out.push_back("ERR[" + j_str(j, "fn") + "]: " + j_str(j, "msg"));
-    } else if (type == "info" || type == "warn" || type == "fatal") {
-        s_script_out.push_back(j_str(j, "msg"));
-    } else if (type == "ready") {
-        s_script_out.push_back("agent ready: " + j_str(j, "msg"));
-    }
 }
 
 void menu_init() {
-    apply_theme();   // sets initial theme/font
+    apply_theme();
+    frida_set_message_callback([](const std::string& j) {
+        s_script_out.push_back(j);
+    });
 }
 
-void menu_poll_messages() {
-    if (!ImGui::GetCurrentContext()) return;
-    std::vector<std::string> msgs;
-    int n = frida_drain_messages(msgs);
-    if (n <= 0) return;
-    for (auto& m : msgs) {
-        try { handle_message(m); }
-        catch(...) {}
-    }
-}
-
-// ── Tabs ───────────────────────────────────────────────────
 static void tab_settings() {
-    if (ImGui::SliderFloat("Font size", &s_font_sz, 8, 32)) {
-        ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
-    }
+    if (ImGui::SliderFloat("Font",    &s_font_sz, 8, 32)) {}
     if (ImGui::SliderFloat("Opacity", &s_opacity, .3f, 1.f)) apply_theme();
     const char* th[] = {"Dark","Light","Classic"};
     if (ImGui::Combo("Theme", &s_theme, th, 3)) apply_theme();
@@ -386,14 +214,13 @@ static void tab_classes() {
     if (ImGui::Button("Open") && s_cname[0]) {
         char a[256]; snprintf(a, sizeof(a), "{\"class\":\"%s\"}", s_cname);
         post_rpc("openClass", a);
-        s_classes.push_back({s_cname, {}, {}, false});
+        s_classes.push_back({s_cname, {}, {}});
         s_cname[0] = 0;
     }
     for (int i = 0; i < (int)s_classes.size(); i++) {
         ImGui::PushID(i);
         auto& c = s_classes[i];
         if (ImGui::CollapsingHeader(c.cname.c_str())) {
-            if (!c.loaded) ImGui::TextDisabled("Loading…");
             if (ImGui::Button("List Instances")) {
                 char a[256]; snprintf(a, sizeof(a), "{\"class\":\"%s\"}", c.cname.c_str());
                 post_rpc("listInstances", a);
@@ -431,12 +258,12 @@ static void tab_classes() {
 }
 
 void menu_draw() {
-    if (!s_visible || !ImGui::GetCurrentContext()) return;
+    if (!s_visible) return;
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * .75f, 500), ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(s_opacity);
-    ImGui::Begin("Dex-tool v1.3", &s_visible, ImGuiWindowFlags_NoCollapse);
+    ImGui::Begin("Dex-tool v1.0", &s_visible, ImGuiWindowFlags_NoCollapse);
     if (ImGui::BeginTabBar("tb")) {
         if (ImGui::BeginTabItem("Settings")) { tab_settings(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Patches"))  { tab_patches();  ImGui::EndTabItem(); }
