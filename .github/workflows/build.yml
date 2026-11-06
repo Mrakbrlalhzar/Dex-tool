@@ -306,23 +306,34 @@ jobs:
           void log_crash_raw(const char* msg);
           DXTLOGH
 
+      # ─────────────────────────────────────────────────────────────
+      # logger.cpp — crash handler FIX:
+      #   - sigaction + sigaltstack (works even on stack overflow)
+      #   - dumps si_addr AND faulting PC, both hex (async-signal-safe)
+      #   - _exit() to avoid re-raising (was causing double-log)
+      # ─────────────────────────────────────────────────────────────
       - name: Generate logger.cpp
         run: |
           cat > src/logger.cpp << 'DXTLOGC'
           #include "logger.h"
           #include <cstdio>
           #include <cstring>
+          #include <cstdint>
           #include <ctime>
           #include <fcntl.h>
           #include <unistd.h>
           #include <sys/stat.h>
           #include <signal.h>
+          #include <ucontext.h>
           #include <pthread.h>
           
           static FILE* g_info_fp  = nullptr;
           static FILE* g_debug_fp = nullptr;
           static int   g_crash_fd = -1;
           static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+          
+          // 64 KiB altstack — used if the crash is a stack overflow.
+          static char g_altstack[65536];
           
           static void ts(char* buf, size_t n) {
               time_t t = time(nullptr);
@@ -333,12 +344,43 @@ jobs:
                        tm.tm_hour, tm.tm_min, tm.tm_sec);
           }
           
-          static void crash_sig(int sig) {
-              char m[64];
-              snprintf(m, sizeof(m), "CRASH signal=%d\n", sig);
-              log_crash_raw(m);
-              signal(sig, SIG_DFL);
-              raise(sig);
+          // Async-signal-safe hex dump into buffer.
+          static size_t put_hex(char* dst, size_t cap, uintptr_t v) {
+              char tmp[20]; int n = 0;
+              if (v == 0) tmp[n++] = '0';
+              while (v > 0) { tmp[n++] = "0123456789abcdef"[v & 0xf]; v >>= 4; }
+              size_t p = 0;
+              if (cap < 3) return 0;
+              dst[p++] = '0'; dst[p++] = 'x';
+              while (n > 0 && p < cap - 1) dst[p++] = tmp[--n];
+              dst[p] = 0;
+              return p;
+          }
+          
+          static void crash_handler(int sig, siginfo_t* info, void* ucv) {
+              char buf[192]; size_t p = 0;
+              auto append = [&](const char* s) {
+                  while (*s && p < sizeof(buf) - 1) buf[p++] = *s++;
+              };
+              append("CRASH sig=");
+              if (sig >= 10) buf[p++] = '0' + ((sig / 10) % 10);
+              buf[p++] = '0' + (sig % 10);
+              append(" addr=");
+              char hx[24];
+              put_hex(hx, sizeof(hx), (uintptr_t)info->si_addr);
+              append(hx);
+              append(" pc=");
+              uintptr_t pc = 0;
+          #if defined(__aarch64__)
+              if (ucv) pc = (uintptr_t)((ucontext_t*)ucv)->uc_mcontext.pc;
+          #elif defined(__arm__)
+              if (ucv) pc = (uintptr_t)((ucontext_t*)ucv)->uc_mcontext.arm_pc;
+          #endif
+              put_hex(hx, sizeof(hx), pc);
+              append(hx);
+              buf[p++] = '\n';
+              if (g_crash_fd >= 0) write(g_crash_fd, buf, p);
+              _exit(128 + sig);
           }
           
           void logger_init(const char* base_dir) {
@@ -350,9 +392,23 @@ jobs:
               g_debug_fp = fopen(p, "a");
               snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
               g_crash_fd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
-              signal(SIGSEGV, crash_sig);
-              signal(SIGABRT, crash_sig);
-              signal(SIGBUS,  crash_sig);
+          
+              stack_t ss;
+              ss.ss_sp    = g_altstack;
+              ss.ss_size  = sizeof(g_altstack);
+              ss.ss_flags = 0;
+              sigaltstack(&ss, nullptr);
+          
+              struct sigaction sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sa_sigaction = crash_handler;
+              sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+              sigemptyset(&sa.sa_mask);
+              sigaction(SIGSEGV, &sa, nullptr);
+              sigaction(SIGABRT, &sa, nullptr);
+              sigaction(SIGBUS,  &sa, nullptr);
+              sigaction(SIGILL,  &sa, nullptr);
+              sigaction(SIGFPE,  &sa, nullptr);
               log_info("logger_init done");
           }
           
@@ -401,13 +457,12 @@ jobs:
           #endif
           DXTOVLH
 
-      # ───────────────────────────────────────────────────────────────
-      # overlay.cpp — FIXES:
-      #   1. Touch uses raw screen coords (agent supplies getRawX/Y)
-      #   2. Thread-safe input queue (touch / key / text / backspace)
-      #   3. Hooks eglSwapBuffers + WithDamageKHR + WithDamageEXT
-      #   4. Tells agent when ImGui wants text input (for IME)
-      # ───────────────────────────────────────────────────────────────
+      # ─────────────────────────────────────────────────────────────
+      # overlay.cpp — fixes for this crash:
+      #   1. imgui_init() runs BEFORE spawning frida thread (no race)
+      #   2. frida pthread gets a 16 MB stack (QJS needs more than default)
+      #   3. Checkpoints in file log at each stage
+      # ─────────────────────────────────────────────────────────────
       - name: Generate overlay.cpp
         run: |
           cat > src/overlay.cpp << 'DXTOVLC'
@@ -442,7 +497,6 @@ jobs:
           static EGLContext        g_egl_ctx       = EGL_NO_CONTEXT;
           static std::atomic<bool> g_want_text_last{false};
           
-          // ── Thread-safe input queue ─────────────────────────────────
           struct Evt {
               enum Kind { TOUCH, KEY, TEXT, BACKSPACE } kind;
               float x = 0, y = 0;
@@ -468,45 +522,56 @@ jobs:
           
           extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
               Evt e; e.kind = Evt::TOUCH; e.x = x; e.y = y;
-              e.pressed = (action == 0 /*DOWN*/ || action == 2 /*MOVE*/);
+              e.pressed = (action == 0 || action == 2);
               push_evt(e);
           }
-          
           extern "C" JNIEXPORT void dextool_on_key(int keycode, int action) {
               Evt e; e.kind = Evt::KEY; e.keycode = keycode; e.action = action;
               push_evt(e);
           }
-          
           extern "C" JNIEXPORT void dextool_on_text(const char* utf8) {
               if (!utf8) return;
               Evt e; e.kind = Evt::TEXT;
               strncpy(e.text, utf8, sizeof(e.text) - 1);
               push_evt(e);
           }
-          
           extern "C" JNIEXPORT void dextool_on_backspace(void) {
               Evt e; e.kind = Evt::BACKSPACE;
               push_evt(e);
           }
           
-          // ── Worker thread ───────────────────────────────────────────
           static void* frida_thread(void*) {
               frida_bridge_start(g_jvm);
               return nullptr;
           }
           
-          // ── ImGui lifecycle ─────────────────────────────────────────
+          static void spawn_frida_thread() {
+              log_info("[overlay] spawning frida thread (16MB stack)");
+              pthread_t ft;
+              pthread_attr_t a;
+              pthread_attr_init(&a);
+              pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+              pthread_attr_setstacksize(&a, 16 * 1024 * 1024);
+              int rc = pthread_create(&ft, &a, frida_thread, nullptr);
+              pthread_attr_destroy(&a);
+              if (rc != 0) {
+                  char m[64]; snprintf(m, sizeof(m), "[overlay] pthread_create rc=%d", rc);
+                  log_crash_raw(m);
+              }
+          }
+          
           static void imgui_shutdown() {
               if (g_imgui_up.load()) {
                   ImGui_ImplOpenGL3_Shutdown();
                   ImGui::DestroyContext();
                   g_imgui_up.store(false);
                   g_imgui_failed = false;
-                  LOGI("[overlay] ImGui shut down (context loss)");
+                  log_info("[overlay] ImGui shut down (context loss)");
               }
           }
           
           static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
+              log_info("[overlay] imgui_init entry");
               EGLint w = 1080, h = 1920;
               eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
@@ -514,14 +579,13 @@ jobs:
               const GLubyte* ver = glGetString(GL_VERSION);
               bool is_es = ver && strstr((const char*)ver, "OpenGL ES");
               if (!is_es) {
-                  LOGE("[overlay] GL is not OpenGL ES (ver=%s), ImGui disabled",
-                       ver ? (const char*)ver : "null");
+                  log_info("[overlay] GL not OpenGL ES, ImGui disabled");
                   g_imgui_failed = true;
                   return;
               }
-              LOGI("[overlay] GL: %s (%dx%d)", (const char*)ver, w, h);
-          
+              log_info("[overlay] imgui_init creating ImGui context");
               ImGui::CreateContext();
+              log_info("[overlay] imgui_init context created");
               ImGuiIO& io   = ImGui::GetIO();
               io.DisplaySize = ImVec2((float)w, (float)h);
               io.DeltaTime   = 1.0f / 60.0f;
@@ -531,17 +595,17 @@ jobs:
               ImGui::GetStyle().WindowRounding = 6.0f;
           
               ImGui_ImplOpenGL3_Init("#version 100");
+              log_info("[overlay] imgui_init GL backend OK, menu_init");
               menu_init();
               g_imgui_up.store(true);
-              LOGI("[overlay] ImGui up (%dx%d)", w, h);
+              log_info("[overlay] imgui_init done");
           }
           
-          // ── Key mapping ─────────────────────────────────────────────
           static ImGuiKey map_key(int kc) {
               switch (kc) {
-                  case 67:  return ImGuiKey_Backspace;   // KEYCODE_DEL
-                  case 66:  return ImGuiKey_Enter;       // KEYCODE_ENTER
-                  case 4:   return ImGuiKey_Escape;      // KEYCODE_BACK
+                  case 67:  return ImGuiKey_Backspace;
+                  case 66:  return ImGuiKey_Enter;
+                  case 4:   return ImGuiKey_Escape;
                   case 19:  return ImGuiKey_UpArrow;
                   case 20:  return ImGuiKey_DownArrow;
                   case 21:  return ImGuiKey_LeftArrow;
@@ -554,7 +618,6 @@ jobs:
               }
           }
           
-          // ── Drain queued input into ImGui (called on GL thread) ─────
           static void drain_input() {
               std::lock_guard<std::mutex> lk(g_in_mtx);
               if (g_in_q.empty()) return;
@@ -568,8 +631,7 @@ jobs:
                       case Evt::KEY: {
                           ImGuiKey k = map_key(e.keycode);
                           if (k != ImGuiKey_None) {
-                              bool down = (e.action == 0 /*DOWN*/);
-                              io.AddKeyEvent(k, down);
+                              io.AddKeyEvent(k, e.action == 0);
                           }
                           break;
                       }
@@ -585,23 +647,24 @@ jobs:
               g_in_q.clear();
           }
           
-          // ── Shared frame work ────────────────────────────────────────
           static void render_frame(EGLDisplay dpy, EGLSurface surf) {
               EGLContext cur_ctx = eglGetCurrentContext();
               if (!g_gum_inited.exchange(true)) {
                   g_egl_ctx = cur_ctx;
+                  log_info("[overlay] first swap: gum_init_embedded");
                   gum_init_embedded();
                   log_info("[overlay] gum_init_embedded done");
-                  pthread_t ft;
-                  pthread_attr_t a;
-                  pthread_attr_init(&a);
-                  pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-                  pthread_create(&ft, &a, frida_thread, nullptr);
-                  pthread_attr_destroy(&a);
+                  // Do ImGui init FIRST — it is entirely GL-side, and running it
+                  // before the frida thread removes the init race on GLib state.
+                  log_info("[overlay] touch_install_hooks");
                   touch_install_hooks();
+                  log_info("[overlay] imgui_init (before frida spawn)");
                   imgui_init(dpy, surf);
+                  // Only after everything local is set up do we spawn GumJS.
+                  spawn_frida_thread();
+                  log_info("[overlay] first-frame setup complete");
               } else if (cur_ctx != EGL_NO_CONTEXT && cur_ctx != g_egl_ctx) {
-                  LOGI("[overlay] EGL context changed, re-initing ImGui");
+                  log_info("[overlay] EGL context changed, re-initing ImGui");
                   g_egl_ctx = cur_ctx;
                   imgui_shutdown();
                   imgui_init(dpy, surf);
@@ -616,7 +679,6 @@ jobs:
               ImGui::Render();
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
           
-              // Notify agent to show/hide soft keyboard if WantTextInput changed.
               bool want = ImGui::GetIO().WantTextInput;
               if (want != g_want_text_last.load()) {
                   g_want_text_last.store(want);
@@ -626,12 +688,10 @@ jobs:
               }
           }
           
-          // ── Hooked entry points ────────────────────────────────────
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
               render_frame(dpy, surf);
               return g_orig_swap(dpy, surf);
           }
-          
           static EGLBoolean my_swap_khr(EGLDisplay dpy, EGLSurface surf,
                                         const EGLint* rects, EGLint n) {
               render_frame(dpy, surf);
@@ -639,7 +699,6 @@ jobs:
               if (g_orig_swap)     return g_orig_swap(dpy, surf);
               return EGL_FALSE;
           }
-          
           static EGLBoolean my_swap_ext(EGLDisplay dpy, EGLSurface surf,
                                         const EGLint* rects, EGLint n) {
               render_frame(dpy, surf);
@@ -652,39 +711,25 @@ jobs:
           bool install_swap_hook() {
               void* egl = dlopen("libEGL.so", RTLD_NOW);
               if (!egl) { LOGE("dlopen libEGL.so: %s", dlerror()); return false; }
-          
               int hooked = 0;
-          
               void* s1 = dlsym(egl, "eglSwapBuffers");
-              if (s1) {
-                  if (DobbyHook(s1,
-                          reinterpret_cast<dobby_dummy_func_t>(my_swap),
-                          reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap)) == 0) {
-                      LOGI("eglSwapBuffers hooked OK");
-                      hooked++;
-                  }
+              if (s1 && DobbyHook(s1,
+                      reinterpret_cast<dobby_dummy_func_t>(my_swap),
+                      reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap)) == 0) {
+                  LOGI("eglSwapBuffers hooked"); hooked++;
               }
-          
               void* s2 = dlsym(egl, "eglSwapBuffersWithDamageKHR");
-              if (s2) {
-                  if (DobbyHook(s2,
-                          reinterpret_cast<dobby_dummy_func_t>(my_swap_khr),
-                          reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_khr)) == 0) {
-                      LOGI("eglSwapBuffersWithDamageKHR hooked OK");
-                      hooked++;
-                  }
+              if (s2 && DobbyHook(s2,
+                      reinterpret_cast<dobby_dummy_func_t>(my_swap_khr),
+                      reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_khr)) == 0) {
+                  LOGI("eglSwapBuffersWithDamageKHR hooked"); hooked++;
               }
-          
               void* s3 = dlsym(egl, "eglSwapBuffersWithDamageEXT");
-              if (s3) {
-                  if (DobbyHook(s3,
-                          reinterpret_cast<dobby_dummy_func_t>(my_swap_ext),
-                          reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_ext)) == 0) {
-                      LOGI("eglSwapBuffersWithDamageEXT hooked OK");
-                      hooked++;
-                  }
+              if (s3 && DobbyHook(s3,
+                      reinterpret_cast<dobby_dummy_func_t>(my_swap_ext),
+                      reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_ext)) == 0) {
+                  LOGI("eglSwapBuffersWithDamageEXT hooked"); hooked++;
               }
-          
               return hooked > 0;
           }
           DXTOVLC
@@ -722,15 +767,16 @@ jobs:
           }
           
           void touch_install_hooks() {
+              log_info("[touch] entry");
               void* lib = dlopen("libandroid.so", RTLD_NOW);
-              if (!lib) { LOGD("touch: dlopen libandroid.so failed (OK for Java apps)"); return; }
+              if (!lib) { log_info("[touch] dlopen libandroid.so failed"); return; }
               void* sym = dlsym(lib, "AInputQueue_getEvent");
-              if (!sym) { LOGD("touch: AInputQueue_getEvent not found (OK for Java apps)"); return; }
+              if (!sym) { log_info("[touch] AInputQueue_getEvent not found"); return; }
               int r = DobbyHook(sym,
                                 reinterpret_cast<dobby_dummy_func_t>(my_getEvent),
                                 reinterpret_cast<dobby_dummy_func_t*>(&g_orig_get));
-              if (r != 0) LOGD("touch: DobbyHook failed: %d (OK for Java apps)", r);
-              else        LOGI("touch: AInputQueue_getEvent hooked (NativeActivity)");
+              if (r != 0) log_info("[touch] DobbyHook failed");
+              else        log_info("[touch] AInputQueue_getEvent hooked");
           }
           DXTTCH
 
@@ -747,6 +793,10 @@ jobs:
           void frida_set_message_callback(MsgCallback cb);
           DXTFBH
 
+      # ─────────────────────────────────────────────────────────────
+      # frida_bridge.cpp — FIX: fine-grained file-log checkpoints so
+      # we can see EXACTLY which GumJS call crashes if it still does.
+      # ─────────────────────────────────────────────────────────────
       - name: Generate frida_bridge.cpp
         run: |
           cat > src/frida_bridge.cpp << 'DXTFBC'
@@ -769,14 +819,18 @@ jobs:
           }
           
           void frida_bridge_start(JavaVM*) {
-              log_info("[frida_bridge] starting GumJS");
+              log_info("[frida] A: starting GumJS");
               g_ctx  = g_main_context_new();
+              log_info("[frida] B: main_context_new");
               g_loop = g_main_loop_new(g_ctx, FALSE);
+              log_info("[frida] C: main_loop_new");
               g_main_context_push_thread_default(g_ctx);
+              log_info("[frida] D: push_thread_default");
           
               g_backend = gum_script_backend_obtain_qjs();
+              log_info("[frida] E: obtain_qjs");
               if (!g_backend) {
-                  log_crash_raw("[frida_bridge] FATAL: no QJS backend\n");
+                  log_crash_raw("[frida] FATAL: no QJS backend\n");
                   return;
               }
           
@@ -784,19 +838,24 @@ jobs:
               g_script = gum_script_backend_create_sync(
                              g_backend, "dextool-agent",
                              g_agent_js, nullptr, nullptr, &err);
+              log_info("[frida] F: create_sync returned");
               if (!g_script || err) {
                   char m[512];
-                  snprintf(m, sizeof(m), "[frida_bridge] create failed: %s\n",
+                  snprintf(m, sizeof(m), "[frida] create failed: %s\n",
                            err ? err->message : "(null)");
                   log_crash_raw(m);
                   if (err) g_error_free(err);
                   return;
               }
+          
               gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
+              log_info("[frida] G: msg handler set");
+          
               gum_script_load_sync(g_script, nullptr);
-              log_info("[frida_bridge] agent running");
+              log_info("[frida] H: load_sync returned");
+              log_info("[frida] agent running");
               g_main_loop_run(g_loop);
-              log_info("[frida_bridge] loop exited");
+              log_info("[frida] loop exited");
           }
           
           void frida_post(const std::string& json) {
@@ -932,12 +991,6 @@ jobs:
           void menu_draw();
           DXTMNH
 
-      # ───────────────────────────────────────────────────────────────
-      # menu.cpp — FIXES:
-      #   1. Font-size slider actually applies (FontGlobalScale)
-      #   2. RPC responses are parsed and populate Classes tab etc.
-      #   3. Minimal JSON tokenizer (no extra deps)
-      # ───────────────────────────────────────────────────────────────
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
@@ -952,7 +1005,6 @@ jobs:
           #include <cstdio>
           #include <cstring>
           
-          // ── Mini JSON extractors (flat object, string/array-of-string) ─
           static std::string j_str(const std::string& j, const std::string& key) {
               std::string n = "\"" + key + "\":\"";
               size_t p = j.find(n);
@@ -1061,7 +1113,6 @@ jobs:
               return out;
           }
           
-          // ── State ──────────────────────────────────────────────────
           static float s_opacity = 0.92f;
           static float s_font_sz = 14.f;
           static int   s_theme   = 0;
@@ -1107,12 +1158,10 @@ jobs:
               ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
           }
           
-          // ── RPC message dispatcher ──────────────────────────────────
           static void handle_message(const std::string& j) {
               std::lock_guard<std::mutex> lk(g_state_mtx);
               std::string type = j_str(j, "type");
               if (type.empty()) return;
-          
               if (type == "classInfo") {
                   std::string cls = j_str(j, "class");
                   auto methods = j_arr(j, "methods");
@@ -1142,8 +1191,7 @@ jobs:
                   for (auto& t : s_trackers)
                       if (t.name == name) t.log.push_back(line);
               } else if (type == "recorded") {
-                  std::string line = j_str(j, "cls") + "." + j_str(j, "method");
-                  s_rec_log.push_back(line);
+                  s_rec_log.push_back(j_str(j, "cls") + "." + j_str(j, "method"));
               } else if (type == "scriptResult" || type == "scriptError") {
                   s_script_out.push_back(j_str(j, "result").empty()
                       ? j_str(j, "msg") : j_str(j, "result"));
@@ -1163,7 +1211,6 @@ jobs:
               });
           }
           
-          // ── Tabs ────────────────────────────────────────────────────
           static void tab_settings() {
               if (ImGui::SliderFloat("Font size", &s_font_sz, 8, 32)) {
                   ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
@@ -1389,7 +1436,7 @@ jobs:
               ImGui::End();
           }
           DXTMNC
-          
+
       - name: Generate main.cpp
         run: |
           cat > src/main.cpp << 'DXTMAIN'
@@ -1432,375 +1479,357 @@ jobs:
           }
           DXTMAIN
 
-      # ───────────────────────────────────────────────────────────────
-      # agent.js — FIXES:
-      #   1. touch uses getRawX/getRawY (screen coords)
-      #   2. hidden EditText as IME target, InputConnection hooks forward
-      #      soft-keyboard text + backspace to ImGui
-      #   3. dispatchKeyEvent forwards hardware keys
-      #   4. tracks current Activity for IME show/hide
-      # ───────────────────────────────────────────────────────────────
+      # ─────────────────────────────────────────────────────────────
+      # agent.js — top-level code in try/catch IIFE; Java.perform
+      # calls deferred to a microtask so they don't execute inline
+      # inside gum_script_load_sync.
+      # ─────────────────────────────────────────────────────────────
       - name: Generate agent.js
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
           
-          var patches  = {};
-          var hooks    = {};
-          var trackers = {};
-          var recOn    = false;
-          var monOn    = false;
-          
-          function sendMsg(type, payload) {
-              send(JSON.stringify({ type: type, payload: payload }));
-          }
-          
-          // Native symbols exported by libtool.so
-          var symTouch  = Module.findExportByName('libtool.so', 'dextool_on_touch');
-          var symKey    = Module.findExportByName('libtool.so', 'dextool_on_key');
-          var symText   = Module.findExportByName('libtool.so', 'dextool_on_text');
-          var symBksp   = Module.findExportByName('libtool.so', 'dextool_on_backspace');
-          
-          var fnTouch = symTouch ? new NativeFunction(symTouch, 'void', ['float','float','int']) : null;
-          var fnKey   = symKey   ? new NativeFunction(symKey,   'void', ['int','int'])            : null;
-          var fnText  = symText  ? new NativeFunction(symText,  'void', ['pointer'])              : null;
-          var fnBksp  = symBksp  ? new NativeFunction(symBksp,  'void', [])                       : null;
-          
-          // ── Track current foreground Activity ──────────────────────
-          var currentActivity = null;
-          Java.perform(function() {
+          (function() {
               try {
-                  var Activity = Java.use('android.app.Activity');
-                  Activity.onResume.implementation = function() {
-                      currentActivity = this;
-                      this.onResume();
-                  };
-                  Activity.onPause.implementation = function() {
-                      if (currentActivity === this) currentActivity = null;
-                      this.onPause();
-                  };
-              } catch (e) {
-                  sendMsg('warn', { msg: 'activity track hook failed: ' + e.message });
-              }
-          });
+                  var patches  = {};
+                  var hooks    = {};
+                  var trackers = {};
+                  var recOn    = false;
+                  var monOn    = false;
           
-          // ── Touch hook (raw screen coordinates) ───────────────────
-          function installTouchHook() {
-              if (!fnTouch) {
-                  sendMsg('warn', { msg: 'dextool_on_touch not found' });
-                  return;
-              }
-              Java.perform(function() {
-                  try {
-                      var Activity = Java.use('android.app.Activity');
-                      Activity.dispatchTouchEvent.implementation = function(ev) {
-                          try {
-                              // getRawX/Y = absolute screen pixels (matches EGL surface)
-                              fnTouch(ev.getRawX(), ev.getRawY(), ev.getAction() & 0xff);
-                          } catch(e2) {}
-                          return this.dispatchTouchEvent(ev);
-                      };
-                      sendMsg('info', { msg: 'Touch hook OK (getRawX/Y)' });
-                  } catch (e) {
-                      sendMsg('warn', { msg: 'touch hook failed: ' + e.message });
+                  function sendMsg(type, payload) {
+                      try { send(JSON.stringify({ type: type, payload: payload })); } catch(e) {}
                   }
-              });
-          }
-          installTouchHook();
           
-          // ── Hardware key hook ──────────────────────────────────────
-          function installKeyHook() {
-              if (!fnKey) return;
-              Java.perform(function() {
+                  var symTouch, symKey, symText, symBksp;
+                  var fnTouch = null, fnKey = null, fnText = null, fnBksp = null;
                   try {
-                      var Activity = Java.use('android.app.Activity');
-                      Activity.dispatchKeyEvent.implementation = function(ev) {
-                          try {
-                              fnKey(ev.getKeyCode(), ev.getAction());
-                          } catch(e2) {}
-                          return this.dispatchKeyEvent(ev);
-                      };
-                  } catch (e) {
-                      sendMsg('warn', { msg: 'key hook failed: ' + e.message });
+                      symTouch = Module.findExportByName('libtool.so', 'dextool_on_touch');
+                      symKey   = Module.findExportByName('libtool.so', 'dextool_on_key');
+                      symText  = Module.findExportByName('libtool.so', 'dextool_on_text');
+                      symBksp  = Module.findExportByName('libtool.so', 'dextool_on_backspace');
+                      if (symTouch) fnTouch = new NativeFunction(symTouch, 'void', ['float','float','int']);
+                      if (symKey)   fnKey   = new NativeFunction(symKey,   'void', ['int','int']);
+                      if (symText)  fnText  = new NativeFunction(symText,  'void', ['pointer']);
+                      if (symBksp)  fnBksp  = new NativeFunction(symBksp,  'void', []);
+                  } catch(e) {
+                      sendMsg('warn', { msg: 'native lookup failed: ' + e.message });
                   }
-              });
-          }
-          installKeyHook();
           
-          // ── Soft keyboard (hidden EditText + InputConnection hooks) ─
-          var imeEditText   = null;
-          var imeViewGroup  = null;
-          var TextWatcherCls = null;
+                  var currentActivity = null;
+                  var imeEditText = null;
+                  var imeViewGroup = null;
           
-          function buildTextWatcher() {
-              if (TextWatcherCls) return TextWatcherCls;
-              var TW = Java.use('android.text.TextWatcher');
-              TextWatcherCls = Java.registerClass({
-                  name: 'DexToolTW',
-                  implements: [TW],
-                  methods: {
-                      beforeTextChanged: function(s, st, c, a) {},
-                      onTextChanged:     function(s, st, b, c) {},
-                      afterTextChanged: function(s) {}
-                  }
-              });
-              return TextWatcherCls;
-          }
-          
-          function showKeyboard() {
-              if (!currentActivity || imeEditText) return;
-              var act = currentActivity;
-              Java.perform(function() {
-                  try {
-                      var EditText   = Java.use('android.widget.EditText');
-                      var ViewGroup  = Java.use('android.view.ViewGroup$LayoutParams');
-                      var decor      = act.getWindow().getDecorView();
-                      imeViewGroup   = decor;
-                      imeEditText    = EditText.$new(act);
-                      imeEditText.setAlpha(0);
-                      imeEditText.setSingleLine(true);
-                      imeEditText.setInputType(0x00000001); // TYPE_CLASS_TEXT
-                      var lp = ViewGroup.$new(1, 1);
-                      decor.addView(imeEditText, lp);
-                      imeEditText.requestFocus();
-                      var imm = Java.use('android.view.inputmethod.InputMethodManager');
-                      var immInst = act.getSystemService('input_method');
-                      immInst.showSoftInput(imeEditText, 0);
-                      sendMsg('info', { msg: 'IME shown' });
-                  } catch (e) {
-                      sendMsg('error', { fn: 'showKeyboard', msg: e.message });
-                  }
-              });
-          }
-          
-          function hideKeyboard() {
-              if (!currentActivity) return;
-              var act = currentActivity;
-              Java.perform(function() {
-                  try {
-                      var imm = Java.use('android.view.inputmethod.InputMethodManager');
-                      var immInst = act.getSystemService('input_method');
-                      if (imeEditText) {
-                          try { immInst.hideSoftInputFromWindow(imeEditText.getWindowToken(), 0); } catch(e) {}
-                          try { imeViewGroup.removeView(imeEditText); } catch(e) {}
-                          imeEditText = null;
-                      }
-                      sendMsg('info', { msg: 'IME hidden' });
-                  } catch (e) {
-                      sendMsg('error', { fn: 'hideKeyboard', msg: e.message });
-                  }
-              });
-          }
-          
-          // Hook InputConnection so soft-keyboard text reaches ImGui
-          function installImeInputHooks() {
-              if (!fnText && !fnBksp) return;
-              Java.perform(function() {
-                  try {
-                      var BaseIC = Java.use('android.view.inputmethod.BaseInputConnection');
-                      BaseIC.commitText.implementation = function(text, ncp) {
-                          try {
-                              if (imeEditText && text && text.length() > 0) {
-                                  var s = Memory.allocUtf8String(text.toString());
-                                  fnText(s);
-                              }
-                          } catch(e) {}
-                          return this.commitText(text, ncp);
-                      };
-                      BaseIC.deleteSurroundingText.implementation = function(before, after) {
-                          try {
-                              if (imeEditText && fnBksp) {
-                                  for (var i = 0; i < (before | 0); i++) fnBksp();
-                              }
-                          } catch(e) {}
-                          return this.deleteSurroundingText(before, after);
-                      };
-                      sendMsg('info', { msg: 'IME input hooks OK' });
-                  } catch (e) {
-                      sendMsg('warn', { msg: 'IME hooks failed: ' + e.message });
-                  }
-              });
-          }
-          installImeInputHooks();
-          
-          // ── RPC exports ────────────────────────────────────────────
-          rpc.exports = {
-              addPatch: function(name, value) {
-                  try {
+                  function installActivityTracker() {
                       Java.perform(function() {
-                          var parts = name.split('.');
-                          var field = parts.pop();
-                          var cls   = parts.join('.');
-                          var jcls  = Java.use(cls);
-                          var f     = jcls.class.getDeclaredField(field);
-                          f.setAccessible(true);
-                          var t = f.getType().getName();
-                          if (t==='int'||t==='long'||t==='short'||t==='byte') f.set(null, parseInt(value));
-                          else if (t==='boolean') f.set(null, value === 'true');
-                          else if (t==='float'||t==='double') f.set(null, parseFloat(value));
-                          else f.set(null, value);
-                          patches[name] = { value: value, enabled: true };
-                          sendMsg('patchApplied', { name: name });
-                      });
-                  } catch(e) { sendMsg('error', { fn: 'addPatch', msg: e.message }); }
-              },
-              removePatch: function(name) { delete patches[name]; sendMsg('patchRemoved', { name: name }); },
-              setPatchEnabled: function(name, enabled) {
-                  if (patches[name]) patches[name].enabled = enabled;
-                  sendMsg('patchUpdated', { name: name, enabled: enabled });
-              },
-              addHook: function(name, mode, code) {
-                  try {
-                      Java.perform(function() {
-                          var parts = name.split('.'); var method = parts.pop();
-                          var jcls  = Java.use(parts.join('.'));
-                          if (mode === 'noop') {
-                              jcls[method].implementation = function() {
-                                  sendMsg('hookFired', { name: name, mode: 'noop' });
-                                  return null;
+                          try {
+                              var Activity = Java.use('android.app.Activity');
+                              Activity.onResume.implementation = function() {
+                                  currentActivity = this;
+                                  this.onResume();
                               };
-                          } else if (mode === 'Java') {
-                              var fn = new Function('Java', 'send', 'args', code);
-                              jcls[method].implementation = function() {
-                                  return fn(Java, send, Array.from(arguments));
+                              Activity.onPause.implementation = function() {
+                                  if (currentActivity === this) currentActivity = null;
+                                  this.onPause();
                               };
+                              sendMsg('info', { msg: 'activity tracker OK' });
+                          } catch(e) {
+                              sendMsg('warn', { msg: 'activity track hook failed: ' + e.message });
                           }
-                          hooks[name] = { mode: mode, enabled: true };
-                          sendMsg('hookAdded', { name: name });
                       });
-                  } catch(e) { sendMsg('error', { fn: 'addHook', msg: e.message }); }
-              },
-              removeHook: function(name) {
-                  try {
+                  }
+          
+                  function installTouchHook() {
+                      if (!fnTouch) { sendMsg('warn', { msg: 'dextool_on_touch missing' }); return; }
                       Java.perform(function() {
-                          var parts = name.split('.'); var m = parts.pop();
-                          Java.use(parts.join('.'))[m].implementation = null;
-                          delete hooks[name];
-                          sendMsg('hookRemoved', { name: name });
-                      });
-                  } catch(e) { sendMsg('error', { fn: 'removeHook', msg: e.message }); }
-              },
-              setHookEnabled: function(name, enabled) {
-                  if (hooks[name]) hooks[name].enabled = enabled;
-                  sendMsg('hookUpdated', { name: name, enabled: enabled });
-              },
-              addTracker: function(name) {
-                  try {
-                      Java.perform(function() {
-                          var parts = name.split('.'); var m = parts.pop();
-                          var jcls  = Java.use(parts.join('.'));
-                          jcls[m].implementation = function() {
-                              var args = Array.from(arguments).map(String);
-                              var ret;
-                              try { ret = this[m].apply(this, arguments); } catch(e) { ret = null; }
-                              sendMsg('trackerEvent', { name: name, args: args, ret: String(ret) });
-                              return ret;
-                          };
-                          trackers[name] = true;
-                          sendMsg('trackerAdded', { name: name });
-                      });
-                  } catch(e) { sendMsg('error', { fn: 'addTracker', msg: e.message }); }
-              },
-              removeTracker: function(name) {
-                  try {
-                      Java.perform(function() {
-                          var parts = name.split('.'); var m = parts.pop();
-                          Java.use(parts.join('.'))[m].implementation = null;
-                          delete trackers[name];
-                          sendMsg('trackerRemoved', { name: name });
-                      });
-                  } catch(e) { sendMsg('error', { fn: 'removeTracker', msg: e.message }); }
-              },
-              startRecorder: function() {
-                  recOn = true;
-                  Java.perform(function() {
-                      Java.enumerateLoadedClassesSync().forEach(function(cls) {
                           try {
-                              var jcls = Java.use(cls);
-                              jcls.class.getDeclaredMethods().forEach(function(md) {
-                                  var mn = md.getName();
+                              var Activity = Java.use('android.app.Activity');
+                              Activity.dispatchTouchEvent.implementation = function(ev) {
+                                  try { fnTouch(ev.getRawX(), ev.getRawY(), ev.getAction() & 0xff); } catch(e2) {}
+                                  return this.dispatchTouchEvent(ev);
+                              };
+                              sendMsg('info', { msg: 'touch hook OK' });
+                          } catch(e) {
+                              sendMsg('warn', { msg: 'touch hook failed: ' + e.message });
+                          }
+                      });
+                  }
+          
+                  function installKeyHook() {
+                      if (!fnKey) return;
+                      Java.perform(function() {
+                          try {
+                              var Activity = Java.use('android.app.Activity');
+                              Activity.dispatchKeyEvent.implementation = function(ev) {
+                                  try { fnKey(ev.getKeyCode(), ev.getAction()); } catch(e2) {}
+                                  return this.dispatchKeyEvent(ev);
+                              };
+                          } catch(e) {
+                              sendMsg('warn', { msg: 'key hook failed: ' + e.message });
+                          }
+                      });
+                  }
+          
+                  function installImeInputHooks() {
+                      if (!fnText && !fnBksp) return;
+                      Java.perform(function() {
+                          try {
+                              var BaseIC = Java.use('android.view.inputmethod.BaseInputConnection');
+                              BaseIC.commitText.implementation = function(text, ncp) {
                                   try {
-                                      jcls[mn].overloads.forEach(function(ovl) {
-                                          ovl.implementation = function() {
-                                              if (!recOn) { ovl.implementation = null; return this[mn].apply(this, arguments); }
-                                              sendMsg('recorded', { cls: cls, method: mn, args: Array.from(arguments).map(String) });
-                                              return this[mn].apply(this, arguments);
-                                          };
+                                      if (imeEditText && text && text.length() > 0 && fnText) {
+                                          fnText(Memory.allocUtf8String(text.toString()));
+                                      }
+                                  } catch(e) {}
+                                  return this.commitText(text, ncp);
+                              };
+                              BaseIC.deleteSurroundingText.implementation = function(before, after) {
+                                  try {
+                                      if (imeEditText && fnBksp) {
+                                          for (var i = 0; i < (before | 0); i++) fnBksp();
+                                      }
+                                  } catch(e) {}
+                                  return this.deleteSurroundingText(before, after);
+                              };
+                              sendMsg('info', { msg: 'IME input hooks OK' });
+                          } catch(e) {
+                              sendMsg('warn', { msg: 'IME hooks failed: ' + e.message });
+                          }
+                      });
+                  }
+          
+                  function showKeyboard() {
+                      if (!currentActivity || imeEditText) return;
+                      var act = currentActivity;
+                      Java.perform(function() {
+                          try {
+                              var EditText   = Java.use('android.widget.EditText');
+                              var ViewGroup  = Java.use('android.view.ViewGroup$LayoutParams');
+                              var decor      = act.getWindow().getDecorView();
+                              imeViewGroup   = decor;
+                              imeEditText    = EditText.$new(act);
+                              imeEditText.setAlpha(0);
+                              imeEditText.setSingleLine(true);
+                              imeEditText.setInputType(0x00000001);
+                              decor.addView(imeEditText, ViewGroup.$new(1, 1));
+                              imeEditText.requestFocus();
+                              var immInst = act.getSystemService('input_method');
+                              immInst.showSoftInput(imeEditText, 0);
+                              sendMsg('info', { msg: 'IME shown' });
+                          } catch (e) {
+                              sendMsg('error', { fn: 'showKeyboard', msg: e.message });
+                          }
+                      });
+                  }
+          
+                  function hideKeyboard() {
+                      if (!currentActivity) return;
+                      var act = currentActivity;
+                      Java.perform(function() {
+                          try {
+                              var immInst = act.getSystemService('input_method');
+                              if (imeEditText) {
+                                  try { immInst.hideSoftInputFromWindow(imeEditText.getWindowToken(), 0); } catch(e) {}
+                                  try { imeViewGroup.removeView(imeEditText); } catch(e) {}
+                                  imeEditText = null;
+                              }
+                              sendMsg('info', { msg: 'IME hidden' });
+                          } catch (e) {
+                              sendMsg('error', { fn: 'hideKeyboard', msg: e.message });
+                          }
+                      });
+                  }
+          
+                  // Defer Java hooks so we finish loading before touching the JVM.
+                  setImmediate(function() {
+                      try {
+                          installActivityTracker();
+                          installTouchHook();
+                          installKeyHook();
+                          installImeInputHooks();
+                      } catch(e) {
+                          sendMsg('error', { fn: 'deferred_install', msg: e.message });
+                      }
+                  });
+          
+                  rpc.exports = {
+                      addPatch: function(name, value) {
+                          try {
+                              Java.perform(function() {
+                                  var parts = name.split('.'); var field = parts.pop();
+                                  var jcls  = Java.use(parts.join('.'));
+                                  var f     = jcls.class.getDeclaredField(field);
+                                  f.setAccessible(true);
+                                  var t = f.getType().getName();
+                                  if (t==='int'||t==='long'||t==='short'||t==='byte') f.set(null, parseInt(value));
+                                  else if (t==='boolean') f.set(null, value === 'true');
+                                  else if (t==='float'||t==='double') f.set(null, parseFloat(value));
+                                  else f.set(null, value);
+                                  patches[name] = { value: value, enabled: true };
+                                  sendMsg('patchApplied', { name: name });
+                              });
+                          } catch(e) { sendMsg('error', { fn: 'addPatch', msg: e.message }); }
+                      },
+                      removePatch: function(name) { delete patches[name]; sendMsg('patchRemoved', { name: name }); },
+                      setPatchEnabled: function(name, enabled) {
+                          if (patches[name]) patches[name].enabled = enabled;
+                          sendMsg('patchUpdated', { name: name, enabled: enabled });
+                      },
+                      addHook: function(name, mode, code) {
+                          try {
+                              Java.perform(function() {
+                                  var parts = name.split('.'); var method = parts.pop();
+                                  var jcls  = Java.use(parts.join('.'));
+                                  if (mode === 'noop') {
+                                      jcls[method].implementation = function() {
+                                          sendMsg('hookFired', { name: name, mode: 'noop' });
+                                          return null;
+                                      };
+                                  } else if (mode === 'Java') {
+                                      var fn = new Function('Java', 'send', 'args', code);
+                                      jcls[method].implementation = function() {
+                                          return fn(Java, send, Array.from(arguments));
+                                      };
+                                  }
+                                  hooks[name] = { mode: mode, enabled: true };
+                                  sendMsg('hookAdded', { name: name });
+                              });
+                          } catch(e) { sendMsg('error', { fn: 'addHook', msg: e.message }); }
+                      },
+                      removeHook: function(name) {
+                          try {
+                              Java.perform(function() {
+                                  var parts = name.split('.'); var m = parts.pop();
+                                  Java.use(parts.join('.'))[m].implementation = null;
+                                  delete hooks[name];
+                                  sendMsg('hookRemoved', { name: name });
+                              });
+                          } catch(e) { sendMsg('error', { fn: 'removeHook', msg: e.message }); }
+                      },
+                      setHookEnabled: function(name, enabled) {
+                          if (hooks[name]) hooks[name].enabled = enabled;
+                          sendMsg('hookUpdated', { name: name, enabled: enabled });
+                      },
+                      addTracker: function(name) {
+                          try {
+                              Java.perform(function() {
+                                  var parts = name.split('.'); var m = parts.pop();
+                                  var jcls  = Java.use(parts.join('.'));
+                                  jcls[m].implementation = function() {
+                                      var args = Array.from(arguments).map(String);
+                                      var ret;
+                                      try { ret = this[m].apply(this, arguments); } catch(e) { ret = null; }
+                                      sendMsg('trackerEvent', { name: name, args: args, ret: String(ret) });
+                                      return ret;
+                                  };
+                                  trackers[name] = true;
+                                  sendMsg('trackerAdded', { name: name });
+                              });
+                          } catch(e) { sendMsg('error', { fn: 'addTracker', msg: e.message }); }
+                      },
+                      removeTracker: function(name) {
+                          try {
+                              Java.perform(function() {
+                                  var parts = name.split('.'); var m = parts.pop();
+                                  Java.use(parts.join('.'))[m].implementation = null;
+                                  delete trackers[name];
+                                  sendMsg('trackerRemoved', { name: name });
+                              });
+                          } catch(e) { sendMsg('error', { fn: 'removeTracker', msg: e.message }); }
+                      },
+                      startRecorder: function() {
+                          recOn = true;
+                          Java.perform(function() {
+                              Java.enumerateLoadedClassesSync().forEach(function(cls) {
+                                  try {
+                                      var jcls = Java.use(cls);
+                                      jcls.class.getDeclaredMethods().forEach(function(md) {
+                                          var mn = md.getName();
+                                          try {
+                                              jcls[mn].overloads.forEach(function(ovl) {
+                                                  ovl.implementation = function() {
+                                                      if (!recOn) { ovl.implementation = null; return this[mn].apply(this, arguments); }
+                                                      sendMsg('recorded', { cls: cls, method: mn, args: Array.from(arguments).map(String) });
+                                                      return this[mn].apply(this, arguments);
+                                                  };
+                                              });
+                                          } catch(ignored) {}
                                       });
                                   } catch(ignored) {}
                               });
-                          } catch(ignored) {}
-                      });
-                  });
-                  sendMsg('recorderStarted', {});
-              },
-              stopRecorder: function() { recOn = false; sendMsg('recorderStopped', {}); },
-              startMonitor: function() {
-                  monOn = true;
-                  Java.perform(function() {
-                      try {
-                          var SSLCtx = Java.use('javax.net.ssl.SSLContext');
-                          SSLCtx.init.overload(
-                              '[Ljavax.net.ssl.KeyManager;',
-                              '[Ljavax.net.ssl.TrustManager;',
-                              'java.security.SecureRandom'
-                          ).implementation = function(km, tm, sr) {
-                              sendMsg('sslInit', { note: 'SSLContext.init intercepted' });
-                              return this.init(km, tm, sr);
-                          };
-                      } catch(e) {}
-                      try { Java.use('okhttp3.OkHttpClient'); sendMsg('monitorInfo', { note: 'OkHttp detected' }); } catch(e) {}
-                  });
-                  sendMsg('monitorStarted', {});
-              },
-              stopMonitor: function() { monOn = false; sendMsg('monitorStopped', {}); },
-              evalScript: function(src) {
-                  try { sendMsg('scriptResult', { result: String(eval(src)) }); }
-                  catch(e) { sendMsg('scriptError', { msg: e.message }); }
-              },
-              openClass: function(className) {
-                  try {
-                      Java.perform(function() {
-                          var jcls = Java.use(className);
-                          sendMsg('classInfo', {
-                              class:   className,
-                              methods: jcls.class.getDeclaredMethods().map(function(m) { return m.getName(); }),
-                              fields:  jcls.class.getDeclaredFields().map(function(f)  { return f.getName(); })
                           });
-                      });
-                  } catch(e) { sendMsg('error', { fn: 'openClass', msg: e.message }); }
-              },
-              listInstances: function(className) {
-                  try {
-                      Java.perform(function() {
-                          var list = [];
-                          Java.choose(className, {
-                              onMatch:    function(i) { list.push(String(i)); if (list.length >= 20) return 'stop'; },
-                              onComplete: function()  { sendMsg('instanceList', { class: className, instances: list }); }
+                          sendMsg('recorderStarted', {});
+                      },
+                      stopRecorder: function() { recOn = false; sendMsg('recorderStopped', {}); },
+                      startMonitor: function() {
+                          monOn = true;
+                          Java.perform(function() {
+                              try {
+                                  var SSLCtx = Java.use('javax.net.ssl.SSLContext');
+                                  SSLCtx.init.overload(
+                                      '[Ljavax.net.ssl.KeyManager;',
+                                      '[Ljavax.net.ssl.TrustManager;',
+                                      'java.security.SecureRandom'
+                                  ).implementation = function(km, tm, sr) {
+                                      sendMsg('sslInit', { note: 'SSLContext.init intercepted' });
+                                      return this.init(km, tm, sr);
+                                  };
+                              } catch(e) {}
+                              try { Java.use('okhttp3.OkHttpClient'); sendMsg('monitorInfo', { note: 'OkHttp detected' }); } catch(e) {}
                           });
-                      });
-                  } catch(e) { sendMsg('error', { fn: 'listInstances', msg: e.message }); }
-              },
-              hookMethod:  function(cls, m) { this.addHook(cls + '.' + m, 'noop', ''); },
-              trackMethod: function(cls, m) { this.addTracker(cls + '.' + m); },
-              patchField:  function(cls, f) { sendMsg('info', { msg: 'patchField: ' + cls + '.' + f }); }
-          };
+                          sendMsg('monitorStarted', {});
+                      },
+                      stopMonitor: function() { monOn = false; sendMsg('monitorStopped', {}); },
+                      evalScript: function(src) {
+                          try { sendMsg('scriptResult', { result: String(eval(src)) }); }
+                          catch(e) { sendMsg('scriptError', { msg: e.message }); }
+                      },
+                      openClass: function(className) {
+                          try {
+                              Java.perform(function() {
+                                  var jcls = Java.use(className);
+                                  sendMsg('classInfo', {
+                                      class:   className,
+                                      methods: jcls.class.getDeclaredMethods().map(function(m) { return m.getName(); }),
+                                      fields:  jcls.class.getDeclaredFields().map(function(f)  { return f.getName(); })
+                                  });
+                              });
+                          } catch(e) { sendMsg('error', { fn: 'openClass', msg: e.message }); }
+                      },
+                      listInstances: function(className) {
+                          try {
+                              Java.perform(function() {
+                                  var list = [];
+                                  Java.choose(className, {
+                                      onMatch:    function(i) { list.push(String(i)); if (list.length >= 20) return 'stop'; },
+                                      onComplete: function()  { sendMsg('instanceList', { class: className, instances: list }); }
+                                  });
+                              });
+                          } catch(e) { sendMsg('error', { fn: 'listInstances', msg: e.message }); }
+                      },
+                      hookMethod:  function(cls, m) { this.addHook(cls + '.' + m, 'noop', ''); },
+                      trackMethod: function(cls, m) { this.addTracker(cls + '.' + m); },
+                      patchField:  function(cls, f) { sendMsg('info', { msg: 'patchField: ' + cls + '.' + f }); }
+                  };
           
-          // ── Message loop ───────────────────────────────────────────
-          function onMsg(msg) {
-              if (!msg) return;
-              if (msg.type === 'keyboard') {
-                  if (msg.show) showKeyboard(); else hideKeyboard();
-              } else if (msg.type === 'rpc' && rpc.exports[msg.fn]) {
-                  var a = msg.args || {};
-                  try { rpc.exports[msg.fn].apply(rpc.exports, Object.values(a)); }
-                  catch(e) { sendMsg('error', { fn: msg.fn, msg: e.message }); }
+                  function onMsg(msg) {
+                      if (!msg) return;
+                      if (msg.type === 'keyboard') {
+                          if (msg.show) showKeyboard(); else hideKeyboard();
+                      } else if (msg.type === 'rpc' && rpc.exports[msg.fn]) {
+                          var a = msg.args || {};
+                          try { rpc.exports[msg.fn].apply(rpc.exports, Object.values(a)); }
+                          catch(e) { sendMsg('error', { fn: msg.fn, msg: e.message }); }
+                      }
+                      recv(onMsg);
+                  }
+                  recv(onMsg);
+          
+                  sendMsg('ready', { msg: 'Dex-tool agent v1.2 loaded' });
+              } catch (e) {
+                  try { send(JSON.stringify({ type: 'fatal', payload: { msg: String(e) } })); } catch(_) {}
               }
-              recv(onMsg);
-          }
-          recv(onMsg);
-          
-          sendMsg('ready', { msg: 'Dex-tool agent v1.1 loaded' });
+          })();
           DXTAGNT
 
       - name: Embed agent.js as C array
@@ -2088,48 +2117,25 @@ jobs:
       - name: Generate README.md and .gitignore
         run: |
           cat > README.md << 'DXTRDME'
-          # Dex-tool v1.1
+          # Dex-tool v1.2
           
           Standalone runtime instrumentation framework for Android APKs.
           Ships as one native shared library: libtool.so (armeabi-v7a + arm64-v8a).
           No root. No frida-server. Android 8.0+ (API 26).
           
-          ## Fixes in v1.1
+          ## v1.2 changes
           
-          - Touch input offset (2 cm above button): use `getRawX()/getRawY()`
-            (screen coords) instead of `getX()/getY()` (view-relative coords).
-            These now map 1:1 to the EGL surface ImGui renders to.
-          
-          - Soft keyboard / text boxes: native input queue + hidden `EditText`
-            created on demand as IME target. `InputConnection.commitText` and
-            `deleteSurroundingText` are hooked and forwarded to ImGui.
-            `Activity.dispatchKeyEvent` handles hardware keys (backspace,
-            enter, arrows, etc.).
-          
-          - Classes tab now shows methods/fields: RPC responses (`classInfo`,
-            `instanceList`, `trackerEvent`) are parsed by a small JSON
-            tokenizer in `menu.cpp` and populate the UI.
-          
-          - Font-size slider works: sets `ImGui::GetIO().FontGlobalScale`
-            (`s_font_sz / 14.0f`) every time it changes.
-          
-          - Menu doesn't appear in some apps: hooked `eglSwapBuffers`,
-            `eglSwapBuffersWithDamageKHR`, and `eglSwapBuffersWithDamageEXT`.
-            Modern HWUI apps call the KHR variant, not the base one — that
-            was the previous miss. Vulkan-only apps are still unsupported.
-          
-          ## Usage
-          
-          1. Take any target APK.
-          2. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
-          3. Inject `System.loadLibrary("tool")` into the launcher Activity
-             smali or Application subclass onCreate().
-          4. Copy smali-fat.jar into assets/.
-          5. Re-sign and install.
-          
-          The overlay shows only if the app calls one of the EGL swap
-          functions (GLSurfaceView apps and every HWUI app do). Vulkan-only
-          apps will not show the overlay; the Frida agent still runs.
+          - **Crash handler** rewritten with `sigaction` + sigaltstack so it
+            still runs on stack overflow, and logs fault addr + PC.
+          - **GumJS startup**: frida pthread now gets 16 MB stack; ImGui is
+            fully initialized *before* the frida thread is spawned, removing
+            a GLib-state race.
+          - **Fine-grained GumJS checkpoints** in `dextool.log`:
+            A … B … C … D … E … F … G … H — the last one before the crash
+            tells us exactly which gum_* call fails.
+          - **Agent** top-level code runs inside a try/catch IIFE and the
+            Java hooks are deferred with `setImmediate` so they don’t fire
+            synchronously inside `gum_script_load_sync`.
           DXTRDME
                     cat > .gitignore << 'DXTGI'
           build-arm64/
@@ -2175,7 +2181,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix: touch(offset)+ime-keyboard+classes-parsing+font+multi-swap-hook [skip ci]"
+            git commit -m "fix: gumjs startup crash — 16MB stack + no imgui race + checkpoints [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
