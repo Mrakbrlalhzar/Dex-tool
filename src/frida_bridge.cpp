@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include <cstdio>
+#include <cstring>
 
 static GumScriptBackend* g_backend = nullptr;
 static GumScript*        g_script  = nullptr;
@@ -14,6 +15,16 @@ static std::mutex        g_pmtx;
 static MsgCallback       g_cb;
 
 static void on_message(const gchar* msg, GBytes*, gpointer) {
+    if (msg) {
+        const char* t = strstr(msg, "\"type\":\"");
+        if (t) {
+            char tag[72];
+            snprintf(tag, sizeof(tag), "[msg] %.48s", t + 8);
+            char* q = strchr(tag, '"');
+            if (q) *q = '\0';
+            log_debug(tag);
+        }
+    }
     MsgCallback local;
     {
         std::lock_guard<std::mutex> lk(g_pmtx);

@@ -8,3 +8,4 @@ void logger_init(const char* base_dir);
 void log_info(const char* msg);
 void log_debug(const char* msg);
 void log_crash_raw(const char* msg);
+void logger_install_abort_capture();

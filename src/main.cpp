@@ -24,6 +24,7 @@ JNI_OnLoad(JavaVM* vm, void*) {
     g_jvm_global = vm;
     write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=entry");
     logger_init("/sdcard/Download");
+    logger_install_abort_capture();
     log_info("[JNI_OnLoad] entry");
     write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=logger_ready");
     overlay_set_java_vm(vm);
