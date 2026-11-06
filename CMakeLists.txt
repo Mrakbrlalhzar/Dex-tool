@@ -44,8 +44,6 @@ target_include_directories(tool PRIVATE
     ${IMGUI_DIR}/
     ${IMGUI_DIR}/backends/)
 
-# IMGUI_IMPL_OPENGL_ES2: makes ImGui use GLES2 functions and #version 100 GLSL.
-# This works on ES2 devices AND on ES3 devices (ES3 is backward-compatible).
 target_compile_definitions(tool PRIVATE IMGUI_IMPL_OPENGL_ES2=1)
 
 target_compile_options(tool PRIVATE

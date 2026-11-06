@@ -5,8 +5,6 @@
 #include <dlfcn.h>
 #include <android/input.h>
 
-// AInputQueue hook: fires for NativeActivity-based apps only.
-// Standard Java Activity apps get touch via GumJS (agent.js).
 typedef int32_t (*fn_getEvent)(AInputQueue*, AInputEvent**);
 static fn_getEvent g_orig_get = nullptr;
 

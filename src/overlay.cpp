@@ -13,43 +13,76 @@
 #include <cstring>
 #include <pthread.h>
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 typedef EGLBoolean (*fn_swap)(EGLDisplay, EGLSurface);
-static fn_swap              g_orig_swap     = nullptr;
-static std::atomic<bool>    g_gum_inited   {false};
-static std::atomic<bool>    g_imgui_up     {false};
-static bool                 g_imgui_failed  = false;
-static JavaVM*              g_jvm           = nullptr;
+typedef EGLBoolean (*fn_swap_dmg)(EGLDisplay, EGLSurface, const EGLint*, EGLint);
 
-// FIX 1: Track EGL context to detect pause/resume context recreation.
-static EGLContext           g_egl_ctx       = EGL_NO_CONTEXT;
+static fn_swap        g_orig_swap     = nullptr;
+static fn_swap_dmg    g_orig_swap_khr = nullptr;
+static fn_swap_dmg    g_orig_swap_ext = nullptr;
+static std::atomic<bool> g_gum_inited   {false};
+static std::atomic<bool> g_imgui_up     {false};
+static bool              g_imgui_failed  = false;
+static JavaVM*           g_jvm           = nullptr;
+static EGLContext        g_egl_ctx       = EGL_NO_CONTEXT;
+static std::atomic<bool> g_want_text_last{false};
 
-struct Touch {
-    std::atomic<float> x{0}, y{0};
-    std::atomic<bool> pressed{false}, dirty{false};
+// ── Thread-safe input queue ─────────────────────────────────
+struct Evt {
+    enum Kind { TOUCH, KEY, TEXT, BACKSPACE } kind;
+    float x = 0, y = 0;
+    bool  pressed = false;
+    int   keycode = 0, action = 0;
+    char  text[128] = {};
 };
-static Touch g_touch;
+static std::mutex       g_in_mtx;
+static std::vector<Evt> g_in_q;
+
+static void push_evt(const Evt& e) {
+    std::lock_guard<std::mutex> lk(g_in_mtx);
+    if (g_in_q.size() > 256) g_in_q.erase(g_in_q.begin());
+    g_in_q.push_back(e);
+}
 
 void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
 
 void overlay_on_touch(float x, float y, bool p) {
-    g_touch.x = x; g_touch.y = y;
-    g_touch.pressed = p; g_touch.dirty = true;
+    Evt e; e.kind = Evt::TOUCH; e.x = x; e.y = y; e.pressed = p;
+    push_evt(e);
 }
 
-// FIX 3: Exported C symbol for GumJS agent to call via NativeFunction.
-// The agent hooks Activity.dispatchTouchEvent in Java and calls this.
-// action: 0=DOWN, 1=UP, 2=MOVE (matches MotionEvent constants).
 extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
-    overlay_on_touch(x, y, action == 0 || action == 2);
+    Evt e; e.kind = Evt::TOUCH; e.x = x; e.y = y;
+    e.pressed = (action == 0 /*DOWN*/ || action == 2 /*MOVE*/);
+    push_evt(e);
 }
 
+extern "C" JNIEXPORT void dextool_on_key(int keycode, int action) {
+    Evt e; e.kind = Evt::KEY; e.keycode = keycode; e.action = action;
+    push_evt(e);
+}
+
+extern "C" JNIEXPORT void dextool_on_text(const char* utf8) {
+    if (!utf8) return;
+    Evt e; e.kind = Evt::TEXT;
+    strncpy(e.text, utf8, sizeof(e.text) - 1);
+    push_evt(e);
+}
+
+extern "C" JNIEXPORT void dextool_on_backspace(void) {
+    Evt e; e.kind = Evt::BACKSPACE;
+    push_evt(e);
+}
+
+// ── Worker thread ───────────────────────────────────────────
 static void* frida_thread(void*) {
     frida_bridge_start(g_jvm);
     return nullptr;
 }
 
-// FIX 1: Tear down ImGui GL resources before context switch.
+// ── ImGui lifecycle ─────────────────────────────────────────
 static void imgui_shutdown() {
     if (g_imgui_up.load()) {
         ImGui_ImplOpenGL3_Shutdown();
@@ -60,9 +93,6 @@ static void imgui_shutdown() {
     }
 }
 
-// FIX 2: Accept any OpenGL ES (ES2 or ES3). Use #version 100 GLSL.
-// The binary is compiled with IMGUI_IMPL_OPENGL_ES2=1 so ImGui always
-// uses ES2 function set, which is a subset of ES3.
 static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
     EGLint w = 1080, h = 1920;
     eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
@@ -87,68 +117,160 @@ static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
     ImGui::StyleColorsDark();
     ImGui::GetStyle().WindowRounding = 6.0f;
 
-    // "#version 100" = GLSL ES 1.00, works on ES2 and ES3.
     ImGui_ImplOpenGL3_Init("#version 100");
     menu_init();
     g_imgui_up.store(true);
     LOGI("[overlay] ImGui up (%dx%d)", w, h);
 }
 
-// CRITICAL: calls g_orig_swap — NEVER recurses into eglSwapBuffers symbol.
-// FIX 1: eglGetCurrentContext() detects context change after pause/resume.
-static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
+// ── Key mapping ─────────────────────────────────────────────
+static ImGuiKey map_key(int kc) {
+    switch (kc) {
+        case 67:  return ImGuiKey_Backspace;   // KEYCODE_DEL
+        case 66:  return ImGuiKey_Enter;       // KEYCODE_ENTER
+        case 4:   return ImGuiKey_Escape;      // KEYCODE_BACK
+        case 19:  return ImGuiKey_UpArrow;
+        case 20:  return ImGuiKey_DownArrow;
+        case 21:  return ImGuiKey_LeftArrow;
+        case 22:  return ImGuiKey_RightArrow;
+        case 61:  return ImGuiKey_Tab;
+        case 112: return ImGuiKey_Delete;
+        case 122: return ImGuiKey_Home;
+        case 123: return ImGuiKey_End;
+        default:  return ImGuiKey_None;
+    }
+}
+
+// ── Drain queued input into ImGui (called on GL thread) ─────
+static void drain_input() {
+    std::lock_guard<std::mutex> lk(g_in_mtx);
+    if (g_in_q.empty()) return;
+    ImGuiIO& io = ImGui::GetIO();
+    for (const auto& e : g_in_q) {
+        switch (e.kind) {
+            case Evt::TOUCH:
+                io.AddMousePosEvent(e.x, e.y);
+                io.AddMouseButtonEvent(0, e.pressed);
+                break;
+            case Evt::KEY: {
+                ImGuiKey k = map_key(e.keycode);
+                if (k != ImGuiKey_None) {
+                    bool down = (e.action == 0 /*DOWN*/);
+                    io.AddKeyEvent(k, down);
+                }
+                break;
+            }
+            case Evt::TEXT:
+                io.AddInputCharactersUTF8(e.text);
+                break;
+            case Evt::BACKSPACE:
+                io.AddKeyEvent(ImGuiKey_Backspace, true);
+                io.AddKeyEvent(ImGuiKey_Backspace, false);
+                break;
+        }
+    }
+    g_in_q.clear();
+}
+
+// ── Shared frame work ────────────────────────────────────────
+static void render_frame(EGLDisplay dpy, EGLSurface surf) {
     EGLContext cur_ctx = eglGetCurrentContext();
-
     if (!g_gum_inited.exchange(true)) {
-        // ── First call: full initialization ──────────────────────
         g_egl_ctx = cur_ctx;
-        gum_init_embedded();   // FIRST gum_* call, GL context valid
+        gum_init_embedded();
         log_info("[overlay] gum_init_embedded done");
-
         pthread_t ft;
         pthread_attr_t a;
         pthread_attr_init(&a);
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
         pthread_create(&ft, &a, frida_thread, nullptr);
         pthread_attr_destroy(&a);
-
-        touch_install_hooks();   // NativeActivity fallback
+        touch_install_hooks();
         imgui_init(dpy, surf);
-
     } else if (cur_ctx != EGL_NO_CONTEXT && cur_ctx != g_egl_ctx) {
-        // ── Context changed after pause/resume: re-init ImGui ─────
-        LOGI("[overlay] EGL context changed (%p -> %p), re-initing ImGui",
-             g_egl_ctx, cur_ctx);
+        LOGI("[overlay] EGL context changed, re-initing ImGui");
         g_egl_ctx = cur_ctx;
         imgui_shutdown();
         imgui_init(dpy, surf);
     }
 
-    if (g_imgui_up.load() && !g_imgui_failed) {
-        ImGuiIO& io = ImGui::GetIO();
-        if (g_touch.dirty.exchange(false)) {
-            io.MousePos     = ImVec2(g_touch.x.load(), g_touch.y.load());
-            io.MouseDown[0] = g_touch.pressed.load();
-        }
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui::NewFrame();
-        menu_draw();
-        ImGui::Render();
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-    }
+    if (!g_imgui_up.load() || g_imgui_failed) return;
 
+    drain_input();
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui::NewFrame();
+    menu_draw();
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    // Notify agent to show/hide soft keyboard if WantTextInput changed.
+    bool want = ImGui::GetIO().WantTextInput;
+    if (want != g_want_text_last.load()) {
+        g_want_text_last.store(want);
+        frida_post(want
+            ? "{\"type\":\"keyboard\",\"show\":true}"
+            : "{\"type\":\"keyboard\",\"show\":false}");
+    }
+}
+
+// ── Hooked entry points ────────────────────────────────────
+static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
+    render_frame(dpy, surf);
     return g_orig_swap(dpy, surf);
+}
+
+static EGLBoolean my_swap_khr(EGLDisplay dpy, EGLSurface surf,
+                              const EGLint* rects, EGLint n) {
+    render_frame(dpy, surf);
+    if (g_orig_swap_khr) return g_orig_swap_khr(dpy, surf, rects, n);
+    if (g_orig_swap)     return g_orig_swap(dpy, surf);
+    return EGL_FALSE;
+}
+
+static EGLBoolean my_swap_ext(EGLDisplay dpy, EGLSurface surf,
+                              const EGLint* rects, EGLint n) {
+    render_frame(dpy, surf);
+    if (g_orig_swap_ext) return g_orig_swap_ext(dpy, surf, rects, n);
+    if (g_orig_swap_khr) return g_orig_swap_khr(dpy, surf, rects, n);
+    if (g_orig_swap)     return g_orig_swap(dpy, surf);
+    return EGL_FALSE;
 }
 
 bool install_swap_hook() {
     void* egl = dlopen("libEGL.so", RTLD_NOW);
     if (!egl) { LOGE("dlopen libEGL.so: %s", dlerror()); return false; }
-    void* sym = dlsym(egl, "eglSwapBuffers");
-    if (!sym) { LOGE("dlsym eglSwapBuffers failed"); return false; }
-    int r = DobbyHook(sym,
-                      reinterpret_cast<dobby_dummy_func_t>(my_swap),
-                      reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap));
-    if (r != 0) { LOGE("DobbyHook eglSwapBuffers failed: %d", r); return false; }
-    LOGI("eglSwapBuffers hooked OK");
-    return true;
+
+    int hooked = 0;
+
+    void* s1 = dlsym(egl, "eglSwapBuffers");
+    if (s1) {
+        if (DobbyHook(s1,
+                reinterpret_cast<dobby_dummy_func_t>(my_swap),
+                reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap)) == 0) {
+            LOGI("eglSwapBuffers hooked OK");
+            hooked++;
+        }
+    }
+
+    void* s2 = dlsym(egl, "eglSwapBuffersWithDamageKHR");
+    if (s2) {
+        if (DobbyHook(s2,
+                reinterpret_cast<dobby_dummy_func_t>(my_swap_khr),
+                reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_khr)) == 0) {
+            LOGI("eglSwapBuffersWithDamageKHR hooked OK");
+            hooked++;
+        }
+    }
+
+    void* s3 = dlsym(egl, "eglSwapBuffersWithDamageEXT");
+    if (s3) {
+        if (DobbyHook(s3,
+                reinterpret_cast<dobby_dummy_func_t>(my_swap_ext),
+                reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_ext)) == 0) {
+            LOGI("eglSwapBuffersWithDamageEXT hooked OK");
+            hooked++;
+        }
+    }
+
+    return hooked > 0;
 }

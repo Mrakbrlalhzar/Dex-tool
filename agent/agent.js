@@ -10,58 +10,176 @@ function sendMsg(type, payload) {
     send(JSON.stringify({ type: type, payload: payload }));
 }
 
-// ── FIX: Java touch hook ───────────────────────────────────────
-// AInputQueue_getEvent in touch.cpp only fires for NativeActivity apps.
-// For standard Java Activity apps (99% of apps), we hook at the Java level:
-// Activity.dispatchTouchEvent is called once per touch event at the top
-// of the view hierarchy, then calls dextool_on_touch in libtool.so.
-function installTouchHook() {
+// Native symbols exported by libtool.so
+var symTouch  = Module.findExportByName('libtool.so', 'dextool_on_touch');
+var symKey    = Module.findExportByName('libtool.so', 'dextool_on_key');
+var symText   = Module.findExportByName('libtool.so', 'dextool_on_text');
+var symBksp   = Module.findExportByName('libtool.so', 'dextool_on_backspace');
+
+var fnTouch = symTouch ? new NativeFunction(symTouch, 'void', ['float','float','int']) : null;
+var fnKey   = symKey   ? new NativeFunction(symKey,   'void', ['int','int'])            : null;
+var fnText  = symText  ? new NativeFunction(symText,  'void', ['pointer'])              : null;
+var fnBksp  = symBksp  ? new NativeFunction(symBksp,  'void', [])                       : null;
+
+// ── Track current foreground Activity ──────────────────────
+var currentActivity = null;
+Java.perform(function() {
     try {
-        var sym = Module.findExportByName('libtool.so', 'dextool_on_touch');
-        if (!sym) {
-            sendMsg('warn', { msg: 'dextool_on_touch symbol not found in libtool.so' });
-            return;
-        }
-        // void dextool_on_touch(float x, float y, int action)
-        var nativeTouch = new NativeFunction(sym, 'void', ['float', 'float', 'int']);
-
-        Java.perform(function() {
-            // Primary: hook at Activity level (one call per gesture)
-            try {
-                var Activity = Java.use('android.app.Activity');
-                Activity.dispatchTouchEvent.implementation = function(ev) {
-                    try {
-                        nativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
-                    } catch(e2) {}
-                    return this.dispatchTouchEvent(ev);
-                };
-                sendMsg('info', { msg: 'Touch hook: Activity.dispatchTouchEvent OK' });
-            } catch(e) {
-                // Fallback: some apps subclass Dialog or use a custom Window
-                try {
-                    var Window = Java.use('android.view.Window');
-                    Window.superDispatchTouchEvent.implementation = function(ev) {
-                        try {
-                            nativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
-                        } catch(e3) {}
-                        return this.superDispatchTouchEvent(ev);
-                    };
-                    sendMsg('info', { msg: 'Touch hook: Window.superDispatchTouchEvent (fallback) OK' });
-                } catch(e2) {
-                    sendMsg('warn', { msg: 'Touch hook failed: ' + e.message });
-                }
-            }
-        });
-    } catch(e) {
-        sendMsg('error', { fn: 'installTouchHook', msg: e.message });
+        var Activity = Java.use('android.app.Activity');
+        Activity.onResume.implementation = function() {
+            currentActivity = this;
+            this.onResume();
+        };
+        Activity.onPause.implementation = function() {
+            if (currentActivity === this) currentActivity = null;
+            this.onPause();
+        };
+    } catch (e) {
+        sendMsg('warn', { msg: 'activity track hook failed: ' + e.message });
     }
-}
+});
 
+// ── Touch hook (raw screen coordinates) ───────────────────
+function installTouchHook() {
+    if (!fnTouch) {
+        sendMsg('warn', { msg: 'dextool_on_touch not found' });
+        return;
+    }
+    Java.perform(function() {
+        try {
+            var Activity = Java.use('android.app.Activity');
+            Activity.dispatchTouchEvent.implementation = function(ev) {
+                try {
+                    // getRawX/Y = absolute screen pixels (matches EGL surface)
+                    fnTouch(ev.getRawX(), ev.getRawY(), ev.getAction() & 0xff);
+                } catch(e2) {}
+                return this.dispatchTouchEvent(ev);
+            };
+            sendMsg('info', { msg: 'Touch hook OK (getRawX/Y)' });
+        } catch (e) {
+            sendMsg('warn', { msg: 'touch hook failed: ' + e.message });
+        }
+    });
+}
 installTouchHook();
 
-// ── RPC exports ───────────────────────────────────────────────
-rpc.exports = {
+// ── Hardware key hook ──────────────────────────────────────
+function installKeyHook() {
+    if (!fnKey) return;
+    Java.perform(function() {
+        try {
+            var Activity = Java.use('android.app.Activity');
+            Activity.dispatchKeyEvent.implementation = function(ev) {
+                try {
+                    fnKey(ev.getKeyCode(), ev.getAction());
+                } catch(e2) {}
+                return this.dispatchKeyEvent(ev);
+            };
+        } catch (e) {
+            sendMsg('warn', { msg: 'key hook failed: ' + e.message });
+        }
+    });
+}
+installKeyHook();
 
+// ── Soft keyboard (hidden EditText + InputConnection hooks) ─
+var imeEditText   = null;
+var imeViewGroup  = null;
+var TextWatcherCls = null;
+
+function buildTextWatcher() {
+    if (TextWatcherCls) return TextWatcherCls;
+    var TW = Java.use('android.text.TextWatcher');
+    TextWatcherCls = Java.registerClass({
+        name: 'DexToolTW',
+        implements: [TW],
+        methods: {
+            beforeTextChanged: function(s, st, c, a) {},
+            onTextChanged:     function(s, st, b, c) {},
+            afterTextChanged: function(s) {}
+        }
+    });
+    return TextWatcherCls;
+}
+
+function showKeyboard() {
+    if (!currentActivity || imeEditText) return;
+    var act = currentActivity;
+    Java.perform(function() {
+        try {
+            var EditText   = Java.use('android.widget.EditText');
+            var ViewGroup  = Java.use('android.view.ViewGroup$LayoutParams');
+            var decor      = act.getWindow().getDecorView();
+            imeViewGroup   = decor;
+            imeEditText    = EditText.$new(act);
+            imeEditText.setAlpha(0);
+            imeEditText.setSingleLine(true);
+            imeEditText.setInputType(0x00000001); // TYPE_CLASS_TEXT
+            var lp = ViewGroup.$new(1, 1);
+            decor.addView(imeEditText, lp);
+            imeEditText.requestFocus();
+            var imm = Java.use('android.view.inputmethod.InputMethodManager');
+            var immInst = act.getSystemService('input_method');
+            immInst.showSoftInput(imeEditText, 0);
+            sendMsg('info', { msg: 'IME shown' });
+        } catch (e) {
+            sendMsg('error', { fn: 'showKeyboard', msg: e.message });
+        }
+    });
+}
+
+function hideKeyboard() {
+    if (!currentActivity) return;
+    var act = currentActivity;
+    Java.perform(function() {
+        try {
+            var imm = Java.use('android.view.inputmethod.InputMethodManager');
+            var immInst = act.getSystemService('input_method');
+            if (imeEditText) {
+                try { immInst.hideSoftInputFromWindow(imeEditText.getWindowToken(), 0); } catch(e) {}
+                try { imeViewGroup.removeView(imeEditText); } catch(e) {}
+                imeEditText = null;
+            }
+            sendMsg('info', { msg: 'IME hidden' });
+        } catch (e) {
+            sendMsg('error', { fn: 'hideKeyboard', msg: e.message });
+        }
+    });
+}
+
+// Hook InputConnection so soft-keyboard text reaches ImGui
+function installImeInputHooks() {
+    if (!fnText && !fnBksp) return;
+    Java.perform(function() {
+        try {
+            var BaseIC = Java.use('android.view.inputmethod.BaseInputConnection');
+            BaseIC.commitText.implementation = function(text, ncp) {
+                try {
+                    if (imeEditText && text && text.length() > 0) {
+                        var s = Memory.allocUtf8String(text.toString());
+                        fnText(s);
+                    }
+                } catch(e) {}
+                return this.commitText(text, ncp);
+            };
+            BaseIC.deleteSurroundingText.implementation = function(before, after) {
+                try {
+                    if (imeEditText && fnBksp) {
+                        for (var i = 0; i < (before | 0); i++) fnBksp();
+                    }
+                } catch(e) {}
+                return this.deleteSurroundingText(before, after);
+            };
+            sendMsg('info', { msg: 'IME input hooks OK' });
+        } catch (e) {
+            sendMsg('warn', { msg: 'IME hooks failed: ' + e.message });
+        }
+    });
+}
+installImeInputHooks();
+
+// ── RPC exports ────────────────────────────────────────────
+rpc.exports = {
     addPatch: function(name, value) {
         try {
             Java.perform(function() {
@@ -72,37 +190,25 @@ rpc.exports = {
                 var f     = jcls.class.getDeclaredField(field);
                 f.setAccessible(true);
                 var t = f.getType().getName();
-                if (t==='int'||t==='long'||t==='short'||t==='byte')
-                    f.set(null, parseInt(value));
-                else if (t==='boolean')
-                    f.set(null, value === 'true');
-                else if (t==='float'||t==='double')
-                    f.set(null, parseFloat(value));
-                else
-                    f.set(null, value);
+                if (t==='int'||t==='long'||t==='short'||t==='byte') f.set(null, parseInt(value));
+                else if (t==='boolean') f.set(null, value === 'true');
+                else if (t==='float'||t==='double') f.set(null, parseFloat(value));
+                else f.set(null, value);
                 patches[name] = { value: value, enabled: true };
                 sendMsg('patchApplied', { name: name });
             });
         } catch(e) { sendMsg('error', { fn: 'addPatch', msg: e.message }); }
     },
-
-    removePatch: function(name) {
-        delete patches[name];
-        sendMsg('patchRemoved', { name: name });
-    },
-
+    removePatch: function(name) { delete patches[name]; sendMsg('patchRemoved', { name: name }); },
     setPatchEnabled: function(name, enabled) {
         if (patches[name]) patches[name].enabled = enabled;
         sendMsg('patchUpdated', { name: name, enabled: enabled });
     },
-
     addHook: function(name, mode, code) {
         try {
             Java.perform(function() {
-                var parts  = name.split('.');
-                var method = parts.pop();
-                var cls    = parts.join('.');
-                var jcls   = Java.use(cls);
+                var parts = name.split('.'); var method = parts.pop();
+                var jcls  = Java.use(parts.join('.'));
                 if (mode === 'noop') {
                     jcls[method].implementation = function() {
                         sendMsg('hookFired', { name: name, mode: 'noop' });
@@ -113,15 +219,12 @@ rpc.exports = {
                     jcls[method].implementation = function() {
                         return fn(Java, send, Array.from(arguments));
                     };
-                } else if (mode === 'Smali') {
-                    sendMsg('smaliRequest', { name: name, code: code });
                 }
                 hooks[name] = { mode: mode, enabled: true };
                 sendMsg('hookAdded', { name: name });
             });
         } catch(e) { sendMsg('error', { fn: 'addHook', msg: e.message }); }
     },
-
     removeHook: function(name) {
         try {
             Java.perform(function() {
@@ -132,12 +235,10 @@ rpc.exports = {
             });
         } catch(e) { sendMsg('error', { fn: 'removeHook', msg: e.message }); }
     },
-
     setHookEnabled: function(name, enabled) {
         if (hooks[name]) hooks[name].enabled = enabled;
         sendMsg('hookUpdated', { name: name, enabled: enabled });
     },
-
     addTracker: function(name) {
         try {
             Java.perform(function() {
@@ -155,7 +256,6 @@ rpc.exports = {
             });
         } catch(e) { sendMsg('error', { fn: 'addTracker', msg: e.message }); }
     },
-
     removeTracker: function(name) {
         try {
             Java.perform(function() {
@@ -166,7 +266,6 @@ rpc.exports = {
             });
         } catch(e) { sendMsg('error', { fn: 'removeTracker', msg: e.message }); }
     },
-
     startRecorder: function() {
         recOn = true;
         Java.perform(function() {
@@ -190,9 +289,7 @@ rpc.exports = {
         });
         sendMsg('recorderStarted', {});
     },
-
     stopRecorder: function() { recOn = false; sendMsg('recorderStopped', {}); },
-
     startMonitor: function() {
         monOn = true;
         Java.perform(function() {
@@ -211,14 +308,11 @@ rpc.exports = {
         });
         sendMsg('monitorStarted', {});
     },
-
     stopMonitor: function() { monOn = false; sendMsg('monitorStopped', {}); },
-
     evalScript: function(src) {
         try { sendMsg('scriptResult', { result: String(eval(src)) }); }
         catch(e) { sendMsg('scriptError', { msg: e.message }); }
     },
-
     openClass: function(className) {
         try {
             Java.perform(function() {
@@ -231,7 +325,6 @@ rpc.exports = {
             });
         } catch(e) { sendMsg('error', { fn: 'openClass', msg: e.message }); }
     },
-
     listInstances: function(className) {
         try {
             Java.perform(function() {
@@ -243,18 +336,23 @@ rpc.exports = {
             });
         } catch(e) { sendMsg('error', { fn: 'listInstances', msg: e.message }); }
     },
-
     hookMethod:  function(cls, m) { this.addHook(cls + '.' + m, 'noop', ''); },
     trackMethod: function(cls, m) { this.addTracker(cls + '.' + m); },
     patchField:  function(cls, f) { sendMsg('info', { msg: 'patchField: ' + cls + '.' + f }); }
 };
 
-recv(function onMsg(msg) {
-    if (msg && msg.type === 'rpc' && rpc.exports[msg.fn]) {
+// ── Message loop ───────────────────────────────────────────
+function onMsg(msg) {
+    if (!msg) return;
+    if (msg.type === 'keyboard') {
+        if (msg.show) showKeyboard(); else hideKeyboard();
+    } else if (msg.type === 'rpc' && rpc.exports[msg.fn]) {
         var a = msg.args || {};
-        rpc.exports[msg.fn].apply(rpc.exports, Object.values(a));
+        try { rpc.exports[msg.fn].apply(rpc.exports, Object.values(a)); }
+        catch(e) { sendMsg('error', { fn: msg.fn, msg: e.message }); }
     }
     recv(onMsg);
-});
+}
+recv(onMsg);
 
-sendMsg('ready', { msg: 'Dex-tool agent loaded' });
+sendMsg('ready', { msg: 'Dex-tool agent v1.1 loaded' });
