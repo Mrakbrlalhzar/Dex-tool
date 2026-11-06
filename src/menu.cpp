@@ -4,11 +4,10 @@
 #include "imgui.h"
 #include <string>
 #include <vector>
-#include <map>
-#include <mutex>
 #include <cstdio>
 #include <cstring>
 
+// ── Minimal JSON extractors (flat object, string / array-of-string) ─
 static std::string j_str(const std::string& j, const std::string& key) {
     std::string n = "\"" + key + "\":\"";
     size_t p = j.find(n);
@@ -117,6 +116,7 @@ static std::vector<std::string> j_arr(const std::string& j, const std::string& k
     return out;
 }
 
+// ── UI state (GL thread only after menu_init) ──────────────
 static float s_opacity = 0.92f;
 static float s_font_sz = 14.f;
 static int   s_theme   = 0;
@@ -134,7 +134,6 @@ static std::vector<ClassWin>     s_classes;
 
 static bool s_rec_on = false, s_mon_on = false;
 static std::vector<std::string> s_rec_log, s_mon_log, s_script_out;
-static std::mutex g_state_mtx;
 
 static char s_pname[256]  = {};
 static char s_pval[512]   = {};
@@ -153,6 +152,7 @@ static void post_rpc(const char* fn, const char* args) {
 }
 
 static void apply_theme() {
+    if (!ImGui::GetCurrentContext()) return;
     switch (s_theme) {
         case 0: ImGui::StyleColorsDark();    break;
         case 1: ImGui::StyleColorsLight();   break;
@@ -162,8 +162,8 @@ static void apply_theme() {
     ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
 }
 
+// GL thread only.
 static void handle_message(const std::string& j) {
-    std::lock_guard<std::mutex> lk(g_state_mtx);
     std::string type = j_str(j, "type");
     if (type.empty()) return;
     if (type == "classInfo") {
@@ -203,18 +203,29 @@ static void handle_message(const std::string& j) {
         s_mon_log.push_back(j_str(j, "note"));
     } else if (type == "error") {
         s_script_out.push_back("ERR[" + j_str(j, "fn") + "]: " + j_str(j, "msg"));
-    } else if (type == "info" || type == "warn") {
+    } else if (type == "info" || type == "warn" || type == "fatal") {
         s_script_out.push_back(j_str(j, "msg"));
+    } else if (type == "ready") {
+        s_script_out.push_back("agent ready: " + j_str(j, "msg"));
     }
 }
 
 void menu_init() {
-    apply_theme();
-    frida_set_message_callback([](const std::string& j) {
-        handle_message(j);
-    });
+    apply_theme();   // sets initial theme/font
 }
 
+void menu_poll_messages() {
+    if (!ImGui::GetCurrentContext()) return;
+    std::vector<std::string> msgs;
+    int n = frida_drain_messages(msgs);
+    if (n <= 0) return;
+    for (auto& m : msgs) {
+        try { handle_message(m); }
+        catch(...) {}
+    }
+}
+
+// ── Tabs ───────────────────────────────────────────────────
 static void tab_settings() {
     if (ImGui::SliderFloat("Font size", &s_font_sz, 8, 32)) {
         ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
@@ -420,12 +431,12 @@ static void tab_classes() {
 }
 
 void menu_draw() {
-    if (!s_visible) return;
+    if (!s_visible || !ImGui::GetCurrentContext()) return;
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * .75f, 500), ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(s_opacity);
-    ImGui::Begin("Dex-tool v1.1", &s_visible, ImGuiWindowFlags_NoCollapse);
+    ImGui::Begin("Dex-tool v1.3", &s_visible, ImGuiWindowFlags_NoCollapse);
     if (ImGui::BeginTabBar("tb")) {
         if (ImGui::BeginTabItem("Settings")) { tab_settings(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Patches"))  { tab_patches();  ImGui::EndTabItem(); }

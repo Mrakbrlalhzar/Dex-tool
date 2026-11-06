@@ -14,8 +14,6 @@ static FILE* g_info_fp  = nullptr;
 static FILE* g_debug_fp = nullptr;
 static int   g_crash_fd = -1;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-
-// 64 KiB altstack — used if the crash is a stack overflow.
 static char g_altstack[65536];
 
 static void ts(char* buf, size_t n) {
@@ -27,7 +25,6 @@ static void ts(char* buf, size_t n) {
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-// Async-signal-safe hex dump into buffer.
 static size_t put_hex(char* dst, size_t cap, uintptr_t v) {
     char tmp[20]; int n = 0;
     if (v == 0) tmp[n++] = '0';

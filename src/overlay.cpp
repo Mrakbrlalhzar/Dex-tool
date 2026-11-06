@@ -29,6 +29,11 @@ static JavaVM*           g_jvm           = nullptr;
 static EGLContext        g_egl_ctx       = EGL_NO_CONTEXT;
 static std::atomic<bool> g_want_text_last{false};
 
+// Track known EGL contexts so A<->B oscillation doesn't reinit forever.
+static EGLContext g_known_ctx[8]   = {};
+static int        g_known_count    = 0;
+static int        g_reinit_count   = 0;
+
 struct Evt {
     enum Kind { TOUCH, KEY, TEXT, BACKSPACE } kind;
     float x = 0, y = 0;
@@ -46,7 +51,6 @@ static void push_evt(const Evt& e) {
 }
 
 void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
-
 void overlay_on_touch(float x, float y, bool p) {
     Evt e; e.kind = Evt::TOUCH; e.x = x; e.y = y; e.pressed = p;
     push_evt(e);
@@ -92,18 +96,9 @@ static void spawn_frida_thread() {
     }
 }
 
-static void imgui_shutdown() {
-    if (g_imgui_up.load()) {
-        ImGui_ImplOpenGL3_Shutdown();
-        ImGui::DestroyContext();
-        g_imgui_up.store(false);
-        g_imgui_failed = false;
-        log_info("[overlay] ImGui shut down (context loss)");
-    }
-}
-
-static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
-    log_info("[overlay] imgui_init entry");
+// Full init: called exactly ONCE per process.
+static void imgui_full_init(EGLDisplay dpy, EGLSurface surf) {
+    log_info("[overlay] imgui_full_init entry");
     EGLint w = 1080, h = 1920;
     eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
@@ -115,9 +110,7 @@ static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
         g_imgui_failed = true;
         return;
     }
-    log_info("[overlay] imgui_init creating ImGui context");
     ImGui::CreateContext();
-    log_info("[overlay] imgui_init context created");
     ImGuiIO& io   = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)w, (float)h);
     io.DeltaTime   = 1.0f / 60.0f;
@@ -125,12 +118,18 @@ static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui::StyleColorsDark();
     ImGui::GetStyle().WindowRounding = 6.0f;
-
     ImGui_ImplOpenGL3_Init("#version 100");
-    log_info("[overlay] imgui_init GL backend OK, menu_init");
-    menu_init();
+    menu_init();          // <-- one-time: applies theme only
     g_imgui_up.store(true);
-    log_info("[overlay] imgui_init done");
+    log_info("[overlay] imgui_full_init done");
+}
+
+// Rebuild GL backend only (context change). Keeps UI state.
+static void imgui_rebuild_backend() {
+    log_info("[overlay] imgui_rebuild_backend (GL context changed)");
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplOpenGL3_Init("#version 100");
+    g_imgui_up.store(true);
 }
 
 static ImGuiKey map_key(int kc) {
@@ -162,9 +161,7 @@ static void drain_input() {
                 break;
             case Evt::KEY: {
                 ImGuiKey k = map_key(e.keycode);
-                if (k != ImGuiKey_None) {
-                    io.AddKeyEvent(k, e.action == 0);
-                }
+                if (k != ImGuiKey_None) io.AddKeyEvent(k, e.action == 0);
                 break;
             }
             case Evt::TEXT:
@@ -179,31 +176,49 @@ static void drain_input() {
     g_in_q.clear();
 }
 
+static bool is_known_ctx(EGLContext ctx) {
+    for (int i = 0; i < g_known_count; i++)
+        if (g_known_ctx[i] == ctx) return true;
+    return false;
+}
+static void remember_ctx(EGLContext ctx) {
+    if (g_known_count < 8) g_known_ctx[g_known_count++] = ctx;
+}
+
 static void render_frame(EGLDisplay dpy, EGLSurface surf) {
     EGLContext cur_ctx = eglGetCurrentContext();
+
     if (!g_gum_inited.exchange(true)) {
+        // ── First swap ─────────────────────────────────────────
         g_egl_ctx = cur_ctx;
+        if (cur_ctx != EGL_NO_CONTEXT) remember_ctx(cur_ctx);
         log_info("[overlay] first swap: gum_init_embedded");
         gum_init_embedded();
         log_info("[overlay] gum_init_embedded done");
-        // Do ImGui init FIRST — it is entirely GL-side, and running it
-        // before the frida thread removes the init race on GLib state.
-        log_info("[overlay] touch_install_hooks");
         touch_install_hooks();
-        log_info("[overlay] imgui_init (before frida spawn)");
-        imgui_init(dpy, surf);
-        // Only after everything local is set up do we spawn GumJS.
+        imgui_full_init(dpy, surf);
         spawn_frida_thread();
         log_info("[overlay] first-frame setup complete");
+
     } else if (cur_ctx != EGL_NO_CONTEXT && cur_ctx != g_egl_ctx) {
-        log_info("[overlay] EGL context changed, re-initing ImGui");
-        g_egl_ctx = cur_ctx;
-        imgui_shutdown();
-        imgui_init(dpy, surf);
+        // ── Context changed ───────────────────────────────────
+        if (!is_known_ctx(cur_ctx)) {
+            remember_ctx(cur_ctx);
+            g_egl_ctx = cur_ctx;
+            if (g_reinit_count++ < 8) imgui_rebuild_backend();
+            else log_info("[overlay] too many reinits, keeping current state");
+        } else {
+            // Oscillation between known contexts: rebuild once, then
+            // stop (dropping ImGui GL objects for that ctx is fine).
+            g_egl_ctx = cur_ctx;
+            if (g_reinit_count++ < 8) imgui_rebuild_backend();
+        }
     }
 
     if (!g_imgui_up.load() || g_imgui_failed) return;
+    if (!ImGui::GetCurrentContext()) return;
 
+    menu_poll_messages();   // <-- drain frida msgs on GL thread
     drain_input();
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();

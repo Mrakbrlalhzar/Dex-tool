@@ -12,17 +12,16 @@
             try { send(JSON.stringify({ type: type, payload: payload })); } catch(e) {}
         }
 
-        var symTouch, symKey, symText, symBksp;
         var fnTouch = null, fnKey = null, fnText = null, fnBksp = null;
         try {
-            symTouch = Module.findExportByName('libtool.so', 'dextool_on_touch');
-            symKey   = Module.findExportByName('libtool.so', 'dextool_on_key');
-            symText  = Module.findExportByName('libtool.so', 'dextool_on_text');
-            symBksp  = Module.findExportByName('libtool.so', 'dextool_on_backspace');
-            if (symTouch) fnTouch = new NativeFunction(symTouch, 'void', ['float','float','int']);
-            if (symKey)   fnKey   = new NativeFunction(symKey,   'void', ['int','int']);
-            if (symText)  fnText  = new NativeFunction(symText,  'void', ['pointer']);
-            if (symBksp)  fnBksp  = new NativeFunction(symBksp,  'void', []);
+            var sT = Module.findExportByName('libtool.so', 'dextool_on_touch');
+            var sK = Module.findExportByName('libtool.so', 'dextool_on_key');
+            var sX = Module.findExportByName('libtool.so', 'dextool_on_text');
+            var sB = Module.findExportByName('libtool.so', 'dextool_on_backspace');
+            if (sT) fnTouch = new NativeFunction(sT, 'void', ['float','float','int']);
+            if (sK) fnKey   = new NativeFunction(sK, 'void', ['int','int']);
+            if (sX) fnText  = new NativeFunction(sX, 'void', ['pointer']);
+            if (sB) fnBksp  = new NativeFunction(sB, 'void', []);
         } catch(e) {
             sendMsg('warn', { msg: 'native lookup failed: ' + e.message });
         }
@@ -49,7 +48,6 @@
                 }
             });
         }
-
         function installTouchHook() {
             if (!fnTouch) { sendMsg('warn', { msg: 'dextool_on_touch missing' }); return; }
             Java.perform(function() {
@@ -65,7 +63,6 @@
                 }
             });
         }
-
         function installKeyHook() {
             if (!fnKey) return;
             Java.perform(function() {
@@ -80,7 +77,6 @@
                 }
             });
         }
-
         function installImeInputHooks() {
             if (!fnText && !fnBksp) return;
             Java.perform(function() {
@@ -108,7 +104,6 @@
                 }
             });
         }
-
         function showKeyboard() {
             if (!currentActivity || imeEditText) return;
             var act = currentActivity;
@@ -132,7 +127,6 @@
                 }
             });
         }
-
         function hideKeyboard() {
             if (!currentActivity) return;
             var act = currentActivity;
@@ -151,7 +145,6 @@
             });
         }
 
-        // Defer Java hooks so we finish loading before touching the JVM.
         setImmediate(function() {
             try {
                 installActivityTracker();
@@ -336,7 +329,7 @@
         }
         recv(onMsg);
 
-        sendMsg('ready', { msg: 'Dex-tool agent v1.2 loaded' });
+        sendMsg('ready', { msg: 'Dex-tool agent v1.3 loaded' });
     } catch (e) {
         try { send(JSON.stringify({ type: 'fatal', payload: { msg: String(e) } })); } catch(_) {}
     }

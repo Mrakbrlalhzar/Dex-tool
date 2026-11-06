@@ -4,16 +4,25 @@
 #include "agent_bundle_embed.h"
 #include <mutex>
 #include <string>
+#include <vector>
+#include <atomic>
 
-static GumScriptBackend* g_backend = nullptr;
-static GumScript*        g_script  = nullptr;
-static GMainLoop*        g_loop    = nullptr;
-static GMainContext*     g_ctx     = nullptr;
-static std::mutex        g_pmtx;
-static MsgCallback       g_cb;
+static GumScriptBackend*          g_backend = nullptr;
+static std::atomic<GumScript*>    g_script {nullptr};
+static GMainLoop*                 g_loop    = nullptr;
+static GMainContext*              g_ctx     = nullptr;
+static std::mutex                 g_post_mtx;
+static std::mutex                 g_msg_mtx;
+static std::vector<std::string>   g_msg_queue;
 
 static void on_message(const gchar* msg, GBytes*, gpointer) {
-    if (g_cb && msg) g_cb(std::string(msg));
+    if (!msg) return;
+    std::lock_guard<std::mutex> lk(g_msg_mtx);
+    if (g_msg_queue.size() > 1024) {
+        g_msg_queue.erase(g_msg_queue.begin(),
+                          g_msg_queue.begin() + 512);
+    }
+    g_msg_queue.push_back(std::string(msg));
 }
 
 void frida_bridge_start(JavaVM*) {
@@ -33,11 +42,11 @@ void frida_bridge_start(JavaVM*) {
     }
 
     GError* err = nullptr;
-    g_script = gum_script_backend_create_sync(
+    GumScript* script = gum_script_backend_create_sync(
                    g_backend, "dextool-agent",
                    g_agent_js, nullptr, nullptr, &err);
     log_info("[frida] F: create_sync returned");
-    if (!g_script || err) {
+    if (!script || err) {
         char m[512];
         snprintf(m, sizeof(m), "[frida] create failed: %s\n",
                  err ? err->message : "(null)");
@@ -45,11 +54,12 @@ void frida_bridge_start(JavaVM*) {
         if (err) g_error_free(err);
         return;
     }
+    g_script.store(script);
 
-    gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
+    gum_script_set_message_handler(script, on_message, nullptr, nullptr);
     log_info("[frida] G: msg handler set");
 
-    gum_script_load_sync(g_script, nullptr);
+    gum_script_load_sync(script, nullptr);
     log_info("[frida] H: load_sync returned");
     log_info("[frida] agent running");
     g_main_loop_run(g_loop);
@@ -57,9 +67,14 @@ void frida_bridge_start(JavaVM*) {
 }
 
 void frida_post(const std::string& json) {
-    if (!g_script) return;
-    std::lock_guard<std::mutex> lk(g_pmtx);
-    gum_script_post(g_script, json.c_str(), nullptr);
+    GumScript* s = g_script.load();
+    if (!s) return;
+    std::lock_guard<std::mutex> lk(g_post_mtx);
+    gum_script_post(s, json.c_str(), nullptr);
 }
 
-void frida_set_message_callback(MsgCallback cb) { g_cb = cb; }
+int frida_drain_messages(std::vector<std::string>& out) {
+    std::lock_guard<std::mutex> lk(g_msg_mtx);
+    out.swap(g_msg_queue);
+    return (int)out.size();
+}
