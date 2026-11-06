@@ -4,6 +4,7 @@
 #include "agent_bundle_embed.h"
 #include <mutex>
 #include <string>
+#include <cstdio>
 
 static GumScriptBackend* g_backend = nullptr;
 static GumScript*        g_script  = nullptr;
@@ -13,7 +14,12 @@ static std::mutex        g_pmtx;
 static MsgCallback       g_cb;
 
 static void on_message(const gchar* msg, GBytes*, gpointer) {
-    if (g_cb && msg) g_cb(std::string(msg));
+    MsgCallback local;
+    {
+        std::lock_guard<std::mutex> lk(g_pmtx);
+        local = g_cb;
+    }
+    if (local && msg) local(std::string(msg));
 }
 
 void frida_bridge_start(JavaVM*) {
@@ -26,6 +32,7 @@ void frida_bridge_start(JavaVM*) {
         log_crash_raw("[frida_bridge] FATAL: no QJS backend\n");
         return;
     }
+    log_info("[frida_bridge] QJS backend obtained");
     GError* err = nullptr;
     g_script = gum_script_backend_create_sync(
                    g_backend, "dextool-agent",
@@ -38,6 +45,7 @@ void frida_bridge_start(JavaVM*) {
         if (err) g_error_free(err);
         return;
     }
+    log_info("[frida_bridge] script created, loading agent");
     gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
     gum_script_load_sync(g_script, nullptr);
     log_info("[frida_bridge] agent running");
@@ -51,4 +59,7 @@ void frida_post(const std::string& json) {
     gum_script_post(g_script, json.c_str(), nullptr);
 }
 
-void frida_set_message_callback(MsgCallback cb) { g_cb = cb; }
+void frida_set_message_callback(MsgCallback cb) {
+    std::lock_guard<std::mutex> lk(g_pmtx);
+    g_cb = cb;
+}

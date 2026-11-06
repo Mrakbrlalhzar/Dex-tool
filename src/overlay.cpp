@@ -65,6 +65,21 @@ static void* frida_thread(void*) {
     return nullptr;
 }
 
+void overlay_start(JavaVM*) {
+    if (g_gum_inited.exchange(true)) return;
+    gum_init_embedded();
+    log_info("[overlay] gum_init_embedded done");
+    pthread_t ft;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 8 * 1024 * 1024);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_create(&ft, &a, frida_thread, nullptr);
+    pthread_attr_destroy(&a);
+    touch_install_hooks();
+    log_info("[overlay] touch hooks installed, frida thread started");
+}
+
 static void imgui_shutdown() {
     if (g_imgui_up.exchange(false)) {
         ImGui_ImplOpenGL3_Shutdown();
@@ -107,21 +122,12 @@ static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
 static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     EGLContext ctx = eglGetCurrentContext();
 
-    if (!g_gum_inited.exchange(true)) {
+    if (ctx != EGL_NO_CONTEXT && ctx != g_egl_ctx) {
+        if (g_egl_ctx != EGL_NO_CONTEXT) {
+            LOGI("[overlay] EGL context changed, re-init ImGui");
+            imgui_shutdown();
+        }
         g_egl_ctx = ctx;
-        gum_init_embedded();
-        log_info("[overlay] gum_init_embedded done");
-        pthread_t ft;
-        pthread_attr_t a; pthread_attr_init(&a);
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_create(&ft, &a, frida_thread, nullptr);
-        pthread_attr_destroy(&a);
-        touch_install_hooks();
-        imgui_init(dpy, surf);
-    } else if (ctx != EGL_NO_CONTEXT && ctx != g_egl_ctx) {
-        LOGI("[overlay] EGL context changed, re-init ImGui");
-        g_egl_ctx = ctx;
-        imgui_shutdown();
         imgui_init(dpy, surf);
     }
 
