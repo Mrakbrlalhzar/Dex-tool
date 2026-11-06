@@ -60,8 +60,7 @@ public class DexToolApp extends Application {
             File d = new File(DL, n);
             try (InputStream  is = new FileInputStream(s);
                  OutputStream os = new FileOutputStream(d, true)) {
-                byte[] buf = new byte[8192];
-                int len;
+                byte[] buf = new byte[8192]; int len;
                 while ((len = is.read(buf)) != -1) os.write(buf, 0, len);
             }
         }
@@ -73,8 +72,7 @@ public class DexToolApp extends Application {
         Thread.setDefaultUncaughtExceptionHandler((thr, ex) -> {
             try (FileOutputStream f =
                      new FileOutputStream(DL + "/dextool-crash.log", true)) {
-                f.write(("JAVA_CRASH thr=" + thr.getName()
-                          + " " + ex + "\n").getBytes());
+                f.write(("JAVA_CRASH thr=" + thr.getName() + " " + ex + "\n").getBytes());
             } catch (IOException ignored) {}
             if (prev != null) prev.uncaughtException(thr, ex);
         });

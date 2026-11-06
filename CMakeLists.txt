@@ -14,7 +14,7 @@ set_target_properties(dobby_static PROPERTIES
     IMPORTED_LOCATION "${DOBBY_DIR}/${ANDROID_ABI}/libdobby.a")
 
 find_library(lib_egl     EGL)
-find_library(lib_gles    GLESv3)
+find_library(lib_gles2   GLESv2)
 find_library(lib_log     log)
 find_library(lib_dl      dl)
 find_library(lib_android android)
@@ -44,11 +44,15 @@ target_include_directories(tool PRIVATE
     ${IMGUI_DIR}/
     ${IMGUI_DIR}/backends/)
 
+# IMGUI_IMPL_OPENGL_ES2: makes ImGui use GLES2 functions and #version 100 GLSL.
+# This works on ES2 devices AND on ES3 devices (ES3 is backward-compatible).
+target_compile_definitions(tool PRIVATE IMGUI_IMPL_OPENGL_ES2=1)
+
 target_compile_options(tool PRIVATE
     -fvisibility=hidden -ffunction-sections -fdata-sections -O2
     -Wno-unused-variable -Wno-unused-function)
 
 target_link_libraries(tool
     frida-gumjs dobby_static
-    ${lib_egl} ${lib_gles} ${lib_log} ${lib_dl} ${lib_android}
+    ${lib_egl} ${lib_gles2} ${lib_log} ${lib_dl} ${lib_android}
     -lm -Wl,--gc-sections -Wl,--exclude-libs,ALL)

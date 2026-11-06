@@ -41,7 +41,6 @@ void frida_bridge_start(JavaVM*) {
         return;
     }
     gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
-
     gum_script_load_sync(g_script, nullptr);
     log_info("[frida_bridge] agent running");
     g_main_loop_run(g_loop);

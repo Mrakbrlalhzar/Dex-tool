@@ -39,8 +39,7 @@ static std::string extract_jar(JNIEnv* env) {
     FILE* f = fopen(jar, "wb");
     if (!f) { AAsset_close(a); return ""; }
     fwrite(AAsset_getBuffer(a), 1, (size_t)AAsset_getLength(a), f);
-    fclose(f);
-    AAsset_close(a);
+    fclose(f); AAsset_close(a);
     return std::string(jar);
 }
 
@@ -63,8 +62,7 @@ static bool ensure_ready(JNIEnv* env) {
         env->GetMethodID(cl, "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;"), cn);
     if (!s_main_cls || env->ExceptionCheck()) {
-        env->ExceptionClear();
-        return false;
+        env->ExceptionClear(); return false;
     }
     s_main_cls = (jclass)env->NewGlobalRef(s_main_cls);
     s_ready = true;
@@ -84,8 +82,7 @@ std::string smali_compile(const std::string& src,
     std::string df = std::string(tmp) + "/out.dex";
     FILE* f = fopen(sf.c_str(), "w");
     if (!f) return "fopen failed";
-    fwrite(src.c_str(), 1, src.size(), f);
-    fclose(f);
+    fwrite(src.c_str(), 1, src.size(), f); fclose(f);
     jclass       sc = env->FindClass("java/lang/String");
     jmethodID    m  = env->GetStaticMethodID(s_main_cls, "main",
                                               "([Ljava/lang/String;)V");
@@ -99,11 +96,8 @@ std::string smali_compile(const std::string& src,
     if (env->ExceptionCheck()) { env->ExceptionClear(); return "smali threw"; }
     FILE* df2 = fopen(df.c_str(), "rb");
     if (!df2) return "no dex output";
-    fseek(df2, 0, SEEK_END);
-    long sz = ftell(df2);
-    rewind(df2);
+    fseek(df2, 0, SEEK_END); long sz = ftell(df2); rewind(df2);
     out.resize((size_t)sz);
-    fread(out.data(), 1, (size_t)sz, df2);
-    fclose(df2);
+    fread(out.data(), 1, (size_t)sz, df2); fclose(df2);
     return "";
 }

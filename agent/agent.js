@@ -10,6 +10,56 @@ function sendMsg(type, payload) {
     send(JSON.stringify({ type: type, payload: payload }));
 }
 
+// ── FIX: Java touch hook ───────────────────────────────────────
+// AInputQueue_getEvent in touch.cpp only fires for NativeActivity apps.
+// For standard Java Activity apps (99% of apps), we hook at the Java level:
+// Activity.dispatchTouchEvent is called once per touch event at the top
+// of the view hierarchy, then calls dextool_on_touch in libtool.so.
+function installTouchHook() {
+    try {
+        var sym = Module.findExportByName('libtool.so', 'dextool_on_touch');
+        if (!sym) {
+            sendMsg('warn', { msg: 'dextool_on_touch symbol not found in libtool.so' });
+            return;
+        }
+        // void dextool_on_touch(float x, float y, int action)
+        var nativeTouch = new NativeFunction(sym, 'void', ['float', 'float', 'int']);
+
+        Java.perform(function() {
+            // Primary: hook at Activity level (one call per gesture)
+            try {
+                var Activity = Java.use('android.app.Activity');
+                Activity.dispatchTouchEvent.implementation = function(ev) {
+                    try {
+                        nativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
+                    } catch(e2) {}
+                    return this.dispatchTouchEvent(ev);
+                };
+                sendMsg('info', { msg: 'Touch hook: Activity.dispatchTouchEvent OK' });
+            } catch(e) {
+                // Fallback: some apps subclass Dialog or use a custom Window
+                try {
+                    var Window = Java.use('android.view.Window');
+                    Window.superDispatchTouchEvent.implementation = function(ev) {
+                        try {
+                            nativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
+                        } catch(e3) {}
+                        return this.superDispatchTouchEvent(ev);
+                    };
+                    sendMsg('info', { msg: 'Touch hook: Window.superDispatchTouchEvent (fallback) OK' });
+                } catch(e2) {
+                    sendMsg('warn', { msg: 'Touch hook failed: ' + e.message });
+                }
+            }
+        });
+    } catch(e) {
+        sendMsg('error', { fn: 'installTouchHook', msg: e.message });
+    }
+}
+
+installTouchHook();
+
+// ── RPC exports ───────────────────────────────────────────────
 rpc.exports = {
 
     addPatch: function(name, value) {

@@ -69,8 +69,7 @@ static void tab_patches() {
     ImGui::InputText("Value##pv", s_pval,  sizeof(s_pval));
     if (ImGui::Button("Add Patch") && s_pname[0]) {
         char a[1024];
-        snprintf(a, sizeof(a),
-                 "{\"name\":\"%s\",\"value\":\"%s\"}", s_pname, s_pval);
+        snprintf(a, sizeof(a), "{\"name\":\"%s\",\"value\":\"%s\"}", s_pname, s_pval);
         post_rpc("addPatch", a);
         s_patches.push_back({s_pname, s_pval, true});
         s_pname[0] = s_pval[0] = 0;
@@ -81,8 +80,7 @@ static void tab_patches() {
         auto& p = s_patches[i];
         if (ImGui::Checkbox("##e", &p.enabled)) {
             char a[256];
-            snprintf(a, sizeof(a),
-                     "{\"name\":\"%s\",\"enabled\":%s}",
+            snprintf(a, sizeof(a), "{\"name\":\"%s\",\"enabled\":%s}",
                      p.name.c_str(), p.enabled ? "true" : "false");
             post_rpc("setPatchEnabled", a);
         }
@@ -90,8 +88,7 @@ static void tab_patches() {
         ImGui::Text("%s=%s", p.name.c_str(), p.value.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("X")) {
-            char a[256];
-            snprintf(a, sizeof(a), "{\"name\":\"%s\"}", p.name.c_str());
+            char a[256]; snprintf(a, sizeof(a), "{\"name\":\"%s\"}", p.name.c_str());
             post_rpc("removePatch", a);
             s_patches.erase(s_patches.begin() + i);
             ImGui::PopID(); break;
@@ -104,12 +101,10 @@ static void tab_hooks() {
     const char* modes[] = {"Java","Smali","noop"};
     ImGui::InputText("Method##hn", s_hname, sizeof(s_hname));
     ImGui::Combo("Mode", &s_hmode, modes, 3);
-    ImGui::InputTextMultiline("Code##hc", s_hcode, sizeof(s_hcode),
-                               ImVec2(-1, 80));
+    ImGui::InputTextMultiline("Code##hc", s_hcode, sizeof(s_hcode), ImVec2(-1, 80));
     if (ImGui::Button("Add Hook") && s_hname[0]) {
         char a[2048];
-        snprintf(a, sizeof(a),
-                 "{\"name\":\"%s\",\"mode\":\"%s\",\"code\":\"%s\"}",
+        snprintf(a, sizeof(a), "{\"name\":\"%s\",\"mode\":\"%s\",\"code\":\"%s\"}",
                  s_hname, modes[s_hmode], s_hcode);
         post_rpc("addHook", a);
         s_hooks.push_back({s_hname, s_hcode, true, s_hmode});
@@ -121,8 +116,7 @@ static void tab_hooks() {
         auto& h = s_hooks[i];
         if (ImGui::Checkbox("##he", &h.enabled)) {
             char a[256];
-            snprintf(a, sizeof(a),
-                     "{\"name\":\"%s\",\"enabled\":%s}",
+            snprintf(a, sizeof(a), "{\"name\":\"%s\",\"enabled\":%s}",
                      h.name.c_str(), h.enabled ? "true" : "false");
             post_rpc("setHookEnabled", a);
         }
@@ -130,8 +124,7 @@ static void tab_hooks() {
         ImGui::Text("[%s] %s", modes[h.mode], h.name.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("X")) {
-            char a[256];
-            snprintf(a, sizeof(a), "{\"name\":\"%s\"}", h.name.c_str());
+            char a[256]; snprintf(a, sizeof(a), "{\"name\":\"%s\"}", h.name.c_str());
             post_rpc("removeHook", a);
             s_hooks.erase(s_hooks.begin() + i);
             ImGui::PopID(); break;
@@ -143,8 +136,7 @@ static void tab_hooks() {
 static void tab_tracker() {
     ImGui::InputText("Method##tn", s_tname, sizeof(s_tname));
     if (ImGui::Button("Track") && s_tname[0]) {
-        char a[256];
-        snprintf(a, sizeof(a), "{\"name\":\"%s\"}", s_tname);
+        char a[256]; snprintf(a, sizeof(a), "{\"name\":\"%s\"}", s_tname);
         post_rpc("addTracker", a);
         s_trackers.push_back({s_tname, {}});
         s_tname[0] = 0;
@@ -156,8 +148,7 @@ static void tab_tracker() {
         if (ImGui::CollapsingHeader(t.name.c_str())) {
             for (auto& l : t.log) ImGui::TextUnformatted(l.c_str());
             if (ImGui::SmallButton("Remove")) {
-                char a[256];
-                snprintf(a, sizeof(a), "{\"name\":\"%s\"}", t.name.c_str());
+                char a[256]; snprintf(a, sizeof(a), "{\"name\":\"%s\"}", t.name.c_str());
                 post_rpc("removeTracker", a);
                 s_trackers.erase(s_trackers.begin() + i);
                 ImGui::PopID(); break;
@@ -174,12 +165,8 @@ static void tab_recorder() {
             post_rpc("startRecorder", "{}");
         }
     } else {
-        if (ImGui::Button("Stop")) {
-            s_rec_on = false;
-            post_rpc("stopRecorder", "{}");
-        }
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0,1,0,1), "REC");
+        if (ImGui::Button("Stop")) { s_rec_on = false; post_rpc("stopRecorder", "{}"); }
+        ImGui::SameLine(); ImGui::TextColored(ImVec4(0,1,0,1), "REC");
     }
     ImGui::Separator();
     ImGui::BeginChild("rl", ImVec2(0, 180), true);
@@ -189,19 +176,15 @@ static void tab_recorder() {
 }
 
 static void tab_monitor() {
-    ImGui::TextDisabled("(best-effort: Java HTTP + SSLContext.init)");
+    ImGui::TextDisabled("(best-effort: Java SSLContext.init)");
     if (!s_mon_on) {
         if (ImGui::Button("Start")) {
             s_mon_on = true; s_mon_log.clear();
             post_rpc("startMonitor", "{}");
         }
     } else {
-        if (ImGui::Button("Stop")) {
-            s_mon_on = false;
-            post_rpc("stopMonitor", "{}");
-        }
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0,1,0,1), "MON");
+        if (ImGui::Button("Stop")) { s_mon_on = false; post_rpc("stopMonitor", "{}"); }
+        ImGui::SameLine(); ImGui::TextColored(ImVec4(0,1,0,1), "MON");
     }
     ImGui::Separator();
     ImGui::BeginChild("ml", ImVec2(0, 180), true);
@@ -211,12 +194,10 @@ static void tab_monitor() {
 }
 
 static void tab_script() {
-    ImGui::InputTextMultiline("##sc", s_script, sizeof(s_script),
-                               ImVec2(-1, 140));
+    ImGui::InputTextMultiline("##sc", s_script, sizeof(s_script), ImVec2(-1, 140));
     if (ImGui::Button("Run")) {
         s_script_out.clear();
-        char a[8256];
-        snprintf(a, sizeof(a), "{\"src\":\"%s\"}", s_script);
+        char a[8256]; snprintf(a, sizeof(a), "{\"src\":\"%s\"}", s_script);
         post_rpc("evalScript", a);
     }
     ImGui::SameLine();
@@ -231,8 +212,7 @@ static void tab_classes() {
     ImGui::InputText("Class##cn", s_cname, sizeof(s_cname));
     ImGui::SameLine();
     if (ImGui::Button("Open") && s_cname[0]) {
-        char a[256];
-        snprintf(a, sizeof(a), "{\"class\":\"%s\"}", s_cname);
+        char a[256]; snprintf(a, sizeof(a), "{\"class\":\"%s\"}", s_cname);
         post_rpc("openClass", a);
         s_classes.push_back({s_cname, {}, {}});
         s_cname[0] = 0;
@@ -242,38 +222,32 @@ static void tab_classes() {
         auto& c = s_classes[i];
         if (ImGui::CollapsingHeader(c.cname.c_str())) {
             if (ImGui::Button("List Instances")) {
-                char a[256];
-                snprintf(a, sizeof(a), "{\"class\":\"%s\"}", c.cname.c_str());
+                char a[256]; snprintf(a, sizeof(a), "{\"class\":\"%s\"}", c.cname.c_str());
                 post_rpc("listInstances", a);
             }
             ImGui::Text("Methods:");
             for (auto& m : c.methods) {
-                ImGui::BulletText("%s", m.c_str());
-                ImGui::SameLine();
+                ImGui::BulletText("%s", m.c_str()); ImGui::SameLine();
                 if (ImGui::SmallButton("Hook")) {
                     char a[256];
-                    snprintf(a, sizeof(a),
-                             "{\"class\":\"%s\",\"method\":\"%s\"}",
+                    snprintf(a, sizeof(a), "{\"class\":\"%s\",\"method\":\"%s\"}",
                              c.cname.c_str(), m.c_str());
                     post_rpc("hookMethod", a);
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Track")) {
                     char a[256];
-                    snprintf(a, sizeof(a),
-                             "{\"class\":\"%s\",\"method\":\"%s\"}",
+                    snprintf(a, sizeof(a), "{\"class\":\"%s\",\"method\":\"%s\"}",
                              c.cname.c_str(), m.c_str());
                     post_rpc("trackMethod", a);
                 }
             }
             ImGui::Text("Fields:");
             for (auto& f : c.fields) {
-                ImGui::BulletText("%s", f.c_str());
-                ImGui::SameLine();
+                ImGui::BulletText("%s", f.c_str()); ImGui::SameLine();
                 if (ImGui::SmallButton("Patch")) {
                     char a[256];
-                    snprintf(a, sizeof(a),
-                             "{\"class\":\"%s\",\"field\":\"%s\"}",
+                    snprintf(a, sizeof(a), "{\"class\":\"%s\",\"field\":\"%s\"}",
                              c.cname.c_str(), f.c_str());
                     post_rpc("patchField", a);
                 }
