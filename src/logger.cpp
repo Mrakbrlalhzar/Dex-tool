@@ -1,17 +1,22 @@
 #include "logger.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <pthread.h>
 
 static FILE* g_info_fp  = nullptr;
 static FILE* g_debug_fp = nullptr;
 static int   g_crash_fd = -1;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// 64 KiB altstack — used if the crash is a stack overflow.
+static char g_altstack[65536];
 
 static void ts(char* buf, size_t n) {
     time_t t = time(nullptr);
@@ -22,12 +27,43 @@ static void ts(char* buf, size_t n) {
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-static void crash_sig(int sig) {
-    char m[64];
-    snprintf(m, sizeof(m), "CRASH signal=%d\n", sig);
-    log_crash_raw(m);
-    signal(sig, SIG_DFL);
-    raise(sig);
+// Async-signal-safe hex dump into buffer.
+static size_t put_hex(char* dst, size_t cap, uintptr_t v) {
+    char tmp[20]; int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v > 0) { tmp[n++] = "0123456789abcdef"[v & 0xf]; v >>= 4; }
+    size_t p = 0;
+    if (cap < 3) return 0;
+    dst[p++] = '0'; dst[p++] = 'x';
+    while (n > 0 && p < cap - 1) dst[p++] = tmp[--n];
+    dst[p] = 0;
+    return p;
+}
+
+static void crash_handler(int sig, siginfo_t* info, void* ucv) {
+    char buf[192]; size_t p = 0;
+    auto append = [&](const char* s) {
+        while (*s && p < sizeof(buf) - 1) buf[p++] = *s++;
+    };
+    append("CRASH sig=");
+    if (sig >= 10) buf[p++] = '0' + ((sig / 10) % 10);
+    buf[p++] = '0' + (sig % 10);
+    append(" addr=");
+    char hx[24];
+    put_hex(hx, sizeof(hx), (uintptr_t)info->si_addr);
+    append(hx);
+    append(" pc=");
+    uintptr_t pc = 0;
+#if defined(__aarch64__)
+    if (ucv) pc = (uintptr_t)((ucontext_t*)ucv)->uc_mcontext.pc;
+#elif defined(__arm__)
+    if (ucv) pc = (uintptr_t)((ucontext_t*)ucv)->uc_mcontext.arm_pc;
+#endif
+    put_hex(hx, sizeof(hx), pc);
+    append(hx);
+    buf[p++] = '\n';
+    if (g_crash_fd >= 0) write(g_crash_fd, buf, p);
+    _exit(128 + sig);
 }
 
 void logger_init(const char* base_dir) {
@@ -39,9 +75,23 @@ void logger_init(const char* base_dir) {
     g_debug_fp = fopen(p, "a");
     snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
     g_crash_fd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
-    signal(SIGSEGV, crash_sig);
-    signal(SIGABRT, crash_sig);
-    signal(SIGBUS,  crash_sig);
+
+    stack_t ss;
+    ss.ss_sp    = g_altstack;
+    ss.ss_size  = sizeof(g_altstack);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, nullptr);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+    sigaction(SIGILL,  &sa, nullptr);
+    sigaction(SIGFPE,  &sa, nullptr);
     log_info("logger_init done");
 }
 

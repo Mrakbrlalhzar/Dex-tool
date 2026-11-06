@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <cstring>
 
-// ── Mini JSON extractors (flat object, string/array-of-string) ─
 static std::string j_str(const std::string& j, const std::string& key) {
     std::string n = "\"" + key + "\":\"";
     size_t p = j.find(n);
@@ -118,7 +117,6 @@ static std::vector<std::string> j_arr(const std::string& j, const std::string& k
     return out;
 }
 
-// ── State ──────────────────────────────────────────────────
 static float s_opacity = 0.92f;
 static float s_font_sz = 14.f;
 static int   s_theme   = 0;
@@ -164,12 +162,10 @@ static void apply_theme() {
     ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
 }
 
-// ── RPC message dispatcher ──────────────────────────────────
 static void handle_message(const std::string& j) {
     std::lock_guard<std::mutex> lk(g_state_mtx);
     std::string type = j_str(j, "type");
     if (type.empty()) return;
-
     if (type == "classInfo") {
         std::string cls = j_str(j, "class");
         auto methods = j_arr(j, "methods");
@@ -199,8 +195,7 @@ static void handle_message(const std::string& j) {
         for (auto& t : s_trackers)
             if (t.name == name) t.log.push_back(line);
     } else if (type == "recorded") {
-        std::string line = j_str(j, "cls") + "." + j_str(j, "method");
-        s_rec_log.push_back(line);
+        s_rec_log.push_back(j_str(j, "cls") + "." + j_str(j, "method"));
     } else if (type == "scriptResult" || type == "scriptError") {
         s_script_out.push_back(j_str(j, "result").empty()
             ? j_str(j, "msg") : j_str(j, "result"));
@@ -220,7 +215,6 @@ void menu_init() {
     });
 }
 
-// ── Tabs ────────────────────────────────────────────────────
 static void tab_settings() {
     if (ImGui::SliderFloat("Font size", &s_font_sz, 8, 32)) {
         ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;

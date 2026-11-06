@@ -24,13 +24,14 @@ static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
 }
 
 void touch_install_hooks() {
+    log_info("[touch] entry");
     void* lib = dlopen("libandroid.so", RTLD_NOW);
-    if (!lib) { LOGD("touch: dlopen libandroid.so failed (OK for Java apps)"); return; }
+    if (!lib) { log_info("[touch] dlopen libandroid.so failed"); return; }
     void* sym = dlsym(lib, "AInputQueue_getEvent");
-    if (!sym) { LOGD("touch: AInputQueue_getEvent not found (OK for Java apps)"); return; }
+    if (!sym) { log_info("[touch] AInputQueue_getEvent not found"); return; }
     int r = DobbyHook(sym,
                       reinterpret_cast<dobby_dummy_func_t>(my_getEvent),
                       reinterpret_cast<dobby_dummy_func_t*>(&g_orig_get));
-    if (r != 0) LOGD("touch: DobbyHook failed: %d (OK for Java apps)", r);
-    else        LOGI("touch: AInputQueue_getEvent hooked (NativeActivity)");
+    if (r != 0) log_info("[touch] DobbyHook failed");
+    else        log_info("[touch] AInputQueue_getEvent hooked");
 }
