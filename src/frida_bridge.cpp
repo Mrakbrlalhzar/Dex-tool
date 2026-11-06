@@ -21,20 +21,18 @@ void frida_bridge_start(JavaVM*) {
     g_ctx  = g_main_context_new();
     g_loop = g_main_loop_new(g_ctx, FALSE);
     g_main_context_push_thread_default(g_ctx);
-
     g_backend = gum_script_backend_obtain_qjs();
     if (!g_backend) {
         log_crash_raw("[frida_bridge] FATAL: no QJS backend\n");
         return;
     }
-
     GError* err = nullptr;
     g_script = gum_script_backend_create_sync(
                    g_backend, "dextool-agent",
                    g_agent_js, nullptr, nullptr, &err);
     if (!g_script || err) {
         char m[512];
-        snprintf(m, sizeof(m), "[frida_bridge] create failed: %s\n",
+        snprintf(m, sizeof(m), "[frida_bridge] create: %s\n",
                  err ? err->message : "(null)");
         log_crash_raw(m);
         if (err) g_error_free(err);

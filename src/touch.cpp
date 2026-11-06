@@ -5,8 +5,6 @@
 #include <dlfcn.h>
 #include <android/input.h>
 
-// AInputQueue hook: fires for NativeActivity-based apps only.
-// Standard Java Activity apps get touch via GumJS (agent.js).
 typedef int32_t (*fn_getEvent)(AInputQueue*, AInputEvent**);
 static fn_getEvent g_orig_get = nullptr;
 
@@ -27,12 +25,12 @@ static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
 
 void touch_install_hooks() {
     void* lib = dlopen("libandroid.so", RTLD_NOW);
-    if (!lib) { LOGD("touch: dlopen libandroid.so failed (OK for Java apps)"); return; }
+    if (!lib) { LOGD("touch: libandroid not found (OK for Java apps)"); return; }
     void* sym = dlsym(lib, "AInputQueue_getEvent");
     if (!sym) { LOGD("touch: AInputQueue_getEvent not found (OK for Java apps)"); return; }
     int r = DobbyHook(sym,
-                      reinterpret_cast<dobby_dummy_func_t>(my_getEvent),
-                      reinterpret_cast<dobby_dummy_func_t*>(&g_orig_get));
-    if (r != 0) LOGD("touch: DobbyHook failed: %d (OK for Java apps)", r);
-    else        LOGI("touch: AInputQueue_getEvent hooked (NativeActivity)");
+        reinterpret_cast<dobby_dummy_func_t>(my_getEvent),
+        reinterpret_cast<dobby_dummy_func_t*>(&g_orig_get));
+    if (r == 0) LOGI("touch: AInputQueue_getEvent hooked (NativeActivity)");
+    else        LOGD("touch: DobbyHook AInputQueue_getEvent: %d", r);
 }

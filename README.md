@@ -1,57 +1,43 @@
 # Dex-tool
 
-Standalone runtime instrumentation framework for Android APKs.
-Ships as one native shared library: libtool.so (armeabi-v7a + arm64-v8a).
-No root. No frida-server. Android 8.0+ (API 26).
+Standalone runtime instrumentation for Android APKs.
+libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
-## Bug fixes in this version
+## Fixes in this version
 
-    FIX 1 - Touch input (Java apps):
-      AInputQueue_getEvent only fires for NativeActivity apps.
-      Java Activity apps get touch via GumJS hooking Activity.dispatchTouchEvent,
-      which calls dextool_on_touch() (JNIEXPORT symbol in libtool.so) via
-      NativeFunction. The NativeActivity hook remains as a fallback.
+    1. Touch offset: Activity.dispatchTouchEvent coordinates are
+       corrected by the content-view y-offset measured in
+       onWindowFocusChanged (removes ActionBar shift).
 
-    FIX 2 - Menu disappears on pause/resume:
-      eglGetCurrentContext() is checked on every swap. When the EGL context
-      handle changes (new context after GLSurfaceView recreates on resume),
-      ImGui is shut down cleanly and re-initialized with the new context.
+    2. Keyboard: invisible EditText + TextWatcher bridge. When ImGui
+       sets WantCaptureKeyboard, the agent posts showKeyboard to the
+       C++ layer, which calls frida_post back to the GumJS agent,
+       which shows the IME on the main thread. Characters arrive via
+       TextWatcher -> dextool_add_char NativeFunction -> ImGui
+       AddInputCharacter on the GL thread.
 
-    FIX 3 - Menu not shown in ES2 apps:
-      Compiled with IMGUI_IMPL_OPENGL_ES2=1. ImGui uses GLES2 function set
-      and #version 100 GLSL, which works on ES2 and ES3. The ES3-only guard
-      is replaced with an OpenGL ES (any version) check.
+    3. Font size: FontGlobalScale is updated immediately when the
+       slider changes value.
+
+    4. Classes tab: JSON response from openClass is parsed in the
+       message callback and stored in ClassWin.methods/fields under
+       mutex. CollapsingHeader now shows method/field counts.
+
+    5. Menu in injected APKs: eglSwapBuffersWithDamageKHR is now
+       also hooked (many apps use this instead of eglSwapBuffers).
+       glBindFramebuffer(0) is called before ImGui render to ensure
+       we draw to the default framebuffer.
+
+    6. Thread safety: menu data structures are protected with a
+       pthread_mutex (message callback = GumJS thread, draw = GL thread).
 
 ## Usage
 
-    1. Take any target APK.
-    2. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
-    3. Inject System.loadLibrary("tool") into the launcher Activity smali
-       or Application subclass onCreate().
-    4. Copy smali-fat.jar into assets/.
-    5. Re-sign and install.
-    Note: overlay only appears if the app calls eglSwapBuffers (OpenGL ES).
-    Vulkan-only apps will not show the overlay but the Frida agent still runs.
-
-## Architecture
-
-    libtool.so
-      JNI_OnLoad
-        write boot marker (raw I/O, no gum)
-        logger_init()
-        install_swap_hook() via Dobby (LSPosed/Dobby)
-      eglSwapBuffers replacement (GL thread)
-        First call:
-          gum_init_embedded()      <- FIRST gum call, valid EGL context
-          spawn frida pthread      <- GumJS / QuickJS agent
-          touch_install_hooks()    <- NativeActivity fallback
-          imgui_init()             <- ES2 or ES3, any OpenGL ES
-        On context change (pause/resume):
-          imgui_shutdown() + imgui_init()
-        Every frame:
-          inject touch (from Java hook via dextool_on_touch)
-          ImGui render
-          g_orig_swap()           <- never recurses
+    1. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
+    2. Inject System.loadLibrary("tool") into Application.onCreate()
+       or the launcher Activity.
+    3. Copy smali-fat.jar into assets/.
+    4. Re-sign and install.
 
 ## Components
 

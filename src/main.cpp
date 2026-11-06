@@ -27,9 +27,8 @@ JNI_OnLoad(JavaVM* vm, void*) {
     log_info("[JNI_OnLoad] entry");
     write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=logger_ready");
     overlay_set_java_vm(vm);
-    if (!install_swap_hook()) {
+    if (!install_swap_hook())
         log_crash_raw("[JNI_OnLoad] FATAL: install_swap_hook failed\n");
-    }
     write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=hooks_installed");
     log_info("[JNI_OnLoad] done — awaiting first eglSwapBuffers");
     write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=jni_return");
