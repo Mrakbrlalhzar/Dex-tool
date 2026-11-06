@@ -90,7 +90,6 @@ jobs:
             -dname "CN=Android Debug,O=Android,C=US" \
             -keyalg RSA -keysize 2048 -validity 10000 2>/dev/null || true
 
-      # ── frida-gum 16.7.19 arm64-v8a ───────────────────────────
       - name: Cache frida-gum arm64-v8a
         id: cache-frida-arm64
         uses: actions/cache@v4
@@ -122,21 +121,12 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a"
           GUMLIB="$(find . "$FRIDA_PFX" -name 'libfrida-gumjs.a' 2>/dev/null | head -1)"
           GUMHDR="$(find . "$FRIDA_PFX" -name 'frida-gumjs.h'   2>/dev/null | head -1)"
-          [ -z "$GUMLIB" ] && {
-            echo "ERROR: libfrida-gumjs.a not found"
-            find . -name "*.a" | head -20
-            exit 1
-          }
-          [ -z "$GUMHDR" ] && {
-            echo "ERROR: frida-gumjs.h not found"
-            find . -name "*.h" | head -20
-            exit 1
-          }
+          [ -z "$GUMLIB" ] && { echo "ERROR: libfrida-gumjs.a not found"; find . -name "*.a" | head -20; exit 1; }
+          [ -z "$GUMHDR" ] && { echo "ERROR: frida-gumjs.h not found"; find . -name "*.h" | head -20; exit 1; }
           cp "$GUMLIB" "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/libfrida-gumjs.a"
           cp "$GUMHDR" "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/frida-gumjs.h"
           ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/arm64-v8a/"
 
-      # ── frida-gum 16.7.19 armeabi-v7a ─────────────────────────
       - name: Cache frida-gum armeabi-v7a
         id: cache-frida-arm
         uses: actions/cache@v4
@@ -176,7 +166,6 @@ jobs:
           cp "$GUMHDR" "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/frida-gumjs.h"
           ls -lh "$GITHUB_WORKSPACE/deps/frida-gum/armeabi-v7a/"
 
-      # ── Dobby (LSPosed/Dobby) ─────────────────────────────────
       - name: Cache Dobby
         id: cache-dobby
         uses: actions/cache@v4
@@ -188,17 +177,8 @@ jobs:
         if: "${{ steps.cache-dobby.outputs.cache-hit != 'true' }}"
         run: |
           git clone --depth 1 https://github.com/LSPosed/Dobby.git dobby-src
-
-          while IFS= read -r -d '' f; do
-            sed -i -E 's/([a-zA-Z0-9_()]+)@PAGEOFF/:lo12:\1/g' "$f"
-            sed -i -E 's/([a-zA-Z0-9_()]+)@PAGE\b/\1/g' "$f"
-          done < <(find dobby-src -name "*.asm" -print0 2>/dev/null)
-
-          echo "Dobby ASM files patched for ELF."
-
           mkdir -p deps/dobby
           cp -r dobby-src/include deps/dobby/
-
           for ABI in arm64-v8a armeabi-v7a; do
             cmake -S dobby-src -B "dobby-src/build-$ABI" \
               -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
@@ -235,9 +215,7 @@ jobs:
             "https://repo1.maven.org/maven2/com/google/guava/guava/30.1.1-android/guava-30.1.1-android.jar" \
             -O deps/smali/guava.jar
           MERGE="$(mktemp -d)"
-          for j in deps/smali/*.jar; do
-            unzip -nqo "$j" -d "$MERGE" 2>/dev/null || true
-          done
+          for j in deps/smali/*.jar; do unzip -nqo "$j" -d "$MERGE" 2>/dev/null || true; done
           jar cf deps/smali/smali-fat.jar -C "$MERGE" .
           ls -lh deps/smali/smali-fat.jar
 
@@ -254,6 +232,7 @@ jobs:
 
       # ═══════════════════════════════════════════════════════════
       # CMakeLists.txt
+      # FIX: use GLESv2 + IMGUI_IMPL_OPENGL_ES2 for ES2/ES3 compat
       # ═══════════════════════════════════════════════════════════
       - name: Generate CMakeLists.txt
         run: |
@@ -274,7 +253,7 @@ jobs:
               IMPORTED_LOCATION "${DOBBY_DIR}/${ANDROID_ABI}/libdobby.a")
           
           find_library(lib_egl     EGL)
-          find_library(lib_gles    GLESv3)
+          find_library(lib_gles2   GLESv2)
           find_library(lib_log     log)
           find_library(lib_dl      dl)
           find_library(lib_android android)
@@ -304,19 +283,20 @@ jobs:
               ${IMGUI_DIR}/
               ${IMGUI_DIR}/backends/)
           
+          # IMGUI_IMPL_OPENGL_ES2: makes ImGui use GLES2 functions and #version 100 GLSL.
+          # This works on ES2 devices AND on ES3 devices (ES3 is backward-compatible).
+          target_compile_definitions(tool PRIVATE IMGUI_IMPL_OPENGL_ES2=1)
+          
           target_compile_options(tool PRIVATE
               -fvisibility=hidden -ffunction-sections -fdata-sections -O2
               -Wno-unused-variable -Wno-unused-function)
           
           target_link_libraries(tool
               frida-gumjs dobby_static
-              ${lib_egl} ${lib_gles} ${lib_log} ${lib_dl} ${lib_android}
+              ${lib_egl} ${lib_gles2} ${lib_log} ${lib_dl} ${lib_android}
               -lm -Wl,--gc-sections -Wl,--exclude-libs,ALL)
           DXTCMK
 
-      # ═══════════════════════════════════════════════════════════
-      # logger.h
-      # ═══════════════════════════════════════════════════════════
       - name: Generate logger.h
         run: |
           cat > src/logger.h << 'DXTLOGH'
@@ -332,9 +312,6 @@ jobs:
           void log_crash_raw(const char* msg);
           DXTLOGH
 
-      # ═══════════════════════════════════════════════════════════
-      # logger.cpp
-      # ═══════════════════════════════════════════════════════════
       - name: Generate logger.cpp
         run: |
           cat > src/logger.cpp << 'DXTLOGC'
@@ -410,6 +387,7 @@ jobs:
 
       # ═══════════════════════════════════════════════════════════
       # overlay.h
+      # FIX: expose dextool_on_touch for GumJS NativeFunction call
       # ═══════════════════════════════════════════════════════════
       - name: Generate overlay.h
         run: |
@@ -420,10 +398,23 @@ jobs:
           bool install_swap_hook();
           void overlay_set_java_vm(JavaVM* vm);
           void overlay_on_touch(float x, float y, bool pressed);
+          
+          // Exported C symbol called by GumJS agent via NativeFunction.
+          // JNIEXPORT ensures visibility despite -fvisibility=hidden.
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          JNIEXPORT void dextool_on_touch(float x, float y, int action);
+          #ifdef __cplusplus
+          }
+          #endif
           DXTOVLH
 
       # ═══════════════════════════════════════════════════════════
-      # overlay.cpp
+      # overlay.cpp — THREE BUG FIXES:
+      # 1. EGL context tracking: re-init ImGui on pause/resume
+      # 2. ES2 support: accept OpenGL ES 2 and 3, use #version 100
+      # 3. dextool_on_touch export for GumJS Java touch hook
       # ═══════════════════════════════════════════════════════════
       - name: Generate overlay.cpp
         run: |
@@ -438,18 +429,21 @@ jobs:
           #include "dobby.h"
           #include "frida-gumjs.h"
           #include <EGL/egl.h>
-          #include <GLES3/gl3.h>
+          #include <GLES2/gl2.h>
           #include <dlfcn.h>
           #include <cstring>
           #include <pthread.h>
           #include <atomic>
           
           typedef EGLBoolean (*fn_swap)(EGLDisplay, EGLSurface);
-          static fn_swap              g_orig_swap    = nullptr;
-          static std::atomic<bool>    g_gum_inited  {false};
-          static std::atomic<bool>    g_imgui_up    {false};
-          static bool                 g_imgui_failed = false;
-          static JavaVM*              g_jvm          = nullptr;
+          static fn_swap              g_orig_swap     = nullptr;
+          static std::atomic<bool>    g_gum_inited   {false};
+          static std::atomic<bool>    g_imgui_up     {false};
+          static bool                 g_imgui_failed  = false;
+          static JavaVM*              g_jvm           = nullptr;
+          
+          // FIX 1: Track EGL context to detect pause/resume context recreation.
+          static EGLContext           g_egl_ctx       = EGL_NO_CONTEXT;
           
           struct Touch {
               std::atomic<float> x{0}, y{0};
@@ -464,21 +458,47 @@ jobs:
               g_touch.pressed = p; g_touch.dirty = true;
           }
           
+          // FIX 3: Exported C symbol for GumJS agent to call via NativeFunction.
+          // The agent hooks Activity.dispatchTouchEvent in Java and calls this.
+          // action: 0=DOWN, 1=UP, 2=MOVE (matches MotionEvent constants).
+          extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
+              overlay_on_touch(x, y, action == 0 || action == 2);
+          }
+          
           static void* frida_thread(void*) {
               frida_bridge_start(g_jvm);
               return nullptr;
           }
           
+          // FIX 1: Tear down ImGui GL resources before context switch.
+          static void imgui_shutdown() {
+              if (g_imgui_up.load()) {
+                  ImGui_ImplOpenGL3_Shutdown();
+                  ImGui::DestroyContext();
+                  g_imgui_up.store(false);
+                  g_imgui_failed = false;
+                  LOGI("[overlay] ImGui shut down (context loss)");
+              }
+          }
+          
+          // FIX 2: Accept any OpenGL ES (ES2 or ES3). Use #version 100 GLSL.
+          // The binary is compiled with IMGUI_IMPL_OPENGL_ES2=1 so ImGui always
+          // uses ES2 function set, which is a subset of ES3.
           static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
               EGLint w = 1080, h = 1920;
               eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+          
               const GLubyte* ver = glGetString(GL_VERSION);
-              if (!ver || !strstr((const char*)ver, "OpenGL ES 3")) {
-                  LOGE("ImGui disabled: not ES3 (ver=%s)", ver ? (const char*)ver : "null");
+              bool is_es = ver && strstr((const char*)ver, "OpenGL ES");
+              if (!is_es) {
+                  LOGE("[overlay] GL is not OpenGL ES (ver=%s), ImGui disabled",
+                       ver ? (const char*)ver : "null");
                   g_imgui_failed = true;
                   return;
               }
+              LOGI("[overlay] GL: %s (%dx%d)", (const char*)ver, w, h);
+          
               ImGui::CreateContext();
               ImGuiIO& io   = ImGui::GetIO();
               io.DisplaySize = ImVec2((float)w, (float)h);
@@ -487,26 +507,45 @@ jobs:
               io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
               ImGui::StyleColorsDark();
               ImGui::GetStyle().WindowRounding = 6.0f;
-              ImGui_ImplOpenGL3_Init("#version 300 es");
+          
+              // "#version 100" = GLSL ES 1.00, works on ES2 and ES3.
+              ImGui_ImplOpenGL3_Init("#version 100");
               menu_init();
-              g_imgui_up = true;
-              LOGI("ImGui up (%dx%d ES3)", w, h);
+              g_imgui_up.store(true);
+              LOGI("[overlay] ImGui up (%dx%d)", w, h);
           }
           
+          // CRITICAL: calls g_orig_swap — NEVER recurses into eglSwapBuffers symbol.
+          // FIX 1: eglGetCurrentContext() detects context change after pause/resume.
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
+              EGLContext cur_ctx = eglGetCurrentContext();
+          
               if (!g_gum_inited.exchange(true)) {
-                  gum_init_embedded();
+                  // ── First call: full initialization ──────────────────────
+                  g_egl_ctx = cur_ctx;
+                  gum_init_embedded();   // FIRST gum_* call, GL context valid
                   log_info("[overlay] gum_init_embedded done");
+          
                   pthread_t ft;
                   pthread_attr_t a;
                   pthread_attr_init(&a);
                   pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
                   pthread_create(&ft, &a, frida_thread, nullptr);
                   pthread_attr_destroy(&a);
-                  touch_install_hooks();
+          
+                  touch_install_hooks();   // NativeActivity fallback
+                  imgui_init(dpy, surf);
+          
+              } else if (cur_ctx != EGL_NO_CONTEXT && cur_ctx != g_egl_ctx) {
+                  // ── Context changed after pause/resume: re-init ImGui ─────
+                  LOGI("[overlay] EGL context changed (%p -> %p), re-initing ImGui",
+                       g_egl_ctx, cur_ctx);
+                  g_egl_ctx = cur_ctx;
+                  imgui_shutdown();
                   imgui_init(dpy, surf);
               }
-              if (g_imgui_up && !g_imgui_failed) {
+          
+              if (g_imgui_up.load() && !g_imgui_failed) {
                   ImGuiIO& io = ImGui::GetIO();
                   if (g_touch.dirty.exchange(false)) {
                       io.MousePos     = ImVec2(g_touch.x.load(), g_touch.y.load());
@@ -518,6 +557,7 @@ jobs:
                   ImGui::Render();
                   ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
               }
+          
               return g_orig_swap(dpy, surf);
           }
           
@@ -529,22 +569,21 @@ jobs:
               int r = DobbyHook(sym,
                                 reinterpret_cast<dobby_dummy_func_t>(my_swap),
                                 reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap));
-              if (r != 0) { LOGE("DobbyHook failed: %d", r); return false; }
+              if (r != 0) { LOGE("DobbyHook eglSwapBuffers failed: %d", r); return false; }
               LOGI("eglSwapBuffers hooked OK");
               return true;
           }
           DXTOVLC
 
-      # ═══════════════════════════════════════════════════════════
-      # touch.h + touch.cpp
-      # ═══════════════════════════════════════════════════════════
       - name: Generate touch.h and touch.cpp
         run: |
           cat > src/touch.h << 'DXTTHH'
           #pragma once
+          // NativeActivity fallback touch hook.
+          // Java-based apps get touch via GumJS Activity.dispatchTouchEvent hook.
           void touch_install_hooks();
           DXTTHH
-          cat > src/touch.cpp << 'DXTTCH'
+                    cat > src/touch.cpp << 'DXTTCH'
           #include "touch.h"
           #include "overlay.h"
           #include "logger.h"
@@ -552,6 +591,8 @@ jobs:
           #include <dlfcn.h>
           #include <android/input.h>
           
+          // AInputQueue hook: fires for NativeActivity-based apps only.
+          // Standard Java Activity apps get touch via GumJS (agent.js).
           typedef int32_t (*fn_getEvent)(AInputQueue*, AInputEvent**);
           static fn_getEvent g_orig_get = nullptr;
           
@@ -572,20 +613,17 @@ jobs:
           
           void touch_install_hooks() {
               void* lib = dlopen("libandroid.so", RTLD_NOW);
-              if (!lib) { LOGE("touch: dlopen libandroid.so failed"); return; }
+              if (!lib) { LOGD("touch: dlopen libandroid.so failed (OK for Java apps)"); return; }
               void* sym = dlsym(lib, "AInputQueue_getEvent");
-              if (!sym) { LOGE("touch: AInputQueue_getEvent not found"); return; }
+              if (!sym) { LOGD("touch: AInputQueue_getEvent not found (OK for Java apps)"); return; }
               int r = DobbyHook(sym,
                                 reinterpret_cast<dobby_dummy_func_t>(my_getEvent),
                                 reinterpret_cast<dobby_dummy_func_t*>(&g_orig_get));
-              if (r != 0) LOGE("touch: DobbyHook failed: %d", r);
-              else        LOGI("touch: AInputQueue_getEvent hooked");
+              if (r != 0) LOGD("touch: DobbyHook failed: %d (OK for Java apps)", r);
+              else        LOGI("touch: AInputQueue_getEvent hooked (NativeActivity)");
           }
           DXTTCH
 
-      # ═══════════════════════════════════════════════════════════
-      # frida_bridge.h
-      # ═══════════════════════════════════════════════════════════
       - name: Generate frida_bridge.h
         run: |
           cat > src/frida_bridge.h << 'DXTFBH'
@@ -599,9 +637,6 @@ jobs:
           void frida_set_message_callback(MsgCallback cb);
           DXTFBH
 
-      # ═══════════════════════════════════════════════════════════
-      # frida_bridge.cpp
-      # ═══════════════════════════════════════════════════════════
       - name: Generate frida_bridge.cpp
         run: |
           cat > src/frida_bridge.cpp << 'DXTFBC'
@@ -648,7 +683,6 @@ jobs:
                   return;
               }
               gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
-          
               gum_script_load_sync(g_script, nullptr);
               log_info("[frida_bridge] agent running");
               g_main_loop_run(g_loop);
@@ -664,9 +698,6 @@ jobs:
           void frida_set_message_callback(MsgCallback cb) { g_cb = cb; }
           DXTFBC
 
-      # ═══════════════════════════════════════════════════════════
-      # smali_runtime.h + smali_runtime.cpp
-      # ═══════════════════════════════════════════════════════════
       - name: Generate smali_runtime.h and smali_runtime.cpp
         run: |
           cat > src/smali_runtime.h << 'DXTSRH'
@@ -677,7 +708,7 @@ jobs:
                                     const std::string& class_name,
                                     std::vector<uint8_t>& dex_out);
           DXTSRH
-          cat > src/smali_runtime.cpp << 'DXTSRC'
+                    cat > src/smali_runtime.cpp << 'DXTSRC'
           #include "smali_runtime.h"
           #include "logger.h"
           #include <jni.h>
@@ -719,8 +750,7 @@ jobs:
               FILE* f = fopen(jar, "wb");
               if (!f) { AAsset_close(a); return ""; }
               fwrite(AAsset_getBuffer(a), 1, (size_t)AAsset_getLength(a), f);
-              fclose(f);
-              AAsset_close(a);
+              fclose(f); AAsset_close(a);
               return std::string(jar);
           }
           
@@ -743,8 +773,7 @@ jobs:
                   env->GetMethodID(cl, "loadClass",
                       "(Ljava/lang/String;)Ljava/lang/Class;"), cn);
               if (!s_main_cls || env->ExceptionCheck()) {
-                  env->ExceptionClear();
-                  return false;
+                  env->ExceptionClear(); return false;
               }
               s_main_cls = (jclass)env->NewGlobalRef(s_main_cls);
               s_ready = true;
@@ -764,8 +793,7 @@ jobs:
               std::string df = std::string(tmp) + "/out.dex";
               FILE* f = fopen(sf.c_str(), "w");
               if (!f) return "fopen failed";
-              fwrite(src.c_str(), 1, src.size(), f);
-              fclose(f);
+              fwrite(src.c_str(), 1, src.size(), f); fclose(f);
               jclass       sc = env->FindClass("java/lang/String");
               jmethodID    m  = env->GetStaticMethodID(s_main_cls, "main",
                                                         "([Ljava/lang/String;)V");
@@ -779,19 +807,13 @@ jobs:
               if (env->ExceptionCheck()) { env->ExceptionClear(); return "smali threw"; }
               FILE* df2 = fopen(df.c_str(), "rb");
               if (!df2) return "no dex output";
-              fseek(df2, 0, SEEK_END);
-              long sz = ftell(df2);
-              rewind(df2);
+              fseek(df2, 0, SEEK_END); long sz = ftell(df2); rewind(df2);
               out.resize((size_t)sz);
-              fread(out.data(), 1, (size_t)sz, df2);
-              fclose(df2);
+              fread(out.data(), 1, (size_t)sz, df2); fclose(df2);
               return "";
           }
           DXTSRC
 
-      # ═══════════════════════════════════════════════════════════
-      # menu.h
-      # ═══════════════════════════════════════════════════════════
       - name: Generate menu.h
         run: |
           cat > src/menu.h << 'DXTMNH'
@@ -800,9 +822,6 @@ jobs:
           void menu_draw();
           DXTMNH
 
-      # ═══════════════════════════════════════════════════════════
-      # menu.cpp
-      # ═══════════════════════════════════════════════════════════
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
@@ -877,8 +896,7 @@ jobs:
               ImGui::InputText("Value##pv", s_pval,  sizeof(s_pval));
               if (ImGui::Button("Add Patch") && s_pname[0]) {
                   char a[1024];
-                  snprintf(a, sizeof(a),
-                           "{\"name\":\"%s\",\"value\":\"%s\"}", s_pname, s_pval);
+                  snprintf(a, sizeof(a), "{\"name\":\"%s\",\"value\":\"%s\"}", s_pname, s_pval);
                   post_rpc("addPatch", a);
                   s_patches.push_back({s_pname, s_pval, true});
                   s_pname[0] = s_pval[0] = 0;
@@ -889,8 +907,7 @@ jobs:
                   auto& p = s_patches[i];
                   if (ImGui::Checkbox("##e", &p.enabled)) {
                       char a[256];
-                      snprintf(a, sizeof(a),
-                               "{\"name\":\"%s\",\"enabled\":%s}",
+                      snprintf(a, sizeof(a), "{\"name\":\"%s\",\"enabled\":%s}",
                                p.name.c_str(), p.enabled ? "true" : "false");
                       post_rpc("setPatchEnabled", a);
                   }
@@ -898,8 +915,7 @@ jobs:
                   ImGui::Text("%s=%s", p.name.c_str(), p.value.c_str());
                   ImGui::SameLine();
                   if (ImGui::SmallButton("X")) {
-                      char a[256];
-                      snprintf(a, sizeof(a), "{\"name\":\"%s\"}", p.name.c_str());
+                      char a[256]; snprintf(a, sizeof(a), "{\"name\":\"%s\"}", p.name.c_str());
                       post_rpc("removePatch", a);
                       s_patches.erase(s_patches.begin() + i);
                       ImGui::PopID(); break;
@@ -912,12 +928,10 @@ jobs:
               const char* modes[] = {"Java","Smali","noop"};
               ImGui::InputText("Method##hn", s_hname, sizeof(s_hname));
               ImGui::Combo("Mode", &s_hmode, modes, 3);
-              ImGui::InputTextMultiline("Code##hc", s_hcode, sizeof(s_hcode),
-                                         ImVec2(-1, 80));
+              ImGui::InputTextMultiline("Code##hc", s_hcode, sizeof(s_hcode), ImVec2(-1, 80));
               if (ImGui::Button("Add Hook") && s_hname[0]) {
                   char a[2048];
-                  snprintf(a, sizeof(a),
-                           "{\"name\":\"%s\",\"mode\":\"%s\",\"code\":\"%s\"}",
+                  snprintf(a, sizeof(a), "{\"name\":\"%s\",\"mode\":\"%s\",\"code\":\"%s\"}",
                            s_hname, modes[s_hmode], s_hcode);
                   post_rpc("addHook", a);
                   s_hooks.push_back({s_hname, s_hcode, true, s_hmode});
@@ -929,8 +943,7 @@ jobs:
                   auto& h = s_hooks[i];
                   if (ImGui::Checkbox("##he", &h.enabled)) {
                       char a[256];
-                      snprintf(a, sizeof(a),
-                               "{\"name\":\"%s\",\"enabled\":%s}",
+                      snprintf(a, sizeof(a), "{\"name\":\"%s\",\"enabled\":%s}",
                                h.name.c_str(), h.enabled ? "true" : "false");
                       post_rpc("setHookEnabled", a);
                   }
@@ -938,8 +951,7 @@ jobs:
                   ImGui::Text("[%s] %s", modes[h.mode], h.name.c_str());
                   ImGui::SameLine();
                   if (ImGui::SmallButton("X")) {
-                      char a[256];
-                      snprintf(a, sizeof(a), "{\"name\":\"%s\"}", h.name.c_str());
+                      char a[256]; snprintf(a, sizeof(a), "{\"name\":\"%s\"}", h.name.c_str());
                       post_rpc("removeHook", a);
                       s_hooks.erase(s_hooks.begin() + i);
                       ImGui::PopID(); break;
@@ -951,8 +963,7 @@ jobs:
           static void tab_tracker() {
               ImGui::InputText("Method##tn", s_tname, sizeof(s_tname));
               if (ImGui::Button("Track") && s_tname[0]) {
-                  char a[256];
-                  snprintf(a, sizeof(a), "{\"name\":\"%s\"}", s_tname);
+                  char a[256]; snprintf(a, sizeof(a), "{\"name\":\"%s\"}", s_tname);
                   post_rpc("addTracker", a);
                   s_trackers.push_back({s_tname, {}});
                   s_tname[0] = 0;
@@ -964,8 +975,7 @@ jobs:
                   if (ImGui::CollapsingHeader(t.name.c_str())) {
                       for (auto& l : t.log) ImGui::TextUnformatted(l.c_str());
                       if (ImGui::SmallButton("Remove")) {
-                          char a[256];
-                          snprintf(a, sizeof(a), "{\"name\":\"%s\"}", t.name.c_str());
+                          char a[256]; snprintf(a, sizeof(a), "{\"name\":\"%s\"}", t.name.c_str());
                           post_rpc("removeTracker", a);
                           s_trackers.erase(s_trackers.begin() + i);
                           ImGui::PopID(); break;
@@ -982,12 +992,8 @@ jobs:
                       post_rpc("startRecorder", "{}");
                   }
               } else {
-                  if (ImGui::Button("Stop")) {
-                      s_rec_on = false;
-                      post_rpc("stopRecorder", "{}");
-                  }
-                  ImGui::SameLine();
-                  ImGui::TextColored(ImVec4(0,1,0,1), "REC");
+                  if (ImGui::Button("Stop")) { s_rec_on = false; post_rpc("stopRecorder", "{}"); }
+                  ImGui::SameLine(); ImGui::TextColored(ImVec4(0,1,0,1), "REC");
               }
               ImGui::Separator();
               ImGui::BeginChild("rl", ImVec2(0, 180), true);
@@ -997,19 +1003,15 @@ jobs:
           }
           
           static void tab_monitor() {
-              ImGui::TextDisabled("(best-effort: Java HTTP + SSLContext.init)");
+              ImGui::TextDisabled("(best-effort: Java SSLContext.init)");
               if (!s_mon_on) {
                   if (ImGui::Button("Start")) {
                       s_mon_on = true; s_mon_log.clear();
                       post_rpc("startMonitor", "{}");
                   }
               } else {
-                  if (ImGui::Button("Stop")) {
-                      s_mon_on = false;
-                      post_rpc("stopMonitor", "{}");
-                  }
-                  ImGui::SameLine();
-                  ImGui::TextColored(ImVec4(0,1,0,1), "MON");
+                  if (ImGui::Button("Stop")) { s_mon_on = false; post_rpc("stopMonitor", "{}"); }
+                  ImGui::SameLine(); ImGui::TextColored(ImVec4(0,1,0,1), "MON");
               }
               ImGui::Separator();
               ImGui::BeginChild("ml", ImVec2(0, 180), true);
@@ -1019,12 +1021,10 @@ jobs:
           }
           
           static void tab_script() {
-              ImGui::InputTextMultiline("##sc", s_script, sizeof(s_script),
-                                         ImVec2(-1, 140));
+              ImGui::InputTextMultiline("##sc", s_script, sizeof(s_script), ImVec2(-1, 140));
               if (ImGui::Button("Run")) {
                   s_script_out.clear();
-                  char a[8256];
-                  snprintf(a, sizeof(a), "{\"src\":\"%s\"}", s_script);
+                  char a[8256]; snprintf(a, sizeof(a), "{\"src\":\"%s\"}", s_script);
                   post_rpc("evalScript", a);
               }
               ImGui::SameLine();
@@ -1039,8 +1039,7 @@ jobs:
               ImGui::InputText("Class##cn", s_cname, sizeof(s_cname));
               ImGui::SameLine();
               if (ImGui::Button("Open") && s_cname[0]) {
-                  char a[256];
-                  snprintf(a, sizeof(a), "{\"class\":\"%s\"}", s_cname);
+                  char a[256]; snprintf(a, sizeof(a), "{\"class\":\"%s\"}", s_cname);
                   post_rpc("openClass", a);
                   s_classes.push_back({s_cname, {}, {}});
                   s_cname[0] = 0;
@@ -1050,38 +1049,32 @@ jobs:
                   auto& c = s_classes[i];
                   if (ImGui::CollapsingHeader(c.cname.c_str())) {
                       if (ImGui::Button("List Instances")) {
-                          char a[256];
-                          snprintf(a, sizeof(a), "{\"class\":\"%s\"}", c.cname.c_str());
+                          char a[256]; snprintf(a, sizeof(a), "{\"class\":\"%s\"}", c.cname.c_str());
                           post_rpc("listInstances", a);
                       }
                       ImGui::Text("Methods:");
                       for (auto& m : c.methods) {
-                          ImGui::BulletText("%s", m.c_str());
-                          ImGui::SameLine();
+                          ImGui::BulletText("%s", m.c_str()); ImGui::SameLine();
                           if (ImGui::SmallButton("Hook")) {
                               char a[256];
-                              snprintf(a, sizeof(a),
-                                       "{\"class\":\"%s\",\"method\":\"%s\"}",
+                              snprintf(a, sizeof(a), "{\"class\":\"%s\",\"method\":\"%s\"}",
                                        c.cname.c_str(), m.c_str());
                               post_rpc("hookMethod", a);
                           }
                           ImGui::SameLine();
                           if (ImGui::SmallButton("Track")) {
                               char a[256];
-                              snprintf(a, sizeof(a),
-                                       "{\"class\":\"%s\",\"method\":\"%s\"}",
+                              snprintf(a, sizeof(a), "{\"class\":\"%s\",\"method\":\"%s\"}",
                                        c.cname.c_str(), m.c_str());
                               post_rpc("trackMethod", a);
                           }
                       }
                       ImGui::Text("Fields:");
                       for (auto& f : c.fields) {
-                          ImGui::BulletText("%s", f.c_str());
-                          ImGui::SameLine();
+                          ImGui::BulletText("%s", f.c_str()); ImGui::SameLine();
                           if (ImGui::SmallButton("Patch")) {
                               char a[256];
-                              snprintf(a, sizeof(a),
-                                       "{\"class\":\"%s\",\"field\":\"%s\"}",
+                              snprintf(a, sizeof(a), "{\"class\":\"%s\",\"field\":\"%s\"}",
                                        c.cname.c_str(), f.c_str());
                               post_rpc("patchField", a);
                           }
@@ -1112,10 +1105,7 @@ jobs:
               ImGui::End();
           }
           DXTMNC
-
-      # ═══════════════════════════════════════════════════════════
-      # main.cpp
-      # ═══════════════════════════════════════════════════════════
+          
       - name: Generate main.cpp
         run: |
           cat > src/main.cpp << 'DXTMAIN'
@@ -1143,30 +1133,25 @@ jobs:
           extern "C" JNIEXPORT jint JNICALL
           JNI_OnLoad(JavaVM* vm, void*) {
               g_jvm_global = vm;
-          
               write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=entry");
-          
               logger_init("/sdcard/Download");
               log_info("[JNI_OnLoad] entry");
-          
               write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=logger_ready");
-          
               overlay_set_java_vm(vm);
-          
               if (!install_swap_hook()) {
                   log_crash_raw("[JNI_OnLoad] FATAL: install_swap_hook failed\n");
               }
-          
               write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=hooks_installed");
               log_info("[JNI_OnLoad] done — awaiting first eglSwapBuffers");
               write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=jni_return");
-          
               return JNI_VERSION_1_6;
           }
           DXTMAIN
 
       # ═══════════════════════════════════════════════════════════
       # agent.js
+      # FIX: Java touch hook via Activity.dispatchTouchEvent +
+      #      NativeFunction call to dextool_on_touch in libtool.so
       # ═══════════════════════════════════════════════════════════
       - name: Generate agent.js
         run: |
@@ -1183,6 +1168,56 @@ jobs:
               send(JSON.stringify({ type: type, payload: payload }));
           }
           
+          // ── FIX: Java touch hook ───────────────────────────────────────
+          // AInputQueue_getEvent in touch.cpp only fires for NativeActivity apps.
+          // For standard Java Activity apps (99% of apps), we hook at the Java level:
+          // Activity.dispatchTouchEvent is called once per touch event at the top
+          // of the view hierarchy, then calls dextool_on_touch in libtool.so.
+          function installTouchHook() {
+              try {
+                  var sym = Module.findExportByName('libtool.so', 'dextool_on_touch');
+                  if (!sym) {
+                      sendMsg('warn', { msg: 'dextool_on_touch symbol not found in libtool.so' });
+                      return;
+                  }
+                  // void dextool_on_touch(float x, float y, int action)
+                  var nativeTouch = new NativeFunction(sym, 'void', ['float', 'float', 'int']);
+          
+                  Java.perform(function() {
+                      // Primary: hook at Activity level (one call per gesture)
+                      try {
+                          var Activity = Java.use('android.app.Activity');
+                          Activity.dispatchTouchEvent.implementation = function(ev) {
+                              try {
+                                  nativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
+                              } catch(e2) {}
+                              return this.dispatchTouchEvent(ev);
+                          };
+                          sendMsg('info', { msg: 'Touch hook: Activity.dispatchTouchEvent OK' });
+                      } catch(e) {
+                          // Fallback: some apps subclass Dialog or use a custom Window
+                          try {
+                              var Window = Java.use('android.view.Window');
+                              Window.superDispatchTouchEvent.implementation = function(ev) {
+                                  try {
+                                      nativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
+                                  } catch(e3) {}
+                                  return this.superDispatchTouchEvent(ev);
+                              };
+                              sendMsg('info', { msg: 'Touch hook: Window.superDispatchTouchEvent (fallback) OK' });
+                          } catch(e2) {
+                              sendMsg('warn', { msg: 'Touch hook failed: ' + e.message });
+                          }
+                      }
+                  });
+              } catch(e) {
+                  sendMsg('error', { fn: 'installTouchHook', msg: e.message });
+              }
+          }
+          
+          installTouchHook();
+          
+          // ── RPC exports ───────────────────────────────────────────────
           rpc.exports = {
           
               addPatch: function(name, value) {
@@ -1403,11 +1438,8 @@ jobs:
           fs.writeFileSync('src/agent_bundle_embed.h', out);
           console.log('agent_bundle_embed.h: ' + bytes.length + ' bytes');
           DXTNJS
-          node /tmp/gen_embed.js
+                    node /tmp/gen_embed.js
 
-      # ═══════════════════════════════════════════════════════════
-      # BUILD libtool.so  arm64-v8a + armeabi-v7a
-      # ═══════════════════════════════════════════════════════════
       - name: Build libtool.so arm64-v8a
         run: |
           cmake -S . -B build-arm64 \
@@ -1436,9 +1468,6 @@ jobs:
                    -o out/lib/armeabi-v7a/libtool.so
           echo "armeabi-v7a size: $(du -sh out/lib/armeabi-v7a/libtool.so)"
 
-      # ═══════════════════════════════════════════════════════════
-      # SAMPLE APP — Java sources
-      # ═══════════════════════════════════════════════════════════
       - name: Generate DexToolApp.java
         run: |
           cat > sample-app/app/src/main/java/com/dextool/app/DexToolApp.java << 'DXTAPPJ'
@@ -1504,8 +1533,7 @@ jobs:
                       File d = new File(DL, n);
                       try (InputStream  is = new FileInputStream(s);
                            OutputStream os = new FileOutputStream(d, true)) {
-                          byte[] buf = new byte[8192];
-                          int len;
+                          byte[] buf = new byte[8192]; int len;
                           while ((len = is.read(buf)) != -1) os.write(buf, 0, len);
                       }
                   }
@@ -1517,8 +1545,7 @@ jobs:
                   Thread.setDefaultUncaughtExceptionHandler((thr, ex) -> {
                       try (FileOutputStream f =
                                new FileOutputStream(DL + "/dextool-crash.log", true)) {
-                          f.write(("JAVA_CRASH thr=" + thr.getName()
-                                    + " " + ex + "\n").getBytes());
+                          f.write(("JAVA_CRASH thr=" + thr.getName() + " " + ex + "\n").getBytes());
                       } catch (IOException ignored) {}
                       if (prev != null) prev.uncaughtException(thr, ex);
                   });
@@ -1558,9 +1585,6 @@ jobs:
           }
           DXTMAINAJ
 
-      # ═══════════════════════════════════════════════════════════
-      # SAMPLE APP — Manifest + Gradle
-      # ═══════════════════════════════════════════════════════════
       - name: Generate Android Manifest and resources
         run: |
           cat > sample-app/app/src/main/AndroidManifest.xml << 'DXTMNFST'
@@ -1585,7 +1609,7 @@ jobs:
               </application>
           </manifest>
           DXTMNFST
-          cat > sample-app/app/src/main/res/values/strings.xml << 'DXTSTRS'
+                    cat > sample-app/app/src/main/res/values/strings.xml << 'DXTSTRS'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">DexTool Sample</string>
@@ -1599,18 +1623,18 @@ jobs:
           android.enableJetifier=true
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           DXTGRADP
-          cat > sample-app/settings.gradle << 'DXTSETS'
+                    cat > sample-app/settings.gradle << 'DXTSETS'
           rootProject.name = "DexToolSample"
           include ':app'
           DXTSETS
-          cat > sample-app/build.gradle << 'DXTROOTB'
+                    cat > sample-app/build.gradle << 'DXTROOTB'
           buildscript {
               repositories { google(); mavenCentral() }
               dependencies { classpath 'com.android.tools.build:gradle:8.1.4' }
           }
           allprojects { repositories { google(); mavenCentral() } }
           DXTROOTB
-          cat > sample-app/app/build.gradle << 'DXTAPPB'
+                    cat > sample-app/app/build.gradle << 'DXTAPPB'
           plugins { id 'com.android.application' }
           android {
               namespace          'com.dextool.app'
@@ -1648,11 +1672,8 @@ jobs:
               implementation 'androidx.appcompat:appcompat:1.6.1'
           }
           DXTAPPB
-          echo "sdk.dir=$ANDROID_HOME" > sample-app/local.properties
+                    echo "sdk.dir=$ANDROID_HOME" > sample-app/local.properties
 
-      # ═══════════════════════════════════════════════════════════
-      # BUILD SAMPLE APKs
-      # ═══════════════════════════════════════════════════════════
       - name: Build sample-signed.apk (with libtool.so)
         run: |
           cp out/lib/arm64-v8a/libtool.so \
@@ -1679,9 +1700,6 @@ jobs:
              "$GITHUB_WORKSPACE/sample-nolib-signed.apk"
           echo "sample-nolib-signed.apk: $(du -sh "$GITHUB_WORKSPACE/sample-nolib-signed.apk")"
 
-      # ═══════════════════════════════════════════════════════════
-      # README + .gitignore
-      # ═══════════════════════════════════════════════════════════
       - name: Generate README.md and .gitignore
         run: |
           cat > README.md << 'DXTRDME'
@@ -1691,14 +1709,34 @@ jobs:
           Ships as one native shared library: libtool.so (armeabi-v7a + arm64-v8a).
           No root. No frida-server. Android 8.0+ (API 26).
           
+          ## Bug fixes in this version
+          
+              FIX 1 - Touch input (Java apps):
+                AInputQueue_getEvent only fires for NativeActivity apps.
+                Java Activity apps get touch via GumJS hooking Activity.dispatchTouchEvent,
+                which calls dextool_on_touch() (JNIEXPORT symbol in libtool.so) via
+                NativeFunction. The NativeActivity hook remains as a fallback.
+          
+              FIX 2 - Menu disappears on pause/resume:
+                eglGetCurrentContext() is checked on every swap. When the EGL context
+                handle changes (new context after GLSurfaceView recreates on resume),
+                ImGui is shut down cleanly and re-initialized with the new context.
+          
+              FIX 3 - Menu not shown in ES2 apps:
+                Compiled with IMGUI_IMPL_OPENGL_ES2=1. ImGui uses GLES2 function set
+                and #version 100 GLSL, which works on ES2 and ES3. The ES3-only guard
+                is replaced with an OpenGL ES (any version) check.
+          
           ## Usage
           
               1. Take any target APK.
               2. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
               3. Inject System.loadLibrary("tool") into the launcher Activity smali
-                 or into an Application subclass onCreate().
-              4. Copy smali-fat.jar into the APK assets/.
+                 or Application subclass onCreate().
+              4. Copy smali-fat.jar into assets/.
               5. Re-sign and install.
+              Note: overlay only appears if the app calls eglSwapBuffers (OpenGL ES).
+              Vulkan-only apps will not show the overlay but the Frida agent still runs.
           
           ## Architecture
           
@@ -1706,69 +1744,28 @@ jobs:
                 JNI_OnLoad
                   write boot marker (raw I/O, no gum)
                   logger_init()
-                  install_swap_hook() via Dobby
-                eglSwapBuffers replacement (GL thread, first call only)
-                  gum_init_embedded()      <- FIRST gum call, valid EGL context
-                  spawn frida pthread      <- GumJS / QuickJS agent
-                  touch_install_hooks()
-                  imgui_init()             <- guarded: OpenGL ES 3 only
-                per-frame
-                  inject touch into ImGui
-                  ImGui::NewFrame / menu_draw / Render
-                  g_orig_swap()            <- never recurses into eglSwapBuffers symbol
-          
-          ## Menu Tabs
-          
-              Settings  opacity, font size, theme
-              Patches   patch Java static fields at runtime
-              Hooks     hook methods: Java JS replacement, Smali recompile, noop
-              Tracker   log method calls with args and return values
-              Recorder  capture all Java method calls while active
-              Monitor   network interception best-effort (SSLContext.init)
-              Script    run arbitrary Frida JS in the embedded QuickJS runtime
-              Classes   browse loaded classes, fields, methods, instances
-          
-          ## Diagnostic files in /sdcard/Download/
-          
-              dextool-boot.marker   DexToolApp.onCreate BEFORE loadLibrary
-              dextool-jni.marker    JNI_OnLoad at 4 checkpoints
-              dextool.log           INFO log
-              dextool-debug.log     DEBUG log
-              dextool-crash.log     signal handler + Java uncaught exception
+                  install_swap_hook() via Dobby (LSPosed/Dobby)
+                eglSwapBuffers replacement (GL thread)
+                  First call:
+                    gum_init_embedded()      <- FIRST gum call, valid EGL context
+                    spawn frida pthread      <- GumJS / QuickJS agent
+                    touch_install_hooks()    <- NativeActivity fallback
+                    imgui_init()             <- ES2 or ES3, any OpenGL ES
+                  On context change (pause/resume):
+                    imgui_shutdown() + imgui_init()
+                  Every frame:
+                    inject touch (from Java hook via dextool_on_touch)
+                    ImGui render
+                    g_orig_swap()           <- never recurses
           
           ## Components
           
               frida-gum 16.7.19   QuickJS / GumJS scripting runtime
-              Dobby               inline function hook framework (LSPosed/Dobby)
-              ImGui 1.90.4        immediate-mode overlay GUI
+              Dobby (LSPosed)     inline function hook framework
+              ImGui 1.90.4        immediate-mode overlay GUI (ES2 mode)
               smali 3.0.7         runtime .smali to DEX assembler (bundled JAR)
-          
-          ## Known Limitations
-          
-              Smali hook mode uses InMemoryDexClassLoader (API 26+ only).
-              Re-loading the same class name requires a fresh ClassLoader instance.
-          
-              Network monitor is best-effort. It hooks Java SSLContext.init.
-              Native BoringSSL interception is not included in this release.
-          
-              ImGui overlay requires OpenGL ES 3.0+. ES 2.x targets degrade
-              gracefully (Frida agent still runs; only the overlay is off).
-          
-              gum_init_embedded() is deferred to the first eglSwapBuffers call
-              so a valid EGL context exists when it fires, preventing early crashes.
-          
-          ## Build notes
-          
-              Dobby is sourced from LSPosed/Dobby. The CMake target is "dobby",
-              and DOBBY_GENERATE_SHARED=OFF is required to produce libdobby.a.
-              DobbyHook calls use reinterpret_cast<dobby_dummy_func_t> to match
-              LSPosed/Dobby's strict function-pointer signature.
-              frida-gum 16.7.19's GumScriptMessageHandler takes (const char*, GBytes*, void*)
-              without the GumScript* parameter, and gum_script_load_sync takes 2 arguments.
-              The sample app enables android.useAndroidX and android.enableJetifier
-              in gradle.properties to satisfy its AppCompat dependency.
           DXTRDME
-          cat > .gitignore << 'DXTGI'
+                    cat > .gitignore << 'DXTGI'
           build-arm64/
           build-arm/
           frida-gum-src/
@@ -1781,9 +1778,6 @@ jobs:
           *.tar.*
           DXTGI
 
-      # ═══════════════════════════════════════════════════════════
-      # UPLOAD ARTIFACTS
-      # ═══════════════════════════════════════════════════════════
       - name: Upload libtool.so artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -1800,14 +1794,10 @@ jobs:
             sample-signed.apk
             sample-nolib-signed.apk
 
-      # ═══════════════════════════════════════════════════════════
-      # COMMIT AND PUSH TO dev
-      # ═══════════════════════════════════════════════════════════
       - name: Commit and push generated sources to dev
         run: |
           git fetch origin dev || true
           git checkout -B dev origin/dev 2>/dev/null || git checkout -B dev
-
           git add --ignore-errors \
             CMakeLists.txt \
             src/ \
@@ -1816,11 +1806,10 @@ jobs:
             README.md \
             .gitignore \
             .github/workflows/build.yml
-
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "chore: Dex-tool scaffold — enable AndroidX for sample app [skip ci]"
+            git commit -m "fix: touch+ES2+pause-resume bugs fixed [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
