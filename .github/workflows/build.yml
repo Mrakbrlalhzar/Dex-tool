@@ -230,10 +230,6 @@ jobs:
             out/lib/arm64-v8a out/lib/armeabi-v7a \
             .github/workflows
 
-      # ═══════════════════════════════════════════════════════════
-      # CMakeLists.txt
-      # FIX: use GLESv2 + IMGUI_IMPL_OPENGL_ES2 for ES2/ES3 compat
-      # ═══════════════════════════════════════════════════════════
       - name: Generate CMakeLists.txt
         run: |
           cat > CMakeLists.txt << 'DXTCMK'
@@ -283,8 +279,6 @@ jobs:
               ${IMGUI_DIR}/
               ${IMGUI_DIR}/backends/)
           
-          # IMGUI_IMPL_OPENGL_ES2: makes ImGui use GLES2 functions and #version 100 GLSL.
-          # This works on ES2 devices AND on ES3 devices (ES3 is backward-compatible).
           target_compile_definitions(tool PRIVATE IMGUI_IMPL_OPENGL_ES2=1)
           
           target_compile_options(tool PRIVATE
@@ -385,10 +379,6 @@ jobs:
           }
           DXTLOGC
 
-      # ═══════════════════════════════════════════════════════════
-      # overlay.h
-      # FIX: expose dextool_on_touch for GumJS NativeFunction call
-      # ═══════════════════════════════════════════════════════════
       - name: Generate overlay.h
         run: |
           cat > src/overlay.h << 'DXTOVLH'
@@ -399,23 +389,25 @@ jobs:
           void overlay_set_java_vm(JavaVM* vm);
           void overlay_on_touch(float x, float y, bool pressed);
           
-          // Exported C symbol called by GumJS agent via NativeFunction.
-          // JNIEXPORT ensures visibility despite -fvisibility=hidden.
           #ifdef __cplusplus
           extern "C" {
           #endif
           JNIEXPORT void dextool_on_touch(float x, float y, int action);
+          JNIEXPORT void dextool_on_key(int keycode, int action);
+          JNIEXPORT void dextool_on_text(const char* utf8);
+          JNIEXPORT void dextool_on_backspace(void);
           #ifdef __cplusplus
           }
           #endif
           DXTOVLH
 
-      # ═══════════════════════════════════════════════════════════
-      # overlay.cpp — THREE BUG FIXES:
-      # 1. EGL context tracking: re-init ImGui on pause/resume
-      # 2. ES2 support: accept OpenGL ES 2 and 3, use #version 100
-      # 3. dextool_on_touch export for GumJS Java touch hook
-      # ═══════════════════════════════════════════════════════════
+      # ───────────────────────────────────────────────────────────────
+      # overlay.cpp — FIXES:
+      #   1. Touch uses raw screen coords (agent supplies getRawX/Y)
+      #   2. Thread-safe input queue (touch / key / text / backspace)
+      #   3. Hooks eglSwapBuffers + WithDamageKHR + WithDamageEXT
+      #   4. Tells agent when ImGui wants text input (for IME)
+      # ───────────────────────────────────────────────────────────────
       - name: Generate overlay.cpp
         run: |
           cat > src/overlay.cpp << 'DXTOVLC'
@@ -434,43 +426,76 @@ jobs:
           #include <cstring>
           #include <pthread.h>
           #include <atomic>
+          #include <mutex>
+          #include <vector>
           
           typedef EGLBoolean (*fn_swap)(EGLDisplay, EGLSurface);
-          static fn_swap              g_orig_swap     = nullptr;
-          static std::atomic<bool>    g_gum_inited   {false};
-          static std::atomic<bool>    g_imgui_up     {false};
-          static bool                 g_imgui_failed  = false;
-          static JavaVM*              g_jvm           = nullptr;
+          typedef EGLBoolean (*fn_swap_dmg)(EGLDisplay, EGLSurface, const EGLint*, EGLint);
           
-          // FIX 1: Track EGL context to detect pause/resume context recreation.
-          static EGLContext           g_egl_ctx       = EGL_NO_CONTEXT;
+          static fn_swap        g_orig_swap     = nullptr;
+          static fn_swap_dmg    g_orig_swap_khr = nullptr;
+          static fn_swap_dmg    g_orig_swap_ext = nullptr;
+          static std::atomic<bool> g_gum_inited   {false};
+          static std::atomic<bool> g_imgui_up     {false};
+          static bool              g_imgui_failed  = false;
+          static JavaVM*           g_jvm           = nullptr;
+          static EGLContext        g_egl_ctx       = EGL_NO_CONTEXT;
+          static std::atomic<bool> g_want_text_last{false};
           
-          struct Touch {
-              std::atomic<float> x{0}, y{0};
-              std::atomic<bool> pressed{false}, dirty{false};
+          // ── Thread-safe input queue ─────────────────────────────────
+          struct Evt {
+              enum Kind { TOUCH, KEY, TEXT, BACKSPACE } kind;
+              float x = 0, y = 0;
+              bool  pressed = false;
+              int   keycode = 0, action = 0;
+              char  text[128] = {};
           };
-          static Touch g_touch;
+          static std::mutex       g_in_mtx;
+          static std::vector<Evt> g_in_q;
+          
+          static void push_evt(const Evt& e) {
+              std::lock_guard<std::mutex> lk(g_in_mtx);
+              if (g_in_q.size() > 256) g_in_q.erase(g_in_q.begin());
+              g_in_q.push_back(e);
+          }
           
           void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
           
           void overlay_on_touch(float x, float y, bool p) {
-              g_touch.x = x; g_touch.y = y;
-              g_touch.pressed = p; g_touch.dirty = true;
+              Evt e; e.kind = Evt::TOUCH; e.x = x; e.y = y; e.pressed = p;
+              push_evt(e);
           }
           
-          // FIX 3: Exported C symbol for GumJS agent to call via NativeFunction.
-          // The agent hooks Activity.dispatchTouchEvent in Java and calls this.
-          // action: 0=DOWN, 1=UP, 2=MOVE (matches MotionEvent constants).
           extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
-              overlay_on_touch(x, y, action == 0 || action == 2);
+              Evt e; e.kind = Evt::TOUCH; e.x = x; e.y = y;
+              e.pressed = (action == 0 /*DOWN*/ || action == 2 /*MOVE*/);
+              push_evt(e);
           }
           
+          extern "C" JNIEXPORT void dextool_on_key(int keycode, int action) {
+              Evt e; e.kind = Evt::KEY; e.keycode = keycode; e.action = action;
+              push_evt(e);
+          }
+          
+          extern "C" JNIEXPORT void dextool_on_text(const char* utf8) {
+              if (!utf8) return;
+              Evt e; e.kind = Evt::TEXT;
+              strncpy(e.text, utf8, sizeof(e.text) - 1);
+              push_evt(e);
+          }
+          
+          extern "C" JNIEXPORT void dextool_on_backspace(void) {
+              Evt e; e.kind = Evt::BACKSPACE;
+              push_evt(e);
+          }
+          
+          // ── Worker thread ───────────────────────────────────────────
           static void* frida_thread(void*) {
               frida_bridge_start(g_jvm);
               return nullptr;
           }
           
-          // FIX 1: Tear down ImGui GL resources before context switch.
+          // ── ImGui lifecycle ─────────────────────────────────────────
           static void imgui_shutdown() {
               if (g_imgui_up.load()) {
                   ImGui_ImplOpenGL3_Shutdown();
@@ -481,9 +506,6 @@ jobs:
               }
           }
           
-          // FIX 2: Accept any OpenGL ES (ES2 or ES3). Use #version 100 GLSL.
-          // The binary is compiled with IMGUI_IMPL_OPENGL_ES2=1 so ImGui always
-          // uses ES2 function set, which is a subset of ES3.
           static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
               EGLint w = 1080, h = 1920;
               eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
@@ -508,70 +530,162 @@ jobs:
               ImGui::StyleColorsDark();
               ImGui::GetStyle().WindowRounding = 6.0f;
           
-              // "#version 100" = GLSL ES 1.00, works on ES2 and ES3.
               ImGui_ImplOpenGL3_Init("#version 100");
               menu_init();
               g_imgui_up.store(true);
               LOGI("[overlay] ImGui up (%dx%d)", w, h);
           }
           
-          // CRITICAL: calls g_orig_swap — NEVER recurses into eglSwapBuffers symbol.
-          // FIX 1: eglGetCurrentContext() detects context change after pause/resume.
-          static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
+          // ── Key mapping ─────────────────────────────────────────────
+          static ImGuiKey map_key(int kc) {
+              switch (kc) {
+                  case 67:  return ImGuiKey_Backspace;   // KEYCODE_DEL
+                  case 66:  return ImGuiKey_Enter;       // KEYCODE_ENTER
+                  case 4:   return ImGuiKey_Escape;      // KEYCODE_BACK
+                  case 19:  return ImGuiKey_UpArrow;
+                  case 20:  return ImGuiKey_DownArrow;
+                  case 21:  return ImGuiKey_LeftArrow;
+                  case 22:  return ImGuiKey_RightArrow;
+                  case 61:  return ImGuiKey_Tab;
+                  case 112: return ImGuiKey_Delete;
+                  case 122: return ImGuiKey_Home;
+                  case 123: return ImGuiKey_End;
+                  default:  return ImGuiKey_None;
+              }
+          }
+          
+          // ── Drain queued input into ImGui (called on GL thread) ─────
+          static void drain_input() {
+              std::lock_guard<std::mutex> lk(g_in_mtx);
+              if (g_in_q.empty()) return;
+              ImGuiIO& io = ImGui::GetIO();
+              for (const auto& e : g_in_q) {
+                  switch (e.kind) {
+                      case Evt::TOUCH:
+                          io.AddMousePosEvent(e.x, e.y);
+                          io.AddMouseButtonEvent(0, e.pressed);
+                          break;
+                      case Evt::KEY: {
+                          ImGuiKey k = map_key(e.keycode);
+                          if (k != ImGuiKey_None) {
+                              bool down = (e.action == 0 /*DOWN*/);
+                              io.AddKeyEvent(k, down);
+                          }
+                          break;
+                      }
+                      case Evt::TEXT:
+                          io.AddInputCharactersUTF8(e.text);
+                          break;
+                      case Evt::BACKSPACE:
+                          io.AddKeyEvent(ImGuiKey_Backspace, true);
+                          io.AddKeyEvent(ImGuiKey_Backspace, false);
+                          break;
+                  }
+              }
+              g_in_q.clear();
+          }
+          
+          // ── Shared frame work ────────────────────────────────────────
+          static void render_frame(EGLDisplay dpy, EGLSurface surf) {
               EGLContext cur_ctx = eglGetCurrentContext();
-          
               if (!g_gum_inited.exchange(true)) {
-                  // ── First call: full initialization ──────────────────────
                   g_egl_ctx = cur_ctx;
-                  gum_init_embedded();   // FIRST gum_* call, GL context valid
+                  gum_init_embedded();
                   log_info("[overlay] gum_init_embedded done");
-          
                   pthread_t ft;
                   pthread_attr_t a;
                   pthread_attr_init(&a);
                   pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
                   pthread_create(&ft, &a, frida_thread, nullptr);
                   pthread_attr_destroy(&a);
-          
-                  touch_install_hooks();   // NativeActivity fallback
+                  touch_install_hooks();
                   imgui_init(dpy, surf);
-          
               } else if (cur_ctx != EGL_NO_CONTEXT && cur_ctx != g_egl_ctx) {
-                  // ── Context changed after pause/resume: re-init ImGui ─────
-                  LOGI("[overlay] EGL context changed (%p -> %p), re-initing ImGui",
-                       g_egl_ctx, cur_ctx);
+                  LOGI("[overlay] EGL context changed, re-initing ImGui");
                   g_egl_ctx = cur_ctx;
                   imgui_shutdown();
                   imgui_init(dpy, surf);
               }
           
-              if (g_imgui_up.load() && !g_imgui_failed) {
-                  ImGuiIO& io = ImGui::GetIO();
-                  if (g_touch.dirty.exchange(false)) {
-                      io.MousePos     = ImVec2(g_touch.x.load(), g_touch.y.load());
-                      io.MouseDown[0] = g_touch.pressed.load();
-                  }
-                  ImGui_ImplOpenGL3_NewFrame();
-                  ImGui::NewFrame();
-                  menu_draw();
-                  ImGui::Render();
-                  ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-              }
+              if (!g_imgui_up.load() || g_imgui_failed) return;
           
+              drain_input();
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui::NewFrame();
+              menu_draw();
+              ImGui::Render();
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+          
+              // Notify agent to show/hide soft keyboard if WantTextInput changed.
+              bool want = ImGui::GetIO().WantTextInput;
+              if (want != g_want_text_last.load()) {
+                  g_want_text_last.store(want);
+                  frida_post(want
+                      ? "{\"type\":\"keyboard\",\"show\":true}"
+                      : "{\"type\":\"keyboard\",\"show\":false}");
+              }
+          }
+          
+          // ── Hooked entry points ────────────────────────────────────
+          static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
+              render_frame(dpy, surf);
               return g_orig_swap(dpy, surf);
+          }
+          
+          static EGLBoolean my_swap_khr(EGLDisplay dpy, EGLSurface surf,
+                                        const EGLint* rects, EGLint n) {
+              render_frame(dpy, surf);
+              if (g_orig_swap_khr) return g_orig_swap_khr(dpy, surf, rects, n);
+              if (g_orig_swap)     return g_orig_swap(dpy, surf);
+              return EGL_FALSE;
+          }
+          
+          static EGLBoolean my_swap_ext(EGLDisplay dpy, EGLSurface surf,
+                                        const EGLint* rects, EGLint n) {
+              render_frame(dpy, surf);
+              if (g_orig_swap_ext) return g_orig_swap_ext(dpy, surf, rects, n);
+              if (g_orig_swap_khr) return g_orig_swap_khr(dpy, surf, rects, n);
+              if (g_orig_swap)     return g_orig_swap(dpy, surf);
+              return EGL_FALSE;
           }
           
           bool install_swap_hook() {
               void* egl = dlopen("libEGL.so", RTLD_NOW);
               if (!egl) { LOGE("dlopen libEGL.so: %s", dlerror()); return false; }
-              void* sym = dlsym(egl, "eglSwapBuffers");
-              if (!sym) { LOGE("dlsym eglSwapBuffers failed"); return false; }
-              int r = DobbyHook(sym,
-                                reinterpret_cast<dobby_dummy_func_t>(my_swap),
-                                reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap));
-              if (r != 0) { LOGE("DobbyHook eglSwapBuffers failed: %d", r); return false; }
-              LOGI("eglSwapBuffers hooked OK");
-              return true;
+          
+              int hooked = 0;
+          
+              void* s1 = dlsym(egl, "eglSwapBuffers");
+              if (s1) {
+                  if (DobbyHook(s1,
+                          reinterpret_cast<dobby_dummy_func_t>(my_swap),
+                          reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap)) == 0) {
+                      LOGI("eglSwapBuffers hooked OK");
+                      hooked++;
+                  }
+              }
+          
+              void* s2 = dlsym(egl, "eglSwapBuffersWithDamageKHR");
+              if (s2) {
+                  if (DobbyHook(s2,
+                          reinterpret_cast<dobby_dummy_func_t>(my_swap_khr),
+                          reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_khr)) == 0) {
+                      LOGI("eglSwapBuffersWithDamageKHR hooked OK");
+                      hooked++;
+                  }
+              }
+          
+              void* s3 = dlsym(egl, "eglSwapBuffersWithDamageEXT");
+              if (s3) {
+                  if (DobbyHook(s3,
+                          reinterpret_cast<dobby_dummy_func_t>(my_swap_ext),
+                          reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_ext)) == 0) {
+                      LOGI("eglSwapBuffersWithDamageEXT hooked OK");
+                      hooked++;
+                  }
+              }
+          
+              return hooked > 0;
           }
           DXTOVLC
 
@@ -579,8 +693,6 @@ jobs:
         run: |
           cat > src/touch.h << 'DXTTHH'
           #pragma once
-          // NativeActivity fallback touch hook.
-          // Java-based apps get touch via GumJS Activity.dispatchTouchEvent hook.
           void touch_install_hooks();
           DXTTHH
                     cat > src/touch.cpp << 'DXTTCH'
@@ -591,8 +703,6 @@ jobs:
           #include <dlfcn.h>
           #include <android/input.h>
           
-          // AInputQueue hook: fires for NativeActivity-based apps only.
-          // Standard Java Activity apps get touch via GumJS (agent.js).
           typedef int32_t (*fn_getEvent)(AInputQueue*, AInputEvent**);
           static fn_getEvent g_orig_get = nullptr;
           
@@ -822,6 +932,12 @@ jobs:
           void menu_draw();
           DXTMNH
 
+      # ───────────────────────────────────────────────────────────────
+      # menu.cpp — FIXES:
+      #   1. Font-size slider actually applies (FontGlobalScale)
+      #   2. RPC responses are parsed and populate Classes tab etc.
+      #   3. Minimal JSON tokenizer (no extra deps)
+      # ───────────────────────────────────────────────────────────────
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
@@ -831,8 +947,121 @@ jobs:
           #include "imgui.h"
           #include <string>
           #include <vector>
+          #include <map>
+          #include <mutex>
           #include <cstdio>
+          #include <cstring>
           
+          // ── Mini JSON extractors (flat object, string/array-of-string) ─
+          static std::string j_str(const std::string& j, const std::string& key) {
+              std::string n = "\"" + key + "\":\"";
+              size_t p = j.find(n);
+              if (p == std::string::npos) return "";
+              p += n.size();
+              std::string out;
+              while (p < j.size() && j[p] != '"') {
+                  if (j[p] == '\\' && p + 1 < j.size()) {
+                      char c = j[p+1];
+                      switch (c) {
+                          case 'n': out += '\n'; break;
+                          case 't': out += '\t'; break;
+                          case 'r': out += '\r'; break;
+                          case '"': out += '"';  break;
+                          case '\\': out += '\\'; break;
+                          case '/': out += '/';  break;
+                          case 'u': {
+                              if (p + 5 < j.size()) {
+                                  unsigned cp = 0;
+                                  for (int k = 0; k < 4; k++) {
+                                      char h = j[p+2+k];
+                                      cp <<= 4;
+                                      if (h >= '0' && h <= '9') cp |= h - '0';
+                                      else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10;
+                                      else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10;
+                                  }
+                                  if (cp < 0x80) out += (char)cp;
+                                  else if (cp < 0x800) {
+                                      out += (char)(0xC0 | (cp >> 6));
+                                      out += (char)(0x80 | (cp & 0x3F));
+                                  } else {
+                                      out += (char)(0xE0 | (cp >> 12));
+                                      out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                                      out += (char)(0x80 | (cp & 0x3F));
+                                  }
+                                  p += 4;
+                              }
+                              break;
+                          }
+                          default: out += c; break;
+                      }
+                      p += 2;
+                  } else out += j[p++];
+              }
+              return out;
+          }
+          
+          static std::vector<std::string> j_arr(const std::string& j, const std::string& key) {
+              std::vector<std::string> out;
+              std::string n = "\"" + key + "\":[";
+              size_t p = j.find(n);
+              if (p == std::string::npos) return out;
+              p += n.size();
+              size_t e = j.find(']', p);
+              if (e == std::string::npos) return out;
+              std::string seg = j.substr(p, e - p);
+              size_t i = 0;
+              while (i < seg.size()) {
+                  while (i < seg.size() && seg[i] != '"') i++;
+                  if (i >= seg.size()) break;
+                  i++;
+                  std::string val;
+                  while (i < seg.size() && seg[i] != '"') {
+                      if (seg[i] == '\\' && i + 1 < seg.size()) {
+                          char c = seg[i+1];
+                          switch (c) {
+                              case 'n': val += '\n'; break;
+                              case 't': val += '\t'; break;
+                              case 'r': val += '\r'; break;
+                              case '"': val += '"';  break;
+                              case '\\': val += '\\'; break;
+                              case '/': val += '/';  break;
+                              case 'u': {
+                                  if (i + 5 < seg.size()) {
+                                      unsigned cp = 0;
+                                      for (int k = 0; k < 4; k++) {
+                                          char h = seg[i+2+k];
+                                          cp <<= 4;
+                                          if (h >= '0' && h <= '9') cp |= h - '0';
+                                          else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10;
+                                          else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10;
+                                      }
+                                      if (cp < 0x80) val += (char)cp;
+                                      else if (cp < 0x800) {
+                                          val += (char)(0xC0 | (cp >> 6));
+                                          val += (char)(0x80 | (cp & 0x3F));
+                                      } else {
+                                          val += (char)(0xE0 | (cp >> 12));
+                                          val += (char)(0x80 | ((cp >> 6) & 0x3F));
+                                          val += (char)(0x80 | (cp & 0x3F));
+                                      }
+                                      i += 4;
+                                  }
+                                  break;
+                              }
+                              default: val += c; break;
+                          }
+                          i += 2;
+                      } else val += seg[i++];
+                  }
+                  i++;
+                  out.push_back(val);
+                  while (i < seg.size() && seg[i] != ',') i++;
+                  if (i < seg.size()) i++;
+              }
+              return out;
+          }
+          
+          // ── State ──────────────────────────────────────────────────
           static float s_opacity = 0.92f;
           static float s_font_sz = 14.f;
           static int   s_theme   = 0;
@@ -841,7 +1070,7 @@ jobs:
           struct PatchEntry  { std::string name, value; bool enabled = true; };
           struct HookEntry   { std::string name, code;  bool enabled = true; int mode = 0; };
           struct TrackerEntry{ std::string name; std::vector<std::string> log; };
-          struct ClassWin    { std::string cname; std::vector<std::string> methods, fields; };
+          struct ClassWin    { std::string cname; std::vector<std::string> methods, fields; bool loaded = false; };
           
           static std::vector<PatchEntry>   s_patches;
           static std::vector<HookEntry>    s_hooks;
@@ -850,6 +1079,7 @@ jobs:
           
           static bool s_rec_on = false, s_mon_on = false;
           static std::vector<std::string> s_rec_log, s_mon_log, s_script_out;
+          static std::mutex g_state_mtx;
           
           static char s_pname[256]  = {};
           static char s_pval[512]   = {};
@@ -874,17 +1104,70 @@ jobs:
                   case 2: ImGui::StyleColorsClassic(); break;
               }
               ImGui::GetStyle().Alpha = s_opacity;
+              ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
+          }
+          
+          // ── RPC message dispatcher ──────────────────────────────────
+          static void handle_message(const std::string& j) {
+              std::lock_guard<std::mutex> lk(g_state_mtx);
+              std::string type = j_str(j, "type");
+              if (type.empty()) return;
+          
+              if (type == "classInfo") {
+                  std::string cls = j_str(j, "class");
+                  auto methods = j_arr(j, "methods");
+                  auto fields  = j_arr(j, "fields");
+                  for (auto& c : s_classes) {
+                      if (c.cname == cls) {
+                          c.methods = std::move(methods);
+                          c.fields  = std::move(fields);
+                          c.loaded  = true;
+                          break;
+                      }
+                  }
+              } else if (type == "instanceList") {
+                  std::string cls = j_str(j, "class");
+                  auto list = j_arr(j, "instances");
+                  for (auto& c : s_classes) {
+                      if (c.cname == cls) {
+                          for (auto& s : list) c.methods.push_back("instance: " + s);
+                          break;
+                      }
+                  }
+              } else if (type == "trackerEvent") {
+                  std::string name = j_str(j, "name");
+                  auto args = j_arr(j, "args");
+                  std::string line = "[" + name + "]";
+                  for (auto& a : args) line += " " + a;
+                  for (auto& t : s_trackers)
+                      if (t.name == name) t.log.push_back(line);
+              } else if (type == "recorded") {
+                  std::string line = j_str(j, "cls") + "." + j_str(j, "method");
+                  s_rec_log.push_back(line);
+              } else if (type == "scriptResult" || type == "scriptError") {
+                  s_script_out.push_back(j_str(j, "result").empty()
+                      ? j_str(j, "msg") : j_str(j, "result"));
+              } else if (type == "sslInit" || type == "monitorInfo") {
+                  s_mon_log.push_back(j_str(j, "note"));
+              } else if (type == "error") {
+                  s_script_out.push_back("ERR[" + j_str(j, "fn") + "]: " + j_str(j, "msg"));
+              } else if (type == "info" || type == "warn") {
+                  s_script_out.push_back(j_str(j, "msg"));
+              }
           }
           
           void menu_init() {
               apply_theme();
               frida_set_message_callback([](const std::string& j) {
-                  s_script_out.push_back(j);
+                  handle_message(j);
               });
           }
           
+          // ── Tabs ────────────────────────────────────────────────────
           static void tab_settings() {
-              if (ImGui::SliderFloat("Font",    &s_font_sz, 8, 32)) {}
+              if (ImGui::SliderFloat("Font size", &s_font_sz, 8, 32)) {
+                  ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
+              }
               if (ImGui::SliderFloat("Opacity", &s_opacity, .3f, 1.f)) apply_theme();
               const char* th[] = {"Dark","Light","Classic"};
               if (ImGui::Combo("Theme", &s_theme, th, 3)) apply_theme();
@@ -1041,13 +1324,14 @@ jobs:
               if (ImGui::Button("Open") && s_cname[0]) {
                   char a[256]; snprintf(a, sizeof(a), "{\"class\":\"%s\"}", s_cname);
                   post_rpc("openClass", a);
-                  s_classes.push_back({s_cname, {}, {}});
+                  s_classes.push_back({s_cname, {}, {}, false});
                   s_cname[0] = 0;
               }
               for (int i = 0; i < (int)s_classes.size(); i++) {
                   ImGui::PushID(i);
                   auto& c = s_classes[i];
                   if (ImGui::CollapsingHeader(c.cname.c_str())) {
+                      if (!c.loaded) ImGui::TextDisabled("Loading…");
                       if (ImGui::Button("List Instances")) {
                           char a[256]; snprintf(a, sizeof(a), "{\"class\":\"%s\"}", c.cname.c_str());
                           post_rpc("listInstances", a);
@@ -1090,7 +1374,7 @@ jobs:
               ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
               ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * .75f, 500), ImGuiCond_Once);
               ImGui::SetNextWindowBgAlpha(s_opacity);
-              ImGui::Begin("Dex-tool v1.0", &s_visible, ImGuiWindowFlags_NoCollapse);
+              ImGui::Begin("Dex-tool v1.1", &s_visible, ImGuiWindowFlags_NoCollapse);
               if (ImGui::BeginTabBar("tb")) {
                   if (ImGui::BeginTabItem("Settings")) { tab_settings(); ImGui::EndTabItem(); }
                   if (ImGui::BeginTabItem("Patches"))  { tab_patches();  ImGui::EndTabItem(); }
@@ -1148,11 +1432,14 @@ jobs:
           }
           DXTMAIN
 
-      # ═══════════════════════════════════════════════════════════
-      # agent.js
-      # FIX: Java touch hook via Activity.dispatchTouchEvent +
-      #      NativeFunction call to dextool_on_touch in libtool.so
-      # ═══════════════════════════════════════════════════════════
+      # ───────────────────────────────────────────────────────────────
+      # agent.js — FIXES:
+      #   1. touch uses getRawX/getRawY (screen coords)
+      #   2. hidden EditText as IME target, InputConnection hooks forward
+      #      soft-keyboard text + backspace to ImGui
+      #   3. dispatchKeyEvent forwards hardware keys
+      #   4. tracks current Activity for IME show/hide
+      # ───────────────────────────────────────────────────────────────
       - name: Generate agent.js
         run: |
           cat > agent/agent.js << 'DXTAGNT'
@@ -1168,58 +1455,176 @@ jobs:
               send(JSON.stringify({ type: type, payload: payload }));
           }
           
-          // ── FIX: Java touch hook ───────────────────────────────────────
-          // AInputQueue_getEvent in touch.cpp only fires for NativeActivity apps.
-          // For standard Java Activity apps (99% of apps), we hook at the Java level:
-          // Activity.dispatchTouchEvent is called once per touch event at the top
-          // of the view hierarchy, then calls dextool_on_touch in libtool.so.
-          function installTouchHook() {
+          // Native symbols exported by libtool.so
+          var symTouch  = Module.findExportByName('libtool.so', 'dextool_on_touch');
+          var symKey    = Module.findExportByName('libtool.so', 'dextool_on_key');
+          var symText   = Module.findExportByName('libtool.so', 'dextool_on_text');
+          var symBksp   = Module.findExportByName('libtool.so', 'dextool_on_backspace');
+          
+          var fnTouch = symTouch ? new NativeFunction(symTouch, 'void', ['float','float','int']) : null;
+          var fnKey   = symKey   ? new NativeFunction(symKey,   'void', ['int','int'])            : null;
+          var fnText  = symText  ? new NativeFunction(symText,  'void', ['pointer'])              : null;
+          var fnBksp  = symBksp  ? new NativeFunction(symBksp,  'void', [])                       : null;
+          
+          // ── Track current foreground Activity ──────────────────────
+          var currentActivity = null;
+          Java.perform(function() {
               try {
-                  var sym = Module.findExportByName('libtool.so', 'dextool_on_touch');
-                  if (!sym) {
-                      sendMsg('warn', { msg: 'dextool_on_touch symbol not found in libtool.so' });
-                      return;
-                  }
-                  // void dextool_on_touch(float x, float y, int action)
-                  var nativeTouch = new NativeFunction(sym, 'void', ['float', 'float', 'int']);
-          
-                  Java.perform(function() {
-                      // Primary: hook at Activity level (one call per gesture)
-                      try {
-                          var Activity = Java.use('android.app.Activity');
-                          Activity.dispatchTouchEvent.implementation = function(ev) {
-                              try {
-                                  nativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
-                              } catch(e2) {}
-                              return this.dispatchTouchEvent(ev);
-                          };
-                          sendMsg('info', { msg: 'Touch hook: Activity.dispatchTouchEvent OK' });
-                      } catch(e) {
-                          // Fallback: some apps subclass Dialog or use a custom Window
-                          try {
-                              var Window = Java.use('android.view.Window');
-                              Window.superDispatchTouchEvent.implementation = function(ev) {
-                                  try {
-                                      nativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
-                                  } catch(e3) {}
-                                  return this.superDispatchTouchEvent(ev);
-                              };
-                              sendMsg('info', { msg: 'Touch hook: Window.superDispatchTouchEvent (fallback) OK' });
-                          } catch(e2) {
-                              sendMsg('warn', { msg: 'Touch hook failed: ' + e.message });
-                          }
-                      }
-                  });
-              } catch(e) {
-                  sendMsg('error', { fn: 'installTouchHook', msg: e.message });
+                  var Activity = Java.use('android.app.Activity');
+                  Activity.onResume.implementation = function() {
+                      currentActivity = this;
+                      this.onResume();
+                  };
+                  Activity.onPause.implementation = function() {
+                      if (currentActivity === this) currentActivity = null;
+                      this.onPause();
+                  };
+              } catch (e) {
+                  sendMsg('warn', { msg: 'activity track hook failed: ' + e.message });
               }
-          }
+          });
           
+          // ── Touch hook (raw screen coordinates) ───────────────────
+          function installTouchHook() {
+              if (!fnTouch) {
+                  sendMsg('warn', { msg: 'dextool_on_touch not found' });
+                  return;
+              }
+              Java.perform(function() {
+                  try {
+                      var Activity = Java.use('android.app.Activity');
+                      Activity.dispatchTouchEvent.implementation = function(ev) {
+                          try {
+                              // getRawX/Y = absolute screen pixels (matches EGL surface)
+                              fnTouch(ev.getRawX(), ev.getRawY(), ev.getAction() & 0xff);
+                          } catch(e2) {}
+                          return this.dispatchTouchEvent(ev);
+                      };
+                      sendMsg('info', { msg: 'Touch hook OK (getRawX/Y)' });
+                  } catch (e) {
+                      sendMsg('warn', { msg: 'touch hook failed: ' + e.message });
+                  }
+              });
+          }
           installTouchHook();
           
-          // ── RPC exports ───────────────────────────────────────────────
-          rpc.exports = {
+          // ── Hardware key hook ──────────────────────────────────────
+          function installKeyHook() {
+              if (!fnKey) return;
+              Java.perform(function() {
+                  try {
+                      var Activity = Java.use('android.app.Activity');
+                      Activity.dispatchKeyEvent.implementation = function(ev) {
+                          try {
+                              fnKey(ev.getKeyCode(), ev.getAction());
+                          } catch(e2) {}
+                          return this.dispatchKeyEvent(ev);
+                      };
+                  } catch (e) {
+                      sendMsg('warn', { msg: 'key hook failed: ' + e.message });
+                  }
+              });
+          }
+          installKeyHook();
           
+          // ── Soft keyboard (hidden EditText + InputConnection hooks) ─
+          var imeEditText   = null;
+          var imeViewGroup  = null;
+          var TextWatcherCls = null;
+          
+          function buildTextWatcher() {
+              if (TextWatcherCls) return TextWatcherCls;
+              var TW = Java.use('android.text.TextWatcher');
+              TextWatcherCls = Java.registerClass({
+                  name: 'DexToolTW',
+                  implements: [TW],
+                  methods: {
+                      beforeTextChanged: function(s, st, c, a) {},
+                      onTextChanged:     function(s, st, b, c) {},
+                      afterTextChanged: function(s) {}
+                  }
+              });
+              return TextWatcherCls;
+          }
+          
+          function showKeyboard() {
+              if (!currentActivity || imeEditText) return;
+              var act = currentActivity;
+              Java.perform(function() {
+                  try {
+                      var EditText   = Java.use('android.widget.EditText');
+                      var ViewGroup  = Java.use('android.view.ViewGroup$LayoutParams');
+                      var decor      = act.getWindow().getDecorView();
+                      imeViewGroup   = decor;
+                      imeEditText    = EditText.$new(act);
+                      imeEditText.setAlpha(0);
+                      imeEditText.setSingleLine(true);
+                      imeEditText.setInputType(0x00000001); // TYPE_CLASS_TEXT
+                      var lp = ViewGroup.$new(1, 1);
+                      decor.addView(imeEditText, lp);
+                      imeEditText.requestFocus();
+                      var imm = Java.use('android.view.inputmethod.InputMethodManager');
+                      var immInst = act.getSystemService('input_method');
+                      immInst.showSoftInput(imeEditText, 0);
+                      sendMsg('info', { msg: 'IME shown' });
+                  } catch (e) {
+                      sendMsg('error', { fn: 'showKeyboard', msg: e.message });
+                  }
+              });
+          }
+          
+          function hideKeyboard() {
+              if (!currentActivity) return;
+              var act = currentActivity;
+              Java.perform(function() {
+                  try {
+                      var imm = Java.use('android.view.inputmethod.InputMethodManager');
+                      var immInst = act.getSystemService('input_method');
+                      if (imeEditText) {
+                          try { immInst.hideSoftInputFromWindow(imeEditText.getWindowToken(), 0); } catch(e) {}
+                          try { imeViewGroup.removeView(imeEditText); } catch(e) {}
+                          imeEditText = null;
+                      }
+                      sendMsg('info', { msg: 'IME hidden' });
+                  } catch (e) {
+                      sendMsg('error', { fn: 'hideKeyboard', msg: e.message });
+                  }
+              });
+          }
+          
+          // Hook InputConnection so soft-keyboard text reaches ImGui
+          function installImeInputHooks() {
+              if (!fnText && !fnBksp) return;
+              Java.perform(function() {
+                  try {
+                      var BaseIC = Java.use('android.view.inputmethod.BaseInputConnection');
+                      BaseIC.commitText.implementation = function(text, ncp) {
+                          try {
+                              if (imeEditText && text && text.length() > 0) {
+                                  var s = Memory.allocUtf8String(text.toString());
+                                  fnText(s);
+                              }
+                          } catch(e) {}
+                          return this.commitText(text, ncp);
+                      };
+                      BaseIC.deleteSurroundingText.implementation = function(before, after) {
+                          try {
+                              if (imeEditText && fnBksp) {
+                                  for (var i = 0; i < (before | 0); i++) fnBksp();
+                              }
+                          } catch(e) {}
+                          return this.deleteSurroundingText(before, after);
+                      };
+                      sendMsg('info', { msg: 'IME input hooks OK' });
+                  } catch (e) {
+                      sendMsg('warn', { msg: 'IME hooks failed: ' + e.message });
+                  }
+              });
+          }
+          installImeInputHooks();
+          
+          // ── RPC exports ────────────────────────────────────────────
+          rpc.exports = {
               addPatch: function(name, value) {
                   try {
                       Java.perform(function() {
@@ -1230,37 +1635,25 @@ jobs:
                           var f     = jcls.class.getDeclaredField(field);
                           f.setAccessible(true);
                           var t = f.getType().getName();
-                          if (t==='int'||t==='long'||t==='short'||t==='byte')
-                              f.set(null, parseInt(value));
-                          else if (t==='boolean')
-                              f.set(null, value === 'true');
-                          else if (t==='float'||t==='double')
-                              f.set(null, parseFloat(value));
-                          else
-                              f.set(null, value);
+                          if (t==='int'||t==='long'||t==='short'||t==='byte') f.set(null, parseInt(value));
+                          else if (t==='boolean') f.set(null, value === 'true');
+                          else if (t==='float'||t==='double') f.set(null, parseFloat(value));
+                          else f.set(null, value);
                           patches[name] = { value: value, enabled: true };
                           sendMsg('patchApplied', { name: name });
                       });
                   } catch(e) { sendMsg('error', { fn: 'addPatch', msg: e.message }); }
               },
-          
-              removePatch: function(name) {
-                  delete patches[name];
-                  sendMsg('patchRemoved', { name: name });
-              },
-          
+              removePatch: function(name) { delete patches[name]; sendMsg('patchRemoved', { name: name }); },
               setPatchEnabled: function(name, enabled) {
                   if (patches[name]) patches[name].enabled = enabled;
                   sendMsg('patchUpdated', { name: name, enabled: enabled });
               },
-          
               addHook: function(name, mode, code) {
                   try {
                       Java.perform(function() {
-                          var parts  = name.split('.');
-                          var method = parts.pop();
-                          var cls    = parts.join('.');
-                          var jcls   = Java.use(cls);
+                          var parts = name.split('.'); var method = parts.pop();
+                          var jcls  = Java.use(parts.join('.'));
                           if (mode === 'noop') {
                               jcls[method].implementation = function() {
                                   sendMsg('hookFired', { name: name, mode: 'noop' });
@@ -1271,15 +1664,12 @@ jobs:
                               jcls[method].implementation = function() {
                                   return fn(Java, send, Array.from(arguments));
                               };
-                          } else if (mode === 'Smali') {
-                              sendMsg('smaliRequest', { name: name, code: code });
                           }
                           hooks[name] = { mode: mode, enabled: true };
                           sendMsg('hookAdded', { name: name });
                       });
                   } catch(e) { sendMsg('error', { fn: 'addHook', msg: e.message }); }
               },
-          
               removeHook: function(name) {
                   try {
                       Java.perform(function() {
@@ -1290,12 +1680,10 @@ jobs:
                       });
                   } catch(e) { sendMsg('error', { fn: 'removeHook', msg: e.message }); }
               },
-          
               setHookEnabled: function(name, enabled) {
                   if (hooks[name]) hooks[name].enabled = enabled;
                   sendMsg('hookUpdated', { name: name, enabled: enabled });
               },
-          
               addTracker: function(name) {
                   try {
                       Java.perform(function() {
@@ -1313,7 +1701,6 @@ jobs:
                       });
                   } catch(e) { sendMsg('error', { fn: 'addTracker', msg: e.message }); }
               },
-          
               removeTracker: function(name) {
                   try {
                       Java.perform(function() {
@@ -1324,7 +1711,6 @@ jobs:
                       });
                   } catch(e) { sendMsg('error', { fn: 'removeTracker', msg: e.message }); }
               },
-          
               startRecorder: function() {
                   recOn = true;
                   Java.perform(function() {
@@ -1348,9 +1734,7 @@ jobs:
                   });
                   sendMsg('recorderStarted', {});
               },
-          
               stopRecorder: function() { recOn = false; sendMsg('recorderStopped', {}); },
-          
               startMonitor: function() {
                   monOn = true;
                   Java.perform(function() {
@@ -1369,14 +1753,11 @@ jobs:
                   });
                   sendMsg('monitorStarted', {});
               },
-          
               stopMonitor: function() { monOn = false; sendMsg('monitorStopped', {}); },
-          
               evalScript: function(src) {
                   try { sendMsg('scriptResult', { result: String(eval(src)) }); }
                   catch(e) { sendMsg('scriptError', { msg: e.message }); }
               },
-          
               openClass: function(className) {
                   try {
                       Java.perform(function() {
@@ -1389,7 +1770,6 @@ jobs:
                       });
                   } catch(e) { sendMsg('error', { fn: 'openClass', msg: e.message }); }
               },
-          
               listInstances: function(className) {
                   try {
                       Java.perform(function() {
@@ -1401,21 +1781,26 @@ jobs:
                       });
                   } catch(e) { sendMsg('error', { fn: 'listInstances', msg: e.message }); }
               },
-          
               hookMethod:  function(cls, m) { this.addHook(cls + '.' + m, 'noop', ''); },
               trackMethod: function(cls, m) { this.addTracker(cls + '.' + m); },
               patchField:  function(cls, f) { sendMsg('info', { msg: 'patchField: ' + cls + '.' + f }); }
           };
           
-          recv(function onMsg(msg) {
-              if (msg && msg.type === 'rpc' && rpc.exports[msg.fn]) {
+          // ── Message loop ───────────────────────────────────────────
+          function onMsg(msg) {
+              if (!msg) return;
+              if (msg.type === 'keyboard') {
+                  if (msg.show) showKeyboard(); else hideKeyboard();
+              } else if (msg.type === 'rpc' && rpc.exports[msg.fn]) {
                   var a = msg.args || {};
-                  rpc.exports[msg.fn].apply(rpc.exports, Object.values(a));
+                  try { rpc.exports[msg.fn].apply(rpc.exports, Object.values(a)); }
+                  catch(e) { sendMsg('error', { fn: msg.fn, msg: e.message }); }
               }
               recv(onMsg);
-          });
+          }
+          recv(onMsg);
           
-          sendMsg('ready', { msg: 'Dex-tool agent loaded' });
+          sendMsg('ready', { msg: 'Dex-tool agent v1.1 loaded' });
           DXTAGNT
 
       - name: Embed agent.js as C array
@@ -1703,67 +2088,48 @@ jobs:
       - name: Generate README.md and .gitignore
         run: |
           cat > README.md << 'DXTRDME'
-          # Dex-tool
+          # Dex-tool v1.1
           
           Standalone runtime instrumentation framework for Android APKs.
           Ships as one native shared library: libtool.so (armeabi-v7a + arm64-v8a).
           No root. No frida-server. Android 8.0+ (API 26).
           
-          ## Bug fixes in this version
+          ## Fixes in v1.1
           
-              FIX 1 - Touch input (Java apps):
-                AInputQueue_getEvent only fires for NativeActivity apps.
-                Java Activity apps get touch via GumJS hooking Activity.dispatchTouchEvent,
-                which calls dextool_on_touch() (JNIEXPORT symbol in libtool.so) via
-                NativeFunction. The NativeActivity hook remains as a fallback.
+          - Touch input offset (2 cm above button): use `getRawX()/getRawY()`
+            (screen coords) instead of `getX()/getY()` (view-relative coords).
+            These now map 1:1 to the EGL surface ImGui renders to.
           
-              FIX 2 - Menu disappears on pause/resume:
-                eglGetCurrentContext() is checked on every swap. When the EGL context
-                handle changes (new context after GLSurfaceView recreates on resume),
-                ImGui is shut down cleanly and re-initialized with the new context.
+          - Soft keyboard / text boxes: native input queue + hidden `EditText`
+            created on demand as IME target. `InputConnection.commitText` and
+            `deleteSurroundingText` are hooked and forwarded to ImGui.
+            `Activity.dispatchKeyEvent` handles hardware keys (backspace,
+            enter, arrows, etc.).
           
-              FIX 3 - Menu not shown in ES2 apps:
-                Compiled with IMGUI_IMPL_OPENGL_ES2=1. ImGui uses GLES2 function set
-                and #version 100 GLSL, which works on ES2 and ES3. The ES3-only guard
-                is replaced with an OpenGL ES (any version) check.
+          - Classes tab now shows methods/fields: RPC responses (`classInfo`,
+            `instanceList`, `trackerEvent`) are parsed by a small JSON
+            tokenizer in `menu.cpp` and populate the UI.
+          
+          - Font-size slider works: sets `ImGui::GetIO().FontGlobalScale`
+            (`s_font_sz / 14.0f`) every time it changes.
+          
+          - Menu doesn't appear in some apps: hooked `eglSwapBuffers`,
+            `eglSwapBuffersWithDamageKHR`, and `eglSwapBuffersWithDamageEXT`.
+            Modern HWUI apps call the KHR variant, not the base one — that
+            was the previous miss. Vulkan-only apps are still unsupported.
           
           ## Usage
           
-              1. Take any target APK.
-              2. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
-              3. Inject System.loadLibrary("tool") into the launcher Activity smali
-                 or Application subclass onCreate().
-              4. Copy smali-fat.jar into assets/.
-              5. Re-sign and install.
-              Note: overlay only appears if the app calls eglSwapBuffers (OpenGL ES).
-              Vulkan-only apps will not show the overlay but the Frida agent still runs.
+          1. Take any target APK.
+          2. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
+          3. Inject `System.loadLibrary("tool")` into the launcher Activity
+             smali or Application subclass onCreate().
+          4. Copy smali-fat.jar into assets/.
+          5. Re-sign and install.
           
-          ## Architecture
-          
-              libtool.so
-                JNI_OnLoad
-                  write boot marker (raw I/O, no gum)
-                  logger_init()
-                  install_swap_hook() via Dobby (LSPosed/Dobby)
-                eglSwapBuffers replacement (GL thread)
-                  First call:
-                    gum_init_embedded()      <- FIRST gum call, valid EGL context
-                    spawn frida pthread      <- GumJS / QuickJS agent
-                    touch_install_hooks()    <- NativeActivity fallback
-                    imgui_init()             <- ES2 or ES3, any OpenGL ES
-                  On context change (pause/resume):
-                    imgui_shutdown() + imgui_init()
-                  Every frame:
-                    inject touch (from Java hook via dextool_on_touch)
-                    ImGui render
-                    g_orig_swap()           <- never recurses
-          
-          ## Components
-          
-              frida-gum 16.7.19   QuickJS / GumJS scripting runtime
-              Dobby (LSPosed)     inline function hook framework
-              ImGui 1.90.4        immediate-mode overlay GUI (ES2 mode)
-              smali 3.0.7         runtime .smali to DEX assembler (bundled JAR)
+          The overlay shows only if the app calls one of the EGL swap
+          functions (GLSurfaceView apps and every HWUI app do). Vulkan-only
+          apps will not show the overlay; the Frida agent still runs.
           DXTRDME
                     cat > .gitignore << 'DXTGI'
           build-arm64/
@@ -1809,7 +2175,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix: touch+ES2+pause-resume bugs fixed [skip ci]"
+            git commit -m "fix: touch(offset)+ime-keyboard+classes-parsing+font+multi-swap-hook [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
