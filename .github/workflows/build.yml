@@ -306,12 +306,6 @@ jobs:
           void log_crash_raw(const char* msg);
           DXTLOGH
 
-      # ─────────────────────────────────────────────────────────────
-      # logger.cpp — crash handler FIX:
-      #   - sigaction + sigaltstack (works even on stack overflow)
-      #   - dumps si_addr AND faulting PC, both hex (async-signal-safe)
-      #   - _exit() to avoid re-raising (was causing double-log)
-      # ─────────────────────────────────────────────────────────────
       - name: Generate logger.cpp
         run: |
           cat > src/logger.cpp << 'DXTLOGC'
@@ -331,8 +325,6 @@ jobs:
           static FILE* g_debug_fp = nullptr;
           static int   g_crash_fd = -1;
           static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-          
-          // 64 KiB altstack — used if the crash is a stack overflow.
           static char g_altstack[65536];
           
           static void ts(char* buf, size_t n) {
@@ -344,7 +336,6 @@ jobs:
                        tm.tm_hour, tm.tm_min, tm.tm_sec);
           }
           
-          // Async-signal-safe hex dump into buffer.
           static size_t put_hex(char* dst, size_t cap, uintptr_t v) {
               char tmp[20]; int n = 0;
               if (v == 0) tmp[n++] = '0';
@@ -458,10 +449,11 @@ jobs:
           DXTOVLH
 
       # ─────────────────────────────────────────────────────────────
-      # overlay.cpp — fixes for this crash:
-      #   1. imgui_init() runs BEFORE spawning frida thread (no race)
-      #   2. frida pthread gets a 16 MB stack (QJS needs more than default)
-      #   3. Checkpoints in file log at each stage
+      # overlay.cpp — fixes:
+      #   - message drain via menu_poll_messages (GL thread only touches UI state)
+      #   - context change rebuilds ONLY the GL backend (no ImGui destroy)
+      #   - context change debounce: new contexts tracked; oscillation detected
+      #   - menu_draw null-guard
       # ─────────────────────────────────────────────────────────────
       - name: Generate overlay.cpp
         run: |
@@ -497,6 +489,11 @@ jobs:
           static EGLContext        g_egl_ctx       = EGL_NO_CONTEXT;
           static std::atomic<bool> g_want_text_last{false};
           
+          // Track known EGL contexts so A<->B oscillation doesn't reinit forever.
+          static EGLContext g_known_ctx[8]   = {};
+          static int        g_known_count    = 0;
+          static int        g_reinit_count   = 0;
+          
           struct Evt {
               enum Kind { TOUCH, KEY, TEXT, BACKSPACE } kind;
               float x = 0, y = 0;
@@ -514,7 +511,6 @@ jobs:
           }
           
           void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
-          
           void overlay_on_touch(float x, float y, bool p) {
               Evt e; e.kind = Evt::TOUCH; e.x = x; e.y = y; e.pressed = p;
               push_evt(e);
@@ -560,18 +556,9 @@ jobs:
               }
           }
           
-          static void imgui_shutdown() {
-              if (g_imgui_up.load()) {
-                  ImGui_ImplOpenGL3_Shutdown();
-                  ImGui::DestroyContext();
-                  g_imgui_up.store(false);
-                  g_imgui_failed = false;
-                  log_info("[overlay] ImGui shut down (context loss)");
-              }
-          }
-          
-          static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
-              log_info("[overlay] imgui_init entry");
+          // Full init: called exactly ONCE per process.
+          static void imgui_full_init(EGLDisplay dpy, EGLSurface surf) {
+              log_info("[overlay] imgui_full_init entry");
               EGLint w = 1080, h = 1920;
               eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
@@ -583,9 +570,7 @@ jobs:
                   g_imgui_failed = true;
                   return;
               }
-              log_info("[overlay] imgui_init creating ImGui context");
               ImGui::CreateContext();
-              log_info("[overlay] imgui_init context created");
               ImGuiIO& io   = ImGui::GetIO();
               io.DisplaySize = ImVec2((float)w, (float)h);
               io.DeltaTime   = 1.0f / 60.0f;
@@ -593,12 +578,18 @@ jobs:
               io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
               ImGui::StyleColorsDark();
               ImGui::GetStyle().WindowRounding = 6.0f;
-          
               ImGui_ImplOpenGL3_Init("#version 100");
-              log_info("[overlay] imgui_init GL backend OK, menu_init");
-              menu_init();
+              menu_init();          // <-- one-time: applies theme only
               g_imgui_up.store(true);
-              log_info("[overlay] imgui_init done");
+              log_info("[overlay] imgui_full_init done");
+          }
+          
+          // Rebuild GL backend only (context change). Keeps UI state.
+          static void imgui_rebuild_backend() {
+              log_info("[overlay] imgui_rebuild_backend (GL context changed)");
+              ImGui_ImplOpenGL3_Shutdown();
+              ImGui_ImplOpenGL3_Init("#version 100");
+              g_imgui_up.store(true);
           }
           
           static ImGuiKey map_key(int kc) {
@@ -630,9 +621,7 @@ jobs:
                           break;
                       case Evt::KEY: {
                           ImGuiKey k = map_key(e.keycode);
-                          if (k != ImGuiKey_None) {
-                              io.AddKeyEvent(k, e.action == 0);
-                          }
+                          if (k != ImGuiKey_None) io.AddKeyEvent(k, e.action == 0);
                           break;
                       }
                       case Evt::TEXT:
@@ -647,31 +636,49 @@ jobs:
               g_in_q.clear();
           }
           
+          static bool is_known_ctx(EGLContext ctx) {
+              for (int i = 0; i < g_known_count; i++)
+                  if (g_known_ctx[i] == ctx) return true;
+              return false;
+          }
+          static void remember_ctx(EGLContext ctx) {
+              if (g_known_count < 8) g_known_ctx[g_known_count++] = ctx;
+          }
+          
           static void render_frame(EGLDisplay dpy, EGLSurface surf) {
               EGLContext cur_ctx = eglGetCurrentContext();
+          
               if (!g_gum_inited.exchange(true)) {
+                  // ── First swap ─────────────────────────────────────────
                   g_egl_ctx = cur_ctx;
+                  if (cur_ctx != EGL_NO_CONTEXT) remember_ctx(cur_ctx);
                   log_info("[overlay] first swap: gum_init_embedded");
                   gum_init_embedded();
                   log_info("[overlay] gum_init_embedded done");
-                  // Do ImGui init FIRST — it is entirely GL-side, and running it
-                  // before the frida thread removes the init race on GLib state.
-                  log_info("[overlay] touch_install_hooks");
                   touch_install_hooks();
-                  log_info("[overlay] imgui_init (before frida spawn)");
-                  imgui_init(dpy, surf);
-                  // Only after everything local is set up do we spawn GumJS.
+                  imgui_full_init(dpy, surf);
                   spawn_frida_thread();
                   log_info("[overlay] first-frame setup complete");
+          
               } else if (cur_ctx != EGL_NO_CONTEXT && cur_ctx != g_egl_ctx) {
-                  log_info("[overlay] EGL context changed, re-initing ImGui");
-                  g_egl_ctx = cur_ctx;
-                  imgui_shutdown();
-                  imgui_init(dpy, surf);
+                  // ── Context changed ───────────────────────────────────
+                  if (!is_known_ctx(cur_ctx)) {
+                      remember_ctx(cur_ctx);
+                      g_egl_ctx = cur_ctx;
+                      if (g_reinit_count++ < 8) imgui_rebuild_backend();
+                      else log_info("[overlay] too many reinits, keeping current state");
+                  } else {
+                      // Oscillation between known contexts: rebuild once, then
+                      // stop (dropping ImGui GL objects for that ctx is fine).
+                      g_egl_ctx = cur_ctx;
+                      if (g_reinit_count++ < 8) imgui_rebuild_backend();
+                  }
               }
           
               if (!g_imgui_up.load() || g_imgui_failed) return;
+              if (!ImGui::GetCurrentContext()) return;
           
+              menu_poll_messages();   // <-- drain frida msgs on GL thread
               drain_input();
               ImGui_ImplOpenGL3_NewFrame();
               ImGui::NewFrame();
@@ -786,16 +793,19 @@ jobs:
           #pragma once
           #include <jni.h>
           #include <string>
-          #include <functional>
+          #include <vector>
           void frida_bridge_start(JavaVM* jvm);
           void frida_post(const std::string& json);
-          using MsgCallback = std::function<void(const std::string&)>;
-          void frida_set_message_callback(MsgCallback cb);
+          // Called from GL thread: swaps the pending-message vector into `out`.
+          int frida_drain_messages(std::vector<std::string>& out);
           DXTFBH
 
       # ─────────────────────────────────────────────────────────────
-      # frida_bridge.cpp — FIX: fine-grained file-log checkpoints so
-      # we can see EXACTLY which GumJS call crashes if it still does.
+      # frida_bridge.cpp — FIX:
+      #   - on_message just pushes to a mutex-protected queue
+      #   - no callback invocation from frida thread
+      #   - g_script is std::atomic
+      #   - GL thread drains queue via frida_drain_messages
       # ─────────────────────────────────────────────────────────────
       - name: Generate frida_bridge.cpp
         run: |
@@ -806,16 +816,25 @@ jobs:
           #include "agent_bundle_embed.h"
           #include <mutex>
           #include <string>
+          #include <vector>
+          #include <atomic>
           
-          static GumScriptBackend* g_backend = nullptr;
-          static GumScript*        g_script  = nullptr;
-          static GMainLoop*        g_loop    = nullptr;
-          static GMainContext*     g_ctx     = nullptr;
-          static std::mutex        g_pmtx;
-          static MsgCallback       g_cb;
+          static GumScriptBackend*          g_backend = nullptr;
+          static std::atomic<GumScript*>    g_script {nullptr};
+          static GMainLoop*                 g_loop    = nullptr;
+          static GMainContext*              g_ctx     = nullptr;
+          static std::mutex                 g_post_mtx;
+          static std::mutex                 g_msg_mtx;
+          static std::vector<std::string>   g_msg_queue;
           
           static void on_message(const gchar* msg, GBytes*, gpointer) {
-              if (g_cb && msg) g_cb(std::string(msg));
+              if (!msg) return;
+              std::lock_guard<std::mutex> lk(g_msg_mtx);
+              if (g_msg_queue.size() > 1024) {
+                  g_msg_queue.erase(g_msg_queue.begin(),
+                                    g_msg_queue.begin() + 512);
+              }
+              g_msg_queue.push_back(std::string(msg));
           }
           
           void frida_bridge_start(JavaVM*) {
@@ -835,11 +854,11 @@ jobs:
               }
           
               GError* err = nullptr;
-              g_script = gum_script_backend_create_sync(
+              GumScript* script = gum_script_backend_create_sync(
                              g_backend, "dextool-agent",
                              g_agent_js, nullptr, nullptr, &err);
               log_info("[frida] F: create_sync returned");
-              if (!g_script || err) {
+              if (!script || err) {
                   char m[512];
                   snprintf(m, sizeof(m), "[frida] create failed: %s\n",
                            err ? err->message : "(null)");
@@ -847,11 +866,12 @@ jobs:
                   if (err) g_error_free(err);
                   return;
               }
+              g_script.store(script);
           
-              gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
+              gum_script_set_message_handler(script, on_message, nullptr, nullptr);
               log_info("[frida] G: msg handler set");
           
-              gum_script_load_sync(g_script, nullptr);
+              gum_script_load_sync(script, nullptr);
               log_info("[frida] H: load_sync returned");
               log_info("[frida] agent running");
               g_main_loop_run(g_loop);
@@ -859,12 +879,17 @@ jobs:
           }
           
           void frida_post(const std::string& json) {
-              if (!g_script) return;
-              std::lock_guard<std::mutex> lk(g_pmtx);
-              gum_script_post(g_script, json.c_str(), nullptr);
+              GumScript* s = g_script.load();
+              if (!s) return;
+              std::lock_guard<std::mutex> lk(g_post_mtx);
+              gum_script_post(s, json.c_str(), nullptr);
           }
           
-          void frida_set_message_callback(MsgCallback cb) { g_cb = cb; }
+          int frida_drain_messages(std::vector<std::string>& out) {
+              std::lock_guard<std::mutex> lk(g_msg_mtx);
+              out.swap(g_msg_queue);
+              return (int)out.size();
+          }
           DXTFBC
 
       - name: Generate smali_runtime.h and smali_runtime.cpp
@@ -987,10 +1012,18 @@ jobs:
         run: |
           cat > src/menu.h << 'DXTMNH'
           #pragma once
-          void menu_init();
+          void menu_init();            // one-time: applies theme
+          void menu_poll_messages();   // per-frame GL thread: drains frida msgs
           void menu_draw();
           DXTMNH
 
+      # ─────────────────────────────────────────────────────────────
+      # menu.cpp — FIX:
+      #   - handle_message runs on GL thread only (via menu_poll_messages)
+      #   - no callback / no cross-thread std::function
+      #   - no need for g_state_mtx around UI state
+      #   - menu_draw guards ImGui::GetCurrentContext()
+      # ─────────────────────────────────────────────────────────────
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
@@ -1000,11 +1033,10 @@ jobs:
           #include "imgui.h"
           #include <string>
           #include <vector>
-          #include <map>
-          #include <mutex>
           #include <cstdio>
           #include <cstring>
           
+          // ── Minimal JSON extractors (flat object, string / array-of-string) ─
           static std::string j_str(const std::string& j, const std::string& key) {
               std::string n = "\"" + key + "\":\"";
               size_t p = j.find(n);
@@ -1113,6 +1145,7 @@ jobs:
               return out;
           }
           
+          // ── UI state (GL thread only after menu_init) ──────────────
           static float s_opacity = 0.92f;
           static float s_font_sz = 14.f;
           static int   s_theme   = 0;
@@ -1130,7 +1163,6 @@ jobs:
           
           static bool s_rec_on = false, s_mon_on = false;
           static std::vector<std::string> s_rec_log, s_mon_log, s_script_out;
-          static std::mutex g_state_mtx;
           
           static char s_pname[256]  = {};
           static char s_pval[512]   = {};
@@ -1149,6 +1181,7 @@ jobs:
           }
           
           static void apply_theme() {
+              if (!ImGui::GetCurrentContext()) return;
               switch (s_theme) {
                   case 0: ImGui::StyleColorsDark();    break;
                   case 1: ImGui::StyleColorsLight();   break;
@@ -1158,8 +1191,8 @@ jobs:
               ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
           }
           
+          // GL thread only.
           static void handle_message(const std::string& j) {
-              std::lock_guard<std::mutex> lk(g_state_mtx);
               std::string type = j_str(j, "type");
               if (type.empty()) return;
               if (type == "classInfo") {
@@ -1199,18 +1232,29 @@ jobs:
                   s_mon_log.push_back(j_str(j, "note"));
               } else if (type == "error") {
                   s_script_out.push_back("ERR[" + j_str(j, "fn") + "]: " + j_str(j, "msg"));
-              } else if (type == "info" || type == "warn") {
+              } else if (type == "info" || type == "warn" || type == "fatal") {
                   s_script_out.push_back(j_str(j, "msg"));
+              } else if (type == "ready") {
+                  s_script_out.push_back("agent ready: " + j_str(j, "msg"));
               }
           }
           
           void menu_init() {
-              apply_theme();
-              frida_set_message_callback([](const std::string& j) {
-                  handle_message(j);
-              });
+              apply_theme();   // sets initial theme/font
           }
           
+          void menu_poll_messages() {
+              if (!ImGui::GetCurrentContext()) return;
+              std::vector<std::string> msgs;
+              int n = frida_drain_messages(msgs);
+              if (n <= 0) return;
+              for (auto& m : msgs) {
+                  try { handle_message(m); }
+                  catch(...) {}
+              }
+          }
+          
+          // ── Tabs ───────────────────────────────────────────────────
           static void tab_settings() {
               if (ImGui::SliderFloat("Font size", &s_font_sz, 8, 32)) {
                   ImGui::GetIO().FontGlobalScale = s_font_sz / 14.0f;
@@ -1416,12 +1460,12 @@ jobs:
           }
           
           void menu_draw() {
-              if (!s_visible) return;
+              if (!s_visible || !ImGui::GetCurrentContext()) return;
               ImGuiIO& io = ImGui::GetIO();
               ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
               ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * .75f, 500), ImGuiCond_Once);
               ImGui::SetNextWindowBgAlpha(s_opacity);
-              ImGui::Begin("Dex-tool v1.1", &s_visible, ImGuiWindowFlags_NoCollapse);
+              ImGui::Begin("Dex-tool v1.3", &s_visible, ImGuiWindowFlags_NoCollapse);
               if (ImGui::BeginTabBar("tb")) {
                   if (ImGui::BeginTabItem("Settings")) { tab_settings(); ImGui::EndTabItem(); }
                   if (ImGui::BeginTabItem("Patches"))  { tab_patches();  ImGui::EndTabItem(); }
@@ -1479,11 +1523,6 @@ jobs:
           }
           DXTMAIN
 
-      # ─────────────────────────────────────────────────────────────
-      # agent.js — top-level code in try/catch IIFE; Java.perform
-      # calls deferred to a microtask so they don't execute inline
-      # inside gum_script_load_sync.
-      # ─────────────────────────────────────────────────────────────
       - name: Generate agent.js
         run: |
           cat > agent/agent.js << 'DXTAGNT'
@@ -1501,17 +1540,16 @@ jobs:
                       try { send(JSON.stringify({ type: type, payload: payload })); } catch(e) {}
                   }
           
-                  var symTouch, symKey, symText, symBksp;
                   var fnTouch = null, fnKey = null, fnText = null, fnBksp = null;
                   try {
-                      symTouch = Module.findExportByName('libtool.so', 'dextool_on_touch');
-                      symKey   = Module.findExportByName('libtool.so', 'dextool_on_key');
-                      symText  = Module.findExportByName('libtool.so', 'dextool_on_text');
-                      symBksp  = Module.findExportByName('libtool.so', 'dextool_on_backspace');
-                      if (symTouch) fnTouch = new NativeFunction(symTouch, 'void', ['float','float','int']);
-                      if (symKey)   fnKey   = new NativeFunction(symKey,   'void', ['int','int']);
-                      if (symText)  fnText  = new NativeFunction(symText,  'void', ['pointer']);
-                      if (symBksp)  fnBksp  = new NativeFunction(symBksp,  'void', []);
+                      var sT = Module.findExportByName('libtool.so', 'dextool_on_touch');
+                      var sK = Module.findExportByName('libtool.so', 'dextool_on_key');
+                      var sX = Module.findExportByName('libtool.so', 'dextool_on_text');
+                      var sB = Module.findExportByName('libtool.so', 'dextool_on_backspace');
+                      if (sT) fnTouch = new NativeFunction(sT, 'void', ['float','float','int']);
+                      if (sK) fnKey   = new NativeFunction(sK, 'void', ['int','int']);
+                      if (sX) fnText  = new NativeFunction(sX, 'void', ['pointer']);
+                      if (sB) fnBksp  = new NativeFunction(sB, 'void', []);
                   } catch(e) {
                       sendMsg('warn', { msg: 'native lookup failed: ' + e.message });
                   }
@@ -1538,7 +1576,6 @@ jobs:
                           }
                       });
                   }
-          
                   function installTouchHook() {
                       if (!fnTouch) { sendMsg('warn', { msg: 'dextool_on_touch missing' }); return; }
                       Java.perform(function() {
@@ -1554,7 +1591,6 @@ jobs:
                           }
                       });
                   }
-          
                   function installKeyHook() {
                       if (!fnKey) return;
                       Java.perform(function() {
@@ -1569,7 +1605,6 @@ jobs:
                           }
                       });
                   }
-          
                   function installImeInputHooks() {
                       if (!fnText && !fnBksp) return;
                       Java.perform(function() {
@@ -1597,7 +1632,6 @@ jobs:
                           }
                       });
                   }
-          
                   function showKeyboard() {
                       if (!currentActivity || imeEditText) return;
                       var act = currentActivity;
@@ -1621,7 +1655,6 @@ jobs:
                           }
                       });
                   }
-          
                   function hideKeyboard() {
                       if (!currentActivity) return;
                       var act = currentActivity;
@@ -1640,7 +1673,6 @@ jobs:
                       });
                   }
           
-                  // Defer Java hooks so we finish loading before touching the JVM.
                   setImmediate(function() {
                       try {
                           installActivityTracker();
@@ -1825,7 +1857,7 @@ jobs:
                   }
                   recv(onMsg);
           
-                  sendMsg('ready', { msg: 'Dex-tool agent v1.2 loaded' });
+                  sendMsg('ready', { msg: 'Dex-tool agent v1.3 loaded' });
               } catch (e) {
                   try { send(JSON.stringify({ type: 'fatal', payload: { msg: String(e) } })); } catch(_) {}
               }
@@ -2117,25 +2149,30 @@ jobs:
       - name: Generate README.md and .gitignore
         run: |
           cat > README.md << 'DXTRDME'
-          # Dex-tool v1.2
+          # Dex-tool v1.3
           
           Standalone runtime instrumentation framework for Android APKs.
           Ships as one native shared library: libtool.so (armeabi-v7a + arm64-v8a).
           No root. No frida-server. Android 8.0+ (API 26).
           
-          ## v1.2 changes
+          ## v1.3 changes
           
-          - **Crash handler** rewritten with `sigaction` + sigaltstack so it
-            still runs on stack overflow, and logs fault addr + PC.
-          - **GumJS startup**: frida pthread now gets 16 MB stack; ImGui is
-            fully initialized *before* the frida thread is spawned, removing
-            a GLib-state race.
-          - **Fine-grained GumJS checkpoints** in `dextool.log`:
-            A … B … C … D … E … F … G … H — the last one before the crash
-            tells us exactly which gum_* call fails.
-          - **Agent** top-level code runs inside a try/catch IIFE and the
-            Java hooks are deferred with `setImmediate` so they don’t fire
-            synchronously inside `gum_script_load_sync`.
+          - **Message queue** — the frida thread pushes raw JSON into a
+            mutex-protected queue; the GL thread drains it each frame via
+            `menu_poll_messages()`. **No more cross-thread access** to UI
+            state (`s_classes`, `s_script_out`, …). This was the cause of
+            the `addr=0x3` crash (use-after-free inside `std::vector`).
+          - **No `std::function` race** — `frida_set_message_callback` is
+            gone. No torn read between the two threads.
+          - **EGL context change is cheap now** — only the GL backend is
+            rebuilt (`ImGui_ImplOpenGL3_Shutdown/Init`); the ImGui context
+            and UI state survive. Context switches no longer cause the
+            tab/window state to reset, or the reinit storm we saw in v1.2.
+          - **Bounded reinit counter** — if the same set of EGL contexts
+            oscillates, we stop reinit-ing after 8 tries.
+          - **`g_script` is now atomic** — `frida_post` sees a fully-set
+            pointer or null, never a partially-written one.
+          - **`menu_draw` and `handle_message` guard `ImGui::GetCurrentContext()`**.
           DXTRDME
                     cat > .gitignore << 'DXTGI'
           build-arm64/
@@ -2181,7 +2218,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix: gumjs startup crash — 16MB stack + no imgui race + checkpoints [skip ci]"
+            git commit -m "fix: cross-thread ui-state race + cheap egl ctx rebuild + atomic g_script [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
