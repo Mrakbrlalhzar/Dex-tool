@@ -21,31 +21,31 @@ public class DexToolApp extends Application {
         try { Thread.sleep(500); } catch (InterruptedException ignored) {}
         installUncaughtHandler();
         try {
-            
-            Log.i(TAG, "libtool.so loaded");
+  
+  Log.i(TAG, "libtool.so loaded");
         } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "loadLibrary failed: " + e.getMessage());
+  Log.e(TAG, "loadLibrary failed: " + e.getMessage());
         }
     }
 
     private void writeBootMarker() {
         try {
-            new File(DL).mkdirs();
-            try (FileOutputStream f = new FileOutputStream(DL+"/dextool-boot.marker")) {
-                f.write(("boot ts="+System.currentTimeMillis()+"\n").getBytes());
-            }
+  new File(DL).mkdirs();
+  try (FileOutputStream f = new FileOutputStream(DL+"/dextool-boot.marker")) {
+      f.write(("boot ts="+System.currentTimeMillis()+"\n").getBytes());
+  }
         } catch (IOException e) { Log.w(TAG, "boot marker: "+e.getMessage()); }
     }
 
     private void startCopierThread() {
         Thread t = new Thread(() -> {
-            while (true) {
-                try {
-                    Thread.sleep(5000);
-                    copyLogs();
-                } catch (InterruptedException e) { break; }
-                  catch (Exception e) { Log.w(TAG, "copier: "+e.getMessage()); }
-            }
+  while (true) {
+      try {
+          Thread.sleep(5000);
+          copyLogs();
+      } catch (InterruptedException e) { break; }
+        catch (Exception e) { Log.w(TAG, "copier: "+e.getMessage()); }
+  }
         }, "dextool-copier");
         t.setDaemon(true);
         t.start();
@@ -55,26 +55,26 @@ public class DexToolApp extends Application {
         String[] names = {"dextool.log","dextool-debug.log","dextool-crash.log"};
         new File(DL).mkdirs();
         for (String n : names) {
-            File s = new File(getFilesDir(), "dextool-logs/"+n);
-            if (!s.exists()) continue;
-            File d = new File(DL, n);
-            try (InputStream  is = new FileInputStream(s);
-                 OutputStream os = new FileOutputStream(d, true)) {
-                byte[] buf = new byte[8192]; int len;
-                while ((len=is.read(buf))!=-1) os.write(buf,0,len);
-            }
+  File s = new File(getFilesDir(), "dextool-logs/"+n);
+  if (!s.exists()) continue;
+  File d = new File(DL, n);
+  try (InputStream  is = new FileInputStream(s);
+       OutputStream os = new FileOutputStream(d, true)) {
+      byte[] buf = new byte[8192]; int len;
+      while ((len=is.read(buf))!=-1) os.write(buf,0,len);
+  }
         }
     }
 
     private void installUncaughtHandler() {
         Thread.UncaughtExceptionHandler prev =
-            Thread.getDefaultUncaughtExceptionHandler();
+  Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((thr, ex) -> {
-            try (FileOutputStream f =
-                     new FileOutputStream(DL+"/dextool-crash.log",true)) {
-                f.write(("JAVA_CRASH thr="+thr.getName()+" "+ex+"\n").getBytes());
-            } catch (IOException ignored) {}
-            if (prev!=null) prev.uncaughtException(thr, ex);
+  try (FileOutputStream f =
+           new FileOutputStream(DL+"/dextool-crash.log",true)) {
+      f.write(("JAVA_CRASH thr="+thr.getName()+" "+ex+"\n").getBytes());
+  } catch (IOException ignored) {}
+  if (prev!=null) prev.uncaughtException(thr, ex);
         });
     }
 }
