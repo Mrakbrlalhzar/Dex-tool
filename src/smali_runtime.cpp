@@ -18,13 +18,13 @@ static std::string extract_jar(JNIEnv* env) {
         env->GetStaticMethodID(act,"currentApplication","()Landroid/app/Application;"));
     jobject  am  = env->CallObjectMethod(app,
         env->GetMethodID(env->FindClass("android/content/Context"),
-               "getAssets","()Landroid/content/res/AssetManager;"));
+                         "getAssets","()Landroid/content/res/AssetManager;"));
     jstring  fds = (jstring)env->CallObjectMethod(app,
         env->GetMethodID(env->FindClass("android/content/Context"),
-               "getFilesDir","()Ljava/io/File;"));
+                         "getFilesDir","()Ljava/io/File;"));
     fds = (jstring)env->CallObjectMethod(fds,
         env->GetMethodID(env->FindClass("java/io/File"),
-               "getAbsolutePath","()Ljava/lang/String;"));
+                         "getAbsolutePath","()Ljava/lang/String;"));
     const char* fdp = env->GetStringUTFChars(fds, nullptr);
     char jar[512];
     snprintf(jar, sizeof(jar), "%s/smali-fat.jar", fdp);
@@ -51,7 +51,7 @@ static bool ensure_ready(JNIEnv* env) {
     jstring js = env->NewStringUTF(jar.c_str());
     jobject lo = env->NewObject(dcl,
         env->GetMethodID(dcl,"<init>",
-  "(Ljava/lang/String;Ljava/lang/ClassLoader;)V"),js,sc);
+            "(Ljava/lang/String;Ljava/lang/ClassLoader;)V"),js,sc);
     if (!lo) return false;
     jstring cn = env->NewStringUTF("com.android.tools.smali.smali.Main");
     s_main_cls = (jclass)env->CallObjectMethod(lo,
@@ -63,7 +63,7 @@ static bool ensure_ready(JNIEnv* env) {
 }
 
 std::string smali_compile(const std::string& src, const std::string& cname,
-                std::vector<uint8_t>& out) {
+                          std::vector<uint8_t>& out) {
     JNIEnv* env = nullptr;
     if (!g_jvm_global) return "no JVM";
     g_jvm_global->AttachCurrentThread(&env, nullptr);

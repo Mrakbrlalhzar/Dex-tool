@@ -12,12 +12,12 @@ static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
     int32_t rc = g_orig_get(q, ev);
     if (rc >= 0 && ev && *ev) {
         if (AInputEvent_getType(*ev) == AINPUT_EVENT_TYPE_MOTION) {
-  int32_t act = AMotionEvent_getAction(*ev) & AMOTION_EVENT_ACTION_MASK;
-  float x = AMotionEvent_getX(*ev, 0);
-  float y = AMotionEvent_getY(*ev, 0);
-  bool p  = (act == AMOTION_EVENT_ACTION_DOWN ||
-             act == AMOTION_EVENT_ACTION_MOVE);
-  overlay_on_touch(x, y, p);
+            int32_t act = AMotionEvent_getAction(*ev) & AMOTION_EVENT_ACTION_MASK;
+            float x = AMotionEvent_getX(*ev, 0);
+            float y = AMotionEvent_getY(*ev, 0);
+            bool p  = (act == AMOTION_EVENT_ACTION_DOWN ||
+                       act == AMOTION_EVENT_ACTION_MOVE);
+            overlay_on_touch(x, y, p);
         }
     }
     return rc;
@@ -27,10 +27,10 @@ void touch_install_hooks() {
     void* lib = dlopen("libandroid.so", RTLD_NOW);
     if (!lib) { LOGD("touch: libandroid not found (OK for Java apps)"); return; }
     void* sym = dlsym(lib, "AInputQueue_getEvent");
-    if (!sym) { LOGD("touch: AInputQueue_getEvent not found"); return; }
+    if (!sym) { LOGD("touch: AInputQueue_getEvent not found (OK for Java apps)"); return; }
     int r = DobbyHook(sym,
         reinterpret_cast<dobby_dummy_func_t>(my_getEvent),
         reinterpret_cast<dobby_dummy_func_t*>(&g_orig_get));
     if (r == 0) LOGI("touch: AInputQueue_getEvent hooked (NativeActivity)");
-    else        LOGD("touch: hook failed %d (OK for Java apps)", r);
+    else        LOGD("touch: DobbyHook AInputQueue_getEvent: %d", r);
 }

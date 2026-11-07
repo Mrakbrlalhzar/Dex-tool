@@ -9,8 +9,8 @@
 #include <pthread.h>
 
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-#define MLK()  pthread_mutex_lock(&g_mtx)
-#define MULK() pthread_mutex_unlock(&g_mtx)
+#define MLK()   pthread_mutex_lock(&g_mtx)
+#define MULK()  pthread_mutex_unlock(&g_mtx)
 
 static float s_font_scale = 1.0f;
 static float s_opacity    = 0.92f;
@@ -26,7 +26,7 @@ static std::vector<PatchEntry>   s_patches;
 static std::vector<HookEntry>    s_hooks;
 static std::vector<TrackerEntry> s_trackers;
 static std::vector<ClassWin>     s_classes;
-static bool s_rec_on=false, s_mon_on=false;
+static bool s_rec_on = false, s_mon_on = false;
 static std::vector<std::string> s_rec_log, s_mon_log, s_script_out;
 
 static char s_pname[256]={}, s_pval[512]={};
@@ -38,27 +38,33 @@ static char s_cname[256]={};
 
 static void post_rpc(const char* fn, const char* args) {
     char buf[4096];
-    snprintf(buf,sizeof(buf),
-   "{\"type\":\"rpc\",\"fn\":\"%s\",\"args\":%s}",fn,args);
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"rpc\",\"fn\":\"%s\",\"args\":%s}", fn, args);
     frida_post(std::string(buf));
 }
 
 static std::string jstr(const std::string& j, const char* key) {
-    std::string k=std::string("\"")+key+"\":\"";
-    auto p=j.find(k); if(p==std::string::npos) return "";
-    p+=k.size(); auto e=j.find('"',p);
-    return (e!=std::string::npos)?j.substr(p,e-p):"";
+    std::string k = std::string("\"")+key+"\":\"";
+    auto p = j.find(k);
+    if (p == std::string::npos) return "";
+    p += k.size();
+    auto e = j.find('"', p);
+    return (e!=std::string::npos) ? j.substr(p,e-p) : "";
 }
 
 static std::vector<std::string> jarr(const std::string& j, const char* key) {
     std::vector<std::string> r;
-    std::string k=std::string("\"")+key+"\":[";
-    auto p=j.find(k); if(p==std::string::npos) return r;
-    p+=k.size(); auto e=j.find(']',p); if(e==std::string::npos) return r;
-    std::string seg=j.substr(p,e-p); size_t i=0;
+    std::string k = std::string("\"")+key+"\":[";
+    auto p = j.find(k);
+    if (p==std::string::npos) return r;
+    p += k.size();
+    auto e = j.find(']',p);
+    if (e==std::string::npos) return r;
+    std::string seg = j.substr(p,e-p);
+    size_t i=0;
     while(i<seg.size()){
-        auto s=seg.find('"',i); if(s==std::string::npos) break; s++;
-        auto f=seg.find('"',s); if(f==std::string::npos) break;
+        auto s=seg.find('"',i); if(s==std::string::npos)break; s++;
+        auto f=seg.find('"',s); if(f==std::string::npos)break;
         r.push_back(seg.substr(s,f-s)); i=f+1;
     }
     return r;
@@ -78,30 +84,31 @@ void menu_init() {
     apply_theme();
     frida_set_message_callback([](const std::string& j){
         MLK();
-        if(j.find("\"classInfo\"")!=std::string::npos){
-  auto cls=jstr(j,"class");
-  auto mths=jarr(j,"methods");
-  auto flds=jarr(j,"fields");
-  for(auto& cw:s_classes){
-      if(cw.cname==cls){ cw.methods=mths; cw.fields=flds; break; }
-  }
+        if (j.find("\"classInfo\"")!=std::string::npos) {
+            auto cls=jstr(j,"class");
+            auto mths=jarr(j,"methods");
+            auto flds=jarr(j,"fields");
+            for(auto& cw:s_classes){
+                if(cw.cname==cls){ cw.methods=mths; cw.fields=flds; break; }
+            }
         } else if(j.find("\"trackerEvent\"")!=std::string::npos){
-  auto name=jstr(j,"name"); auto ret=jstr(j,"ret");
-  for(auto& t:s_trackers){
-      if(t.name==name){
-          t.log.push_back(ret.empty()?j:ret);
-          if(t.log.size()>100) t.log.erase(t.log.begin());
-          break;
-      }
-  }
+            auto name=jstr(j,"name");
+            auto ret=jstr(j,"ret");
+            for(auto& t:s_trackers){
+                if(t.name==name){
+                    t.log.push_back(ret.empty()?j:ret);
+                    if(t.log.size()>100) t.log.erase(t.log.begin());
+                    break;
+                }
+            }
         } else if(j.find("\"recorded\"")!=std::string::npos){
-  if(s_rec_log.size()<500) s_rec_log.push_back(j.substr(0,180));
+            if(s_rec_log.size()<500) s_rec_log.push_back(j.substr(0,180));
         } else if(j.find("\"sslInit\"")!=std::string::npos||
-        j.find("\"monitorInfo\"")!=std::string::npos||
-        j.find("\"networkConnect\"")!=std::string::npos){
-  if(s_mon_log.size()<500) s_mon_log.push_back(j.substr(0,180));
+                  j.find("\"monitorInfo\"")!=std::string::npos||
+                  j.find("\"networkConnect\"")!=std::string::npos){
+            if(s_mon_log.size()<500) s_mon_log.push_back(j.substr(0,180));
         } else {
-  if(s_script_out.size()<300) s_script_out.push_back(j.substr(0,200));
+            if(s_script_out.size()<300) s_script_out.push_back(j.substr(0,200));
         }
         MULK();
     });
@@ -131,18 +138,18 @@ static void tab_patches(){
     for(int i=0;i<(int)s_patches.size();i++){
         ImGui::PushID(i); auto& p=s_patches[i];
         if(ImGui::Checkbox("##e",&p.enabled)){
-  char a[256];
-  snprintf(a,sizeof(a),"{\"name\":\"%s\",\"enabled\":%s}",
-           p.name.c_str(),p.enabled?"true":"false");
-  post_rpc("setPatchEnabled",a);
+            char a[256];
+            snprintf(a,sizeof(a),"{\"name\":\"%s\",\"enabled\":%s}",
+                     p.name.c_str(),p.enabled?"true":"false");
+            post_rpc("setPatchEnabled",a);
         }
         ImGui::SameLine(); ImGui::Text("%s=%s",p.name.c_str(),p.value.c_str());
         ImGui::SameLine();
         if(ImGui::SmallButton("X")){
-  char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",p.name.c_str());
-  post_rpc("removePatch",a);
-  s_patches.erase(s_patches.begin()+i);
-  ImGui::PopID(); MULK(); return;
+            char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",p.name.c_str());
+            post_rpc("removePatch",a);
+            s_patches.erase(s_patches.begin()+i);
+            ImGui::PopID(); MULK(); return;
         }
         ImGui::PopID();
     }
@@ -157,7 +164,7 @@ static void tab_hooks(){
     if(ImGui::Button("Add Hook")&&s_hname[0]){
         char a[2048];
         snprintf(a,sizeof(a),"{\"name\":\"%s\",\"mode\":\"%s\",\"code\":\"%s\"}",
-       s_hname,modes[s_hmode],s_hcode);
+                 s_hname,modes[s_hmode],s_hcode);
         post_rpc("addHook",a);
         MLK(); s_hooks.push_back({s_hname,s_hcode,true,s_hmode}); MULK();
         s_hname[0]=s_hcode[0]=0;
@@ -167,18 +174,18 @@ static void tab_hooks(){
     for(int i=0;i<(int)s_hooks.size();i++){
         ImGui::PushID(i); auto& h=s_hooks[i];
         if(ImGui::Checkbox("##he",&h.enabled)){
-  char a[256];
-  snprintf(a,sizeof(a),"{\"name\":\"%s\",\"enabled\":%s}",
-           h.name.c_str(),h.enabled?"true":"false");
-  post_rpc("setHookEnabled",a);
+            char a[256];
+            snprintf(a,sizeof(a),"{\"name\":\"%s\",\"enabled\":%s}",
+                     h.name.c_str(),h.enabled?"true":"false");
+            post_rpc("setHookEnabled",a);
         }
         ImGui::SameLine(); ImGui::Text("[%s] %s",modes[h.mode],h.name.c_str());
         ImGui::SameLine();
         if(ImGui::SmallButton("X")){
-  char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",h.name.c_str());
-  post_rpc("removeHook",a);
-  s_hooks.erase(s_hooks.begin()+i);
-  ImGui::PopID(); MULK(); return;
+            char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",h.name.c_str());
+            post_rpc("removeHook",a);
+            s_hooks.erase(s_hooks.begin()+i);
+            ImGui::PopID(); MULK(); return;
         }
         ImGui::PopID();
     }
@@ -198,13 +205,13 @@ static void tab_tracker(){
     for(int i=0;i<(int)s_trackers.size();i++){
         ImGui::PushID(i); auto& t=s_trackers[i];
         if(ImGui::CollapsingHeader(t.name.c_str())){
-  for(auto& l:t.log) ImGui::TextUnformatted(l.c_str());
-  if(ImGui::SmallButton("Remove")){
-      char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",t.name.c_str());
-      post_rpc("removeTracker",a);
-      s_trackers.erase(s_trackers.begin()+i);
-      ImGui::PopID(); MULK(); return;
-  }
+            for(auto& l:t.log) ImGui::TextUnformatted(l.c_str());
+            if(ImGui::SmallButton("Remove")){
+                char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",t.name.c_str());
+                post_rpc("removeTracker",a);
+                s_trackers.erase(s_trackers.begin()+i);
+                ImGui::PopID(); MULK(); return;
+            }
         }
         ImGui::PopID();
     }
@@ -214,8 +221,8 @@ static void tab_tracker(){
 static void tab_recorder(){
     if(!s_rec_on){
         if(ImGui::Button("Start")){
-  s_rec_on=true; MLK(); s_rec_log.clear(); MULK();
-  post_rpc("startRecorder","{}");
+            s_rec_on=true; MLK(); s_rec_log.clear(); MULK();
+            post_rpc("startRecorder","{}");
         }
     } else {
         if(ImGui::Button("Stop")){ s_rec_on=false; post_rpc("stopRecorder","{}"); }
@@ -231,8 +238,8 @@ static void tab_monitor(){
     ImGui::TextDisabled("(best-effort: Java SSLContext.init)");
     if(!s_mon_on){
         if(ImGui::Button("Start")){
-  s_mon_on=true; MLK(); s_mon_log.clear(); MULK();
-  post_rpc("startMonitor","{}");
+            s_mon_on=true; MLK(); s_mon_log.clear(); MULK();
+            post_rpc("startMonitor","{}");
         }
     } else {
         if(ImGui::Button("Stop")){ s_mon_on=false; post_rpc("stopMonitor","{}"); }
@@ -272,39 +279,39 @@ static void tab_classes(){
     for(int i=0;i<(int)s_classes.size();i++){
         ImGui::PushID(i); auto& c=s_classes[i];
         if(ImGui::CollapsingHeader(c.cname.c_str())){
-  if(ImGui::Button("List Instances")){
-      char a[256]; snprintf(a,sizeof(a),"{\"class\":\"%s\"}",c.cname.c_str());
-      post_rpc("listInstances",a);
-  }
-  ImGui::Text("Methods (%d):",(int)c.methods.size());
-  for(auto& m:c.methods){
-      ImGui::BulletText("%s",m.c_str()); ImGui::SameLine();
-      std::string hid="H##h"+m, tid="T##t"+m;
-      if(ImGui::SmallButton(hid.c_str())){
-          char a[256];
-          snprintf(a,sizeof(a),"{\"class\":\"%s\",\"method\":\"%s\"}",
-                   c.cname.c_str(),m.c_str());
-          post_rpc("hookMethod",a);
-      }
-      ImGui::SameLine();
-      if(ImGui::SmallButton(tid.c_str())){
-          char a[256];
-          snprintf(a,sizeof(a),"{\"class\":\"%s\",\"method\":\"%s\"}",
-                   c.cname.c_str(),m.c_str());
-          post_rpc("trackMethod",a);
-      }
-  }
-  ImGui::Text("Fields (%d):",(int)c.fields.size());
-  for(auto& f:c.fields){
-      ImGui::BulletText("%s",f.c_str()); ImGui::SameLine();
-      std::string pid="P##p"+f;
-      if(ImGui::SmallButton(pid.c_str())){
-          char a[256];
-          snprintf(a,sizeof(a),"{\"class\":\"%s\",\"field\":\"%s\"}",
-                   c.cname.c_str(),f.c_str());
-          post_rpc("patchField",a);
-      }
-  }
+            if(ImGui::Button("List Instances")){
+                char a[256]; snprintf(a,sizeof(a),"{\"class\":\"%s\"}",c.cname.c_str());
+                post_rpc("listInstances",a);
+            }
+            ImGui::Text("Methods (%d):",(int)c.methods.size());
+            for(auto& m:c.methods){
+                ImGui::BulletText("%s",m.c_str()); ImGui::SameLine();
+                std::string hid="H##h"+m, tid="T##t"+m;
+                if(ImGui::SmallButton(hid.c_str())){
+                    char a[256];
+                    snprintf(a,sizeof(a),"{\"class\":\"%s\",\"method\":\"%s\"}",
+                             c.cname.c_str(),m.c_str());
+                    post_rpc("hookMethod",a);
+                }
+                ImGui::SameLine();
+                if(ImGui::SmallButton(tid.c_str())){
+                    char a[256];
+                    snprintf(a,sizeof(a),"{\"class\":\"%s\",\"method\":\"%s\"}",
+                             c.cname.c_str(),m.c_str());
+                    post_rpc("trackMethod",a);
+                }
+            }
+            ImGui::Text("Fields (%d):",(int)c.fields.size());
+            for(auto& f:c.fields){
+                ImGui::BulletText("%s",f.c_str()); ImGui::SameLine();
+                std::string pid="P##p"+f;
+                if(ImGui::SmallButton(pid.c_str())){
+                    char a[256];
+                    snprintf(a,sizeof(a),"{\"class\":\"%s\",\"field\":\"%s\"}",
+                             c.cname.c_str(),f.c_str());
+                    post_rpc("patchField",a);
+                }
+            }
         }
         ImGui::PopID();
     }

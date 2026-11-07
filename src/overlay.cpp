@@ -46,12 +46,16 @@ void overlay_on_touch(float x, float y, bool p) {
     g_touch.pressed = p; g_touch.dirty = true;
 }
 
-void overlay_on_char(int cp) {
+extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
+    overlay_on_touch(x, y, action == 0 || action == 2);
+}
+
+extern "C" JNIEXPORT void dextool_add_char(int cp) {
     std::lock_guard<std::mutex> lk(g_char_mtx);
     g_pending_chars.push_back((unsigned)cp);
 }
 
-void overlay_on_backspace() {
+extern "C" JNIEXPORT void dextool_backspace() {
     std::lock_guard<std::mutex> lk(g_char_mtx);
     g_pending_bs = true;
 }
@@ -59,6 +63,21 @@ void overlay_on_backspace() {
 static void* frida_thread(void*) {
     frida_bridge_start(g_jvm);
     return nullptr;
+}
+
+void overlay_start(JavaVM*) {
+    if (g_gum_inited.exchange(true)) return;
+    gum_init_embedded();
+    log_info("[overlay] gum_init_embedded done");
+    pthread_t ft;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 8 * 1024 * 1024);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_create(&ft, &a, frida_thread, nullptr);
+    pthread_attr_destroy(&a);
+    touch_install_hooks();
+    log_info("[overlay] touch hooks installed, frida thread started");
 }
 
 static void imgui_shutdown() {
@@ -71,16 +90,20 @@ static void imgui_shutdown() {
 }
 
 static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
-    if (eglGetCurrentContext() == EGL_NO_CONTEXT) return;
+    EGLContext ctx = eglGetCurrentContext();
+    if (ctx == EGL_NO_CONTEXT) return;
+
     EGLint w = 1080, h = 1920;
     eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+
     const GLubyte* ver = glGetString(GL_VERSION);
     if (!ver || !strstr((const char*)ver, "OpenGL ES")) {
         LOGE("[overlay] not OpenGL ES: %s", ver ? (const char*)ver : "null");
         g_imgui_failed = true;
         return;
     }
+
     LOGI("[overlay] GL: %s (%dx%d)", (const char*)ver, w, h);
     ImGui::CreateContext();
     ImGuiIO& io   = ImGui::GetIO();
@@ -99,22 +122,12 @@ static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
 static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     EGLContext ctx = eglGetCurrentContext();
 
-    if (!g_gum_inited.exchange(true)) {
+    if (ctx != EGL_NO_CONTEXT && ctx != g_egl_ctx) {
+        if (g_egl_ctx != EGL_NO_CONTEXT) {
+            LOGI("[overlay] EGL context changed, re-init ImGui");
+            imgui_shutdown();
+        }
         g_egl_ctx = ctx;
-        gum_init_embedded();
-        log_info("[overlay] gum_init_embedded done");
-        pthread_t ft;
-        pthread_attr_t a; pthread_attr_init(&a);
-        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-        pthread_attr_setstacksize(&a, 4 * 1024 * 1024);
-        pthread_create(&ft, &a, frida_thread, nullptr);
-        pthread_attr_destroy(&a);
-        touch_install_hooks();
-        imgui_init(dpy, surf);
-    } else if (ctx != EGL_NO_CONTEXT && ctx != g_egl_ctx) {
-        LOGI("[overlay] EGL context changed, re-init ImGui");
-        g_egl_ctx = ctx;
-        imgui_shutdown();
         imgui_init(dpy, surf);
     }
 
@@ -138,9 +151,9 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         for (unsigned cp : g_pending_chars) io.AddInputCharacter(cp);
         g_pending_chars.clear();
         if (g_pending_bs) {
-  io.AddKeyEvent(ImGuiKey_Backspace, true);
-  io.AddKeyEvent(ImGuiKey_Backspace, false);
-  g_pending_bs = false;
+            io.AddKeyEvent(ImGuiKey_Backspace, true);
+            io.AddKeyEvent(ImGuiKey_Backspace, false);
+            g_pending_bs = false;
         }
     }
 
@@ -148,8 +161,8 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     if (want_kbd != g_want_kbd_prev) {
         g_want_kbd_prev = want_kbd;
         frida_post(want_kbd ?
-  "{\"type\":\"showKeyboard\"}" :
-  "{\"type\":\"hideKeyboard\"}");
+            "{\"type\":\"showKeyboard\"}" :
+            "{\"type\":\"hideKeyboard\"}");
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -166,7 +179,7 @@ static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
 }
 
 static EGLBoolean my_swap_dmg(EGLDisplay dpy, EGLSurface surf,
-                     EGLint* rects, EGLint n) {
+                               EGLint* rects, EGLint n) {
     overlay_tick(dpy, surf);
     return g_orig_swap_dmg(dpy, surf, rects, n);
 }
@@ -178,8 +191,8 @@ bool install_swap_hook() {
     void* sym = dlsym(egl, "eglSwapBuffers");
     if (sym) {
         int r = DobbyHook(sym,
-  reinterpret_cast<dobby_dummy_func_t>(my_swap),
-  reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap));
+            reinterpret_cast<dobby_dummy_func_t>(my_swap),
+            reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap));
         if (r == 0) { LOGI("eglSwapBuffers hooked OK"); ok = true; }
         else LOGE("DobbyHook eglSwapBuffers: %d", r);
     }
@@ -188,14 +201,14 @@ bool install_swap_hook() {
         typedef void* (*PFN)(const char*);
         PFN gpa = (PFN)dlsym(egl, "eglGetProcAddress");
         if (gpa) {
-  sym_dmg = gpa("eglSwapBuffersWithDamageKHR");
-  if (!sym_dmg) sym_dmg = gpa("eglSwapBuffersWithDamageEXT");
+            sym_dmg = gpa("eglSwapBuffersWithDamageKHR");
+            if (!sym_dmg) sym_dmg = gpa("eglSwapBuffersWithDamageEXT");
         }
     }
     if (sym_dmg) {
         int r = DobbyHook(sym_dmg,
-  reinterpret_cast<dobby_dummy_func_t>(my_swap_dmg),
-  reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_dmg));
+            reinterpret_cast<dobby_dummy_func_t>(my_swap_dmg),
+            reinterpret_cast<dobby_dummy_func_t*>(&g_orig_swap_dmg));
         if (r == 0) LOGI("eglSwapBuffersWithDamageKHR hooked OK");
         else        LOGE("DobbyHook eglSwapBuffersWithDamageKHR: %d", r);
     }
