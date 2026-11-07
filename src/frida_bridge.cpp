@@ -14,9 +14,29 @@ static GMainContext*     g_ctx     = nullptr;
 static std::mutex        g_pmtx;
 static MsgCallback       g_cb;
 
+/* GumJS `msg` for send(x) is: {"type":"send","payload":<x>}.
+   menu.cpp wants <x> (the agent's own JSON object), not the whole
+   envelope, so extract the payload substring. Log every agent
+   "error" message verbatim - r6 could never match it because the
+   escaping inside the envelope hid the quotes. */
+static std::string extract_payload(const char* msg) {
+    if (!msg) return "";
+    std::string m(msg);
+    size_t p = m.find("\"payload\":");
+    if (p == std::string::npos) return "";
+    p += 10;   /* "payload": is 10 chars incl. quotes+colon */
+    while (p < m.size() && m[p] == ' ') p++;
+    /* payload runs to the end of the envelope object */
+    size_t e = m.rfind('}');
+    if (e == std::string::npos || e < p) return "";
+    return m.substr(p, e - p);
+}
+
 static void on_message(const gchar* msg, GBytes*, gpointer) {
-    if (msg) {
-        const char* t = strstr(msg, "\"type\":\"");
+    if (!msg) return;
+    std::string pl = extract_payload(msg);
+    if (!pl.empty()) {
+        const char* t = strstr(pl.c_str(), "\"type\":\"");
         if (t) {
             char tag[72];
             snprintf(tag, sizeof(tag), "[msg] %.48s", t + 8);
@@ -24,8 +44,8 @@ static void on_message(const gchar* msg, GBytes*, gpointer) {
             if (q) *q = '\0';
             log_debug(tag);
             if (strncmp(tag, "[msg] error", 11) == 0) {
-                char em[340];
-                snprintf(em, sizeof(em), "[agent error] %.300s\n", msg);
+                char em[640];
+                snprintf(em, sizeof(em), "[agent error] %.600s\n", pl.c_str());
                 log_crash_raw(em);
             }
         }
@@ -35,9 +55,8 @@ static void on_message(const gchar* msg, GBytes*, gpointer) {
         std::lock_guard<std::mutex> lk(g_pmtx);
         local = g_cb;
     }
-    if (local && msg) local(std::string(msg));
+    if (local && !pl.empty()) local(pl);
 }
-
 void frida_bridge_start(JavaVM*) {
     log_info("[frida_bridge] starting GumJS");
     g_ctx  = g_main_context_new();

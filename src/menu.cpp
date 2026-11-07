@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <pthread.h>
 
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -16,6 +17,7 @@ static float s_font_scale = 1.0f;
 static float s_opacity    = 0.92f;
 static int   s_theme      = 0;
 static bool  s_visible    = true;
+static bool  s_show_fab   = true;   /* floating toggle button */
 
 struct PatchEntry  { std::string name, value; bool enabled = true; };
 struct HookEntry   { std::string name, code;  bool enabled = true; int mode = 0; };
@@ -26,6 +28,11 @@ static std::vector<PatchEntry>   s_patches;
 static std::vector<HookEntry>    s_hooks;
 static std::vector<TrackerEntry> s_trackers;
 static std::vector<ClassWin>     s_classes;
+static std::vector<std::string>  s_loaded;   /* loaded class names */
+static bool s_loaded_queried = false;
+static std::vector<std::string> s_loaded_filtered;
+static char s_loaded_filter[128] = "";
+static bool s_loaded_filter_dirty = true;
 static bool s_rec_on = false, s_mon_on = false;
 static std::vector<std::string> s_rec_log, s_mon_log, s_script_out;
 
@@ -36,11 +43,38 @@ static char s_tname[256]={};
 static char s_script[8192]="// Frida JS\n";
 static char s_cname[256]={};
 
-static void post_rpc(const char* fn, const char* args) {
-    char buf[4096];
-    snprintf(buf, sizeof(buf),
-             "{\"type\":\"rpc\",\"fn\":\"%s\",\"args\":%s}", fn, args);
-    frida_post(std::string(buf));
+/* ---- JSON helpers -------------------------------------------------- */
+
+/* escape a raw string for safe embedding inside a JSON string
+   literal; r6 passed user text straight into snprintf, so a single
+   quote in any field broke the message the agent received */
+static std::string jesc(const std::string& s) {
+    std::string r;
+    r.reserve(s.size() + 8);
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+            case '"':  r += "\\\""; break;
+            case '\\': r += "\\\\"; break;
+            case '\n': r += "\\n";  break;
+            case '\r': r += "\\r";  break;
+            case '\t': r += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char b[8];
+                    snprintf(b, sizeof(b), "\\u%04x", c);
+                    r += b;
+                } else r += (char)c;
+        }
+    }
+    return r;
+}
+
+static void post_rpc(const char* fn, const std::string& args) {
+    /* args is a complete JSON object string */
+    std::string m = "{\"type\":\"rpc\",\"fn\":\"";
+    m += fn; m += "\",\"args\":"; m += args; m += "}";
+    frida_post(m);
 }
 
 static std::string jstr(const std::string& j, const char* key) {
@@ -70,6 +104,16 @@ static std::vector<std::string> jarr(const std::string& j, const char* key) {
     return r;
 }
 
+static void refresh_loaded_filtered() {
+    s_loaded_filtered.clear();
+    const char* f = s_loaded_filter;
+    size_t fl = strlen(f);
+    for (auto& c : s_loaded) {
+        if (fl == 0 || c.find(f) != std::string::npos)
+            s_loaded_filtered.push_back(c);
+    }
+}
+
 static void apply_theme() {
     switch(s_theme){
         case 0: ImGui::StyleColorsDark();    break;
@@ -80,6 +124,8 @@ static void apply_theme() {
     ImGui::GetIO().FontGlobalScale = s_font_scale;
 }
 
+/* Message callback = GumJS thread. The payload from the agent
+   (fix2 delivers <x>, not the send() envelope). */
 void menu_init() {
     apply_theme();
     frida_set_message_callback([](const std::string& j){
@@ -91,6 +137,10 @@ void menu_init() {
             for(auto& cw:s_classes){
                 if(cw.cname==cls){ cw.methods=mths; cw.fields=flds; break; }
             }
+        } else if (j.find("\"classList\"")!=std::string::npos) {
+            s_loaded = jarr(j,"classes");
+            s_loaded_queried = true;
+            s_loaded_filter_dirty = true;
         } else if(j.find("\"trackerEvent\"")!=std::string::npos){
             auto name=jstr(j,"name");
             auto ret=jstr(j,"ret");
@@ -120,15 +170,21 @@ static void tab_settings(){
     if(ImGui::SliderFloat("Opacity",&s_opacity,.3f,1.f)) apply_theme();
     const char* th[]={"Dark","Light","Classic"};
     if(ImGui::Combo("Theme",&s_theme,th,3)) apply_theme();
+    ImGui::Separator();
+    ImGui::Checkbox("Show toggle button",&s_show_fab);
     ImGui::Checkbox("Visible",&s_visible);
+    if(!s_visible && !s_show_fab)
+        ImGui::TextColored(ImVec4(1,.6f,0,1),
+            "Menu hidden with no toggle - re-enable from Settings is impossible.\n"
+            "Toggle button auto-enabled.");
 }
 
 static void tab_patches(){
     ImGui::InputText("Name##pn",s_pname,sizeof(s_pname));
     ImGui::InputText("Value##pv",s_pval,sizeof(s_pval));
     if(ImGui::Button("Add Patch")&&s_pname[0]){
-        char a[1024];
-        snprintf(a,sizeof(a),"{\"name\":\"%s\",\"value\":\"%s\"}",s_pname,s_pval);
+        std::string a = "{\"name\":\""+jesc(s_pname)
+                      + "\",\"value\":\""+jesc(s_pval)+"\"}";
         post_rpc("addPatch",a);
         MLK(); s_patches.push_back({s_pname,s_pval,true}); MULK();
         s_pname[0]=s_pval[0]=0;
@@ -140,13 +196,14 @@ static void tab_patches(){
         if(ImGui::Checkbox("##e",&p.enabled)){
             char a[256];
             snprintf(a,sizeof(a),"{\"name\":\"%s\",\"enabled\":%s}",
-                     p.name.c_str(),p.enabled?"true":"false");
+                     jesc(p.name.c_str()).c_str(),
+                     p.enabled?"true":"false");
             post_rpc("setPatchEnabled",a);
         }
         ImGui::SameLine(); ImGui::Text("%s=%s",p.name.c_str(),p.value.c_str());
         ImGui::SameLine();
         if(ImGui::SmallButton("X")){
-            char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",p.name.c_str());
+            std::string a = "{\"name\":\""+jesc(p.name.c_str())+"\"}";
             post_rpc("removePatch",a);
             s_patches.erase(s_patches.begin()+i);
             ImGui::PopID(); MULK(); return;
@@ -162,9 +219,9 @@ static void tab_hooks(){
     ImGui::Combo("Mode",&s_hmode,modes,3);
     ImGui::InputTextMultiline("Code##hc",s_hcode,sizeof(s_hcode),ImVec2(-1,80));
     if(ImGui::Button("Add Hook")&&s_hname[0]){
-        char a[2048];
-        snprintf(a,sizeof(a),"{\"name\":\"%s\",\"mode\":\"%s\",\"code\":\"%s\"}",
-                 s_hname,modes[s_hmode],s_hcode);
+        std::string a = "{\"name\":\""+jesc(s_hname)
+                      + "\",\"mode\":\""+modes[s_hmode]
+                      + "\",\"code\":\""+jesc(s_hcode)+"\"}";
         post_rpc("addHook",a);
         MLK(); s_hooks.push_back({s_hname,s_hcode,true,s_hmode}); MULK();
         s_hname[0]=s_hcode[0]=0;
@@ -176,13 +233,14 @@ static void tab_hooks(){
         if(ImGui::Checkbox("##he",&h.enabled)){
             char a[256];
             snprintf(a,sizeof(a),"{\"name\":\"%s\",\"enabled\":%s}",
-                     h.name.c_str(),h.enabled?"true":"false");
+                     jesc(h.name.c_str()).c_str(),
+                     h.enabled?"true":"false");
             post_rpc("setHookEnabled",a);
         }
         ImGui::SameLine(); ImGui::Text("[%s] %s",modes[h.mode],h.name.c_str());
         ImGui::SameLine();
         if(ImGui::SmallButton("X")){
-            char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",h.name.c_str());
+            std::string a = "{\"name\":\""+jesc(h.name.c_str())+"\"}";
             post_rpc("removeHook",a);
             s_hooks.erase(s_hooks.begin()+i);
             ImGui::PopID(); MULK(); return;
@@ -195,7 +253,7 @@ static void tab_hooks(){
 static void tab_tracker(){
     ImGui::InputText("Method##tn",s_tname,sizeof(s_tname));
     if(ImGui::Button("Track")&&s_tname[0]){
-        char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",s_tname);
+        std::string a = "{\"name\":\""+jesc(s_tname)+"\"}";
         post_rpc("addTracker",a);
         MLK(); s_trackers.push_back({s_tname,{}}); MULK();
         s_tname[0]=0;
@@ -207,7 +265,7 @@ static void tab_tracker(){
         if(ImGui::CollapsingHeader(t.name.c_str())){
             for(auto& l:t.log) ImGui::TextUnformatted(l.c_str());
             if(ImGui::SmallButton("Remove")){
-                char a[256]; snprintf(a,sizeof(a),"{\"name\":\"%s\"}",t.name.c_str());
+                std::string a = "{\"name\":\""+jesc(t.name.c_str())+"\"}";
                 post_rpc("removeTracker",a);
                 s_trackers.erase(s_trackers.begin()+i);
                 ImGui::PopID(); MULK(); return;
@@ -255,7 +313,7 @@ static void tab_script(){
     ImGui::InputTextMultiline("##sc",s_script,sizeof(s_script),ImVec2(-1,140));
     if(ImGui::Button("Run")){
         MLK(); s_script_out.clear(); MULK();
-        char a[8256]; snprintf(a,sizeof(a),"{\"src\":\"%s\"}",s_script);
+        std::string a = "{\"src\":\""+jesc(s_script)+"\"}";
         post_rpc("evalScript",a);
     }
     ImGui::SameLine();
@@ -267,20 +325,77 @@ static void tab_script(){
 }
 
 static void tab_classes(){
-    ImGui::InputText("Class##cn",s_cname,sizeof(s_cname));
+    /* --- loaded class list with filter (the missing feature) --- */
+    if (ImGui::Button("List loaded classes")) {
+        post_rpc("listLoadedClasses","{}");
+        s_loaded_queried = true;   /* shows "(waiting)" until reply */
+    }
     ImGui::SameLine();
-    if(ImGui::Button("Open")&&s_cname[0]){
-        char a[256]; snprintf(a,sizeof(a),"{\"class\":\"%s\"}",s_cname);
+    MLK();
+    int  n_total = (int)s_loaded.size();
+    bool have    = n_total > 0;
+    MULK();
+    if (have)
+        ImGui::TextDisabled("%d classes", n_total);
+    else if (s_loaded_queried)
+        ImGui::TextDisabled("(waiting)");
+    else
+        ImGui::TextDisabled("(not queried)");
+
+    if (ImGui::InputText("Filter##cf", s_loaded_filter, sizeof(s_loaded_filter)))
+        s_loaded_filter_dirty = true;
+
+    MLK();
+    if (s_loaded_filter_dirty) { refresh_loaded_filtered(); s_loaded_filter_dirty = false; }
+    int n = (int)s_loaded_filtered.size();
+    MULK();
+
+    ImGui::BeginChild("cl", ImVec2(0, 220), true);
+    for (int i = 0; i < n; i++) {
+        ImGui::PushID(1000000 + i);
+        const std::string& c = s_loaded_filtered[i];
+        if (ImGui::Selectable(c.c_str(), false,
+                              ImGuiSelectableFlags_AllowDoubleClick)) {
+            if (ImGui::IsMouseDoubleClicked(0)) {
+                snprintf(s_cname, sizeof(s_cname), "%s", c.c_str());
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    if (ImGui::Button("Open selected class") && s_cname[0]) {
+        std::string a = "{\"class\":\""+jesc(s_cname)+"\"}";
         post_rpc("openClass",a);
-        MLK(); s_classes.push_back({s_cname,{},{}}); MULK();
+        MLK();
+        bool dup=false;
+        for (auto& cw : s_classes) if (cw.cname==s_cname) { dup=true; break; }
+        if (!dup) s_classes.push_back({s_cname,{},{}});
+        MULK();
         s_cname[0]=0;
     }
+    ImGui::SameLine();
+    ImGui::TextUnformatted(s_cname[0] ? s_cname : "(double-tap a class above)");
+
+    ImGui::Separator();
+    ImGui::InputText("Class##cn",s_cname,sizeof(s_cname));
+    if (ImGui::Button("Open##cls")&&s_cname[0]){
+        std::string a = "{\"class\":\""+jesc(s_cname)+"\"}";
+        post_rpc("openClass",a);
+        MLK();
+        bool dup=false;
+        for (auto& cw : s_classes) if (cw.cname==s_cname) { dup=true; break; }
+        if (!dup) s_classes.push_back({s_cname,{},{}});
+        MULK();
+        s_cname[0]=0;
+    }
+    ImGui::Separator();
     MLK();
     for(int i=0;i<(int)s_classes.size();i++){
         ImGui::PushID(i); auto& c=s_classes[i];
         if(ImGui::CollapsingHeader(c.cname.c_str())){
             if(ImGui::Button("List Instances")){
-                char a[256]; snprintf(a,sizeof(a),"{\"class\":\"%s\"}",c.cname.c_str());
+                std::string a = "{\"class\":\""+jesc(c.cname.c_str())+"\"}";
                 post_rpc("listInstances",a);
             }
             ImGui::Text("Methods (%d):",(int)c.methods.size());
@@ -288,16 +403,14 @@ static void tab_classes(){
                 ImGui::BulletText("%s",m.c_str()); ImGui::SameLine();
                 std::string hid="H##h"+m, tid="T##t"+m;
                 if(ImGui::SmallButton(hid.c_str())){
-                    char a[256];
-                    snprintf(a,sizeof(a),"{\"class\":\"%s\",\"method\":\"%s\"}",
-                             c.cname.c_str(),m.c_str());
+                    std::string a = "{\"class\":\""+jesc(c.cname.c_str())
+                                  + "\",\"method\":\""+jesc(m)+"\"}";
                     post_rpc("hookMethod",a);
                 }
                 ImGui::SameLine();
                 if(ImGui::SmallButton(tid.c_str())){
-                    char a[256];
-                    snprintf(a,sizeof(a),"{\"class\":\"%s\",\"method\":\"%s\"}",
-                             c.cname.c_str(),m.c_str());
+                    std::string a = "{\"class\":\""+jesc(c.cname.c_str())
+                                  + "\",\"method\":\""+jesc(m)+"\"}";
                     post_rpc("trackMethod",a);
                 }
             }
@@ -306,9 +419,8 @@ static void tab_classes(){
                 ImGui::BulletText("%s",f.c_str()); ImGui::SameLine();
                 std::string pid="P##p"+f;
                 if(ImGui::SmallButton(pid.c_str())){
-                    char a[256];
-                    snprintf(a,sizeof(a),"{\"class\":\"%s\",\"field\":\"%s\"}",
-                             c.cname.c_str(),f.c_str());
+                    std::string a = "{\"class\":\""+jesc(c.cname.c_str())
+                                  + "\",\"field\":\""+jesc(f)+"\"}";
                     post_rpc("patchField",a);
                 }
             }
@@ -318,13 +430,38 @@ static void tab_classes(){
     MULK();
 }
 
+/* floating toggle button: brings the menu back after it was hidden
+   (X button or Visible off) — previously there was NO way back and
+   the state combination could leave the user stranded. */
+static void draw_fab(ImVec2 ds) {
+    if (!s_show_fab || s_visible) return;
+    ImGui::SetNextWindowPos(ImVec2(ds.x - 76.f, ds.y - 76.f),
+                            ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 22.f);
+    ImGui::Begin("##fab", nullptr,
+                 ImGuiWindowFlags_NoDecoration |
+                 ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings |
+                 ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoFocusOnAppearing);
+    if (ImGui::Button("MENU", ImVec2(56, 40))) {
+        s_visible = true;
+        apply_theme();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 void menu_draw(){
-    if(!s_visible) return;
     ImGuiIO& io=ImGui::GetIO();
+    ImVec2 ds = io.DisplaySize;
+    draw_fab(ds);
+    if(!s_visible) return;
     ImGui::SetNextWindowPos(ImVec2(20,20),ImGuiCond_Once);
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x*.75f,500),ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(s_opacity);
-    ImGui::Begin("Dex-tool v1.0",&s_visible,ImGuiWindowFlags_NoCollapse);
+    ImGui::Begin("Dex-tool v1.1",&s_visible,ImGuiWindowFlags_NoCollapse);
     if(ImGui::BeginTabBar("tb")){
         if(ImGui::BeginTabItem("Settings")) { tab_settings(); ImGui::EndTabItem(); }
         if(ImGui::BeginTabItem("Patches"))  { tab_patches();  ImGui::EndTabItem(); }

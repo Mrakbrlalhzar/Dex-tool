@@ -5,6 +5,7 @@
 #include <android/asset_manager_jni.h>
 #include <vector>
 #include <cstdio>
+#include <cstdint>
 #include <unistd.h>
 #include <sys/stat.h>
 

@@ -3,8 +3,12 @@
 var patches={}, hooks={}, trackers={};
 var recOn=false, monOn=false;
 
+/* send the OBJECT, not a string. GumJS wraps it as
+   {"type":"send","payload":{...}} and the C++ side (fix2) extracts
+   the payload — r6 sent JSON.stringify(...) which arrived
+   escaped, so no message ever matched. */
 function sendMsg(type, payload) {
-    send(JSON.stringify({ type: type, payload: payload }));
+    send({ type: type, payload: payload });
 }
 
 // Touch offset
@@ -17,13 +21,12 @@ function updateOffset(activity) {
         var loc = Java.array('int', [0,0]);
         cv.getLocationInWindow(loc);
         gOffX = loc[0]; gOffY = loc[1];
-        sendMsg('info', { msg: 'Touch offset: ('+gOffX+','+gOffY+')' });
     } catch(e) {}
 }
 
 // Keyboard bridge
 var gET=null, gIMM=null, gClearing=false;
-var gAddChar=null, gBackspace=null;
+var gAddChar=null, gBackspace=null, gWantMouse=null;
 
 function setupKeyboardBridge(activity) {
     try {
@@ -90,8 +93,12 @@ function setupKeyboardBridge(activity) {
 function installTouchHook() {
     try {
         var sym = Module.findExportByName('libtool.so','dextool_on_touch');
+        var wm  = Module.findExportByName('libtool.so','dextool_want_mouse');
         if (!sym) { sendMsg('warn',{msg:'dextool_on_touch not found'}); return; }
         var nativeTouch = new NativeFunction(sym,'void',['float','float','int']);
+        try {
+            if (wm) gWantMouse = new NativeFunction(wm,'bool',[]);
+        } catch(we) { gWantMouse = null; }
 
         Java.perform(function() {
             var Activity = Java.use('android.app.Activity');
@@ -106,6 +113,13 @@ function installTouchHook() {
 
             Activity.dispatchTouchEvent.implementation = function(ev) {
                 try {
+                    var wants = gWantMouse ? gWantMouse() : false;
+                    if (wants) {
+                        // overlay is hovered: feed it AND consume
+                        nativeTouch(ev.getX()-gOffX, ev.getY()-gOffY,
+                                    ev.getAction()&0xff);
+                        return true;
+                    }
                     nativeTouch(ev.getX()-gOffX, ev.getY()-gOffY,
                                 ev.getAction()&0xff);
                 } catch(e2){}
@@ -117,6 +131,14 @@ function installTouchHook() {
 }
 
 installTouchHook();
+
+function splitName(name) {
+    var parts = name.split('.');
+    var last  = parts.pop();
+    var cls = parts.join('.');
+    // name may be "pkg.Class.method" OR "method" after class split
+    return { cls: cls, member: last };
+}
 
 rpc.exports = {
     addPatch: function(name,value) {
@@ -248,6 +270,15 @@ rpc.exports = {
         catch(e){ sendMsg('scriptError',{msg:e.message}); }
     },
 
+    listLoadedClasses: function(){
+        try{
+            Java.perform(function(){
+                var list=Java.enumerateLoadedClassesSync();
+                sendMsg('classList',{classes:list});
+            });
+        }catch(e){ sendMsg('error',{fn:'listLoadedClasses',msg:e.message}); }
+    },
+
     openClass: function(className){
         try{
             Java.perform(function(){
@@ -285,7 +316,15 @@ recv(function onMsg(msg){
         rpc.exports[msg.fn].apply(rpc.exports,Object.values(a));
     } else if(msg.type==='showKeyboard'){
         Java.scheduleOnMainThread(function(){
-            try{ if(gET&&gIMM){ gET.requestFocus(); gIMM.showSoftInput(gET,1); } }catch(e){}
+            try{
+                if(gET&&gIMM){
+                    gET.requestFocus();
+                    // 0 = SHOW_FORCED-less explicit request: r6 used
+                    // 1 (SHOW_IMPLICIT) which the IME is free to
+                    // ignore from a non-user focus path
+                    gIMM.showSoftInput(gET,0);
+                }
+            }catch(e){}
         });
     } else if(msg.type==='hideKeyboard'){
         Java.scheduleOnMainThread(function(){

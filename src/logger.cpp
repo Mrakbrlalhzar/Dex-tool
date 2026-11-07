@@ -109,7 +109,7 @@ void logger_init(const char* base_dir) {
         snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
         log_crash_raw(boot);
     }
-    log_info("logger_init done (build r6: per-ctx imgui)");
+    log_info("logger_init done (build r7: single-owner overlay)");
 }
 
 void log_info(const char* msg) {

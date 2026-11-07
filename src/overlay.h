@@ -11,6 +11,7 @@ extern "C" {
 JNIEXPORT void dextool_on_touch(float x, float y, int action);
 JNIEXPORT void dextool_add_char(int codepoint);
 JNIEXPORT void dextool_backspace();
+JNIEXPORT bool dextool_want_mouse();
 #ifdef __cplusplus
 }
 #endif
