@@ -15,6 +15,7 @@ set_target_properties(dobby_static PROPERTIES
 
 find_library(lib_egl     EGL)
 find_library(lib_gles2   GLESv2)
+find_library(lib_gles3   GLESv3)
 find_library(lib_log     log)
 find_library(lib_dl      dl)
 find_library(lib_android android)
@@ -52,5 +53,5 @@ target_compile_options(tool PRIVATE
 
 target_link_libraries(tool
     frida-gumjs dobby_static
-    ${lib_egl} ${lib_gles2} ${lib_log} ${lib_dl} ${lib_android}
+    ${lib_egl} ${lib_gles2} ${lib_gles3} ${lib_log} ${lib_dl} ${lib_android}
     -lm -Wl,--gc-sections -Wl,--exclude-libs,ALL)

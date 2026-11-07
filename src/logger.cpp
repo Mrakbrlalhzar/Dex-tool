@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <ucontext.h>
+#include <dlfcn.h>
 #include <pthread.h>
 
 static FILE* g_info_fp  = nullptr;
@@ -46,8 +47,19 @@ static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
     char m[160];
     snprintf(m, sizeof(m), "CRASH signal=%d code=%d addr=%p pc=%p\n",
    sig, si ? si->si_code : 0,
-   si ? si->si_addr : NULL, (void*)pc);
+             si ? si->si_addr : NULL, (void*)pc);
     log_crash_raw(m);
+    {
+        Dl_info di;
+        if (dladdr((const void*)pc, &di) && di.dli_fname) {
+            char lm[256];
+            snprintf(lm, sizeof(lm),
+                     "pc=%p in %s base=%p off=+%zx\n",
+                     (void*)pc, di.dli_fname, di.dli_fbase,
+                     (size_t)(pc - (uintptr_t)di.dli_fbase));
+            log_crash_raw(lm);
+        }
+    }
     if (g_prev_set[sig]) {
         sigaction(sig, &g_prev_act[sig], NULL);
     } else {
@@ -97,7 +109,7 @@ void logger_init(const char* base_dir) {
         snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
         log_crash_raw(boot);
     }
-    log_info("logger_init done");
+    log_info("logger_init done (build r6: per-ctx imgui)");
 }
 
 void log_info(const char* msg) {
