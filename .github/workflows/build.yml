@@ -639,6 +639,10 @@ jobs:
               return nullptr;
           }
           
+          /* called from JNI_OnLoad before overlay_start; the
+             frida thread and the bridge read g_jvm afterwards */
+          void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
+          
           void overlay_start(JavaVM*) {
               if (g_gum_inited.exchange(true)) return;
               gum_init_embedded();
@@ -1583,10 +1587,15 @@ jobs:
               }
               ImGui::SameLine();
               MLK();
-              bool have = !s_loaded.empty();
+              int  n_total = (int)s_loaded.size();
+              bool have    = n_total > 0;
               MULK();
-              ImGui::TextDisabled(have ? "%d classes" :
-                                  (s_loaded_queried ? "(waiting)" : "(not queried)"));
+              if (have)
+                  ImGui::TextDisabled("%d classes", n_total);
+              else if (s_loaded_queried)
+                  ImGui::TextDisabled("(waiting)");
+              else
+                  ImGui::TextDisabled("(not queried)");
           
               if (ImGui::InputText("Filter##cf", s_loaded_filter, sizeof(s_loaded_filter)))
                   s_loaded_filter_dirty = true;
