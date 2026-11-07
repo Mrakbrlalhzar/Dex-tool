@@ -105,6 +105,10 @@ static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
     }
 
     LOGI("[overlay] GL: %s (%dx%d)", (const char*)ver, w, h);
+    /* ImGui is compiled with IMGUI_IMPL_OPENGL_ES2, so its shader
+       body is GLSL ES 100 (attribute/varying). The header must
+       stay "#version 100" even on ES3 contexts — they accept
+       GLSL ES 100 programs. */
     ImGui::CreateContext();
     ImGuiIO& io   = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)w, (float)h);
@@ -120,6 +124,11 @@ static void imgui_init(EGLDisplay dpy, EGLSurface surf) {
 }
 
 static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
+    static thread_local bool in_tick = false;
+    if (in_tick) return;   /* driver re-entry (swap->swapWithDamage) */
+    in_tick = true;
+    struct TickReset { bool& b; ~TickReset() { b = false; } }
+        tick_reset{in_tick};
     EGLContext ctx = eglGetCurrentContext();
 
     if (ctx != EGL_NO_CONTEXT && ctx != g_egl_ctx) {

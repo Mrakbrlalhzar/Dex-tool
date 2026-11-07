@@ -23,6 +23,11 @@ static void on_message(const gchar* msg, GBytes*, gpointer) {
             char* q = strchr(tag, '"');
             if (q) *q = '\0';
             log_debug(tag);
+            if (strncmp(tag, "[msg] error", 11) == 0) {
+                char em[340];
+                snprintf(em, sizeof(em), "[agent error] %.300s\n", msg);
+                log_crash_raw(em);
+            }
         }
     }
     MsgCallback local;

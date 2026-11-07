@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <pthread.h>
 
 static FILE* g_info_fp  = nullptr;
@@ -25,26 +26,77 @@ static void ts(char* buf, size_t n) {
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-static void crash_sig(int sig) {
-    char m[64];
-    snprintf(m, sizeof(m), "CRASH signal=%d\n", sig);
+/* Fatal-signal capture. SA_SIGINFO logs signal/si_code/fault
+   addr/PC, then the PREVIOUS handler is restored and the signal
+   re-raised so debuggerd still writes its tombstone and the
+   "Fatal signal" backtrace to logcat (streamed to
+   dextool-logcat.txt by DexToolApp). */
+static struct sigaction g_prev_act[32];
+static bool             g_prev_set[32];
+static char             g_alt_stack[64 * 1024];
+
+static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
+    uintptr_t pc = 0;
+    ucontext_t* u = (ucontext_t*)uc;
+#if defined(__aarch64__)
+    if (u) pc = (uintptr_t)u->uc_mcontext.pc;
+#elif defined(__arm__)
+    if (u) pc = (uintptr_t)u->uc_mcontext.arm_pc;
+#endif
+    char m[160];
+    snprintf(m, sizeof(m), "CRASH signal=%d code=%d addr=%p pc=%p\n",
+   sig, si ? si->si_code : 0,
+   si ? si->si_addr : NULL, (void*)pc);
     log_crash_raw(m);
-    signal(sig, SIG_DFL);
+    if (g_prev_set[sig]) {
+        sigaction(sig, &g_prev_act[sig], NULL);
+    } else {
+        signal(sig, SIG_DFL);
+    }
     raise(sig);
+}
+
+static void install_crash_sig(int sig) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_sig_action;
+    sa.sa_flags     = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    g_prev_set[sig] = (sigaction(sig, &sa, &g_prev_act[sig]) == 0);
 }
 
 void logger_init(const char* base_dir) {
     mkdir(base_dir, 0755);
     char p[640];
-    snprintf(p, sizeof(p), "%s/dextool.log",      base_dir);
+    snprintf(p, sizeof(p), "%s/dextool.log",       base_dir);
     g_info_fp  = fopen(p, "a");
-    snprintf(p, sizeof(p), "%s/dextool-debug.log", base_dir);
+    snprintf(p, sizeof(p), "%s/dextool-debug.log",  base_dir);
     g_debug_fp = fopen(p, "a");
+    /* keep last boot's crash log; start fresh for this boot so
+       entries map 1:1 to runs */
+    char pprev[640];
+    snprintf(pprev, sizeof(pprev), "%s/dextool-crash.prev.log", base_dir);
     snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
-    g_crash_fd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
-    signal(SIGSEGV, crash_sig);
-    signal(SIGABRT, crash_sig);
-    signal(SIGBUS,  crash_sig);
+    rename(p, pprev);
+    g_crash_fd = open(p, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    {
+        stack_t ss;
+        memset(&ss, 0, sizeof(ss));
+        ss.ss_sp    = g_alt_stack;
+        ss.ss_size  = sizeof(g_alt_stack);
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    }
+    install_crash_sig(SIGSEGV);
+    install_crash_sig(SIGABRT);
+    install_crash_sig(SIGBUS);
+    install_crash_sig(SIGILL);
+    install_crash_sig(SIGFPE);
+    {
+        char boot[96];
+        snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
+        log_crash_raw(boot);
+    }
     log_info("logger_init done");
 }
 

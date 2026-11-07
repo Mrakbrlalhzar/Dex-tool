@@ -16,6 +16,7 @@ public class DexToolApp extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        startLogcatThread();
         writeBootMarker();
         startCopierThread();
         try { Thread.sleep(500); } catch (InterruptedException ignored) {}
@@ -26,6 +27,36 @@ public class DexToolApp extends Application {
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "loadLibrary failed: " + e.getMessage());
         }
+    }
+
+    /* stream this process' logcat (own uid, allowed) so native
+       abort messages that only reach logcat are captured too */
+    private void startLogcatThread() {
+        Thread t = new Thread(() -> {
+            try {
+                new File(DL, "dextool-logcat.txt").delete();
+                Process p = Runtime.getRuntime().exec(new String[]{
+                    "logcat", "-b", "main", "-b", "crash",
+                    "-b", "system",
+                    "--pid=" + android.os.Process.myPid(),
+                    "-v", "brief"});
+                java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()));
+                FileOutputStream f =
+                    new FileOutputStream(DL + "/dextool-logcat.txt", true);
+                String line; int n = 0;
+                while ((line = r.readLine()) != null) {
+                    if (n++ < 20000) {
+                        f.write((line + "\n").getBytes());
+                        f.flush();
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "logcat: " + e.getMessage());
+            }
+        }, "dextool-logcat");
+        t.setDaemon(true);
+        t.start();
     }
 
     private void writeBootMarker() {

@@ -13,7 +13,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         mGLView = new GLSurfaceView(this);
-        mGLView.setEGLContextClientVersion(3);
+        mGLView.setEGLContextClientVersion(2);
         mGLView.setRenderer(new GLSurfaceView.Renderer() {
             public void onSurfaceCreated(GL10 g, EGLConfig c) {}
             public void onSurfaceChanged(GL10 g, int w, int h) {}
