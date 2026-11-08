@@ -109,7 +109,7 @@ void logger_init(const char* base_dir) {
         snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
         log_crash_raw(boot);
     }
-    log_info("logger_init done (build r7: single-owner overlay)");
+    log_info("logger_init done (build r9: touch map + park/adopt)");
 }
 
 void log_info(const char* msg) {

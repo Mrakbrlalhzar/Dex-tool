@@ -8,6 +8,15 @@
 typedef int32_t (*fn_getEvent)(AInputQueue*, AInputEvent**);
 static fn_getEvent g_orig_get = nullptr;
 
+/* Both input paths (this AInputQueue hook for NativeActivity hosts and
+   the Java dispatchTouchEvent hook in agent.js) deliver events in the
+   SAME coordinate space: raw window pixels. r7/r8 fed them straight into
+   ImGui's DisplaySize, which is the *surface* rect of the GL view - on
+   the sample app that surface (540x832) sits inside a taller window
+   (540x960), so every tap landed above its target. r9 maps the raw
+   coords through the rect the agent measured (dextool_set_touch_map)
+   before they reach ImGui; this hook therefore forwards untouched
+   window coords and lets overlay.cpp do the mapping. */
 static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
     int32_t rc = g_orig_get(q, ev);
     if (rc >= 0 && ev && *ev) {
@@ -15,9 +24,11 @@ static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
             int32_t act = AMotionEvent_getAction(*ev) & AMOTION_EVENT_ACTION_MASK;
             float x = AMotionEvent_getX(*ev, 0);
             float y = AMotionEvent_getY(*ev, 0);
-            bool p  = (act == AMOTION_EVENT_ACTION_DOWN ||
-                       act == AMOTION_EVENT_ACTION_MOVE);
-            overlay_on_touch(x, y, p);
+            int a = 2;                       /* move */
+            if      (act == 0)           a = 0;  /* DOWN */
+            else if (act == 1 || act == 3) a = 1; /* UP / CANCEL */
+            else if (act == 5 || act == 6) a = 2; /* pointer up/down */
+            dextool_on_touch(x, y, a);
         }
     }
     return rc;

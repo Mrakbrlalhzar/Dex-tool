@@ -12,6 +12,8 @@
 #include <GLES3/gl3.h>
 #include <dlfcn.h>
 #include <cstring>
+#include <cmath>
+#include <unistd.h>
 #include <ctime>
 #include <pthread.h>
 #include <atomic>
@@ -30,29 +32,34 @@ static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
 static std::atomic<bool> g_gum_inited {false};
 static JavaVM*           g_jvm        = nullptr;
 
-/* ---- single-owner overlay ---------------------------------------- r7
-   The app has TWO GL threads (HWUI's RenderThread and the
-   GLSurfaceView GLThread), each with its own EGL context, and BOTH
-   call eglSwapBuffers. r6 gave every context its own ImGui world and
-   drew the SAME menu from both threads:
-     - two overlapping menus, only one of which received the touch
-       events (they were consumed by whichever GL thread ticked
-       first), so the other looked frozen and could not be resized;
-     - taps landed next to the buttons because the winning thread's
-       coordinate space did not match the surface the menu was on;
-     - hiding the window (X / "Visible") mutated shared state under
-       the other thread's feet.
-   r7: every context still gets a Slot, but exactly ONE "owner" is
-   allowed to run ImGui and draw (elected by swap activity, migrated
-   if it goes quiet). Only the owner thread touches ImGui or GL
-   state. Slots are never freed — eglDestroyContext just marks them
-   dead — so an in-flight tick can never hold a dangling pointer. */
+/* ---- single-owner overlay ---------------------------------------- r9
+   r7 elected exactly one EGL context as the overlay owner (the
+   continuously rendering GL thread of the game/view) and only that
+   thread touches ImGui or GL. r9 keeps that, and adds:
+
+   PARK + ADOPT. When the owner context dies (app switch: the
+   GLSurfaceView destroys its context in onPause; keyboard with
+   adjustResize on some devices; activity relayout) r7 destroyed the
+   whole ImGui world and had to re-elect from scratch after 45 swaps,
+   which looked like "switch to another app and back -> the app closes /
+   the menu is gone". r9 parks the ImGui context (all window layout,
+   input and scroll state) in g_orphan_imgui and the NEXT context that
+   reaches 8 swaps adopts it: the menu reappears exactly as it was,
+   usually within a fraction of a second of coming back to the app.
+   The backend's GL handles died with the old context, so adoption
+   calls ImGui_ImplOpenGL3_Shutdown (GL deletes are no-ops for names
+   that were never created in the new context) and Init again, which
+   makes NewFrame recreate the font texture and shader on the new
+   context. The old context's objects are freed by the driver; we never
+   call GL without a current context. */
 #define DT_ELECT_MIN_SWAPS 45
-#define DT_OWNER_STALE_MS   1500
+#define DT_ADOPT_MIN_SWAPS  8
+#define DT_OWNER_STALE_MS  1500
 
 struct GlState {
     GLint program = 0;
     GLint vao = 0, ab = 0, eb = 0;
+    GLint fb = 0;                     /* r9: app FBO restored too */
     GLint active_tex = GL_TEXTURE0, tex2d = 0;
     GLint viewport[4]    = {0, 0, 0, 0};
     GLint scissor_box[4] = {0, 0, 0, 0};
@@ -76,23 +83,49 @@ static std::mutex g_slots_mtx;
 static std::unordered_map<EGLContext, Slot*> g_slots;
 static std::vector<Slot*> g_graveyard;  /* never freed: no dangling */
 static EGLContext g_owner = nullptr;    /* under g_slots_mtx */
+static ImGuiContext* g_orphan_imgui = nullptr;  /* g_tick_mtx only */
 static std::mutex g_tick_mtx;  /* one ImGui drawer at a time; also
-                                  serializes ownership changes and
-                                  slot teardown against frames */
+                                  serializes ownership changes, adoption
+                                  and slot teardown against frames */
+static std::atomic<bool> g_ready {false};
 
-/* Touch events are queued by the Java hook (and by the
-   NativeActivity hook) and replayed as REAL ImGui events by the
-   owner thread, so a tap can no longer be eaten by the "wrong" GL
-   thread. phase: 0=down 1=up 2=move (cancel folded into up). */
+/* ---- touch mapping ------------------------------------------------
+   Events arrive in raw window pixels from both input paths. The agent
+   measured where the overlay's GL view actually sits inside the window
+   (GLSurfaceView rect, content view as fallback) and reported it via
+   dextool_set_touch_map. Replay maps (raw - origin) * DisplaySize/size,
+   which fixes the "must touch above the item" offset no matter how the
+   window is laid out. Without a map we fall back to the raw position
+   (the r7 behaviour), still clamped to the surface. */
+struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; };
+static std::mutex g_map_mtx;
+static TouchMap   g_map;
+
+/* Touch stream with dedup: a NativeActivity host can deliver the same
+   physical tap through BOTH the AInputQueue and the Java bridge; an
+   event identical to the previous one within 40 ms is dropped. */
 struct TouchEvent { float x, y; int phase; };
 static std::mutex              g_touch_mtx;
 static std::vector<TouchEvent> g_touch_q;
+static TouchEvent              g_touch_last;
+static long                    g_touch_last_ms = 0;
 static std::atomic<bool>       g_want_mouse {false};
 
 static std::mutex            g_char_mtx;
 static std::vector<unsigned>  g_pending_chars;
 static bool                   g_pending_bs    = false;
 static bool                   g_want_kbd_prev = false;
+
+/* scroll regions published by menu_draw (owner thread) */
+static std::vector<float> g_scroll_regions;
+
+/* font atlas: rebuilt on demand from a system font, so the Font Size
+   slider actually changes the glyphs instead of just scaling them */
+static float g_font_size  = 18.0f;
+static bool  g_font_dirty = false;
+static char  g_font_path[128] = "";
+static std::mutex g_disp_mtx;
+static float g_disp_w = 0.f, g_disp_h = 0.f;
 
 static long now_ms() {
     timespec ts;
@@ -102,35 +135,44 @@ static long now_ms() {
 
 static void touch_push(float x, float y, int phase) {
     std::lock_guard<std::mutex> lk(g_touch_mtx);
-    if (g_touch_q.size() > 64) g_touch_q.erase(g_touch_q.begin());
+    long now = now_ms();
+    if (g_touch_last.phase == phase &&
+        fabsf(x - g_touch_last.x) < 0.01f &&
+        fabsf(y - g_touch_last.y) < 0.01f &&
+        (now - g_touch_last_ms) < 40)
+        return;                          /* duplicate from the 2nd path */
+    g_touch_last = {x, y, phase};
+    g_touch_last_ms = now;
+    if (g_touch_q.size() > 96) g_touch_q.erase(g_touch_q.begin());
     g_touch_q.push_back({x, y, phase});
-}
-
-/* legacy boolean interface used by the AInputQueue (NativeActivity)
-   hook; translated into phase events here */
-static bool g_legacy_pressed = false;
-void overlay_on_touch(float x, float y, bool p) {
-    if (p) {
-        touch_push(x, y, g_legacy_pressed ? 2 : 0);
-    } else if (g_legacy_pressed) {
-        touch_push(x, y, 1);
-    }
-    g_legacy_pressed = p;
 }
 
 extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
     int a = action & 0xff;
-    if      (a == 0)           touch_push(x, y, 0);  /* DOWN      */
-    else if (a == 1 || a == 3) touch_push(x, y, 1);  /* UP/CANCEL */
-    else if (a == 2)           touch_push(x, y, 2);  /* MOVE      */
-    else if (a == 5 || a == 6) touch_push(x, y, 2);  /* PTR up/dn */
+    if      (a == 0)            touch_push(x, y, 0);  /* DOWN */
+    else if (a == 1 || a == 3)  touch_push(x, y, 1);  /* UP/CANCEL */
+    else if (a == 2)            touch_push(x, y, 2);  /* MOVE */
+    else if (a == 5 || a == 6)  touch_push(x, y, 2);  /* PTR up/dn */
 }
 
-/* the Java side asks whether the overlay wants the current touch
-   (menu hovered); if true the agent swallows the event so the game
-   does not also react to menu taps */
+extern "C" JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    std::lock_guard<std::mutex> lk(g_map_mtx);
+    bool was = g_map.ok;
+    g_map = { (float)x, (float)y, (float)w, (float)h, true };
+    if (!was)
+        LOGI("[overlay] touch map: view rect in window = (%d,%d %dx%d)",
+             x, y, w, h);
+}
+
 extern "C" JNIEXPORT bool dextool_want_mouse() {
     return g_want_mouse.load();
+}
+
+extern "C" JNIEXPORT int dextool_display_size() {
+    std::lock_guard<std::mutex> lk(g_disp_mtx);
+    if (g_disp_w <= 0 || g_disp_h <= 0) return 0;
+    return ((int)g_disp_w << 16) | (int)g_disp_h;
 }
 
 extern "C" JNIEXPORT void dextool_add_char(int cp) {
@@ -143,13 +185,34 @@ extern "C" JNIEXPORT void dextool_backspace() {
     g_pending_bs = true;
 }
 
+bool overlay_ready() { return g_ready.load(); }
+
+void overlay_get_display_size(float* w, float* h) {
+    std::lock_guard<std::mutex> lk(g_disp_mtx);
+    if (w) *w = g_disp_w;
+    if (h) *h = g_disp_h;
+}
+
+void overlay_request_font_rebuild(float size) {
+    if (size < 10.f) size = 10.f;
+    if (size > 40.f) size = 40.f;
+    g_font_size  = size;
+    g_font_dirty = true;
+}
+
+void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed) {
+    /* publisher (menu_draw) and consumer (replay) are both the owner
+       thread, one frame apart - no lock needed */
+    g_scroll_regions = xywh_speed;
+}
+
 static void* frida_thread(void*) {
     frida_bridge_start(g_jvm);
     return nullptr;
 }
 
-/* called from JNI_OnLoad before overlay_start; the
-   frida thread and the bridge read g_jvm afterwards */
+/* called from JNI_OnLoad before overlay_start; the frida thread and
+   the bridge read g_jvm afterwards */
 void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
 
 void overlay_start(JavaVM*) {
@@ -183,44 +246,74 @@ static Slot* slot_for(EGLContext ctx) {
    g_tick_mtx, so this can never race a draw):
      - fast path: we are already the owner;
      - if the owner went quiet for DT_OWNER_STALE_MS while we keep
-       swapping, ownership migrates to us (the old owner's ImGui is
-       destroyed CPU-side only; its GL objects die with its context);
-     - with no owner, the first slot to reach DT_ELECT_MIN_SWAPS
-       swaps wins — that is the continuously rendering thread (the
-       game), not the bursty HWUI RenderThread that only swaps on UI
-       changes. */
+       swapping, ownership migrates to us;
+     - with no owner: the first slot to reach DT_ELECT_MIN_SWAPS swaps
+       wins (the continuously rendering thread, not the bursty HWUI
+       RenderThread). If an ImGui world is parked from a dead context,
+       DT_ADOPT_MIN_SWAPS is enough - coming back from the background
+       the new context adopts it almost immediately. */
 static bool ensure_ownership(Slot* s, EGLContext ctx) {
     std::lock_guard<std::mutex> lk(g_slots_mtx);
     if (s->dead) return false;
     s->swaps++;
     long now = now_ms();
-    s->last_swap_ms = now;   /* migration test needs "active" */
+    s->last_swap_ms = now;
     Slot* ow = nullptr;
     if (g_owner) {
         auto it = g_slots.find(g_owner);
         if (it != g_slots.end() && !it->second->dead) ow = it->second;
     }
-    if (ow == s) { s->last_swap_ms = now; return true; }
+    if (ow == s) return true;
     if (ow) {
         bool stale = (now - ow->last_swap_ms) > DT_OWNER_STALE_MS &&
                      (now - s->last_swap_ms)  < 600;
         if (!stale) return false;     /* healthy owner elsewhere */
-        if (ow->imgui) {              /* retire the old world */
-            ImGui::DestroyContext(ow->imgui);
-            ow->imgui = nullptr;
-        }
         g_owner = nullptr;
         LOGI("[overlay] owner migrated (previous went quiet)");
     }
-    if (g_owner == nullptr && s->swaps >= DT_ELECT_MIN_SWAPS) {
-        g_owner = ctx;
-        s->last_swap_ms = now;
-        LOGI("[overlay] owner elected after %ld swaps", s->swaps);
-        return true;
+    if (g_owner == nullptr) {
+        long need = g_orphan_imgui ? DT_ADOPT_MIN_SWAPS : DT_ELECT_MIN_SWAPS;
+        if (s->swaps >= need) {
+            g_owner = ctx;
+            LOGI("[overlay] owner elected after %ld swaps%s",
+                 s->swaps, g_orphan_imgui ? " (adopting parked ImGui)" : "");
+            return true;
+        }
     }
     return false;
 }
 
+static void resolve_font_path() {
+    if (g_font_path[0]) return;
+    const char* cands[] = {
+        "/system/fonts/Roboto-Regular.ttf",
+        "/system/fonts/NotoSans-Regular.ttf",
+        "/system/fonts/DroidSans.ttf",
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+    };
+    for (const char* c : cands)
+        if (access(c, R_OK) == 0) {
+            snprintf(g_font_path, sizeof(g_font_path), "%s", c);
+            return;
+        }
+}
+
+static void build_fonts(ImGuiIO& io) {
+    resolve_font_path();
+    io.Fonts->Clear();
+    bool ok = false;
+    if (g_font_path[0]) {
+        ImFontConfig cfg;
+        cfg.SizePixels = g_font_size;
+        ok = io.Fonts->AddFontFromFileTTF(g_font_path, g_font_size,
+                                         nullptr, nullptr) != nullptr;
+    }
+    if (!ok) io.Fonts->AddFontDefault();
+    io.Fonts->Build();
+    g_font_dirty = false;
+}
+
+/* build (or adopt) the ImGui world of a freshly elected slot */
 static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
     EGLint w = 1080, h = 1920;
     eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
@@ -232,15 +325,24 @@ static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
         s->failed = true;
         return;
     }
-
-    LOGI("[overlay] GL: %s (%dx%d)", (const char*)ver, w, h);
-    /* ImGui is compiled with IMGUI_IMPL_OPENGL_ES2, so its shader
-       body is GLSL ES 100 (attribute/varying). The header must
-       stay "#version 100" even on ES3 contexts — they accept
-       GLSL ES 100 programs. */
     s->es3 = strstr((const char*)ver, "OpenGL ES 3") != nullptr;
-    s->imgui = ImGui::CreateContext();
-    ImGui::SetCurrentContext(s->imgui);
+
+    if (g_orphan_imgui) {
+        /* adopt the parked world; its backend GL handles are stale, so
+           ShutDown + Init to force CreateDeviceObjects on this context */
+        s->imgui = g_orphan_imgui;
+        g_orphan_imgui = nullptr;
+        ImGui::SetCurrentContext(s->imgui);
+        ImGui_ImplOpenGL3_Shutdown();   /* GL deletes: no-ops here, the
+                                           names never existed in this
+                                           context; zeroes the handles */
+        LOGI("[overlay] ImGui world adopted after context switch");
+    } else {
+        s->imgui = ImGui::CreateContext();
+        ImGui::SetCurrentContext(s->imgui);
+        LOGI("[overlay] GL: %s (%dx%d)", (const char*)ver, w, h);
+    }
+
     ImGuiIO& io   = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)w, (float)h);
     io.DeltaTime   = 1.0f / 60.0f;
@@ -249,14 +351,22 @@ static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
     io.ConfigWindowsMoveFromTitleBarOnly = true;  /* touch friendly */
     ImGui::StyleColorsDark();
     ImGui::GetStyle().WindowRounding = 6.0f;
+    if (io.Fonts->Fonts.empty() || g_font_dirty) build_fonts(io);
     ImGui_ImplOpenGL3_Init("#version 100");
     s->last_frame_ms = now_ms();
-    LOGI("[overlay] ImGui up OK (%dx%d)", w, h);
+    {
+        std::lock_guard<std::mutex> lk(g_disp_mtx);
+        g_disp_w = (float)w; g_disp_h = (float)h;
+    }
+    LOGI("[overlay] ImGui up OK (%dx%d, font %.0fpx)", w, h, g_font_size);
 }
 
-/* eglDestroyContext hook: retire the slot WITH its context. The
-   Slot object is never freed (graveyard), so an in-flight tick still
-   holds a valid pointer and just sees dead=true on its next tick. */
+/* eglDestroyContext hook: retire the slot WITH its context. r7 tore the
+   whole ImGui world down here, so every activity relayout that recycled
+   the GL context (keyboard with adjustResize, app switch, rotation) was
+   fatal - the user saw it as "the app closes". r9 parks the owner's
+   ImGui world instead and never frees the Slot (graveyard), so an
+   in-flight tick just sees dead=true on its next lock. */
 static void slot_destroy(EGLContext ctx) {
     std::lock_guard<std::mutex> lk(g_tick_mtx);
     std::lock_guard<std::mutex> lk2(g_slots_mtx);
@@ -266,31 +376,37 @@ static void slot_destroy(EGLContext ctx) {
     s->dead = true;
     g_slots.erase(it);
     g_graveyard.push_back(s);
-    if (g_owner == ctx) g_owner = nullptr;
-    if (s->imgui) {
-        ImGui::SetCurrentContext(s->imgui);
-        if (eglGetCurrentContext() == ctx)
-            ImGui_ImplOpenGL3_Shutdown();  /* GL deletes need the ctx */
-        ImGui::DestroyContext(s->imgui);
-        ImGui::SetCurrentContext(nullptr);
-        LOGI("[overlay] ImGui slot destroyed");
+    if (g_owner == ctx) {
+        g_owner = nullptr;
+        g_ready.store(false);
+        if (s->imgui) {
+            if (g_orphan_imgui)
+                ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
+            g_orphan_imgui = s->imgui;
+            s->imgui = nullptr;
+            if (eglGetCurrentContext() == ctx) {
+                /* only valid while the dying context is still current;
+                   otherwise the driver frees everything with the ctx */
+                ImGui::SetCurrentContext(g_orphan_imgui);
+                ImGui_ImplOpenGL3_Shutdown();
+            }
+            LOGI("[overlay] owner context destroyed - ImGui parked, "
+                 "waiting for the next GL context");
+        }
     }
 }
 
-/* HWUI aborts the whole process on GL_INVALID_VALUE, so every
-   binding the ES2 ImGui backend touches (program, VAO, buffers,
-   texture, viewport, scissor, blend, depth/stencil/cull) goes back
-   exactly the way the app had it before the swap continues. */
+/* HWUI aborts the whole process on GL_INVALID_VALUE, so every binding
+   the ES2 ImGui backend touches goes back exactly the way the app had
+   it before the swap continues. */
 static void gl_state_save(Slot* s) {
     GlState& g = s->gl;
     glGetIntegerv(GL_CURRENT_PROGRAM, &g.program);
-    /* ab/eb must be captured on ES2 too: r6 saved them only on ES3
-       and then RESTORED binding 0 on ES2, clobbering the app's
-       buffer bindings every frame */
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING,         &g.ab);
     glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &g.eb);
     if (s->es3)
         glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &g.vao);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &g.fb);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &g.active_tex);
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &g.tex2d);
@@ -314,11 +430,12 @@ static void gl_state_restore(Slot* s) {
     if (s->es3) glBindVertexArray(g.vao);
     glBindBuffer(GL_ARRAY_BUFFER,         g.ab);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.eb);
+    glBindFramebuffer(GL_FRAMEBUFFER,     g.fb);
     glActiveTexture(g.active_tex);
     glBindTexture(GL_TEXTURE_2D, g.tex2d);
     glBlendEquationSeparate(g.blend_eq_rgb, g.blend_eq_a);
     glBlendFuncSeparate(g.blend_src_rgb, g.blend_dst_rgb,
-                        g.blend_src_a,  g.blend_dst_a);
+                        g.blend_src_a, g.blend_dst_a);
     if (g.blend)   glEnable(GL_BLEND);        else glDisable(GL_BLEND);
     if (g.scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     if (g.depth)   glEnable(GL_DEPTH_TEST);   else glDisable(GL_DEPTH_TEST);
@@ -329,6 +446,40 @@ static void gl_state_restore(Slot* s) {
     glViewport(g.viewport[0], g.viewport[1],
                g.viewport[2], g.viewport[3]);
     glUseProgram(g.program);
+    /* never leave a GL error behind: the app's next check would abort */
+    for (int i = 0; i < 8; i++)
+        if (glGetError() == GL_NO_ERROR) break;
+}
+
+/* map a raw window position into the overlay surface's coordinate
+   space via the measured view rect; falls back to identity */
+static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
+    float mx = x, my = y;
+    {
+        std::lock_guard<std::mutex> lk(g_map_mtx);
+        if (g_map.ok && g_map.w > 0 && g_map.h > 0) {
+            float sx = ds.x / g_map.w;
+            float sy = ds.y / g_map.h;
+            mx = (x - g_map.x) * sx;
+            my = (y - g_map.y) * sy;
+        }
+    }
+    if (mx < 0.f)   mx = 0.f;
+    if (my < 0.f)   my = 0.f;
+    if (mx > ds.x)  mx = ds.x;
+    if (my > ds.y)  my = ds.y;
+    return ImVec2(mx, my);
+}
+
+/* is a display-space point inside one of the published scroll rects? */
+static float region_speed_at(float x, float y) {
+    const std::vector<float>& r = g_scroll_regions;
+    for (size_t i = 0; i + 4 < r.size(); i += 5) {
+        if (x >= r[i] && x <= r[i] + r[i+2] &&
+            y >= r[i+1] && y <= r[i+1] + r[i+3])
+            return r[i+4];
+    }
+    return 0.f;
 }
 
 static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
@@ -341,8 +492,8 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     EGLContext ctx = eglGetCurrentContext();
     if (ctx == EGL_NO_CONTEXT) return;
 
-    /* one drawer at a time; also serializes ownership changes and
-       slot teardown against in-flight frames */
+    /* one drawer at a time; also serializes ownership changes, adoption
+       and slot teardown against in-flight frames */
     std::lock_guard<std::mutex> lk(g_tick_mtx);
 
     Slot* s = slot_for(ctx);
@@ -359,6 +510,8 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
         eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
         io.DisplaySize = ImVec2((float)w, (float)h);
+        std::lock_guard<std::mutex> lk2(g_disp_mtx);
+        g_disp_w = (float)w; g_disp_h = (float)h;
     }
     {
         long nowt = now_ms();
@@ -371,7 +524,10 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         s->last_frame_ms = nowt;
     }
 
-    /* replay queued touch events as real ImGui events */
+    /* replay queued touch events as real ImGui events; drags that start
+       inside a published scroll rect additionally become wheel events,
+       scaled by that rect's speed - this is the touch scrolling of the
+       recorder/monitor/class lists and of the menu itself */
     {
         std::vector<TouchEvent> q;
         {
@@ -379,11 +535,27 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
             q.swap(g_touch_q);
         }
         ImVec2 ds = io.DisplaySize;
+        ImVec2 prev(0, 0);
+        bool   have_prev = false;
         for (const TouchEvent& t : q) {
-            float x = t.x < 0.f ? 0.f : (t.x > ds.x ? ds.x : t.x);
-            float y = t.y < 0.f ? 0.f : (t.y > ds.y ? ds.y : t.y);
-            io.AddMousePosEvent(x, y);
-            io.AddMouseButtonEvent(0, t.phase != 1);
+            ImVec2 p = map_touch(t.x, t.y, ds);
+            io.AddMousePosEvent(p.x, p.y);
+            if (t.phase == 0) io.AddMouseButtonEvent(0, true);
+            if (t.phase == 1) io.AddMouseButtonEvent(0, false);
+            if (t.phase == 2) {
+                io.AddMouseButtonEvent(0, true);
+                if (have_prev) {
+                    float sp = region_speed_at(prev.x, prev.y);
+                    if (sp > 0.f) {
+                        float wy = (p.y - prev.y) * sp;
+                        if (wy >  400.f) wy =  400.f;
+                        if (wy < -400.f) wy = -400.f;
+                        if (fabsf(wy) > 2.f) io.AddMouseWheelEvent(0.f, -wy);
+                    }
+                }
+            }
+            prev = p;
+            have_prev = true;
         }
     }
 
@@ -399,12 +571,18 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     }
 
     menu_init_once();
+    if (g_font_dirty) {
+        build_fonts(io);
+        /* drop the GL font texture so NewFrame re-uploads it at the
+           new size; the current context is ours and live right here */
+        ImGui_ImplOpenGL3_DestroyDeviceObjects();
+    }
 
     gl_state_save(s);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    /* the ES2 backend relies on GL_SCISSOR_TEST for clipping; the
-       app may leave it disabled. Enable it for our draw — restore
-       puts the app's state back afterwards. */
+    /* the ES2 backend relies on GL_SCISSOR_TEST for clipping; the app
+       may leave it disabled. Enable it for our draw - restore puts the
+       app's state back afterwards. */
     glEnable(GL_SCISSOR_TEST);
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
@@ -413,8 +591,12 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     gl_state_restore(s);
+    g_ready.store(true);
 
-    bool want_kbd = io.WantCaptureKeyboard;
+    /* soft keyboard follows ImGui's text focus; driven by WantTextInput
+       (true only while an InputText is active), so tapping a field pops
+       the IME and tapping elsewhere closes it */
+    bool want_kbd = io.WantTextInput;
     if (want_kbd != g_want_kbd_prev) {
         g_want_kbd_prev = want_kbd;
         frida_post(want_kbd ?
