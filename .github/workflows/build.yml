@@ -282,6 +282,8 @@ jobs:
           void log_info(const char* msg);
           void log_debug(const char* msg);
           void log_crash_raw(const char* msg);
+          /* r11: base dir captured at init, for menu.cpp config IO */
+          const char* logger_base_dir();
           void logger_install_abort_capture();
           DXTLOGH
 
@@ -306,6 +308,9 @@ jobs:
           static FILE* g_info_fp  = nullptr;
           static FILE* g_debug_fp = nullptr;
           static int   g_crash_fd = -1;
+          static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
+          
+          const char* logger_base_dir() { return g_base_dir; }
           static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
           
           static void ts(char* buf, size_t n) {
@@ -369,6 +374,7 @@ jobs:
           
           void logger_init(const char* base_dir) {
               mkdir(base_dir, 0755);
+              snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
               char p[640];
               snprintf(p, sizeof(p), "%s/dextool.log",       base_dir);
               g_info_fp  = fopen(p, "a");
@@ -399,7 +405,7 @@ jobs:
                   snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
                   log_crash_raw(boot);
               }
-              log_info("logger_init done (build r10: tab bodies, safe kbd, native map)");
+              log_info("logger_init done (build r11: native kbd, paged classes, scoped recorder, Y bias)");
           }
           
           void log_info(const char* msg) {
@@ -423,7 +429,7 @@ jobs:
           void log_crash_raw(const char* msg) {
               if (g_crash_fd >= 0) write(g_crash_fd, msg, strlen(msg));
           }
-
+          
           static void glib_log_capture(const gchar* domain, GLogLevelFlags level,
                                        const gchar* message, gpointer) {
               const char* lv =
@@ -439,7 +445,7 @@ jobs:
                   abort();
               }
           }
-
+          
           static void dt_terminate() {
               log_crash_raw("std::terminate called\n");
               try { std::rethrow_exception(std::current_exception()); }
@@ -452,7 +458,7 @@ jobs:
               }
               abort();
           }
-
+          
           void logger_install_abort_capture() {
               if (g_crash_fd >= 0) {
                   dup2(g_crash_fd, STDOUT_FILENO);
@@ -488,6 +494,17 @@ jobs:
              thread only); overlay converts drags inside them into wheel events at
              the given speed, which is what makes the huge lists touch-scrollable */
           void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed);
+          
+          /* ---- r11 ---- */
+          /* manual Y nudge applied after the touch map (Settings slider); fixes
+             residual status-bar offsets on hosts where the view rect cannot be
+             measured */
+          void overlay_set_touch_bias(float dy);
+          /* menu.cpp publishes the on-screen keyboard rect of the current frame;
+             overlay routes taps inside it to menu_kbd_feed() instead of ImGui */
+          void overlay_publish_kbd_rect(float x, float y, float w, float h);
+          /* one-line description of the active touch map for the Settings status */
+          void overlay_touch_map_desc(char* buf, int n);
           
           #ifdef __cplusplus
           extern "C" {
@@ -533,10 +550,12 @@ jobs:
           typedef EGLBoolean (*fn_swap)(EGLDisplay, EGLSurface);
           typedef EGLBoolean (*fn_swap_dmg)(EGLDisplay, EGLSurface, EGLint*, EGLint);
           typedef EGLBoolean (*fn_destroy_ctx)(EGLDisplay, EGLContext);
+          typedef EGLBoolean (*fn_terminate)(EGLDisplay);
           
           static fn_swap        g_orig_swap        = nullptr;
           static fn_swap_dmg    g_orig_swap_dmg    = nullptr;
           static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
+          static fn_terminate   g_orig_terminate   = nullptr;
           
           static std::atomic<bool> g_gum_inited {false};
           static JavaVM*           g_jvm        = nullptr;
@@ -560,7 +579,14 @@ jobs:
              that were never created in the new context) and Init again, which
              makes NewFrame recreate the font texture and shader on the new
              context. The old context's objects are freed by the driver; we never
-             call GL without a current context. */
+             call GL without a current context.
+          
+             r11 also retires every slot in the eglTerminate hook: terminating a
+             display invalidates all of its contexts, and if the driver later hands
+             out a new context at the same address, the stale slot would happily
+             draw with handles that are invalid in it - the classic
+             "glUseProgram -> GL_INVALID_VALUE (0x501)" abort class reported from
+             the field. */
           #define DT_ELECT_MIN_SWAPS 45
           #define DT_ADOPT_MIN_SWAPS  8
           #define DT_OWNER_STALE_MS  1500
@@ -603,17 +629,19 @@ jobs:
              feed the map, best one wins:
              (a) the agent measured where the overlay's GL view actually sits in
                  the window (view rect via getLocationInWindow) -> dextool_set_touch_map;
-             (b) native estimate: the largest surface ever seen on ANY context is
-                 ~= the full window (on a typical app the HWUI surface spans the
-                 whole 540x960 window while the game surface is smaller). While no
-                 precise map exists, replay scales raw input by DisplaySize/window.
-             Replay maps (raw - origin) * DisplaySize/size, which fixes the "must
-             touch above the item" offset no matter how the window is laid out.
-             Without any map we fall back to the raw position (the r7 behaviour),
-             still clamped to the surface. */
+                 r11 makes this measurement happen on Activity.onResume and on
+                 every touch (throttled), so it no longer depends on
+                 onWindowFocusChanged firing, which it never did in the field.
+             (b) native estimate: the largest surface seen on ANY context is
+                 ~= the full window (a typical app's HWUI surface spans the whole
+                 540x960 window while the game surface is smaller). r11 tracks
+                 every swap for this, not just the owner's.
+             On top of the map, overlay_set_touch_bias() adds a manual Y nudge
+             (Settings) for hosts where neither source can be measured. */
           struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
           static std::mutex g_map_mtx;
           static TouchMap   g_map;
+          static float      g_bias_y = 0.f;      /* manual nudge, under g_map_mtx */
           
           /* Touch stream with dedup: a NativeActivity host can deliver the same
              physical tap through BOTH the AInputQueue and the Java bridge; an
@@ -625,10 +653,14 @@ jobs:
           static long                    g_touch_last_ms = 0;
           static std::atomic<bool>       g_want_mouse {false};
           
+          /* rect of the on-screen keyboard as published by menu_draw (owner
+             thread); read back by dextool_want_mouse on the frida thread */
+          struct KbdRect { bool visible=false; float x=0, y=0, w=0, h=0; };
+          static KbdRect g_kbd;
+          
           static std::mutex            g_char_mtx;
           static std::vector<unsigned>  g_pending_chars;
           static bool                   g_pending_bs    = false;
-          static bool                   g_want_kbd_prev = false;
           
           /* scroll regions published by menu_draw (owner thread) */
           static std::vector<float> g_scroll_regions;
@@ -680,6 +712,29 @@ jobs:
                        x, y, w, h);
           }
           
+          void overlay_set_touch_bias(float dy) {
+              if (dy < -100.f) dy = -100.f;
+              if (dy >  100.f) dy =  100.f;
+              std::lock_guard<std::mutex> lk(g_map_mtx);
+              g_bias_y = dy;
+          }
+          
+          void overlay_publish_kbd_rect(float x, float y, float w, float h) {
+              if (w <= 0 || h <= 0) { g_kbd.visible = false; return; }
+              g_kbd = { true, x, y, w, h };
+          }
+          
+          void overlay_touch_map_desc(char* buf, int n) {
+              if (!buf || n <= 0) return;
+              std::lock_guard<std::mutex> lk(g_map_mtx);
+              if (g_map.ok)
+                  snprintf(buf, n, "%s view (%.0f,%.0f) %.0fx%.0f + Y%+.0f",
+                           g_map.est ? "est" : "measured",
+                           g_map.x, g_map.y, g_map.w, g_map.h, g_bias_y);
+              else
+                  snprintf(buf, n, "none yet (raw passthrough) + Y%+.0f", g_bias_y);
+          }
+          
           /* native estimate: while the agent has not measured the view rect yet,
              assume the window is as tall as the largest surface we have seen (a
              typical app's HWUI surface spans the full window) and that the GL
@@ -698,8 +753,33 @@ jobs:
               LOGI("[overlay] touch map: estimate 0,0 %.0fx%.0f (max surface)", w, h);
           }
           
+          /* defined further down; needed early by dextool_want_mouse */
+          static ImVec2 map_touch(float x, float y, const ImVec2& ds);
+          
           extern "C" JNIEXPORT bool dextool_want_mouse() {
-              return g_want_mouse.load();
+              if (g_want_mouse.load()) return true;
+              /* r11: the on-screen keyboard is not an ImGui window, so
+                 WantCaptureMouse is false over it; report the kbd rect too so the
+                 agent-side dispatchTouchEvent hook consumes kbd taps before they
+                 reach the app underneath. Decides on the last event this same
+                 hook just queued, so it reflects the current tap. */
+              if (!g_kbd.visible) return false;
+              float x, y; int ph;
+              {
+                  std::lock_guard<std::mutex> lk(g_touch_mtx);
+                  x = g_touch_last.x; y = g_touch_last.y; ph = g_touch_last.phase;
+              }
+              if (ph == 1) return false;               /* releases pass through */
+              float dw, dh;
+              {
+                  std::lock_guard<std::mutex> lk(g_disp_mtx);
+                  dw = g_disp_w; dh = g_disp_h;
+              }
+              if (dw <= 0 || dh <= 0) return false;
+              ImVec2 ds(dw, dh);
+              ImVec2 p = map_touch(x, y, ds);
+              return p.x >= g_kbd.x && p.x <= g_kbd.x + g_kbd.w &&
+                     p.y >= g_kbd.y && p.y <= g_kbd.y + g_kbd.h;
           }
           
           extern "C" JNIEXPORT int dextool_display_size() {
@@ -929,9 +1009,10 @@ jobs:
               }
           }
           
-          /* HWUI aborts the whole process on GL_INVALID_VALUE, so every binding
-             the ES2 ImGui backend touches goes back exactly the way the app had
-             it before the swap continues. */
+          /* HWUI and several driver wrappers abort the whole process on stray GL
+             errors (the "glUseProgram -> GL_INVALID_VALUE (0x501)" SIGABRT seen in
+             the field), so every binding the ES2 ImGui backend touches goes back
+             exactly the way the app had it before the swap continues. */
           static void gl_state_save(Slot* s) {
               GlState& g = s->gl;
               glGetIntegerv(GL_CURRENT_PROGRAM, &g.program);
@@ -958,6 +1039,20 @@ jobs:
               glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &g.blend_eq_a);
           }
           
+          /* r11: eat whatever the draw left in the error queue and make it
+             visible in the debug log - some wrappers abort on a stray sticky
+             error at their next check. */
+          static void gl_drain_errors() {
+              GLenum first = GL_NO_ERROR;
+              for (int i = 0; i < 12; i++) {
+                  GLenum e = glGetError();
+                  if (e == GL_NO_ERROR) break;
+                  if (first == GL_NO_ERROR) first = e;
+              }
+              if (first != GL_NO_ERROR)
+                  LOGD("[overlay] drained GL error 0x%04x after draw", first);
+          }
+          
           static void gl_state_restore(Slot* s) {
               GlState& g = s->gl;
               if (s->es3) glBindVertexArray(g.vao);
@@ -978,30 +1073,14 @@ jobs:
                         g.scissor_box[2], g.scissor_box[3]);
               glViewport(g.viewport[0], g.viewport[1],
                          g.viewport[2], g.viewport[3]);
-              glUseProgram(g.program);
-              /* never leave a GL error behind: the app's next check would abort */
-              for (int i = 0; i < 8; i++)
-                  if (glGetError() == GL_NO_ERROR) break;
-          }
-          
-          /* map a raw window position into the overlay surface's coordinate
-             space via the measured view rect; falls back to identity */
-          static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
-              float mx = x, my = y;
-              {
-                  std::lock_guard<std::mutex> lk(g_map_mtx);
-                  if (g_map.ok && g_map.w > 0 && g_map.h > 0) {
-                      float sx = ds.x / g_map.w;
-                      float sy = ds.y / g_map.h;
-                      mx = (x - g_map.x) * sx;
-                      my = (y - g_map.y) * sy;
-                  }
-              }
-              if (mx < 0.f)   mx = 0.f;
-              if (my < 0.f)   my = 0.f;
-              if (mx > ds.x)  mx = ds.x;
-              if (my > ds.y)  my = ds.y;
-              return ImVec2(mx, my);
+              /* r11: only restore a real program. Apps that never bind one (the
+                 sample host just clears) have 0 current; some ES wrappers raise
+                 GL_INVALID_VALUE for glUseProgram(0) and the app's next error
+                 check aborts. If the app had none bound it will bind its own
+                 before drawing, so leaving ours is safe. */
+              if (g.program != 0)
+                  glUseProgram(g.program);
+              gl_drain_errors();
           }
           
           /* is a display-space point inside one of the published scroll rects? */
@@ -1015,6 +1094,28 @@ jobs:
               return 0.f;
           }
           
+          /* map a raw window position into the overlay surface's coordinate
+             space via the measured view rect; falls back to identity. r11 adds
+             the manual Y bias on top (Settings). */
+          static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
+              float mx = x, my = y;
+              {
+                  std::lock_guard<std::mutex> lk(g_map_mtx);
+                  if (g_map.ok && g_map.w > 0 && g_map.h > 0) {
+                      float sx = ds.x / g_map.w;
+                      float sy = ds.y / g_map.h;
+                      mx = (x - g_map.x) * sx;
+                      my = (y - g_map.y) * sy;
+                  }
+                  my += g_bias_y;
+              }
+              if (mx < 0.f)   mx = 0.f;
+              if (my < 0.f)   my = 0.f;
+              if (mx > ds.x)  mx = ds.x;
+              if (my > ds.y)  my = ds.y;
+              return ImVec2(mx, my);
+          }
+          
           static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
               static thread_local bool in_tick = false;
               if (in_tick) return;   /* driver re-entry (swap->swapWithDamage) */
@@ -1024,6 +1125,21 @@ jobs:
           
               EGLContext ctx = eglGetCurrentContext();
               if (ctx == EGL_NO_CONTEXT) return;
+          
+              /* r11: surface bookkeeping for EVERY context, before ownership
+                 gating. The largest surface on any thread (the HWUI window
+                 surface spans the whole window) is the best native estimate of
+                 the full window, so the touch-map fallback no longer depends on
+                 this thread being the owner. */
+              EGLint sw = 0, sh = 0;
+              eglQuerySurface(dpy, surf, EGL_WIDTH,  &sw);
+              eglQuerySurface(dpy, surf, EGL_HEIGHT, &sh);
+              if (sw > 0 && sh > 0) {
+                  std::lock_guard<std::mutex> lk(g_disp_mtx);
+                  if ((float)sw > g_max_surf_w) g_max_surf_w = (float)sw;
+                  if ((float)sh > g_max_surf_h) g_max_surf_h = (float)sh;
+                  if (g_disp_w <= 0.f) { g_disp_w = (float)sw; g_disp_h = (float)sh; }
+              }
           
               /* one drawer at a time; also serializes ownership changes, adoption
                  and slot teardown against in-flight frames */
@@ -1038,15 +1154,10 @@ jobs:
               if (!s->imgui) return;
               ImGui::SetCurrentContext(s->imgui);
               ImGuiIO& io = ImGui::GetIO();
+              io.DisplaySize = ImVec2((float)sw, (float)sh);
               {
-                  EGLint w = 1080, h = 1920;
-                  eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
-                  eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-                  io.DisplaySize = ImVec2((float)w, (float)h);
                   std::lock_guard<std::mutex> lk2(g_disp_mtx);
-                  g_disp_w = (float)w; g_disp_h = (float)h;
-                  if ((float)w > g_max_surf_w) g_max_surf_w = (float)w;
-                  if ((float)h > g_max_surf_h) g_max_surf_h = (float)h;
+                  g_disp_w = (float)sw; g_disp_h = (float)sh;
               }
               {
                   long nowt = now_ms();
@@ -1059,10 +1170,12 @@ jobs:
                   s->last_frame_ms = nowt;
               }
           
-              /* replay queued touch events as real ImGui events; drags that start
-                 inside a published scroll rect additionally become wheel events,
-                 scaled by that rect's speed - this is the touch scrolling of the
-                 recorder/monitor/class lists and of the menu itself */
+              /* replay queued touch events as real ImGui events; taps inside the
+                 on-screen keyboard (r11) are routed to menu_kbd_feed() instead.
+                 Drags that start inside a published scroll rect additionally
+                 become wheel events, scaled by that rect's speed - this is the
+                 touch scrolling of the recorder/monitor/class lists and of the
+                 menu itself */
               {
                   std::vector<TouchEvent> q;
                   {
@@ -1074,6 +1187,8 @@ jobs:
                   bool   have_prev = false;
                   for (const TouchEvent& t : q) {
                       ImVec2 p = map_touch(t.x, t.y, ds);
+                      if (menu_kbd_feed(t.phase, p.x, p.y))
+                          continue;                     /* on-screen keyboard */
                       io.AddMousePosEvent(p.x, p.y);
                       if (t.phase == 0) io.AddMouseButtonEvent(0, true);
                       if (t.phase == 1) io.AddMouseButtonEvent(0, false);
@@ -1128,33 +1243,66 @@ jobs:
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
               gl_state_restore(s);
               g_ready.store(true);
-          
-              /* soft keyboard follows ImGui's text focus; driven by WantTextInput
-                 (true only while an InputText is active), so tapping a field pops
-                 the IME and tapping elsewhere closes it */
-              bool want_kbd = io.WantTextInput;
-              if (want_kbd != g_want_kbd_prev) {
-                  g_want_kbd_prev = want_kbd;
-                  frida_post(want_kbd ?
-                      "{\"type\":\"showKeyboard\"}" :
-                      "{\"type\":\"hideKeyboard\"}");
-              }
           }
           
           static EGLBoolean my_destroy_ctx(EGLDisplay dpy, EGLContext ctx) {
               slot_destroy(ctx);
-              return g_orig_destroy_ctx(dpy, ctx);
+              return g_orig_destroy_ctx ? g_orig_destroy_ctx(dpy, ctx) : EGL_TRUE;
+          }
+          
+          static EGLBoolean my_terminate(EGLDisplay dpy) {
+              /* r11: terminating a display invalidates every context of that
+                 display. Retire all slots now; otherwise the next eglCreateContext
+                 can land at a recycled address whose stale slot would draw with
+                 GL handles that are invalid in the new context (the
+                 glUseProgram GL_INVALID_VALUE 0x501 abort class). */
+              {
+                  std::lock_guard<std::mutex> lk(g_tick_mtx);
+                  std::lock_guard<std::mutex> lk2(g_slots_mtx);
+                  ImGuiContext* park = nullptr;
+                  bool had_owner = false;
+                  for (auto& kv : g_slots) {
+                      Slot* s = kv.second;
+                      s->dead = true;
+                      g_graveyard.push_back(s);
+                      if (g_owner == kv.first) {
+                          had_owner = true;
+                          if (s->imgui) {
+                              if (park) ImGui::DestroyContext(park);
+                              park = s->imgui;
+                              s->imgui = nullptr;
+                          }
+                      } else if (s->imgui) {
+                          ImGui::DestroyContext(s->imgui);
+                          s->imgui = nullptr;
+                      }
+                  }
+                  g_slots.clear();
+                  if (had_owner) {
+                      g_owner = nullptr;
+                      g_ready.store(false);
+                      if (park) {
+                          if (g_orphan_imgui)
+                              ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
+                          g_orphan_imgui = park;
+                          LOGI("[overlay] display terminated - ImGui parked, "
+                               "waiting for the next GL context");
+                      }
+                  }
+              }
+              return g_orig_terminate ? g_orig_terminate(dpy) : EGL_TRUE;
           }
           
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
               overlay_tick(dpy, surf);
-              return g_orig_swap(dpy, surf);
+              return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
           }
           
           static EGLBoolean my_swap_dmg(EGLDisplay dpy, EGLSurface surf,
                                         EGLint* rects, EGLint n) {
               overlay_tick(dpy, surf);
-              return g_orig_swap_dmg(dpy, surf, rects, n);
+              return g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
+                                     : EGL_FALSE;
           }
           
           bool install_swap_hook() {
@@ -1191,7 +1339,20 @@ jobs:
                       reinterpret_cast<dobby_dummy_func_t>(my_destroy_ctx),
                       reinterpret_cast<dobby_dummy_func_t*>(&g_orig_destroy_ctx));
                   if (r == 0) LOGI("eglDestroyContext hooked OK");
-                  else        LOGE("DobbyHook eglDestroyContext: %d", r);
+                  else LOGE("DobbyHook eglDestroyContext: %d", r);
+              }
+              void* sym_term = dlsym(egl, "eglTerminate");
+              if (!sym_term) {
+                  typedef void* (*PFN)(const char*);
+                  PFN gpa = (PFN)dlsym(egl, "eglGetProcAddress");
+                  if (gpa) sym_term = gpa("eglTerminate");
+              }
+              if (sym_term) {
+                  int r = DobbyHook(sym_term,
+                      reinterpret_cast<dobby_dummy_func_t>(my_terminate),
+                      reinterpret_cast<dobby_dummy_func_t*>(&g_orig_terminate));
+                  if (r == 0) LOGI("eglTerminate hooked OK (r11)");
+                  else LOGE("DobbyHook eglTerminate: %d", r);
               }
               return ok;
           }
@@ -1490,6 +1651,11 @@ jobs:
           /* cross-link entry point used by every log list: opens (or focuses) the
              class tab and asks the agent for its methods/fields/instances */
           void menu_open_class(const std::string& name);
+          /* r11 on-screen keyboard: overlay calls this for every touch event
+             (display space) BEFORE feeding the event to ImGui; returns true when
+             the keyboard took the event (tap inside it, or a drag that started
+             on it). */
+          bool menu_kbd_feed(int phase, float x, float y);
           DXTMNH
 
       - name: Generate menu.cpp
@@ -1508,17 +1674,25 @@ jobs:
           #include <cstdlib>
           #include <algorithm>
           #include <pthread.h>
+          #include <ctime>
           
           /* =====================================================================
-             Dex-tool menu (r9)
+             Dex-tool menu (r11)
              - every tab of the spec: Settings, Patches, Hooks, Tracker, Recorder,
                Monitor, Script, Classes
              - cross-linking: clicking a row in Tracker / Recorder / Monitor opens
                that class in the Classes tab (menu_open_class)
              - the recorder/monitor lists are fed by the agent in throttled
-               batches, so a 50k-method recording session no longer hangs the UI
+               batches; the r11 recorder is scoped (package filter + method cap),
+               which is what stops the hook-everything install from exhausting
+               the 32-bit process
              - scrollable areas are published to the overlay, which converts
                drags inside them into wheel events at the configured speed
+             - fully native on-screen keyboard (r11): no system IME, no hidden
+               EditText, no text polling - the r10 bridge stringified an
+               android.text.Editable wrapper and typed the literal
+               "[object Object]" into every field
+             - UI state persists to <logdir>/dextool-ui.conf
              ===================================================================== */
           
           static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -1533,6 +1707,8 @@ jobs:
           static float s_lst_scroll = 1.2f;   /* inner list drag speed */
           static bool  s_visible    = true;
           static bool  s_show_fab   = true;
+          static float s_y_off      = 0.0f;   /* manual touch Y bias (px) */
+          static bool  s_kbd_on     = true;   /* on-screen keyboard enabled */
           
           /* ---------------- agent / overlay status ---------------- */
           static bool  s_agent_ready = false;
@@ -1593,6 +1769,8 @@ jobs:
           
           static bool  s_rec_on=false;  static char s_rec_stat[128]="idle";
           static int   s_rec_installed=0, s_rec_total=0;
+          static char  s_rec_filter[120]="";           /* empty = host package */
+          static int   s_rec_cap=1500;                 /* method cap */
           static bool  s_mon_on=false;  static char s_mon_stat[160]="off";
           
           static char s_pcls[200]={}, s_pfld[128]={}, s_pval[256]={};
@@ -1606,6 +1784,7 @@ jobs:
           static std::vector<std::string> s_search_res;
           static int  s_search_total=0, s_search_shown=0;
           static bool s_search_wait=false;
+          static int  s_search_seq=0, s_search_qid=-1;
           static std::string s_focus_cls;          /* class tab to select */
           static std::string s_next_tab;           /* top tab to select */
           
@@ -1864,6 +2043,57 @@ jobs:
               return s.substr(0, d);
           }
           
+          /* ---------------- UI persistence ---------------- */
+          static char  s_conf_path[512] = "";
+          static bool  s_conf_dirty = false;
+          static long  s_conf_last_ms = 0;
+          
+          static long conf_now_ms() {
+              timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+          }
+          
+          static void conf_load() {
+              snprintf(s_conf_path, sizeof(s_conf_path), "%s/dextool-ui.conf",
+                       logger_base_dir());
+              FILE* f = fopen(s_conf_path, "r");
+              if (!f) return;
+              char ln[128];
+              while (fgets(ln, sizeof(ln), f)) {
+                  char* eq = strchr(ln, '=');
+                  if (!eq) continue;
+                  *eq = 0;
+                  char* k = ln;
+                  float v = strtof(eq + 1, nullptr);
+                  if      (!strcmp(k, "font"))   s_font_size = v;
+                  else if (!strcmp(k, "opacity")) s_opacity  = v;
+                  else if (!strcmp(k, "theme"))  s_theme    = (int)v;
+                  else if (!strcmp(k, "ovl"))    s_ovl_scroll = v;
+                  else if (!strcmp(k, "lst"))    s_lst_scroll = v;
+                  else if (!strcmp(k, "yoff"))   s_y_off    = v;
+                  else if (!strcmp(k, "kbd"))    s_kbd_on   = v > 0.5f;
+                  else if (!strcmp(k, "fab"))    s_show_fab = v > 0.5f;
+              }
+              fclose(f);
+          }
+          
+          static void conf_save() {
+              FILE* f = fopen(s_conf_path, "w");
+              if (!f) return;
+              fprintf(f, "font=%g\n",   s_font_size);
+              fprintf(f, "opacity=%g\n", s_opacity);
+              fprintf(f, "theme=%d\n",  s_theme);
+              fprintf(f, "ovl=%g\n",    s_ovl_scroll);
+              fprintf(f, "lst=%g\n",    s_lst_scroll);
+              fprintf(f, "yoff=%g\n",   s_y_off);
+              fprintf(f, "kbd=%d\n",   s_kbd_on ? 1 : 0);
+              fprintf(f, "fab=%d\n",   s_show_fab ? 1 : 0);
+              fclose(f);
+              s_conf_dirty = false;
+              s_conf_last_ms = conf_now_ms();
+          }
+          
           /* ---------------- theme ---------------- */
           static void apply_theme() {
               switch (s_theme) {
@@ -1877,9 +2107,259 @@ jobs:
                                                          atlas, not from scaling */
           }
           
+          /* ===================== native on-screen keyboard =====================
+             r11. The r10 bridge used a hidden EditText + the system IME and
+             forwarded the text delta from the frida thread. String(EditText
+             .getText()) is NOT the text - it is an android.text.Editable whose
+             String() form is "[object Object]", so every field filled with the
+             keyboard literally received that string (and the IME of a game host
+             resizes/recreates the EGL context, feeding the abort class).
+             The r11 keyboard is plain ImGui: while a kbd-enabled text field is
+             active, menu_draw() lays it out at the bottom of the display and
+             publishes its rect; menu_kbd_feed() (called by the overlay for every
+             touch, BEFORE the event reaches ImGui) maps taps onto keys and turns
+             them into InputText events. */
+          struct KbdState {
+              bool  open = false;        /* visible and ready to take taps   */
+              bool  focus = false;       /* a kbd-enabled field is active    */
+              bool  shift = false;
+              bool  page2 = false;       /* symbol page                      */
+              bool  dragging = false;    /* the current gesture started on   */
+              float x=0, y=0, w=0, h=0;  /* last drawn window rect           */
+              std::string last;          /* label of the last key hit        */
+          } static s_kbd;
+          
+          /* every key as actually laid out by draw_kbd this frame; feed()
+             hit-tests against these, so the drawn geometry IS the hit geometry */
+          struct KbdKey { float x, y, w, h; int act; char ch; };
+          enum { KBD_CHAR=0, KBD_SHIFT, KBD_BKSP, KBD_ENTER, KBD_HIDE,
+                 KBD_SPACE, KBD_PAGE };
+          static std::vector<KbdKey> s_kbd_keys;
+          
+          /* Which text field gets the keys? Every kbd-enabled InputText in this
+             file carries a KbdTag { char* buf; size_t cap; } next to it; a helper
+             draws the field and registers it while it is active. */
+          struct KbdField {
+              char*  buf = nullptr;
+              size_t cap = 0;
+          };
+          static KbdField s_kbd_field;      /* the active field, owner thread */
+          static bool     s_kbd_field_req = false;   /* want to grab focus now */
+          
+          /* draw an InputText that grabs the on-screen keyboard when active */
+          static bool kbd_textfield(const char* label, char* buf, size_t cap) {
+              bool used = ImGui::InputText(label, buf, cap,
+                                           ImGuiInputTextFlags_AutoSelectAll);
+              if (ImGui::IsItemActivated()) {
+                  /* user tapped the field: focus it and pop the keyboard */
+                  s_kbd_field = { buf, cap };
+                  s_kbd_field_req = true;
+              }
+              return used;
+          }
+          
+          /* same for multiline editors (script editor, hook code) */
+          static bool kbd_multiline(const char* label, char* buf, size_t cap,
+                                    ImVec2 size) {
+              bool used = ImGui::InputTextMultiline(label, buf, cap, size);
+              if (ImGui::IsItemActivated()) {
+                  s_kbd_field = { buf, cap };
+                  s_kbd_field_req = true;
+              }
+              return used;
+          }
+          
+          /* delete one character before the caret the way the user typed it
+             (a UTF-16 surrogate pair is deleted together) */
+          static void kbd_del_char(char* buf) {
+              size_t n = strlen(buf);
+              if (!n) return;
+              unsigned char prev = (unsigned char)buf[n - 1];
+              if (n >= 3 && prev >= 0x80 && (unsigned char)buf[n-2] == 0xED &&
+                  (unsigned char)buf[n-3] == 0xED)
+                  n -= 3;                    /* broken pair, drop both halves */
+              else if (n >= 2 && prev >= 0x80 && (prev & 0xC0) == 0x80 &&
+                       (unsigned char)buf[n-2] >= 0xC0)
+                  n -= 2;                    /* 2-byte sequence */
+              else
+                  n -= 1;
+              if (n < 0) n = 0;
+              buf[n] = 0;
+          }
+          
+          /* append a UTF-8 char if it fits */
+          static void kbd_put_char(char* buf, size_t cap, const char* u8, int len) {
+              size_t n = strlen(buf);
+              if (n + (size_t)len + 1 > cap - 1) return;
+              memcpy(buf + n, u8, (size_t)len);
+              buf[n + (size_t)len] = 0;
+          }
+          
+          /* run one key press; used by both the tap path (menu_kbd_feed) and
+             the mouse path (ImGui::Button returning true) */
+          static void kbd_apply(const KbdKey& k) {
+              switch (k.act) {
+              case KBD_CHAR: {
+                  char c = k.ch;
+                  if (!s_kbd.page2 && s_kbd.shift && c >= 'a' && c <= 'z') {
+                      c = (char)(c - 'a' + 'A');
+                      s_kbd.shift = false;          /* one-shot shift */
+                  }
+                  char u8[2] = { c, 0 };
+                  if (s_kbd_field.buf)
+                      kbd_put_char(s_kbd_field.buf, s_kbd_field.cap, u8, 1);
+                  s_kbd.last = std::string(1, c);
+                  break;
+              }
+              case KBD_SHIFT:
+                  s_kbd.shift = !s_kbd.shift; s_kbd.last = "shift"; break;
+              case KBD_BKSP:
+                  if (s_kbd_field.buf) kbd_del_char(s_kbd_field.buf);
+                  s_kbd.last = "bksp"; break;
+              case KBD_ENTER:
+              case KBD_HIDE:
+                  s_kbd.open = false;
+                  s_kbd.last = (k.act == KBD_ENTER) ? "enter" : "hide"; break;
+              case KBD_SPACE:
+                  if (s_kbd_field.buf)
+                      kbd_put_char(s_kbd_field.buf, s_kbd_field.cap, " ", 1);
+                  s_kbd.last = "space"; break;
+              case KBD_PAGE:
+                  s_kbd.page2 = !s_kbd.page2; s_kbd.last = "page"; break;
+              }
+          }
+          
+          /* the r11 input path: every touch first passes through here */
+          bool menu_kbd_feed(int phase, float x, float y) {
+              if (!s_kbd_on || !s_kbd.open) return false;
+              if (phase == 0) {                       /* press */
+                  s_kbd.dragging = false;
+                  if (x >= s_kbd.x && x <= s_kbd.x + s_kbd.w &&
+                      y >= s_kbd.y && y <= s_kbd.y + s_kbd.h) {
+                      s_kbd.dragging = true;          /* gesture is ours */
+                      return true;
+                  }
+                  return false;                       /* tap outside: pass through */
+              }
+              if (!s_kbd.dragging) return false;      /* move/release of others */
+              if (phase == 2) return true;            /* drag inside: swallow */
+              /* release: map onto the drawn keys */
+              s_kbd.dragging = false;
+              for (const KbdKey& k : s_kbd_keys) {
+                  if (x >= k.x && x <= k.x + k.w &&
+                      y >= k.y && y <= k.y + k.h) {
+                      kbd_apply(k);
+                      return true;
+                  }
+              }
+              return true;                            /* between keys: swallow */
+          }
+          
+          /* draw the keyboard at the bottom of the display; called from
+             menu_draw() every frame while a field is focused. Layout constants:
+             pitch 40 (34px keys + 6 spacing), 20px status line, 8px padding -
+             content height 8+20+5*40+8 = 236. */
+          static void draw_kbd(ImVec2 ds) {
+              if (s_kbd_field_req) {
+                  s_kbd_field_req = false;
+                  if (!s_kbd.open) { s_kbd.open = true; s_kbd.page2 = false; }
+              }
+              s_kbd.focus = s_kbd_field.buf != nullptr;
+              if (!s_kbd.open) {
+                  overlay_publish_kbd_rect(0, 0, 0, 0);
+                  return;
+              }
+              s_kbd.w = ds.x;
+              s_kbd.h = 236.f;
+              s_kbd.x = 0;
+              s_kbd.y = ds.y - s_kbd.h;
+              if (s_kbd.y < 0) s_kbd.y = 0;
+              s_kbd_keys.clear();
+          
+              ImGui::SetNextWindowPos(ImVec2(s_kbd.x, s_kbd.y), ImGuiCond_Always);
+              ImGui::SetNextWindowSize(ImVec2(s_kbd.w, s_kbd.h), ImGuiCond_Always);
+              ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+              ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 6));
+              ImGui::Begin("##kbd", nullptr,
+                           ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                           ImGuiWindowFlags_NoSavedSettings |
+                           ImGuiWindowFlags_NoBringToFrontOnFocus);
+          
+              char tag[96];
+              snprintf(tag, sizeof(tag), "r11 kbd%s%s%s  %s",
+                       s_kbd.page2 ? " sym" : "", s_kbd.shift ? " SHIFT" : "",
+                       s_kbd_field.buf ? "" : " (no field!)",
+                       s_kbd.last.empty() ? "" : s_kbd.last.c_str());
+              ImGui::TextDisabled("%s", tag);
+          
+              /* one helper draws a key AND records its rect for the tap path */
+              #define KBD_KEY(LBL, W, ACT, CH) do {                               \
+                  if (ImGui::Button(LBL, ImVec2((W), 34))) {                       \
+                      ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax(); \
+                      kbd_apply({ a.x, a.y, b.x - a.x, b.y - a.y, (ACT), (CH) }); \
+                  }                                                                \
+                  ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax(); \
+                  s_kbd_keys.push_back({ a.x, a.y, b.x - a.x, b.y - a.y,           \
+                                         (ACT), (CH) });                           \
+              } while (0)
+          
+              static const char* R0N = "qwertyuiop";
+              static const char* R1N = "asdfghjkl";
+              static const char* R2N = "zxcvbnm";
+              static const char* R0S = "1234567890";
+              static const char* R1S = "-/:;()$&\"@.,?!'";
+              static const char* R2S = "#%\\*+=_~<>";
+              const char* rows[3];
+              int nkey[3];
+              if (s_kbd.page2) {
+                  rows[0] = R0S; nkey[0] = 10;
+                  rows[1] = R1S; nkey[1] = 14;
+                  rows[2] = R2S; nkey[2] = 12;
+              } else {
+                  rows[0] = R0N; nkey[0] = 10;
+                  rows[1] = R1N; nkey[1] = 9;
+                  rows[2] = R2N; nkey[2] = 7;
+              }
+              for (int r = 0; r < 3; r++) {
+                  float avail = ImGui::GetContentRegionAvail().x - 10.f;
+                  float bw = avail / (float)nkey[r] - 4.f;
+                  for (int k = 0; k < nkey[r]; k++) {
+                      char lb[8], c = rows[r][k];
+                      if (!s_kbd.page2 && s_kbd.shift && c >= 'a' && c <= 'z')
+                          c = (char)(c - 'a' + 'A');
+                      snprintf(lb, sizeof(lb), "%c", c);
+                      KBD_KEY(lb, bw, KBD_CHAR, rows[r][k]);   /* base char, apply() upcases */
+                      if (k < nkey[r] - 1) ImGui::SameLine();
+                  }
+              }
+              {   /* modifiers row */
+                  float bw = ImGui::GetContentRegionAvail().x - 10.f;
+                  KBD_KEY(s_kbd.shift ? "SHIFT" : "shift", bw * 0.30f, KBD_SHIFT, 0);
+                  ImGui::SameLine();
+                  KBD_KEY("bksp",  bw * 0.40f, KBD_BKSP, 0);
+                  ImGui::SameLine();
+                  KBD_KEY("enter", bw * 0.29f, KBD_ENTER, 0);
+              }
+              {   /* bottom row */
+                  float bw = ImGui::GetContentRegionAvail().x - 10.f;
+                  KBD_KEY("hide",  bw * 0.22f, KBD_HIDE, 0);
+                  ImGui::SameLine();
+                  KBD_KEY("space", bw * 0.56f, KBD_SPACE, 0);
+                  ImGui::SameLine();
+                  KBD_KEY(s_kbd.page2 ? "abc" : "#+=", bw * 0.22f, KBD_PAGE, 0);
+              }
+              #undef KBD_KEY
+              ImGui::End();
+              ImGui::PopStyleVar(2);
+              overlay_publish_kbd_rect(s_kbd.x, s_kbd.y, s_kbd.w, s_kbd.h);
+          }
+          
           /* ---------------- message callback (GumJS thread) ---------------- */
           void menu_init() {
               apply_theme();
+              conf_load();
+              overlay_set_touch_bias(s_y_off);
+              overlay_request_font_rebuild(s_font_size);
               frida_set_message_callback([](const std::string& j) {
                   MLK();
                   if (jhas(j, "ready")) {
@@ -1898,11 +2378,19 @@ jobs:
                               c->fields.push_back(parse_field(f));
                       }
                   } else if (jhas(j, "classList")) {
-                      s_search_res.clear();
+                      /* r11: the agent streams the full result in pages of 400;
+                         the r10 single message was capped at 800 names, which is
+                         why "Classes" never displayed all classes */
+                      long qid  = jnum(j, "qid");
+                      long page = jnum(j, "page");
+                      if (qid != s_search_qid || page == 0) {
+                          s_search_res.clear();
+                          s_search_qid = (int)qid;
+                      }
+                      for (auto& c : jarr(j, "classes")) s_search_res.push_back(c);
                       s_search_total = (int)jnum(j, "total");
                       s_search_shown = (int)jnum(j, "shown");
-                      for (auto& c : jarr(j, "classes")) s_search_res.push_back(c);
-                      s_search_wait = false;
+                      if (page + 1 >= jnum(j, "pages")) s_search_wait = false;
                   } else if (jhas(j, "instanceList")) {
                       ClassTab* c = find_tab(jstr(j, "class"));
                       if (c) {
@@ -2011,21 +2499,38 @@ jobs:
                   /* apply on release: rebuilding the atlas mid-drag every frame
                      would stutter */
               }
-              if (ImGui::IsItemDeactivatedAfterEdit())
+              if (ImGui::IsItemDeactivatedAfterEdit()) {
                   overlay_request_font_rebuild(s_font_size);
-              ImGui::SliderFloat("Opacity", &s_opacity, .3f, 1.f);
+                  s_conf_dirty = true;
+              }
+              if (ImGui::SliderFloat("Opacity", &s_opacity, .3f, 1.f))
+                  s_conf_dirty = true;
               const char* th[] = {"Dark", "Light", "Classic"};
-              ImGui::Combo("Theme", &s_theme, th, 3);
+              if (ImGui::Combo("Theme", &s_theme, th, 3))
+                  s_conf_dirty = true;
               ImGui::Separator();
-              ImGui::SliderFloat("Overlay Scroll Speed", &s_ovl_scroll, .2f, 4.f);
-              ImGui::SliderFloat("List Scroll Speed",    &s_lst_scroll, .2f, 4.f);
+              if (ImGui::SliderFloat("Overlay Scroll Speed", &s_ovl_scroll, .2f, 4.f))
+                  s_conf_dirty = true;
+              if (ImGui::SliderFloat("List Scroll Speed",    &s_lst_scroll, .2f, 4.f))
+                  s_conf_dirty = true;
+              /* r11: manual correction for the status-bar class of offsets. The
+                 measured/estimated view map already subtracts the bar; this knob
+                 is for hosts where neither can be derived. */
+              if (ImGui::SliderFloat("Touch Y offset", &s_y_off, -80.f, 80.f, "%+.0f px")) {
+                  overlay_set_touch_bias(s_y_off);
+                  s_conf_dirty = true;
+              }
               ImGui::Separator();
-              ImGui::Checkbox("Show toggle button", &s_show_fab);
-              ImGui::Checkbox("Menu visible", &s_visible);
+              if (ImGui::Checkbox("On-screen keyboard", &s_kbd_on))
+                  s_conf_dirty = true;
+              if (ImGui::Checkbox("Show toggle button", &s_show_fab))
+                  s_conf_dirty = true;
+              if (ImGui::Checkbox("Menu visible", &s_visible))
+                  s_conf_dirty = true;
               if (!s_visible && !s_show_fab)
                   ImGui::TextColored(ImVec4(1, .6f, 0, 1),
                       "Menu hidden with no toggle button - it was re-enabled.");
-              if (!s_show_fab && !s_visible) s_show_fab = true;
+              if (!s_show_fab && !s_visible) { s_show_fab = true; s_conf_dirty = true; }
           
               ImGui::Separator();
               ImGui::TextColored(ImVec4(.5f, .8f, 1.f, 1), "Status");
@@ -2038,6 +2543,9 @@ jobs:
               ImGui::Text("Agent:   %s %s",
                           s_agent_ready ? "ready" : "waiting",
                           s_agent_note);
+              char mb[128];
+              overlay_touch_map_desc(mb, sizeof(mb));
+              ImGui::Text("Input:   %s", mb);
               ImGui::Text("Display: %.0fx%.0f  FPS %.0f", io.DisplaySize.x,
                           io.DisplaySize.y, io.Framerate);
           }
@@ -2051,9 +2559,9 @@ jobs:
                   snprintf(s_pval, sizeof(s_pval), "%s", e.value.c_str());
                   s_pedit = -1;
               }
-              ImGui::InputText("Class##pc",  s_pcls, sizeof(s_pcls));
-              ImGui::InputText("Field##pf",  s_pfld, sizeof(s_pfld));
-              ImGui::InputText("Value##pv",  s_pval, sizeof(s_pval));
+              kbd_textfield("Class##pc",  s_pcls, sizeof(s_pcls));
+              kbd_textfield("Field##pf",  s_pfld, sizeof(s_pfld));
+              kbd_textfield("Value##pv",  s_pval, sizeof(s_pval));
               if (ImGui::Button("Add Patch") && s_pcls[0] && s_pfld[0]) {
                   std::string a = "{\"class\":\"" + jesc(s_pcls)
                                 + "\",\"field\":\"" + jesc(s_pfld)
@@ -2116,10 +2624,10 @@ jobs:
                   s_hmode = e.mode;
                   s_hedit = -1;
               }
-              ImGui::InputText("Class##hc",  s_hcls, sizeof(s_hcls));
-              ImGui::InputText("Method##hm", s_hmth, sizeof(s_hmth));
+              kbd_textfield("Class##hc",  s_hcls, sizeof(s_hcls));
+              kbd_textfield("Method##hm", s_hmth, sizeof(s_hmth));
               ImGui::Combo("Mode##hmd", &s_hmode, modes, 3);
-              ImGui::InputTextMultiline("Code##hcd", s_hcode, sizeof(s_hcode),
+              kbd_multiline("Code##hcd", s_hcode, sizeof(s_hcode),
                                         ImVec2(-1, 90));
               ImGui::TextDisabled("Java: fn(Java,send,console,thiz,args,orig). "
                                   "Smali: body of static hook(Object thiz, Object[] args); "
@@ -2176,14 +2684,14 @@ jobs:
           
           /* ===================== Tracker ===================== */
           static void tab_tracker() {
-              ImGui::InputText("Class##tc",  s_tcls, sizeof(s_tcls));
-              ImGui::InputText("Method##tm", s_tmth, sizeof(s_tmth));
+              kbd_textfield("Class##tc",  s_tcls, sizeof(s_tcls));
+              kbd_textfield("Method##tm", s_tmth, sizeof(s_tmth));
               if (ImGui::Button("Track") && s_tcls[0] && s_tmth[0]) {
                   std::string a = "{\"class\":\"" + jesc(s_tcls)
                                 + "\",\"method\":\"" + jesc(s_tmth) + "\"}";
                   post_rpc("addTracker", a);
                   MLK();
-                  s_trackers.push_back({std::string(s_tcls) + "." + s_tmth,
+                  s_trackers.push_back({std::string(s_tcls) + "." + std::string(s_tmth),
                                         false, {}});
                   MULK();
                   s_tcls[0] = s_tmth[0] = 0;
@@ -2229,7 +2737,15 @@ jobs:
                   MULK();
                   if (ImGui::Button("Start")) {
                       s_rec_on = true;
-                      post_rpc("startRecorder", "{}");
+                      /* r11: scoped recorder. The Start button passes the package
+                         filter and the method cap; the agent enumerates classes
+                         of that package ONLY and stops installing once the cap is
+                         reached, instead of hooking every method of every class in
+                         the process (which could not finish in the 32-bit field
+                         run and looked like a crash). */
+                      std::string a = "{\"filter\":\"" + jesc(s_rec_filter)
+                                     + "\",\"cap\":" + std::to_string(s_rec_cap) + "}";
+                      post_rpc("startRecorder", a);
                       snprintf(s_rec_stat, sizeof(s_rec_stat), "starting...");
                       MLK();
                       s_rec.clear();
@@ -2245,6 +2761,15 @@ jobs:
                   MULK();
               }
               MLK();
+              kbd_textfield("Package filter", s_rec_filter, sizeof(s_rec_filter));
+              ImGui::SameLine();
+              if (ImGui::IsItemHovered())
+                  ImGui::SetTooltip("empty = the app's own package only; "
+                                    "com.foo = that prefix; . = everything (huge!)");
+              ImGui::SliderInt("Method cap", &s_rec_cap, 100, 6000, "%d");
+              ImGui::SameLine();
+              if (ImGui::IsItemHovered())
+                  ImGui::SetTooltip("stop installing hooks after this many methods");
               ImGui::TextDisabled("status: %s | %lu rows (newest last)",
                                   s_rec_stat, (unsigned long)s_rec.size());
               ImGui::BeginChild("recl", ImVec2(0, 260), true);
@@ -2323,7 +2848,7 @@ jobs:
           
           /* ===================== Script ===================== */
           static void tab_script() {
-              ImGui::InputTextMultiline("##sc", s_script, sizeof(s_script),
+              kbd_multiline("##sc", s_script, sizeof(s_script),
                                         ImVec2(-1, 160));
               if (ImGui::Button("Run")) {
                   MLK(); s_cons.clear(); MULK();
@@ -2552,11 +3077,15 @@ jobs:
           
               if (s_search_on) {
                   ImGui::Separator();
-                  ImGui::InputText("Filter##sf", s_search, sizeof(s_search));
+                  kbd_textfield("Filter##sf", s_search, sizeof(s_search));
                   ImGui::SameLine();
                   if (ImGui::Button("Search")) {
+                      MLK();
                       s_search_wait = true;
-                      std::string a = "{\"filter\":\"" + jesc(s_search) + "\"}";
+                      int qid = ++s_search_seq;
+                      MULK();
+                      std::string a = "{\"filter\":\"" + jesc(s_search)
+                                     + "\",\"qid\":" + std::to_string(qid) + "}";
                       post_rpc("listLoadedClasses", a);
                   }
                   MLK();
@@ -2564,13 +3093,17 @@ jobs:
                   else ImGui::TextDisabled("%ld matched, showing %ld",
                                            (long)s_search_total, (long)s_search_shown);
                   ImGui::BeginChild("srch", ImVec2(0, 220), true);
-                  for (int i = 0; i < (int)s_search_res.size(); i++) {
-                      ImGui::PushID(i);
-                      if (ImGui::Selectable(s_search_res[i].c_str())) {
-                          menu_open_class(s_search_res[i]);
-                          s_search_on = false;
+                  ImGuiListClipper clip;
+                  clip.Begin((int)s_search_res.size());
+                  while (clip.Step()) {
+                      for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                          ImGui::PushID(i);
+                          if (ImGui::Selectable(s_search_res[i].c_str())) {
+                              menu_open_class(s_search_res[i]);
+                              s_search_on = false;
+                          }
+                          ImGui::PopID();
                       }
-                      ImGui::PopID();
                   }
                   ImGui::EndChild();
                   mark_scroll_item(s_lst_scroll);
@@ -2668,6 +3201,7 @@ jobs:
                   s_fab_drag = false;
                   if (!s_fab_moved) {           /* it was a tap, not a drag */
                       s_visible = !s_visible;
+                      s_conf_dirty = true;
                   }
               }
               ImGui::End();
@@ -2690,9 +3224,11 @@ jobs:
                   /* publish empty region list: drags elsewhere must not scroll */
                   overlay_publish_scroll_regions(s_regions);
                   s_regions.clear();
+                  overlay_publish_kbd_rect(0, 0, 0, 0);
                   return;
               }
               draw_fab(ds);
+              draw_kbd(ds);
           
               ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
               ImGui::SetNextWindowSizeConstraints(
@@ -2700,9 +3236,9 @@ jobs:
               ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.2 (r10)", &open,
+              ImGui::Begin("Dex-tool v1.2 (r11)", &open,
                            ImGuiWindowFlags_NoCollapse);
-              if (!open) { MLK(); s_visible = false; MULK(); }
+              if (!open) { MLK(); s_visible = false; s_conf_dirty = true; MULK(); }
           
               if (ImGui::BeginTabBar("tb")) {
                   struct TabDef { const char* name; void (*fn)(); };
@@ -2732,7 +3268,36 @@ jobs:
               mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
               overlay_publish_scroll_regions(s_regions);
               s_regions.clear();
+          
+              /* debounce the conf write so sliders do not hit the disk 60x/s */
+              if (s_conf_dirty && s_conf_path[0] &&
+                  conf_now_ms() - s_conf_last_ms > 700) {
+                  conf_save();
+                  MLK();
+                  overlay_set_touch_bias(s_y_off);
+                  MULK();
+              }
           }
+          
+          /* ---- desktop unit-test backdoor (compiled only with -DDXT_KBD_TEST;
+             never defined for the Android build) ---- */
+          #ifdef DXT_KBD_TEST
+          extern "C" void kbd_test_setup(float w, float h) {
+              s_kbd.open = true; s_kbd.shift = false; s_kbd.page2 = false;
+              s_kbd.dragging = false; s_kbd.last.clear();
+              s_kbd.w = w; s_kbd.h = 236.f;
+              s_kbd.x = 0; s_kbd.y = h - s_kbd.h; if (s_kbd.y < 0) s_kbd.y = 0;
+              s_kbd_keys.clear();
+          }
+          extern "C" void kbd_test_field(char* buf, size_t cap) {
+              s_kbd_field = { buf, cap };
+          }
+          extern "C" bool kbd_test_feed(int phase, float x, float y) {
+              return menu_kbd_feed(phase, x, y);
+          }
+          extern "C" bool kbd_test_is_open() { return s_kbd.open; }
+          extern "C" void kbd_test_draw(float w, float h) { draw_kbd(ImVec2(w, h)); }
+          #endif
           DXTMNC
 
       - name: Generate main.cpp
@@ -2782,9 +3347,26 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r9). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r11). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
-             send()/recv(); the C++ menu decodes them in menu.cpp. */
+             send()/recv(); the C++ menu decodes them in menu.cpp.
+          
+             r11 changes (field issues from the r10 run):
+             - keyboard: the hidden-EditText bridge is GONE. String(getText()) is
+               an android.text.Editable, whose String() form is "[object
+               Object]" - which is exactly what got typed into every field. The
+               on-screen keyboard is now drawn natively by libtool.so; this side
+               only consumes kbd-area taps so they do not fall through to the app.
+             - classes: listLoadedClasses streams the FULL result in pages of 400
+               with a qid; the r10 version silently capped at 800 names, so the
+               tab never displayed all classes.
+             - recorder: Start passes {filter, cap}; only classes of the app's
+               own package (or the given prefix) are hooked, and installation
+               stops at cap methods. Hooking every method of every loaded class
+               exhausted the 32-bit process and it died with SIGABRT.
+             - touch map: measured on Activity.onResume AND on every touch
+               (throttled); onWindowFocusChanged never fired on the field host.
+          */
           
           function sendMsg(type, payload) { send({ type: type, payload: payload }); }
           function jstr(v) {
@@ -2792,7 +3374,7 @@ jobs:
                   if (v === null || v === undefined) return 'null';
                   var s = String(v);
                   if (s.length > 160) s = s.substring(0, 157) + '...';
-                  return s.replace(/\|/g, '\u01c2').replace(/#/g, '\u266f');
+                  return s.replace(/\|/g, '!').replace(/#/g, '%');
               } catch (e) { return '?'; }
           }
           function jargs(a) {
@@ -2836,22 +3418,6 @@ jobs:
               } catch (e) { return []; }
           }
           
-          /* smali-like skeleton of a replacement body for the editor */
-          function smali_skel(cls, m) {
-              var name = m.getName(), pn = 0;
-              var ps = m.getParameterTypes(), r = m.getReturnType().getName();
-              var sb = '.class public L' + cls.replace(/\./g, '/') + 'Hook;\n';
-              sb += '.method public static hook(';
-              for (var i = 0; i < ps.length; i++)
-                  sb += (i ? ',' : '') + ps[i].getName();
-              sb += ')' + r + '\n.locals 4\n';
-              sb += '    # edit below, then Apply (runtime dex)\n';
-              sb += '    p0 = 1\n';            /* placeholder rewrite rules */
-              sb += '    return 0\n';
-              sb += '.end method';
-              return sb;
-          }
-          
           /* rewrite rules: parse tiny-language lines from smali code
              supported:  pN = literal | name  /  R = literal   (literal: number,
              true/false/null/"str"/'char' or an identifier=literal arg) */
@@ -2877,12 +3443,11 @@ jobs:
               return undefined;              /* treat as identifier: copy-through */
           }
           
-          var smali_cache = {};              /* key -> {loader, cls, err, code} */
           var gAddChar = null, gBackspace = null, gWantMouse = null;
           var gNativeTouch = null, gSetMap = null, gDispSize = null;
           
           function ensure_native_fns() {
-              if (gAddChar) return true;
+              if (gNativeTouch) return true;
               try {
                   var m = Module.findExportByName('libtool.so', 'dextool_add_char');
                   var b = Module.findExportByName('libtool.so', 'dextool_backspace');
@@ -2902,8 +3467,11 @@ jobs:
           }
           
           /* measure where the drawing view sits inside the window and tell the
-             overlay; repeat on layout changes. view id 0x01020002 = android.R.id.content */
+             overlay. r11: also called from Activity.onResume (onWindowFocusChanged
+             never fired on the field host) and throttled from every touch, so a
+             relayout at any point in the app's life still updates the map. */
           var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
+          var gMapLastTouch = 0;
           function report_map(view) {
               try {
                   if (!view) return;
@@ -2912,93 +3480,19 @@ jobs:
                   var w = view.getWidth(), h = view.getHeight();
                   if (w === gMapSent.w && h === gMapSent.h &&
                       loc[0] === gMapSent.x && loc[1] === gMapSent.y) return;
+                  if (w <= 0 || h <= 0) return;
                   gMapSent = { w: w, h: h, x: loc[0], y: loc[1] };
                   gSetMap(loc[0], loc[1], w, h);
                   sendMsg('info', { msg: 'touch map ' + loc[0] + ',' + loc[1] + ' ' + w + 'x' + h });
               } catch (e) {}
           }
-          
-          
-          /* ---------------- keyboard bridge -----------------------------------
-             r10: no Java.registerClass (fatal "invalid jobject" on 32-bit ART
-             with JNI checks), no Java.scheduleOnMainThread, no TextWatcher.
-             Instead: a hidden EditText is created with plain reflection on the
-             main thread (inside the dispatchTouchEvent hook), the IME is told
-             to show/hide from that same main-thread context, and the frida
-             thread polls the EditText's text and feeds deltas to the overlay
-             (chars + backspaces). */
-          var KBD = {
-              et: null, imm: null, last: '', want: 0, /* 0 none, 1 show, 2 hide */
-              lastPoll: 0
-          };
-          
-          function kbd_ensure_views(activity) {
-              /* runs on the main thread (dispatchTouchEvent context) */
-              if (KBD.et) return true;
+          function content_view(activity) {
               try {
-                  var ET = Java.use('android.widget.EditText');
-                  var LP = Java.use('android.widget.FrameLayout$LayoutParams');
-                  var IMMCls = Java.use('android.view.inputmethod.InputMethodManager');
-                  var VG = Java.use('android.view.ViewGroup');
-          
-                  var et = ET.$new(activity);
-                  et.setAlpha(0.0);
-                  et.setFocusableInTouchMode(true);
-                  var params = LP.$new(1, 1);
-                  Java.cast(activity.getWindow().getDecorView(), VG)
-                      .addView(et, params);
-                  KBD.et = et;
-                  KBD.imm = Java.cast(activity.getSystemService('input_method'), IMMCls);
-                  sendMsg('info', { msg: 'keyboard bridge OK (r10, no registerClass)' });
-                  return true;
-              } catch (e) {
-                  sendMsg('warn', { msg: 'kbd views: ' + e.message });
-                  return false;
-              }
+                  /* 0x01020002 = android.R.id.content */
+                  return activity.getWindow().getDecorView()
+                                  .findViewById(0x01020002);
+              } catch (e) { return null; }
           }
-          
-          function kbd_apply_want(activity) {
-              /* main thread: honour the pending show/hide request */
-              if (!KBD.want || !activity) return;
-              var req = KBD.want;
-              KBD.want = 0;
-              try {
-                  if (!kbd_ensure_views(activity)) return;
-                  if (req === 1) {
-                      KBD.et.requestFocus();
-                      KBD.imm.showSoftInput(KBD.et, 0);
-                      KBD.last = '';
-                      KBD.et.setText('');
-                  } else {
-                      var b = KBD.et.getWindowToken();
-                      if (b) KBD.imm.hideSoftInputFromWindow(b, 0);
-                      KBD.et.clearFocus();
-                      KBD.et.setText('');
-                      KBD.last = '';
-                  }
-              } catch (e) {
-                  sendMsg('warn', { msg: 'kbd apply: ' + e.message });
-              }
-          }
-          
-          setInterval(function () {
-              /* frida thread: poll IME text and forward the delta */
-              if (!KBD.et || !gAddChar) return;
-              try {
-                  var txt = String(KBD.et.getText());
-                  if (txt !== KBD.last) {
-                      var i = 0;
-                      while (i < txt.length && i < KBD.last.length &&
-                             txt.charAt(i) === KBD.last.charAt(i)) i++;
-                      var removed = KBD.last.length - i;
-                      var added   = txt.substring(i);
-                      for (var r = 0; r < removed; r++) gBackspace();
-                      for (var a = 0; a < added.length; a++)
-                          gAddChar(added.charCodeAt(a));
-                      KBD.last = txt;
-                  }
-              } catch (e) { /* view not attached yet */ }
-          }, 120);
           
           /* ---------------- input + view mapping on the host activity -------- */
           function installTouchHook() {
@@ -3008,27 +3502,35 @@ jobs:
               }
               Java.perform(function () {
                   var Activity = Java.use('android.app.Activity');
-                  var contentId = 0x01020002;
-                  Activity.onWindowFocusChanged.implementation = function (has) {
-                      try {
-                          if (has) {
-                              var cv = this.getWindow().getDecorView()
-                                            .findViewById(contentId);
-                              report_map(cv);
-                          }
-                      } catch (e) {}
-                      return this.onWindowFocusChanged(has);
+                  Activity.onResume.implementation = function () {
+                      var r = this.onResume();
+                      try { report_map(content_view(this)); } catch (e) {}
+                      return r;
                   };
                   Activity.dispatchTouchEvent.implementation = function (ev) {
-                      /* MAIN THREAD: the only safe place for view/IME calls */
-                      try { kbd_apply_want(this); } catch (e0) {}
+                      /* MAIN THREAD */
                       try {
-                          /* forward raw window coords; overlay maps them */
-                          gNativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
+                          var act = ev.getAction() & 0xff;
+                          var down = (act === 0);
+                          /* raw window coords first: the overlay maps them */
+                          gNativeTouch(ev.getX(), ev.getY(), act);
+                          if (act === 2) {          /* throttle map refresh on moves */
+                              var now = Date.now();
+                              if (now - gMapLastTouch > 2000) {
+                                  gMapLastTouch = now;
+                                  report_map(content_view(this));
+                              }
+                          }
+                          /* let the overlay decide (menu/keyboard own the tap) */
+                          if (gWantMouse && gWantMouse()) {
+                              if (down || act === 1 || act === 3)
+                                  this.dispatchTouchEvent(ev);   /* original call */
+                              return true;                        /* consume */
+                          }
                       } catch (e) {}
-                      return this.dispatchTouchEvent(ev);
+                      return this.dispatchTouchEvent(ev);         /* original call */
                   };
-                  sendMsg('info', { msg: 'touch + keyboard hooks installed (r10)' });
+                  sendMsg('info', { msg: 'touch hook installed (r11)' });
               });
           }
           installTouchHook();
@@ -3066,18 +3568,16 @@ jobs:
               return out;
           }
           
-          /* ---------------- recorder ---------------- */
+          /* ---------------- recorder ----------------
+             r11: scoped. Only classes matching the package filter are hooked and
+             installation stops at cap methods; the r10 version hooked every
+             method of every class in the process (tens of thousands of ArtMethod
+             hook slots on a 32-bit process) and died with SIGABRT mid-install. */
           var REC = { on: false, busy: false, ring: [], installed: 0, flushBusy: false };
-          var REC_SKIP = [
-              '^android\\.', '^androidx\\.', '^java\\.', '^javax\\.', '^dalvik\\.',
-              '^kotlin\\.', '^kotlinx\\.', '^libcore\\.', '^org\\.apache\\.',
-              '^com\\.android\\.', '^com\\.google\\.android\\.', '^okhttp3\\.',
-              '^okio\\.', '^org\\.json$', '^com\\.android\\.tools\\.'
-          ];
-          function rec_skip(name) {
-              for (var i = 0; i < REC_SKIP.length; i++)
-                  if (name.search(REC_SKIP[i]) === 0) return true;
-              return false;
+          function rec_wanted(name, filter) {
+              if (filter === '.') return true;                 /* everything */
+              if (!filter) return true;                        /* agent default */
+              return name.indexOf(filter) === 0;
           }
           function rec_flush() {
               if (REC.flushBusy || !REC.ring.length) return;
@@ -3094,18 +3594,21 @@ jobs:
           function rec_install_chunk(list, batch) {
               var done = 0;
               for (var i = 0; i < batch && REC.idx < list.length; i++, REC.idx++) {
+                  if (REC.installed >= REC.cap) break;
                   var cls = list[REC.idx];
-                  if (rec_skip(cls)) continue;
+                  if (!rec_wanted(cls, REC.filter)) continue;
                   try {
                       var jc = Java.use(cls);
                       var ms = jc.class.getDeclaredMethods();
                       for (var k = 0; k < ms.length; k++) {
+                          if (REC.installed >= REC.cap) break;
                           var name = ms[k].getName();
                           var ovl;
                           try { ovl = jc[name].overloads; } catch (e0) { continue; }
                           if (!ovl) continue;
                           var made = 0;
                           for (var oi = 0; oi < ovl.length; oi++) {
+                              if (REC.installed >= REC.cap) break;
                               try {
                                   (function (ov, cn, mn) {
                                       ov.implementation = function () {
@@ -3125,24 +3628,24 @@ jobs:
                                           return ov.apply(this, arguments);
                                       };
                                       made++;
+                                      REC.installed++;
                                   })(ovl[oi], cls, name);
                               } catch (e2) {}
                           }
-                          if (made) REC.installed += made;
+                          if (made) REC.installed += 0;   /* counted per overload above */
                       }
                       done++;
                   } catch (e3) {}
               }
               sendMsg('recorderProgress', {
                   installed: REC.installed, total: list.length - REC.idx });
-              if (REC.idx < list.length) {
+              if (REC.idx < list.length && REC.installed < REC.cap) {
                   setTimeout(function () { rec_install_chunk(list, batch); }, 30);
               } else {
                   REC.busy = false;
                   sendMsg('recorderStarted', { installed: REC.installed });
               }
           }
-          
           
           /* ---------------- monitor ---------------- */
           var MON = { on: false, ring: [], origins: {}, okhttp: null };
@@ -3171,7 +3674,6 @@ jobs:
               MON.origins[site] = top;
               return top;
           }
-          var MON_SITES = 0;
           function mon_flush() {
               if (!MON.ring.length) return;
               var items = MON.ring.splice(0, MON.ring.length);
@@ -3218,11 +3720,10 @@ jobs:
                       });
                   } catch (e) {}
           
-                  /* SSL: TLS plaintext via SSLSocket startHandshake sites */
+                  /* SSL: best-effort note only; full plaintext would need
+                     SSL_read/SSL_write native hooks */
                   try {
                       var SSLSocket = Java.use('javax.net.ssl.SSLSocket');
-                      /* best-effort note only; full plaintext would need
-                         SSL_read/SSL_write native hooks */
                       mon_push('ssl', 'engine', 'note',
                                '', 'SSLSocket reachable');
                   } catch (e) {}
@@ -3243,7 +3744,6 @@ jobs:
                   if (jc[member]) found = jc[member];
               } catch (e) {}
               if (!found) {
-                  /* overloads by exact name exist even without $ overloads attr */
                   try {
                       var ms = jc.class.getDeclaredMethods();
                       for (var i = 0; i < ms.length; i++)
@@ -3280,7 +3780,6 @@ jobs:
           
           var patches = {}, hooks = {}, trackers = {};
           
-          
           /* ---------------- rpc exports (called from the menu) ---------------- */
           rpc.exports = {
               /* ---- patches: static-field value replacement ---- */
@@ -3292,7 +3791,6 @@ jobs:
                           var f = jc.class.getDeclaredField(field);
                           f.setAccessible(true);
                           var t = f.getType().getName();
-                          if (!f.getModifiers) {}
                           var st = (f.getModifiers() & 8) !== 0;
                           if (!st) throw new Error('not a static field (instances: Classes tab)');
                           if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
@@ -3324,7 +3822,6 @@ jobs:
                           } catch (e) {}
                       });
                   } else {
-                      /* re-apply: same path as addPatch */
                       rpc.exports.addPatch(cls, field, patches[key] ? patches[key].v : '');
                   }
                   sendMsg('info', { msg: 'patch ' + key + ' -> ' + (en ? 'on' : 'off') });
@@ -3384,10 +3881,6 @@ jobs:
                               hooks[key] = { mode: mode, on: true, code: code };
                               sendMsg('hookAdded', { name: key });
                           } else if (mode === 'Smali') {
-                              /* compile the body with the real smali assembler
-                                 (bundled jar) and load it with InMemoryDexClassLoader;
-                                 the JS hook delegates into the compiled hook. The
-                                 generated class name is fixed so smali_load finds it. */
                               var gen = 'H' + (Date.now() % 1000000);
                               var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
                                          '.super Ljava/lang/Object;\n' +
@@ -3543,11 +4036,24 @@ jobs:
                   sendMsg('info', { msg: 'tracker removed ' + name });
               },
           
-          
               /* ---- recorder ---- */
-              startRecorder: function () {
+              startRecorder: function (filter, cap) {
                   if (REC.on || REC.busy) return;
                   Java.perform(function () {
+                      var pkg = '';
+                      try {
+                          var AT = Java.use('android.app.ActivityThread');
+                          var app = AT.currentApplication();
+                          if (app) pkg = String(app.getPackageName());
+                      } catch (e0) {}
+                      REC.filter = (filter === undefined || filter === null) ? '' :
+                                    String(filter);
+                      if (!REC.filter) REC.filter = pkg;   /* default: own package */
+                      if (REC.filter === '.') REC.filter = pkg;  /* menu: explicit all */
+                      /* '.' sent by the UI means everything; agent: use it directly */
+                      if (filter === '.') REC.filter = '.';
+                      REC.cap = (typeof cap === 'number' && cap > 0) ?
+                                Math.floor(cap) : 1500;
                       var list = Java.enumerateLoadedClassesSync();
                       REC.on = true;
                       REC.busy = true;
@@ -3555,6 +4061,8 @@ jobs:
                       REC.installed = 0;
                       REC.idx = 0;
                       sendMsg('recorderProgress', { installed: 0, total: list.length });
+                      sendMsg('info', { msg: 'recorder scope: filter="' + REC.filter +
+                                             '" cap=' + REC.cap });
                       setTimeout(function () { rec_install_chunk(list, 25); }, 50);
                   });
               },
@@ -3591,7 +4099,7 @@ jobs:
               },
           
               /* ---- classes ---- */
-              listLoadedClasses: function (filter) {
+              listLoadedClasses: function (filter, qid) {
                   Java.perform(function () {
                       try {
                           var all = Java.enumerateLoadedClassesSync();
@@ -3600,11 +4108,27 @@ jobs:
                           for (var i = 0; i < all.length; i++) {
                               if (!f || all[i].toLowerCase().indexOf(f) !== -1)
                                   out.push(all[i]);
-                              if (out.length >= 800) break;
                           }
-                          sendMsg('classList', {
-                              classes: out, total: all.length, shown: out.length
-                          });
+                          /* r11: stream the FULL result in pages of 400. The r10
+                             version sent one message capped at 800 names, so the
+                             Classes tab never displayed all classes. */
+                          var PAGE = 400;
+                          var pages = Math.max(1, Math.ceil(out.length / PAGE));
+                          var q = (typeof qid === 'number') ? qid : 0;
+                          var idx = 0;
+                          var send_page = function () {
+                              var chunk = out.slice(idx, idx + PAGE);
+                              idx += PAGE;
+                              sendMsg('classList', {
+                                  qid: q, page: Math.floor((idx - PAGE) / PAGE),
+                                  pages: pages, total: all.length,
+                                  shown: Math.min(idx, out.length),
+                                  classes: chunk
+                              });
+                              if (idx < out.length)
+                                  setTimeout(send_page, 15);
+                          };
+                          send_page();
                       } catch (e) {
                           sendMsg('error', { fn: 'listLoadedClasses',
                                              msg: String(e.message || e) });
@@ -3684,7 +4208,7 @@ jobs:
                   Java.perform(function () {
                       try {
                           var jc = Java.use(cls);
-                          var best = null, bestScore = -1;
+                          var best = null;
                           jc[method].overloads.forEach(function (ov) {
                               var np = ov.argumentTypes.length;
                               if (np === (args ? args.length : 0)) { best = ov; }
@@ -3740,7 +4264,6 @@ jobs:
               var out = { err: '', dex: null };
               Java.perform(function () {
                   try {
-                      var Path = null;
                       var ctx = null;
                       try {
                           var AT = Java.use('android.app.ActivityThread');
@@ -3775,7 +4298,6 @@ jobs:
                           Array.prototype.map.call(src, function (c) { return c.charCodeAt(0) & 0xff; }));
                       fos2.write(jb);
                       fos2.close();
-                      var Str = Java.use('java.lang.String');
                       var arr = Java.array('java.lang.String', [
                           'assemble', '-o', outF, inF ]);
                       main.main(arr);
@@ -3838,18 +4360,12 @@ jobs:
               try {
                   if (msg.type === 'rpc' && msg.fn && rpc.exports[msg.fn]) {
                       var a = msg.args || {};
-                      /* the menu always sends named args; exports take them
-                         positionally in declaration order per fn */
                       var names = FN_ARGS[msg.fn] || [];
                       var vals = names.map(function (n) { return a[n]; });
                       rpc.exports[msg.fn].apply(rpc.exports, vals);
-                  } else if (msg.type === 'showKeyboard') {
-                      /* r10: no scheduleOnMainThread; the main-thread touch hook
-                         applies the request at its next event */
-                      if (KBD.want === 0) KBD.want = 1;
-                  } else if (msg.type === 'hideKeyboard') {
-                      if (KBD.want === 0) KBD.want = 2;
                   }
+                  /* r11: show/hideKeyboard are gone; the on-screen keyboard is
+                     native. Unknown types fall through silently. */
               } catch (e) {
                   sendMsg('error', { fn: 'recv', msg: String(e.message || e) });
               }
@@ -3857,7 +4373,7 @@ jobs:
           });
           
           /* argument-name table: menu sends {class:..., method:...}; exports
-             were declared as function(cls, method, ...) */
+             were declared as function(cls, method, ...) positionally */
           var FN_ARGS = {
               addPatch:        ['class', 'field', 'value'],
               setPatchEnabled: ['class', 'field', 'enabled'],
@@ -3868,19 +4384,19 @@ jobs:
               addTracker:      ['class', 'method'],
               trackField:      ['class', 'field'],
               removeTracker:   ['name'],
-              startRecorder:   [],
+              startRecorder:   ['filter', 'cap'],
               stopRecorder:    [],
               startMonitor:    [],
               stopMonitor:     [],
               evalScript:      ['src'],
-              listLoadedClasses: ['filter'],
+              listLoadedClasses: ['filter', 'qid'],
               openClass:       ['class'],
               listInstances:   ['class'],
               setInstanceField:['class', 'index', 'field', 'value'],
               callMethod:      ['class', 'method', 'args']
           };
           
-          sendMsg('ready', { msg: 'Dex-tool agent r10 loaded' });
+          sendMsg('ready', { msg: 'Dex-tool agent r11 loaded' });
           DXTAGNT
 
       - name: Embed agent.js as C array
@@ -4208,40 +4724,62 @@ jobs:
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
           
-          ## Fixes in this version (r10)
+          ## Fixes in this version (r11)
           
-              1. All tabs drew empty - the tab loop created the tab items but
-                 never called their body functions (Settings/Patches/Hooks/
-                 Tracker/Recorder/Monitor/Script/Classes are ~500 lines of UI
-                 that simply never ran). The loop now calls each tab's
-                 function between BeginTabItem/EndTabItem.
+          1. Touch offset ("must tap above the item"). The overlay now tracks
+             every EGL surface of the process (not just the owner's), so the
+             native fallback map (largest surface ~= full window) is available
+             from the first frame on any thread. The agent measures the real
+             view rect on Activity.onResume and throttled on every touch
+             (onWindowFocusChanged never fired on the field host). On top of the
+             map there is now a manual "Touch Y offset" slider in Settings for
+             hosts where neither source can be derived; it persists with the
+             rest of the UI state.
           
-              2. App crash right after boot (JNI 'invalid jobject' abort in
-                 nativePollOnce). The keyboard bridge built a TextWatcher with
-                 Java.registerClass and posted it via Java.scheduleOnMainThread
-                 - both are fatal on 32-bit ART with JNI checks. Rewritten -
-                 the hidden EditText and the IME show/hide now happen inside
-                 the main-thread dispatchTouchEvent hook (plain reflection
-                 only), and the frida thread polls the EditText text and feeds
-                 the delta to ImGui (chars + backspace).
+          2. Keyboard typed "[object Object]" into every field. Root cause: the
+             bridge polled a hidden EditText with String(getText()) - that is an
+             android.text.Editable, not the text, and its String() form is
+             "[object Object]", which is exactly what got typed. The whole IME
+             bridge (hidden EditText, InputMethodManager, text polling, the
+             show/hide message round-trip) is gone. The r11 keyboard is drawn
+             natively by libtool.so (qwerty + symbols page, shift, space, bksp):
+             a tap inside it is routed to the active ImGui field and never
+             reaches the app underneath.
           
-              3. Touch offset still present when the agent died before
-                 measuring. The overlay now derives a native fallback map from
-                 the largest surface ever seen (the HWUI surface spans the full
-                 window), so input is scaled correctly from the first frame;
-                 the agent's real measurement replaces it when it arrives.
+          3. Classes tab did not display all classes. The agent sent ONE message
+             capped at 800 names; the field run has thousands of classes. The
+             agent now streams the FULL result in pages of 400 with a query id,
+             and the menu appends pages as they arrive (the list itself is
+             clipperized, so tens of thousands of rows stay smooth).
           
-              4. Park/adopt confirmed in the field - the r9 log shows the menu
-                 surviving an app-switch context destroy ('ImGui parked',
-                 'adopted after 8 swaps'). That path is kept as-is.
+          4. Recorder crashed the app (SIGABRT, "glUseProgram -> GL_INVALID_VALUE
+             (0x501)"). Two independent causes, both fixed:
+             a) r10 hooked EVERY method of EVERY loaded class in the process -
+                tens of thousands of ArtMethod replacements on a 32-bit process.
+                The install loop never finished (the log shows endless
+                "recorderProgress" until death). The recorder is now scoped: the
+                Start button passes a package filter (default: the app's own
+                package) and a method cap; installation stops when the cap is
+                reached.
+             b) The GL abort class: eglTerminate was not covered, so after the
+                display was torn down the next eglCreateContext could land at a
+                recycled address whose stale slot drew with handles that are
+                invalid in the new context. eglTerminate is now hooked and
+                retires every slot of that display; glUseProgram(0) is never
+                restored (some ES wrappers raise GL_INVALID_VALUE for it); any
+                error left after a draw is drained and logged instead of being
+                left sticky for the app's next check.
+          
+          Also: UI state (theme, opacity, font size, scroll speeds, Y offset,
+          keyboard on/off, FAB) persists to <logdir>/dextool-ui.conf.
           
           ## Usage
           
-              1. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
-              2. Inject System.loadLibrary("tool") into Application.onCreate()
-                 or the launcher Activity.
-              3. Copy smali-fat.jar into assets/.
-              4. Re-sign and install.
+          1. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
+          2. Inject System.loadLibrary("tool") into Application.onCreate()
+             or the launcher Activity.
+          3. Copy smali-fat.jar into assets/.
+          4. Re-sign and install.
           
           ## Components
           
@@ -4294,7 +4832,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r10: tab bodies never drawn, JNI crash in keyboard bridge, native touch-map fallback [skip ci]"
+            git commit -m "fix r11: native on-screen keyboard, paged class listing, scoped recorder, Y-offset + GL abort fixes [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
