@@ -248,10 +248,17 @@ function ime_ensure(act) {
 
 function ime_show() {
     Java.perform(function () {
-        var act = IME.act;
-        if (!act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
         Java.scheduleOnMainThread(function () {
             try {
+                /* r13: the onResume hook can miss the FIRST resume (it is
+                   installed while the activity is already resuming), which
+                   left IME.act null forever and the keyboard never opened.
+                   Resolve the current activity on the spot instead of just
+                   warning; the lifecycle tracker keeps it fresh afterwards. */
+                if (!IME.act) {
+                    try { IME.act = find_current_activity(); } catch (e0) {}
+                }
+                if (!IME.act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
                 var edit = ime_ensure(IME.act);
                 if (!edit) return;
                 ime_reset_text();
@@ -277,6 +284,71 @@ function ime_show() {
         });
     });
 }
+
+/* r13: walk ActivityThread.mActivities (IBinder -> ActivityClientRecord)
+   and return a live activity; works with ArrayMap and HashMap because
+   both expose values(). Prefers a record that is neither paused nor
+   stopped. No hook timing involved, so it also covers the very first
+   resume that the onResume hook may have missed. */
+function find_current_activity() {
+    var at = Java.use('android.app.ActivityThread').currentActivityThread();
+    var acts = at.mActivities.value;
+    var it = acts.values().iterator();
+    var best = null;
+    while (it.hasNext()) {
+        var rec = it.next();
+        if (rec === null) continue;
+        var a = null;
+        try { a = rec.activity.value; } catch (e1) { continue; }
+        if (a === null) continue;
+        best = a;
+        var paused = false, stopped = false;
+        try { paused = rec.paused.value; } catch (e2) {}
+        try { stopped = rec.stopped.value; } catch (e3) {}
+        if (!paused && !stopped) return a;
+    }
+    return best;
+}
+
+/* r13: keep IME.act fresh for every future resume via Application
+   callbacks. Unlike the Activity.onResume implementation hook this
+   fires for all activities even when the agent lost the race with the
+   first resume, and it also tracks activity SWITCHES. It deliberately
+   does NOT call report_map(): the field device calibrated the touch
+   offset against the native estimate, and switching that device to the
+   measured view map would shift taps by the bias it corrected. */
+function install_lifecycle() {
+    Java.perform(function () {
+        try {
+            var app = Java.use('android.app.ActivityThread').currentApplication();
+            if (!app) throw new Error('Application not up yet');
+            var CB = Java.registerClass({
+                name: 'com.dextool.ime.LC' + (Date.now() % 1000000),
+                implements: [Java.use('android.app.Application$ActivityLifecycleCallbacks')],
+                methods: {
+                    onActivityCreated: function (a, b) {},
+                    onActivityStarted: function (a) {},
+                    onActivityResumed: function (a) { try { IME.act = a; } catch (e0) {} },
+                    onActivityPaused: function (a) {},
+                    onActivityStopped: function (a) {},
+                    onActivitySaveInstanceState: function (a, b) {},
+                    onActivityDestroyed: function (a) {}
+                }
+            });
+            app.registerActivityLifecycleCallbacks(CB.$new());
+            sendMsg('info', { msg: 'lifecycle tracker armed' });
+        } catch (e) {
+            /* the Application exists before any activity, so a few
+               short retries always succeed */
+            if (install_lifecycle.tries === undefined) install_lifecycle.tries = 0;
+            if (install_lifecycle.tries++ < 20)
+                setTimeout(install_lifecycle, 250);
+            else
+                sendMsg('warn', { msg: 'lifecycle tracker not armed: ' + String(e.message || e) });
+        }
+    });
+}
+install_lifecycle();
 
 function ime_hide() {
     Java.perform(function () {
@@ -1273,4 +1345,4 @@ var FN_ARGS = {
     callMethod:      ['class', 'method', 'args']
 };
 
-sendMsg('ready', { msg: 'Dex-tool agent r12 loaded' });
+sendMsg('ready', { msg: 'Dex-tool agent r13 loaded' });

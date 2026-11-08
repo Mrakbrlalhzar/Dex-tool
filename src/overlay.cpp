@@ -115,7 +115,7 @@ static std::atomic<bool> g_ready {false};
 struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
 static std::mutex g_map_mtx;
 static TouchMap   g_map;
-static float      g_bias_y = 0.f;      /* manual nudge, under g_map_mtx */
+static float      g_bias_y = -80.f;    /* manual nudge, under g_map_mtx; r13 default = constant status-bar offset */
 
 /* Touch stream with dedup: a NativeActivity host can deliver the same
    physical tap through BOTH the AInputQueue and the Java bridge; an

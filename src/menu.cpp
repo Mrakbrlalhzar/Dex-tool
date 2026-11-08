@@ -50,7 +50,7 @@ static float s_ovl_scroll = 1.5f;   /* whole-menu drag speed */
 static float s_lst_scroll = 1.2f;   /* inner list drag speed */
 static bool  s_visible    = true;
 static bool  s_show_fab   = true;
-static float s_y_off      = 0.0f;   /* manual touch Y bias (px) */
+static float s_y_off      = -80.0f; /* manual touch Y bias (px); r13 default = the constant status-bar offset measured on the field device */
 
 /* ---------------- agent / overlay status ---------------- */
 static bool  s_agent_ready = false;
@@ -278,8 +278,14 @@ void menu_open_class(const std::string& name) {
     if (name.empty()) return;
     MLK();
     bool have = false;
-    for (auto& c : s_classes) if (c.cname == name) { have = true; break; }
-    if (!have) s_classes.push_back(ClassTab{name});
+    for (auto& c : s_classes)
+        if (c.cname == name) { have = true; c.waiting = true; break; }
+    if (!have) {
+        ClassTab nt{};
+        nt.cname = name;
+        nt.waiting = true;
+        s_classes.push_back(nt);
+    }
     s_focus_cls = name;
     s_next_tab  = "Classes";
     MULK();
@@ -1046,37 +1052,35 @@ static void tab_script() {
 
 /* ===================== Classes ===================== */
 static void class_tab_content(ClassTab& c) {
-    const char* subs[] = {"Instances", "Methods", "Fields"};
-    if (ImGui::BeginTabBar("cls")) {
+    const char* subs[] = {"Instances", "Fields", "Methods"};
+    /* r13: unique tab-bar id - it used to be "cls", the same id as
+       the outer class-tab bar of tab_classes(); the two bars shared
+       one ImGuiTabBar state and the selection oscillated every frame
+       (lists flashed and disappeared). */
+    if (ImGui::BeginTabBar("clssub")) {
         for (int si = 0; si < 3; si++) {
-            bool sel = (c.sub == si);
-            if (ImGui::BeginTabItem(subs[si], nullptr,
-                    sel ? ImGuiTabItemFlags_SetSelected : 0)) {
+            if (ImGui::BeginTabItem(subs[si], nullptr, 0)) {
                 c.sub = si;
                 ImGui::EndTabItem();
-            } else if (sel) {
-                c.sub = si;
             }
         }
         ImGui::EndTabBar();
     }
-    if (c.waiting && !c.got_info)
-        ImGui::TextDisabled("(waiting for agent...)");
-    if (!c.got_info && !c.waiting)
-        ImGui::TextDisabled("(no data - tap Refresh)");
+    if (!c.got_info)
+        ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
+                                      : "(no data - tap Refresh)");
 
     if (ImGui::Button("Refresh"))
         menu_open_class(c.cname);
-    ImGui::SameLine();
-    if (ImGui::Button("Find instances")) {
-        std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
-        post_rpc("listInstances", a);
-    }
     ImGui::Separator();
 
     if (c.sub == 0) {                        /* ---- Instances ---- */
+        if (ImGui::Button("Find instances##fi")) {
+            std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
+            post_rpc("listInstances", a);
+        }
         if (c.instances.empty()) {
-            ImGui::TextDisabled("no instances loaded - Find instances");
+            ImGui::TextDisabled("no instances loaded - tap Find instances");
         }
         for (int i = 0; i < (int)c.instances.size(); i++) {
             ImGui::PushID(i);
@@ -1134,7 +1138,7 @@ static void class_tab_content(ClassTab& c) {
                 ImGui::PopID();
             }
         }
-    } else if (c.sub == 1) {                 /* ---- Methods ---- */
+    } else if (c.sub == 2) {                 /* ---- Methods ---- */
         if (c.call_open) {
             ImGui::TextColored(ImVec4(0, 1, 0, 1), "call %s.%s",
                                c.cname.c_str(), c.call_sig.name.c_str());
@@ -1213,7 +1217,7 @@ static void class_tab_content(ClassTab& c) {
         }
         ImGui::EndChild();
         mark_scroll_item(s_lst_scroll);
-    } else {                                 /* ---- Fields ---- */
+    } else if (c.sub == 1) {                 /* ---- Fields ---- */
         MLK();
         /* r12: values are NOT read while opening the class anymore
            (reading a static can run the class's <clinit> and hang
@@ -1308,7 +1312,7 @@ static void tab_classes() {
         /* which open class is visible? ImGui has no query for "current
            tab", so remember the last one the user clicked */
         static int s_cls_cur = 0;
-        if (ImGui::BeginTabBar("cls")) {
+        if (ImGui::BeginTabBar("clsTabs")) {
             for (int i = 0; i < (int)s_classes.size(); i++) {
                 bool open = true;
                 ImGuiTabItemFlags fl = 0;
@@ -1439,7 +1443,7 @@ void menu_draw() {
     ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.2 (r12)", &open,
+    ImGui::Begin("Dex-tool v1.2 (r13)", &open,
                  ImGuiWindowFlags_NoCollapse);
     if (!open) { MLK(); s_visible = false; s_conf_dirty = true; MULK(); }
 
@@ -1481,4 +1485,3 @@ void menu_draw() {
         MULK();
     }
 }
-
