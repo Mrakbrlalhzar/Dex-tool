@@ -83,6 +83,7 @@ struct Slot {
     bool  failed = false;
     bool  es3 = false;
     bool  dead = false;         /* under g_slots_mtx */
+    bool  reject_logged = false;  /* r14: one log per rejection */
     long  swaps = 0;            /* under g_slots_mtx */
     long  last_swap_ms = 0;     /* under g_slots_mtx */
     long  last_frame_ms = 0;    /* owner thread only */
@@ -93,6 +94,9 @@ static std::unordered_map<EGLContext, Slot*> g_slots;
 static std::vector<Slot*> g_graveyard;  /* never freed: no dangling */
 static EGLContext g_owner = nullptr;    /* under g_slots_mtx */
 static ImGuiContext* g_orphan_imgui = nullptr;  /* g_tick_mtx only */
+/* r14: DisplaySize of the parked world; surfaces far smaller than
+   this must NOT adopt it (the "small clone of our menu" bug) */
+static float g_orphan_dw = 0.f, g_orphan_dh = 0.f;
 static std::mutex g_tick_mtx;  /* one ImGui drawer at a time; also
                                   serializes ownership changes, adoption
                                   and slot teardown against frames */
@@ -243,6 +247,18 @@ extern "C" JNIEXPORT void dextool_backspace() {
     g_pending_bs = true;
 }
 
+/* r14: the GumJS agent posts phase markers here (NativeFunction on
+   this export) before and around every risky init step. The markers
+   land in dextool-crash.log AND dextool-debug.log, so a field abort
+   pins the exact phase that killed the process. */
+extern "C" JNIEXPORT void dextool_agent_log(const char* msg) {
+    if (!msg) return;
+    char m[560];
+    snprintf(m, sizeof(m), "[agent] %.500s\n", msg);
+    log_crash_raw(m);
+    log_debug(m);
+}
+
 bool overlay_ready() { return g_ready.load(); }
 
 void overlay_get_display_size(float* w, float* h) {
@@ -310,7 +326,8 @@ static Slot* slot_for(EGLContext ctx) {
        RenderThread). If an ImGui world is parked from a dead context,
        DT_ADOPT_MIN_SWAPS is enough - coming back from the background
        the new context adopts it almost immediately. */
-static bool ensure_ownership(Slot* s, EGLContext ctx) {
+static bool ensure_ownership(Slot* s, EGLContext ctx, float sw,
+                             float sh) {
     std::lock_guard<std::mutex> lk(g_slots_mtx);
     if (s->dead) return false;
     s->swaps++;
@@ -322,6 +339,36 @@ static bool ensure_ownership(Slot* s, EGLContext ctx) {
         if (it != g_slots.end() && !it->second->dead) ow = it->second;
     }
     if (ow == s) return true;
+
+    /* r14: never take over a surface far smaller than the menu
+       world. When the owner context died (app menu, dialog,
+       keyboard relayout), the parked ImGui world used to be ADOPTED
+       by the next context to reach 8 swaps - including small popup
+       surfaces, which then rendered the whole menu inside their
+       tiny window ("tapping the app's menu spawns a small clone of
+       our menu"), and the clone ignores taps because the touch map
+       belongs to the main surface. The real surface re-adopts when
+       it returns. */
+    if (sw > 0.f && sh > 0.f) {
+        bool ok;
+        if (g_orphan_imgui && g_orphan_dw > 0.f && g_orphan_dh > 0.f) {
+            float pa = g_orphan_dw * g_orphan_dh;
+            ok = (sw * sh) >= pa * 0.5f &&
+                 sw >= g_orphan_dw * 0.45f &&
+                 sh >= g_orphan_dh * 0.45f;
+        } else {
+            ok = sw >= 220.f && sh >= 220.f;
+        }
+        if (!ok) {
+            if (!s->reject_logged) {
+                s->reject_logged = true;
+                LOGI("[overlay] skip small surface %.0fx%.0f (%s)",
+                     sw, sh, g_orphan_imgui ?
+                         "menu parked - not adopting" : "election");
+            }
+            return false;
+        }
+    }
     if (ow) {
         bool stale = (now - ow->last_swap_ms) > DT_OWNER_STALE_MS &&
                      (now - s->last_swap_ms)  < 600;
@@ -390,6 +437,7 @@ static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
            ShutDown + Init to force CreateDeviceObjects on this context */
         s->imgui = g_orphan_imgui;
         g_orphan_imgui = nullptr;
+        g_orphan_dw = 0.f; g_orphan_dh = 0.f;
         ImGui::SetCurrentContext(s->imgui);
         ImGui_ImplOpenGL3_Shutdown();   /* GL deletes: no-ops here, the
                                            names never existed in this
@@ -442,6 +490,11 @@ static void slot_destroy(EGLContext ctx) {
                 ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
             g_orphan_imgui = s->imgui;
             s->imgui = nullptr;
+            {
+                std::lock_guard<std::mutex> lk3(g_disp_mtx);
+                g_orphan_dw = g_disp_w;
+                g_orphan_dh = g_disp_h;
+            }
             if (eglGetCurrentContext() == ctx) {
                 /* only valid while the dying context is still current;
                    otherwise the driver frees everything with the ctx */
@@ -600,8 +653,7 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     std::lock_guard<std::mutex> lk(g_tick_mtx);
 
     Slot* s = slot_for(ctx);
-    if (!ensure_ownership(s, ctx)) return;  /* not the owner: no
-                                               ImGui, no GL touched */
+    if (!ensure_ownership(s, ctx, (float)sw, (float)sh)) return;
     if (s->dead || s->failed) return;
 
     if (!s->imgui) slot_init(dpy, surf, s);
@@ -737,6 +789,11 @@ static EGLBoolean my_terminate(EGLDisplay dpy) {
                 if (g_orphan_imgui)
                     ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
                 g_orphan_imgui = park;
+                {
+                    std::lock_guard<std::mutex> lk3(g_disp_mtx);
+                    g_orphan_dw = g_disp_w;
+                    g_orphan_dh = g_disp_h;
+                }
                 LOGI("[overlay] display terminated - ImGui parked, "
                      "waiting for the next GL context");
             }

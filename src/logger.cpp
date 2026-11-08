@@ -113,7 +113,30 @@ void logger_init(const char* base_dir) {
         snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
         log_crash_raw(boot);
     }
-    log_info("logger_init done (build r13: fixed class sub-tabs, IME activity race, Y-bias default -80)");
+    /* r14: memory snapshot at boot. lmkd kills (the "crash when I
+       open any app" class) are invisible to signal handlers, so the
+       field report must show how much headroom the process had. */
+    {
+        char ln[256];
+        long avail = -1, rss = -1;
+        FILE* mf = fopen("/proc/meminfo", "r");
+        if (mf) {
+            while (fgets(ln, sizeof(ln), mf))
+                if (sscanf(ln, "MemAvailable: %ld kB", &avail) == 1) break;
+            fclose(mf);
+        }
+        FILE* sf = fopen("/proc/self/status", "r");
+        if (sf) {
+            while (fgets(ln, sizeof(ln), sf))
+                if (sscanf(ln, "VmRSS: %ld kB", &rss) == 1) break;
+            fclose(sf);
+        }
+        char mm[160];
+        snprintf(mm, sizeof(mm),
+                 "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
+        log_info(mm);
+    }
+    log_info("logger_init done (build r14: IME show fix, phased agent init, small-surface ownership gate)");
 }
 
 void log_info(const char* msg) {

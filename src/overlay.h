@@ -39,6 +39,7 @@ JNIEXPORT void dextool_add_char(int codepoint);
 JNIEXPORT void dextool_backspace();
 JNIEXPORT bool dextool_want_mouse();
 JNIEXPORT int  dextool_display_size();  /* (w<<16)|h, 0 until the overlay is up */
+JNIEXPORT void dextool_agent_log(const char* msg); /* r14: agent phase markers -> logs */
 #ifdef __cplusplus
 }
 #endif

@@ -1,5 +1,5 @@
 'use strict';
-/* Dex-tool agent (r12). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r14). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
 
@@ -23,9 +23,43 @@
      smaller so the JS thread never stalls for seconds.
    - touch map: measured on Activity.onResume AND on every touch
      (throttled); onWindowFocusChanged never fired on the field host.
+
+   r14 changes (field issues from the r13 run):
+   - keyboard never opened: ime_show() called act.getSystemService()
+     with `act` undefined, so EVERY show attempt died with a
+     ReferenceError before showSoftInput, and the retry (scheduled
+     after the throw) never ran. Fixed; the activity is resolved
+     from four sources (lifecycle callbacks, onResume hook,
+     ActivityThread walk, heap-scan fallback) and showSoftInput is
+     retried at 150/450/900 ms.
+   - SIGABRT at agent load in some hosts ("opened and run but no
+     menu", CRASH signal=6 right after "script created"): all Java
+     init is deferred out of gum_script_load_sync and each phase is
+     marked via the native dextool_agent_log export.
+   - "small clone of our menu" in popup surfaces: the overlay
+     refuses to adopt the parked ImGui world into surfaces far
+     smaller than the parked DisplaySize (native side, r14).
 */
 
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
+
+/* r14: native phase logging. dextool_agent_log writes straight into
+   dextool-crash.log + dextool-debug.log from libtool.so, so markers
+   survive even when the GumJS message pump never runs again. */
+var gAgentLog = null;
+function agentLog(msg) {
+    try {
+        if (!gAgentLog) {
+            var p = Module.findExportByName('libtool.so',
+                                            'dextool_agent_log');
+            if (!p) return;
+            gAgentLog = new NativeFunction(p, 'void', ['pointer']);
+        }
+        gAgentLog(Memory.allocUtf8String(
+            String(msg).substring(0, 400)));
+    } catch (e) {}
+}
+agentLog('agent: script running (entry)');
 function jstr(v) {
     try {
         if (v === null || v === undefined) return 'null';
@@ -159,7 +193,7 @@ function content_view(activity) {
    bridge into "[object Object]") and forwards the delta to
    libtool.so as dextool_add_char()/dextool_backspace(). */
 var IME = { act: null, edit: null, actHash: 0, prev: '',
-            silent: false, cnt: 0 };
+            silent: false, cnt: 0, everLogged: false };
 
 function ime_on_text(ed) {
     try {
@@ -256,28 +290,51 @@ function ime_show() {
                    Resolve the current activity on the spot instead of just
                    warning; the lifecycle tracker keeps it fresh afterwards. */
                 if (!IME.act) {
-                    try { IME.act = find_current_activity(); } catch (e0) {}
+                    try { IME.act = find_current_activity(); }
+                    catch (e0) {
+                        agentLog('ime: findAct failed: ' + e0);
+                        sendMsg('error', { fn: 'findAct',
+                                           msg: String(e0.message || e0) });
+                    }
                 }
                 if (!IME.act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
+                if (!IME.everLogged) {
+                    IME.everLogged = true;
+                    try {
+                        sendMsg('info', { msg: 'IME host activity: ' +
+                            IME.act.getClass().getName() });
+                    } catch (e5) {}
+                }
                 var edit = ime_ensure(IME.act);
                 if (!edit) return;
                 ime_reset_text();
                 edit.requestFocus();
                 var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
-                var imm = Java.cast(act.getSystemService('input_method'), IMMgr);
+                /* r14 FIX: this used to read act.getSystemService(...)
+                   - `act` does not exist in this scope, so the FIRST
+                   (and normally only) showSoftInput always threw
+                   ReferenceError and the retry below was never even
+                   scheduled. That is why the keyboard never opened. */
+                var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
                 imm.showSoftInput(edit, 0);
+                agentLog('ime: showSoftInput sent');
                 /* the first show right after focus often loses the
-                   race with the window - retry once */
-                setTimeout(function () {
-                    Java.scheduleOnMainThread(function () {
-                        try {
-                            if (!IME.edit) return;
-                            var IM2 = Java.use('android.view.inputmethod.InputMethodManager');
-                            var imm2 = Java.cast(IME.act.getSystemService('input_method'), IM2);
-                            imm2.showSoftInput(IME.edit, 0);
-                        } catch (e2) {}
-                    });
-                }, 150);
+                   race with the window - retry on a ladder; some
+                   hosts also need another requestFocus first */
+                [150, 450, 900].forEach(function (delay) {
+                    setTimeout(function () {
+                        Java.scheduleOnMainThread(function () {
+                            try {
+                                if (!IME.edit || !IME.act) return;
+                                IME.edit.requestFocus();
+                                var IM2 = Java.use('android.view.inputmethod.InputMethodManager');
+                                var imm2 = Java.cast(IME.act.getSystemService('input_method'), IM2);
+                                imm2.showSoftInput(IME.edit, 0);
+                                agentLog('ime: retry show at ' + delay + 'ms');
+                            } catch (e2) {}
+                        });
+                    }, delay);
+                });
             } catch (e) {
                 sendMsg('error', { fn: 'showIme', msg: String(e.message || e) });
             }
@@ -307,6 +364,20 @@ function find_current_activity() {
         try { stopped = rec.stopped.value; } catch (e3) {}
         if (!paused && !stopped) return a;
     }
+    if (best) return best;
+    /* r14 fallback: the record walk can come up empty on hosts that
+       recycle ActivityClientRecords; scan the heap for a live one. */
+    try {
+        var found = null;
+        Java.choose('android.app.Activity', {
+            onMatch: function (a) {
+                if (!found) found = a;
+                return found ? 'stop' : undefined;
+            },
+            onComplete: function () {}
+        });
+        if (found) return found;
+    } catch (e4) {}
     return best;
 }
 
@@ -336,6 +407,7 @@ function install_lifecycle() {
                 }
             });
             app.registerActivityLifecycleCallbacks(CB.$new());
+            agentLog('phase: lifecycle tracker armed');
             sendMsg('info', { msg: 'lifecycle tracker armed' });
         } catch (e) {
             /* the Application exists before any activity, so a few
@@ -348,13 +420,12 @@ function install_lifecycle() {
         }
     });
 }
-install_lifecycle();
 
 function ime_hide() {
     Java.perform(function () {
         Java.scheduleOnMainThread(function () {
             try {
-                if (!IME.edit) return;
+                if (!IME.edit || !IME.act) return;
                 var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
                 var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
                 imm.hideSoftInputFromWindow(IME.edit.getWindowToken(), 0);
@@ -373,12 +444,21 @@ function installTouchHook() {
     }
     Java.perform(function () {
         var Activity = Java.use('android.app.Activity');
-        Activity.onResume.implementation = function () {
-            var r = this.onResume();
-            try { IME.act = this; } catch (e0) {}   /* for the IME */
-            try { report_map(content_view(this)); } catch (e) {}
-            return r;
-        };
+        agentLog('phase: hooking Activity.onResume');
+        try {
+            Activity.onResume.implementation = function () {
+                var r = this.onResume();
+                try { IME.act = this; } catch (e0) {}   /* for the IME */
+                try { report_map(content_view(this)); } catch (e) {}
+                return r;
+            };
+            agentLog('phase: onResume hook ok');
+        } catch (e1) {
+            agentLog('ERR onResume hook: ' + e1);
+            sendMsg('error', { fn: 'hookOnResume',
+                               msg: String(e1 && e1.message || e1) });
+        }
+        agentLog('phase: hooking Activity.dispatchTouchEvent');
         Activity.dispatchTouchEvent.implementation = function (ev) {
             /* MAIN THREAD */
             try {
@@ -402,10 +482,10 @@ function installTouchHook() {
             } catch (e) {}
             return this.dispatchTouchEvent(ev);         /* original call */
         };
-        sendMsg('info', { msg: 'touch hook installed (r11)' });
+        agentLog('phase: dispatchTouchEvent hook ok');
+        sendMsg('info', { msg: 'touch hook installed (r14)' });
     });
 }
-installTouchHook();
 
 /* ---------------- class info ---------------- */
 function field_lines(jc, inst) {
@@ -1345,4 +1425,28 @@ var FN_ARGS = {
     callMethod:      ['class', 'method', 'args']
 };
 
-sendMsg('ready', { msg: 'Dex-tool agent r13 loaded' });
+/* r14: phased startup. gum_script_load_sync must ALWAYS return:
+   the r13 field crash ("script created, loading agent" then
+   CRASH signal=6 with zero JS messages) died inside top-level
+   Java init. Every Java-touching step now runs from the JS job
+   queue AFTER load completes, and each step is phase-marked into
+   the native logs, so an abort pins the exact phase. */
+agentLog('phase: deferred init scheduled');
+setTimeout(function () {
+    try {
+        install_lifecycle();
+    } catch (eL) {
+        agentLog('ERR lifecycle: ' + eL);
+        sendMsg('error', { fn: 'lifecycle',
+                           msg: String(eL && eL.message || eL) });
+    }
+    try {
+        installTouchHook();
+    } catch (eT) {
+        agentLog('ERR touch hook: ' + eT);
+        sendMsg('error', { fn: 'touchhook',
+                           msg: String(eT && eT.message || eT) });
+    }
+    sendMsg('ready', { msg: 'Dex-tool agent r14 loaded' });
+    agentLog('phase: ready sent');
+}, 0);

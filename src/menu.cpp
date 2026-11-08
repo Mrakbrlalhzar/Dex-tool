@@ -1443,7 +1443,7 @@ void menu_draw() {
     ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.2 (r13)", &open,
+    ImGui::Begin("Dex-tool v1.2 (r14)", &open,
                  ImGuiWindowFlags_NoCollapse);
     if (!open) { MLK(); s_visible = false; s_conf_dirty = true; MULK(); }
 
