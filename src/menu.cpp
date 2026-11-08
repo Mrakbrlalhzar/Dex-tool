@@ -3,6 +3,7 @@
 #include "frida_bridge.h"
 #include "logger.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -14,25 +15,30 @@
 #include <ctime>
 
 /* =====================================================================
-   Dex-tool menu (r11)
+   Dex-tool menu (r12)
    - every tab of the spec: Settings, Patches, Hooks, Tracker, Recorder,
      Monitor, Script, Classes
+   - Classes lists ALL loaded classes by default (the agent pages them
+     in); the filter row is optional
+   - text input via the PHONE's keyboard: focusing a field posts
+     showIme to the agent (hidden EditText + TextWatcher -> add_char/
+     backspace); the r11 drawn keyboard is gone
+   - DEADLOCK FIX ("open a class and the app freezes"): g_mtx is a
+     RECURSIVE mutex now. tab_classes() used to lock it a second time
+     while already holding it, and class_tab_content() nested again -
+     the render thread self-deadlocked inside the eglSwapBuffers hook,
+     which froze the host's GL thread: the whole app hung.
    - cross-linking: clicking a row in Tracker / Recorder / Monitor opens
      that class in the Classes tab (menu_open_class)
    - the recorder/monitor lists are fed by the agent in throttled
-     batches; the r11 recorder is scoped (package filter + method cap),
-     which is what stops the hook-everything install from exhausting
-     the 32-bit process
+     batches; the recorder is scoped (package filter + method cap)
    - scrollable areas are published to the overlay, which converts
      drags inside them into wheel events at the configured speed
-   - fully native on-screen keyboard (r11): no system IME, no hidden
-     EditText, no text polling - the r10 bridge stringified an
-     android.text.Editable wrapper and typed the literal
-     "[object Object]" into every field
    - UI state persists to <logdir>/dextool-ui.conf
    ===================================================================== */
 
-static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+/* recursive: tab_classes / class_tab_content / menu_open_class nest */
+static pthread_mutex_t g_mtx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 #define MLK()   pthread_mutex_lock(&g_mtx)
 #define MULK()  pthread_mutex_unlock(&g_mtx)
 
@@ -45,7 +51,6 @@ static float s_lst_scroll = 1.2f;   /* inner list drag speed */
 static bool  s_visible    = true;
 static bool  s_show_fab   = true;
 static float s_y_off      = 0.0f;   /* manual touch Y bias (px) */
-static bool  s_kbd_on     = true;   /* on-screen keyboard enabled */
 
 /* ---------------- agent / overlay status ---------------- */
 static bool  s_agent_ready = false;
@@ -117,8 +122,9 @@ static int  s_hmode=0, s_hedit=-1;
 static char s_tcls[200]={}, s_tmth[128]={};
 static char s_script[16384]="// Frida JS - Java, send, console are available\n";
 static char s_search[160]="";
-static bool s_search_on=false;
 static std::vector<std::string> s_search_res;
+static bool s_cls_auto_done=false;   /* full class list requested once
+                                        per agent session */
 static int  s_search_total=0, s_search_shown=0;
 static bool s_search_wait=false;
 static int  s_search_seq=0, s_search_qid=-1;
@@ -409,7 +415,6 @@ static void conf_load() {
         else if (!strcmp(k, "ovl"))    s_ovl_scroll = v;
         else if (!strcmp(k, "lst"))    s_lst_scroll = v;
         else if (!strcmp(k, "yoff"))   s_y_off    = v;
-        else if (!strcmp(k, "kbd"))    s_kbd_on   = v > 0.5f;
         else if (!strcmp(k, "fab"))    s_show_fab = v > 0.5f;
     }
     fclose(f);
@@ -424,7 +429,6 @@ static void conf_save() {
     fprintf(f, "ovl=%g\n",    s_ovl_scroll);
     fprintf(f, "lst=%g\n",    s_lst_scroll);
     fprintf(f, "yoff=%g\n",   s_y_off);
-    fprintf(f, "kbd=%d\n",   s_kbd_on ? 1 : 0);
     fprintf(f, "fab=%d\n",   s_show_fab ? 1 : 0);
     fclose(f);
     s_conf_dirty = false;
@@ -444,252 +448,70 @@ static void apply_theme() {
                                                atlas, not from scaling */
 }
 
-/* ===================== native on-screen keyboard =====================
-   r11. The r10 bridge used a hidden EditText + the system IME and
-   forwarded the text delta from the frida thread. String(EditText
-   .getText()) is NOT the text - it is an android.text.Editable whose
-   String() form is "[object Object]", so every field filled with the
-   keyboard literally received that string (and the IME of a game host
-   resizes/recreates the EGL context, feeding the abort class).
-   The r11 keyboard is plain ImGui: while a kbd-enabled text field is
-   active, menu_draw() lays it out at the bottom of the display and
-   publishes its rect; menu_kbd_feed() (called by the overlay for every
-   touch, BEFORE the event reaches ImGui) maps taps onto keys and turns
-   them into InputText events. */
-struct KbdState {
-    bool  open = false;        /* visible and ready to take taps   */
-    bool  focus = false;       /* a kbd-enabled field is active    */
-    bool  shift = false;
-    bool  page2 = false;       /* symbol page                      */
-    bool  dragging = false;    /* the current gesture started on   */
-    float x=0, y=0, w=0, h=0;  /* last drawn window rect           */
-    std::string last;          /* label of the last key hit        */
-} static s_kbd;
+/* ===================== system keyboard (IME) bridge =====================
+   r12. The r11 drawn keyboard is GONE. A text field that gains focus
+   asks the agent to pop the PHONE's own soft keyboard: the menu posts
+   showIme / hideIme over the frida bridge; the agent focuses a hidden
+   1x1 EditText on the resumed activity, and its TextWatcher converts
+   IME edits into dextool_add_char()/dextool_backspace() calls.
+   overlay.cpp drains those into ImGui as ordinary character events,
+   so the ACTIVE field receives the text with no extra plumbing here.
+   Closing the IME (Done / back) sends imeHidden, which releases the
+   ImGui field - so the next tap on it re-opens the keyboard. */
+static bool s_ime_active = false;   /* a text field owns ImGui focus */
+static bool s_ime_clear  = false;   /* drop active id next frame      */
 
-/* every key as actually laid out by draw_kbd this frame; feed()
-   hit-tests against these, so the drawn geometry IS the hit geometry */
-struct KbdKey { float x, y, w, h; int act; char ch; };
-enum { KBD_CHAR=0, KBD_SHIFT, KBD_BKSP, KBD_ENTER, KBD_HIDE,
-       KBD_SPACE, KBD_PAGE };
-static std::vector<KbdKey> s_kbd_keys;
+static void ime_show() { post_rpc("showIme", "{}"); }
+static void ime_hide() { post_rpc("hideIme", "{}"); }
 
-/* Which text field gets the keys? Every kbd-enabled InputText in this
-   file carries a KbdTag { char* buf; size_t cap; } next to it; a helper
-   draws the field and registers it while it is active. */
-struct KbdField {
-    char*  buf = nullptr;
-    size_t cap = 0;
-};
-static KbdField s_kbd_field;      /* the active field, owner thread */
-static bool     s_kbd_field_req = false;   /* want to grab focus now */
+static void ime_close_if_active() {
+    if (s_ime_active) { s_ime_active = false; ime_hide(); }
+}
 
-/* draw an InputText that grabs the on-screen keyboard when active */
-static bool kbd_textfield(const char* label, char* buf, size_t cap) {
+/* once per frame, before the menu window: if the user closed the
+   phone keyboard, release the ImGui field as well */
+static void ime_frame_prelude() {
+    bool clear = false;
+    MLK();
+    clear = s_ime_clear;
+    s_ime_clear = false;
+    if (clear) s_ime_active = false;
+    MULK();
+    if (clear) ImGui::ClearActiveID();
+}
+
+/* plain InputText wired to the system keyboard */
+static bool ime_textfield(const char* label, char* buf, size_t cap) {
     bool used = ImGui::InputText(label, buf, cap,
                                  ImGuiInputTextFlags_AutoSelectAll);
     if (ImGui::IsItemActivated()) {
-        /* user tapped the field: focus it and pop the keyboard */
-        s_kbd_field = { buf, cap };
-        s_kbd_field_req = true;
+        s_ime_active = true;
+        ime_show();
+    } else if (ImGui::IsItemDeactivated()) {
+        ime_close_if_active();
+    } else if (s_ime_active && ImGui::IsItemActive() &&
+               ImGui::IsMouseClicked(0)) {
+        ime_show();     /* re-tap while active: keyboard was closed */
     }
     return used;
 }
 
 /* same for multiline editors (script editor, hook code) */
-static bool kbd_multiline(const char* label, char* buf, size_t cap,
+static bool ime_multiline(const char* label, char* buf, size_t cap,
                           ImVec2 size) {
     bool used = ImGui::InputTextMultiline(label, buf, cap, size);
     if (ImGui::IsItemActivated()) {
-        s_kbd_field = { buf, cap };
-        s_kbd_field_req = true;
+        s_ime_active = true;
+        ime_show();
+    } else if (ImGui::IsItemDeactivated()) {
+        ime_close_if_active();
+    } else if (s_ime_active && ImGui::IsItemActive() &&
+               ImGui::IsMouseClicked(0)) {
+        ime_show();
     }
     return used;
 }
 
-/* delete one character before the caret the way the user typed it
-   (a UTF-16 surrogate pair is deleted together) */
-static void kbd_del_char(char* buf) {
-    size_t n = strlen(buf);
-    if (!n) return;
-    unsigned char prev = (unsigned char)buf[n - 1];
-    if (n >= 3 && prev >= 0x80 && (unsigned char)buf[n-2] == 0xED &&
-        (unsigned char)buf[n-3] == 0xED)
-        n -= 3;                    /* broken pair, drop both halves */
-    else if (n >= 2 && prev >= 0x80 && (prev & 0xC0) == 0x80 &&
-             (unsigned char)buf[n-2] >= 0xC0)
-        n -= 2;                    /* 2-byte sequence */
-    else
-        n -= 1;
-    if (n < 0) n = 0;
-    buf[n] = 0;
-}
-
-/* append a UTF-8 char if it fits */
-static void kbd_put_char(char* buf, size_t cap, const char* u8, int len) {
-    size_t n = strlen(buf);
-    if (n + (size_t)len + 1 > cap - 1) return;
-    memcpy(buf + n, u8, (size_t)len);
-    buf[n + (size_t)len] = 0;
-}
-
-/* run one key press; used by both the tap path (menu_kbd_feed) and
-   the mouse path (ImGui::Button returning true) */
-static void kbd_apply(const KbdKey& k) {
-    switch (k.act) {
-    case KBD_CHAR: {
-        char c = k.ch;
-        if (!s_kbd.page2 && s_kbd.shift && c >= 'a' && c <= 'z') {
-            c = (char)(c - 'a' + 'A');
-            s_kbd.shift = false;          /* one-shot shift */
-        }
-        char u8[2] = { c, 0 };
-        if (s_kbd_field.buf)
-            kbd_put_char(s_kbd_field.buf, s_kbd_field.cap, u8, 1);
-        s_kbd.last = std::string(1, c);
-        break;
-    }
-    case KBD_SHIFT:
-        s_kbd.shift = !s_kbd.shift; s_kbd.last = "shift"; break;
-    case KBD_BKSP:
-        if (s_kbd_field.buf) kbd_del_char(s_kbd_field.buf);
-        s_kbd.last = "bksp"; break;
-    case KBD_ENTER:
-    case KBD_HIDE:
-        s_kbd.open = false;
-        s_kbd.last = (k.act == KBD_ENTER) ? "enter" : "hide"; break;
-    case KBD_SPACE:
-        if (s_kbd_field.buf)
-            kbd_put_char(s_kbd_field.buf, s_kbd_field.cap, " ", 1);
-        s_kbd.last = "space"; break;
-    case KBD_PAGE:
-        s_kbd.page2 = !s_kbd.page2; s_kbd.last = "page"; break;
-    }
-}
-
-/* the r11 input path: every touch first passes through here */
-bool menu_kbd_feed(int phase, float x, float y) {
-    if (!s_kbd_on || !s_kbd.open) return false;
-    if (phase == 0) {                       /* press */
-        s_kbd.dragging = false;
-        if (x >= s_kbd.x && x <= s_kbd.x + s_kbd.w &&
-            y >= s_kbd.y && y <= s_kbd.y + s_kbd.h) {
-            s_kbd.dragging = true;          /* gesture is ours */
-            return true;
-        }
-        return false;                       /* tap outside: pass through */
-    }
-    if (!s_kbd.dragging) return false;      /* move/release of others */
-    if (phase == 2) return true;            /* drag inside: swallow */
-    /* release: map onto the drawn keys */
-    s_kbd.dragging = false;
-    for (const KbdKey& k : s_kbd_keys) {
-        if (x >= k.x && x <= k.x + k.w &&
-            y >= k.y && y <= k.y + k.h) {
-            kbd_apply(k);
-            return true;
-        }
-    }
-    return true;                            /* between keys: swallow */
-}
-
-/* draw the keyboard at the bottom of the display; called from
-   menu_draw() every frame while a field is focused. Layout constants:
-   pitch 40 (34px keys + 6 spacing), 20px status line, 8px padding -
-   content height 8+20+5*40+8 = 236. */
-static void draw_kbd(ImVec2 ds) {
-    if (s_kbd_field_req) {
-        s_kbd_field_req = false;
-        if (!s_kbd.open) { s_kbd.open = true; s_kbd.page2 = false; }
-    }
-    s_kbd.focus = s_kbd_field.buf != nullptr;
-    if (!s_kbd.open) {
-        overlay_publish_kbd_rect(0, 0, 0, 0);
-        return;
-    }
-    s_kbd.w = ds.x;
-    s_kbd.h = 236.f;
-    s_kbd.x = 0;
-    s_kbd.y = ds.y - s_kbd.h;
-    if (s_kbd.y < 0) s_kbd.y = 0;
-    s_kbd_keys.clear();
-
-    ImGui::SetNextWindowPos(ImVec2(s_kbd.x, s_kbd.y), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(s_kbd.w, s_kbd.h), ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 6));
-    ImGui::Begin("##kbd", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                 ImGuiWindowFlags_NoSavedSettings |
-                 ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-    char tag[96];
-    snprintf(tag, sizeof(tag), "r11 kbd%s%s%s  %s",
-             s_kbd.page2 ? " sym" : "", s_kbd.shift ? " SHIFT" : "",
-             s_kbd_field.buf ? "" : " (no field!)",
-             s_kbd.last.empty() ? "" : s_kbd.last.c_str());
-    ImGui::TextDisabled("%s", tag);
-
-    /* one helper draws a key AND records its rect for the tap path */
-    #define KBD_KEY(LBL, W, ACT, CH) do {                               \
-        if (ImGui::Button(LBL, ImVec2((W), 34))) {                       \
-            ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax(); \
-            kbd_apply({ a.x, a.y, b.x - a.x, b.y - a.y, (ACT), (CH) }); \
-        }                                                                \
-        ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax(); \
-        s_kbd_keys.push_back({ a.x, a.y, b.x - a.x, b.y - a.y,           \
-                               (ACT), (CH) });                           \
-    } while (0)
-
-    static const char* R0N = "qwertyuiop";
-    static const char* R1N = "asdfghjkl";
-    static const char* R2N = "zxcvbnm";
-    static const char* R0S = "1234567890";
-    static const char* R1S = "-/:;()$&\"@.,?!'";
-    static const char* R2S = "#%\\*+=_~<>";
-    const char* rows[3];
-    int nkey[3];
-    if (s_kbd.page2) {
-        rows[0] = R0S; nkey[0] = 10;
-        rows[1] = R1S; nkey[1] = 14;
-        rows[2] = R2S; nkey[2] = 12;
-    } else {
-        rows[0] = R0N; nkey[0] = 10;
-        rows[1] = R1N; nkey[1] = 9;
-        rows[2] = R2N; nkey[2] = 7;
-    }
-    for (int r = 0; r < 3; r++) {
-        float avail = ImGui::GetContentRegionAvail().x - 10.f;
-        float bw = avail / (float)nkey[r] - 4.f;
-        for (int k = 0; k < nkey[r]; k++) {
-            char lb[8], c = rows[r][k];
-            if (!s_kbd.page2 && s_kbd.shift && c >= 'a' && c <= 'z')
-                c = (char)(c - 'a' + 'A');
-            snprintf(lb, sizeof(lb), "%c", c);
-            KBD_KEY(lb, bw, KBD_CHAR, rows[r][k]);   /* base char, apply() upcases */
-            if (k < nkey[r] - 1) ImGui::SameLine();
-        }
-    }
-    {   /* modifiers row */
-        float bw = ImGui::GetContentRegionAvail().x - 10.f;
-        KBD_KEY(s_kbd.shift ? "SHIFT" : "shift", bw * 0.30f, KBD_SHIFT, 0);
-        ImGui::SameLine();
-        KBD_KEY("bksp",  bw * 0.40f, KBD_BKSP, 0);
-        ImGui::SameLine();
-        KBD_KEY("enter", bw * 0.29f, KBD_ENTER, 0);
-    }
-    {   /* bottom row */
-        float bw = ImGui::GetContentRegionAvail().x - 10.f;
-        KBD_KEY("hide",  bw * 0.22f, KBD_HIDE, 0);
-        ImGui::SameLine();
-        KBD_KEY("space", bw * 0.56f, KBD_SPACE, 0);
-        ImGui::SameLine();
-        KBD_KEY(s_kbd.page2 ? "abc" : "#+=", bw * 0.22f, KBD_PAGE, 0);
-    }
-    #undef KBD_KEY
-    ImGui::End();
-    ImGui::PopStyleVar(2);
-    overlay_publish_kbd_rect(s_kbd.x, s_kbd.y, s_kbd.w, s_kbd.h);
-}
 
 /* ---------------- message callback (GumJS thread) ---------------- */
 void menu_init() {
@@ -701,8 +523,25 @@ void menu_init() {
         MLK();
         if (jhas(j, "ready")) {
             s_agent_ready = true;
+            s_cls_auto_done = false;  /* new agent: re-list classes */
             snprintf(s_agent_note, sizeof(s_agent_note), "%s",
                      jstr(j, "msg").c_str());
+        } else if (jhas(j, "imeHidden")) {
+            /* user closed the phone keyboard (Done / back):
+               drop ImGui focus so the next tap re-opens it */
+            if (s_ime_active) { s_ime_active = false; s_ime_clear = true; }
+        } else if (jhas(j, "staticValues")) {
+            /* r12: static values are read on demand only - reading
+               them during openClass() ran <clinit> of arbitrary
+               classes and could block the agent forever */
+            ClassTab* c = find_tab(jstr(j, "class"));
+            if (c) {
+                for (auto& f : jarr(j, "fields")) {
+                    FieldInfo nf = parse_field(f);
+                    for (auto& old : c->fields)
+                        if (old.name == nf.name) { old.value = nf.value; break; }
+                }
+            }
         } else if (jhas(j, "classInfo")) {
             ClassTab* c = find_tab(jstr(j, "class"));
             if (c) {
@@ -858,8 +697,8 @@ static void tab_settings() {
         s_conf_dirty = true;
     }
     ImGui::Separator();
-    if (ImGui::Checkbox("On-screen keyboard", &s_kbd_on))
-        s_conf_dirty = true;
+    ImGui::TextDisabled("Text input: the phone keyboard (system IME) "
+                        "opens when a field is focused.");
     if (ImGui::Checkbox("Show toggle button", &s_show_fab))
         s_conf_dirty = true;
     if (ImGui::Checkbox("Menu visible", &s_visible))
@@ -896,9 +735,9 @@ static void tab_patches() {
         snprintf(s_pval, sizeof(s_pval), "%s", e.value.c_str());
         s_pedit = -1;
     }
-    kbd_textfield("Class##pc",  s_pcls, sizeof(s_pcls));
-    kbd_textfield("Field##pf",  s_pfld, sizeof(s_pfld));
-    kbd_textfield("Value##pv",  s_pval, sizeof(s_pval));
+    ime_textfield("Class##pc",  s_pcls, sizeof(s_pcls));
+    ime_textfield("Field##pf",  s_pfld, sizeof(s_pfld));
+    ime_textfield("Value##pv",  s_pval, sizeof(s_pval));
     if (ImGui::Button("Add Patch") && s_pcls[0] && s_pfld[0]) {
         std::string a = "{\"class\":\"" + jesc(s_pcls)
                       + "\",\"field\":\"" + jesc(s_pfld)
@@ -961,10 +800,10 @@ static void tab_hooks() {
         s_hmode = e.mode;
         s_hedit = -1;
     }
-    kbd_textfield("Class##hc",  s_hcls, sizeof(s_hcls));
-    kbd_textfield("Method##hm", s_hmth, sizeof(s_hmth));
+    ime_textfield("Class##hc",  s_hcls, sizeof(s_hcls));
+    ime_textfield("Method##hm", s_hmth, sizeof(s_hmth));
     ImGui::Combo("Mode##hmd", &s_hmode, modes, 3);
-    kbd_multiline("Code##hcd", s_hcode, sizeof(s_hcode),
+    ime_multiline("Code##hcd", s_hcode, sizeof(s_hcode),
                               ImVec2(-1, 90));
     ImGui::TextDisabled("Java: fn(Java,send,console,thiz,args,orig). "
                         "Smali: body of static hook(Object thiz, Object[] args); "
@@ -1021,8 +860,8 @@ static void tab_hooks() {
 
 /* ===================== Tracker ===================== */
 static void tab_tracker() {
-    kbd_textfield("Class##tc",  s_tcls, sizeof(s_tcls));
-    kbd_textfield("Method##tm", s_tmth, sizeof(s_tmth));
+    ime_textfield("Class##tc",  s_tcls, sizeof(s_tcls));
+    ime_textfield("Method##tm", s_tmth, sizeof(s_tmth));
     if (ImGui::Button("Track") && s_tcls[0] && s_tmth[0]) {
         std::string a = "{\"class\":\"" + jesc(s_tcls)
                       + "\",\"method\":\"" + jesc(s_tmth) + "\"}";
@@ -1098,7 +937,7 @@ static void tab_recorder() {
         MULK();
     }
     MLK();
-    kbd_textfield("Package filter", s_rec_filter, sizeof(s_rec_filter));
+    ime_textfield("Package filter", s_rec_filter, sizeof(s_rec_filter));
     ImGui::SameLine();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("empty = the app's own package only; "
@@ -1185,7 +1024,7 @@ static void tab_monitor() {
 
 /* ===================== Script ===================== */
 static void tab_script() {
-    kbd_multiline("##sc", s_script, sizeof(s_script),
+    ime_multiline("##sc", s_script, sizeof(s_script),
                               ImVec2(-1, 160));
     if (ImGui::Button("Run")) {
         MLK(); s_cons.clear(); MULK();
@@ -1376,6 +1215,15 @@ static void class_tab_content(ClassTab& c) {
         mark_scroll_item(s_lst_scroll);
     } else {                                 /* ---- Fields ---- */
         MLK();
+        /* r12: values are NOT read while opening the class anymore
+           (reading a static can run the class's <clinit> and hang
+           the agent - the "open a class and the app freezes" bug).
+           This button reads them on demand, for this class only. */
+        if (ImGui::SmallButton("Read static values"))
+            post_rpc("readStaticFields",
+                     "{\"class\":\"" + jesc(c.cname) + "\"}");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%lu fields", (unsigned long)c.fields.size());
         for (int i = 0; i < (int)c.fields.size(); i++) {
             FieldInfo& f = c.fields[i];
             ImGui::PushID(i);
@@ -1401,52 +1249,59 @@ static void class_tab_content(ClassTab& c) {
 }
 
 static void tab_classes() {
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.2f, .5f, .2f, .6f));
-    bool plus = ImGui::Button("+ search");
-    ImGui::PopStyleColor();
-    if (plus) s_search_on = !s_search_on;
-    ImGui::SameLine();
+    /* r12: the full class list loads BY DEFAULT - no "+ search" gate.
+       The agent streams every loaded class in pages of 400; the
+       filter row just re-queries with a substring. */
     MLK();
-    ImGui::TextDisabled("%lu open | agent %s",
-                        (unsigned long)s_classes.size(),
-                        s_agent_ready ? "ready" : "...");
-    MULK();
-
-    if (s_search_on) {
-        ImGui::Separator();
-        kbd_textfield("Filter##sf", s_search, sizeof(s_search));
-        ImGui::SameLine();
-        if (ImGui::Button("Search")) {
-            MLK();
-            s_search_wait = true;
-            int qid = ++s_search_seq;
-            MULK();
-            std::string a = "{\"filter\":\"" + jesc(s_search)
-                           + "\",\"qid\":" + std::to_string(qid) + "}";
-            post_rpc("listLoadedClasses", a);
-        }
-        MLK();
-        if (s_search_wait) ImGui::TextDisabled("(searching...)");
-        else ImGui::TextDisabled("%ld matched, showing %ld",
-                                 (long)s_search_total, (long)s_search_shown);
-        ImGui::BeginChild("srch", ImVec2(0, 220), true);
-        ImGuiListClipper clip;
-        clip.Begin((int)s_search_res.size());
-        while (clip.Step()) {
-            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
-                ImGui::PushID(i);
-                if (ImGui::Selectable(s_search_res[i].c_str())) {
-                    menu_open_class(s_search_res[i]);
-                    s_search_on = false;
-                }
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndChild();
-        mark_scroll_item(s_lst_scroll);
-        MULK();
-        ImGui::Separator();
+    bool agent_ready = s_agent_ready;
+    bool need_auto   = !s_cls_auto_done && !s_search_wait &&
+                       s_search_res.empty();
+    int  qid         = 0;
+    if (agent_ready && need_auto) {
+        s_cls_auto_done = true;
+        s_search_wait   = true;
+        qid = ++s_search_seq;
     }
+    MULK();
+    if (qid)
+        post_rpc("listLoadedClasses",
+                 "{\"filter\":\"\",\"qid\":" + std::to_string(qid) + "}");
+
+    bool do_search = false;
+    MLK();
+    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 150.f);
+    do_search |= ime_textfield("Filter##sf", s_search, sizeof(s_search));
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    if (ImGui::Button("Search##cls")) do_search = true;
+    ImGui::SameLine();
+    if (s_search_wait) ImGui::TextDisabled("(listing...)");
+    else ImGui::TextDisabled("%ld of %ld loaded classes",
+                             (long)s_search_shown, (long)s_search_total);
+    ImGui::BeginChild("srch", ImVec2(0, 220), true);
+    ImGuiListClipper clip;
+    clip.Begin((int)s_search_res.size());
+    while (clip.Step()) {
+        for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(s_search_res[i].c_str()))
+                menu_open_class(s_search_res[i]);
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+    mark_scroll_item(s_lst_scroll);
+    MULK();
+    if (do_search) {
+        MLK();
+        s_search_wait = true;
+        int sqid = ++s_search_seq;
+        MULK();
+        std::string a = "{\"filter\":\"" + jesc(s_search)
+                       + "\",\"qid\":" + std::to_string(sqid) + "}";
+        post_rpc("listLoadedClasses", a);
+    }
+    ImGui::Separator();
 
     MLK();
     if (!s_classes.empty()) {
@@ -1478,16 +1333,20 @@ static void tab_classes() {
             ImGui::EndTabBar();
         }
         int cur = s_cls_cur;
-        MLK();
-        if (cur >= 0 && cur < (int)s_classes.size()) {
+        /* r12 deadlock fix: the r11 code locked g_mtx a SECOND time
+           right here (and class_tab_content locks again inside) -
+           with the plain mutex that self-deadlocked the render
+           thread on the first tap on a class. g_mtx is recursive
+           now and this stray lock is gone. */
+        if (cur >= 0 && cur < (int)s_classes.size())
             class_tab_content(s_classes[cur]);
-        }
         MULK();
     } else {
-        ImGui::TextDisabled("no class tabs - use + search");
+        ImGui::TextDisabled("no class tabs - tap a class above");
+        MULK();
     }
-    MULK();
 }
+
 
 /* ===================== floating toggle button =====================
    Always available (unless disabled in Settings), draggable, and a
@@ -1558,14 +1417,21 @@ void menu_draw() {
 
     if (!vis) {
         draw_fab(ds);
+        MLK();
+        bool ime_was    = s_ime_active;
+        s_ime_active    = false;
+        bool clear_req  = s_ime_clear;
+        s_ime_clear     = false;
+        MULK();
+        if (ime_was) ime_hide();  /* menu hidden: close the phone kb */
+        if (clear_req) ImGui::ClearActiveID();
         /* publish empty region list: drags elsewhere must not scroll */
         overlay_publish_scroll_regions(s_regions);
         s_regions.clear();
-        overlay_publish_kbd_rect(0, 0, 0, 0);
         return;
     }
     draw_fab(ds);
-    draw_kbd(ds);
+    ime_frame_prelude();
 
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
     ImGui::SetNextWindowSizeConstraints(
@@ -1573,7 +1439,7 @@ void menu_draw() {
     ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.2 (r11)", &open,
+    ImGui::Begin("Dex-tool v1.2 (r12)", &open,
                  ImGuiWindowFlags_NoCollapse);
     if (!open) { MLK(); s_visible = false; s_conf_dirty = true; MULK(); }
 
@@ -1616,22 +1482,3 @@ void menu_draw() {
     }
 }
 
-/* ---- desktop unit-test backdoor (compiled only with -DDXT_KBD_TEST;
-   never defined for the Android build) ---- */
-#ifdef DXT_KBD_TEST
-extern "C" void kbd_test_setup(float w, float h) {
-    s_kbd.open = true; s_kbd.shift = false; s_kbd.page2 = false;
-    s_kbd.dragging = false; s_kbd.last.clear();
-    s_kbd.w = w; s_kbd.h = 236.f;
-    s_kbd.x = 0; s_kbd.y = h - s_kbd.h; if (s_kbd.y < 0) s_kbd.y = 0;
-    s_kbd_keys.clear();
-}
-extern "C" void kbd_test_field(char* buf, size_t cap) {
-    s_kbd_field = { buf, cap };
-}
-extern "C" bool kbd_test_feed(int phase, float x, float y) {
-    return menu_kbd_feed(phase, x, y);
-}
-extern "C" bool kbd_test_is_open() { return s_kbd.open; }
-extern "C" void kbd_test_draw(float w, float h) { draw_kbd(ImVec2(w, h)); }
-#endif

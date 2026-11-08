@@ -113,7 +113,7 @@ void logger_init(const char* base_dir) {
         snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
         log_crash_raw(boot);
     }
-    log_info("logger_init done (build r11: native kbd, paged classes, scoped recorder, Y bias)");
+    log_info("logger_init done (build r12: system IME input, default class list, safe class open)");
 }
 
 void log_info(const char* msg) {

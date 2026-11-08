@@ -127,11 +127,6 @@ static TouchEvent              g_touch_last;
 static long                    g_touch_last_ms = 0;
 static std::atomic<bool>       g_want_mouse {false};
 
-/* rect of the on-screen keyboard as published by menu_draw (owner
-   thread); read back by dextool_want_mouse on the frida thread */
-struct KbdRect { bool visible=false; float x=0, y=0, w=0, h=0; };
-static KbdRect g_kbd;
-
 static std::mutex            g_char_mtx;
 static std::vector<unsigned>  g_pending_chars;
 static bool                   g_pending_bs    = false;
@@ -193,11 +188,6 @@ void overlay_set_touch_bias(float dy) {
     g_bias_y = dy;
 }
 
-void overlay_publish_kbd_rect(float x, float y, float w, float h) {
-    if (w <= 0 || h <= 0) { g_kbd.visible = false; return; }
-    g_kbd = { true, x, y, w, h };
-}
-
 void overlay_touch_map_desc(char* buf, int n) {
     if (!buf || n <= 0) return;
     std::lock_guard<std::mutex> lk(g_map_mtx);
@@ -227,33 +217,14 @@ static void maybe_estimate_map() {
     LOGI("[overlay] touch map: estimate 0,0 %.0fx%.0f (max surface)", w, h);
 }
 
-/* defined further down; needed early by dextool_want_mouse */
+/* defined further down */
 static ImVec2 map_touch(float x, float y, const ImVec2& ds);
 
 extern "C" JNIEXPORT bool dextool_want_mouse() {
-    if (g_want_mouse.load()) return true;
-    /* r11: the on-screen keyboard is not an ImGui window, so
-       WantCaptureMouse is false over it; report the kbd rect too so the
-       agent-side dispatchTouchEvent hook consumes kbd taps before they
-       reach the app underneath. Decides on the last event this same
-       hook just queued, so it reflects the current tap. */
-    if (!g_kbd.visible) return false;
-    float x, y; int ph;
-    {
-        std::lock_guard<std::mutex> lk(g_touch_mtx);
-        x = g_touch_last.x; y = g_touch_last.y; ph = g_touch_last.phase;
-    }
-    if (ph == 1) return false;               /* releases pass through */
-    float dw, dh;
-    {
-        std::lock_guard<std::mutex> lk(g_disp_mtx);
-        dw = g_disp_w; dh = g_disp_h;
-    }
-    if (dw <= 0 || dh <= 0) return false;
-    ImVec2 ds(dw, dh);
-    ImVec2 p = map_touch(x, y, ds);
-    return p.x >= g_kbd.x && p.x <= g_kbd.x + g_kbd.w &&
-           p.y >= g_kbd.y && p.y <= g_kbd.y + g_kbd.h;
+    /* r12: the drawn keyboard is gone (text input is the system IME
+       now, which is its own window - its taps never reach the
+       activity). Only the menu itself claims events. */
+    return g_want_mouse.load();
 }
 
 extern "C" JNIEXPORT int dextool_display_size() {
@@ -576,8 +547,17 @@ static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
     {
         std::lock_guard<std::mutex> lk(g_map_mtx);
         if (g_map.ok && g_map.w > 0 && g_map.h > 0) {
+            /* r12 fix (Y-axis scaling mismatch): sy used to be
+               ds.y / g_map.h, but the view rect is TALLER than the
+               GL surface (window 960 vs surface 832), so the false
+               0.867 scale pulled taps toward the center: taps near
+               the top landed low, taps near the bottom landed high,
+               and only the exact center was right. Y is a pure
+               translation now; the static status-bar offset belongs
+               to the manual Y bias (g_bias_y, "Touch Y offset" in
+               Settings). */
             float sx = ds.x / g_map.w;
-            float sy = ds.y / g_map.h;
+            float sy = 1.0f;
             mx = (x - g_map.x) * sx;
             my = (y - g_map.y) * sy;
         }
@@ -644,12 +624,12 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         s->last_frame_ms = nowt;
     }
 
-    /* replay queued touch events as real ImGui events; taps inside the
-       on-screen keyboard (r11) are routed to menu_kbd_feed() instead.
-       Drags that start inside a published scroll rect additionally
-       become wheel events, scaled by that rect's speed - this is the
-       touch scrolling of the recorder/monitor/class lists and of the
-       menu itself */
+    /* replay queued touch events as real ImGui events. Drags that
+       start inside a published scroll rect additionally become wheel
+       events, scaled by that rect's speed - this is the touch
+       scrolling of the recorder/monitor/class lists and of the menu
+       itself. (r12: the drawn keyboard is gone; IME text arrives as
+       character events further down.) */
     {
         std::vector<TouchEvent> q;
         {
@@ -661,8 +641,6 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         bool   have_prev = false;
         for (const TouchEvent& t : q) {
             ImVec2 p = map_touch(t.x, t.y, ds);
-            if (menu_kbd_feed(t.phase, p.x, p.y))
-                continue;                     /* on-screen keyboard */
             io.AddMousePosEvent(p.x, p.y);
             if (t.phase == 0) io.AddMouseButtonEvent(0, true);
             if (t.phase == 1) io.AddMouseButtonEvent(0, false);

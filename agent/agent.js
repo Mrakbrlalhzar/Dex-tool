@@ -1,21 +1,26 @@
 'use strict';
-/* Dex-tool agent (r11). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r12). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
 
-   r11 changes (field issues from the r10 run):
-   - keyboard: the hidden-EditText bridge is GONE. String(getText()) is
-     an android.text.Editable, whose String() form is "[object
-     Object]" - which is exactly what got typed into every field. The
-     on-screen keyboard is now drawn natively by libtool.so; this side
-     only consumes kbd-area taps so they do not fall through to the app.
-   - classes: listLoadedClasses streams the FULL result in pages of 400
-     with a qid; the r10 version silently capped at 800 names, so the
-     tab never displayed all classes.
-   - recorder: Start passes {filter, cap}; only classes of the app's
-     own package (or the given prefix) are hooked, and installation
-     stops at cap methods. Hooking every method of every loaded class
-     exhausted the 32-bit process and it died with SIGABRT.
+   r12 changes (field issues from the r11 run):
+   - keyboard: the menu pops the PHONE's own keyboard (system IME).
+     showIme/hideIme focus a hidden 1x1 EditText on the resumed
+     activity; a TextWatcher diffs .toString() (the METHOD - the r10
+     bug was String(editable) -> "[object Object]") and forwards the
+     deltas as dextool_add_char()/dextool_backspace(). The r11 drawn
+     keyboard is gone.
+   - classes: the Classes tab lists ALL loaded classes by default
+     (listLoadedClasses with an empty filter, still paged 400/qid).
+   - openClass: no static field VALUE reads anymore - f.get(null) can
+     run the class's <clinit>, which may block forever inside app
+     code (that, plus a nested-lock deadlock in menu.cpp, froze the
+     app when a class was opened). Values on demand via
+     readStaticFields.
+   - recorder: Stop now also aborts a running installation; progress
+     messages are throttled (the r11 log flooded ~200
+     recorderProgress lines per install) and install chunks are
+     smaller so the JS thread never stalls for seconds.
    - touch map: measured on Activity.onResume AND on every touch
      (throttled); onWindowFocusChanged never fired on the field host.
 */
@@ -146,6 +151,148 @@ function content_view(activity) {
     } catch (e) { return null; }
 }
 
+/* ---------------- system IME bridge (r12) ----------------
+   Pops the PHONE's own soft keyboard when a menu field is focused.
+   A 1x1 transparent EditText is added to the resumed activity's
+   window; its TextWatcher diffs each new text against the previous
+   one (via .toString() - NOT String(), which is what turned the r10
+   bridge into "[object Object]") and forwards the delta to
+   libtool.so as dextool_add_char()/dextool_backspace(). */
+var IME = { act: null, edit: null, actHash: 0, prev: '',
+            silent: false, cnt: 0 };
+
+function ime_on_text(ed) {
+    try {
+        if (!ensure_native_fns()) return;
+        var cur = '';
+        try { cur = ed.toString(); } catch (e0) { return; }
+        cur = String(cur);
+        if (IME.silent) { IME.prev = cur; return; }   /* programmatic */
+        var prev = IME.prev;
+        if (cur === prev) return;
+        /* longest common prefix / suffix -> the delta */
+        var s = 0;
+        while (s < prev.length && s < cur.length && prev[s] === cur[s]) s++;
+        var e = 0;
+        while (e < prev.length - s && e < cur.length - s &&
+               prev[prev.length - 1 - e] === cur[cur.length - 1 - e]) e++;
+        var delN = prev.length - s - e;      /* UTF-16 units deleted */
+        /* deletions first, then insertions - one event per UTF-16
+           unit keeps the mapping 1:1 with what we inserted (astral
+           chars went in as a surrogate pair, so they also come out
+           as two backspaces). */
+        for (var d = 0; d < delN; d++) gBackspace();
+        var ins = cur.substring(s, cur.length - e);
+        for (var i = 0; i < ins.length; i++) gAddChar(ins.charCodeAt(i));
+        IME.prev = cur;
+    } catch (e) {}
+}
+
+function ime_reset_text() {
+    try {
+        IME.silent = true;
+        if (IME.edit) IME.edit.setText('');
+        IME.prev = '';
+        IME.silent = false;
+    } catch (e) { IME.silent = false; }
+}
+
+function ime_ensure(act) {
+    var h = 0;
+    try { h = act.hashCode(); } catch (e0) {}
+    if (IME.edit && IME.actHash === h) return IME.edit;
+    try {
+        IME.edit = null;               /* activity switched */
+        IME.prev = '';
+        var decor = act.getWindow().getDecorView();
+        var ET = Java.use('android.widget.EditText');
+        var edit = ET.$new(act);
+        edit.setBackgroundDrawable(null);   /* 1x1, transparent */
+        edit.setAlpha(0);
+        var LP = Java.use('android.widget.FrameLayout$LayoutParams');
+        var lp = LP.$new(1, 1);
+        decor.addView(edit, lp);
+        var tag = (++IME.cnt) + '_' + (Date.now() % 1000000);
+        var TW = Java.registerClass({
+            name: 'com.dextool.ime.W' + tag,
+            implements: [Java.use('android.text.TextWatcher')],
+            methods: {
+                beforeTextChanged: function (s, a, b, c) {},
+                onTextChanged: function (s, a, b, c) {},
+                afterTextChanged: function (ed) { ime_on_text(ed); }
+            }
+        });
+        edit.addTextChangedListener(TW.$new());
+        var EA = Java.registerClass({
+            name: 'com.dextool.ime.E' + tag,
+            implements: [Java.use('android.widget.TextView$OnEditorActionListener')],
+            methods: {
+                onEditorAction: function (v, actionId, ev) {
+                    /* Done/Next on the IME: release the menu field so
+                       the next tap on it re-opens the keyboard */
+                    sendMsg('imeHidden', {});
+                    ime_reset_text();
+                    return false;
+                }
+            }
+        });
+        edit.setOnEditorActionListener(EA.$new());
+        IME.edit = edit;
+        IME.actHash = h;
+        return edit;
+    } catch (e) {
+        sendMsg('error', { fn: 'ime_ensure', msg: String(e.message || e) });
+        return null;
+    }
+}
+
+function ime_show() {
+    Java.perform(function () {
+        var act = IME.act;
+        if (!act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
+        Java.scheduleOnMainThread(function () {
+            try {
+                var edit = ime_ensure(IME.act);
+                if (!edit) return;
+                ime_reset_text();
+                edit.requestFocus();
+                var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
+                var imm = Java.cast(act.getSystemService('input_method'), IMMgr);
+                imm.showSoftInput(edit, 0);
+                /* the first show right after focus often loses the
+                   race with the window - retry once */
+                setTimeout(function () {
+                    Java.scheduleOnMainThread(function () {
+                        try {
+                            if (!IME.edit) return;
+                            var IM2 = Java.use('android.view.inputmethod.InputMethodManager');
+                            var imm2 = Java.cast(IME.act.getSystemService('input_method'), IM2);
+                            imm2.showSoftInput(IME.edit, 0);
+                        } catch (e2) {}
+                    });
+                }, 150);
+            } catch (e) {
+                sendMsg('error', { fn: 'showIme', msg: String(e.message || e) });
+            }
+        });
+    });
+}
+
+function ime_hide() {
+    Java.perform(function () {
+        Java.scheduleOnMainThread(function () {
+            try {
+                if (!IME.edit) return;
+                var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
+                var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
+                imm.hideSoftInputFromWindow(IME.edit.getWindowToken(), 0);
+                ime_reset_text();
+            } catch (e) {}
+        });
+    });
+}
+
+
 /* ---------------- input + view mapping on the host activity -------- */
 function installTouchHook() {
     if (!ensure_native_fns()) {
@@ -156,6 +303,7 @@ function installTouchHook() {
         var Activity = Java.use('android.app.Activity');
         Activity.onResume.implementation = function () {
             var r = this.onResume();
+            try { IME.act = this; } catch (e0) {}   /* for the IME */
             try { report_map(content_view(this)); } catch (e) {}
             return r;
         };
@@ -219,13 +367,32 @@ function method_lines(jc) {
     }
     return out;
 }
+/* r12: names+types only - NO value reads. f.get(null) can trigger
+   the class's <clinit>, which may block the agent thread forever
+   (the "open a class and the app freezes" bug). Static values are
+   read on demand via readStaticFields. */
+function field_lines_light(jc) {
+    var out = [];
+    var fs = jc.class.getDeclaredFields();
+    for (var i = 0; i < fs.length; i++) {
+        var f = fs[i];
+        try {
+            f.setAccessible(true);
+            var st = (f.getModifiers() & 8) !== 0;
+            out.push(f.getName() + ':' + f.getType().getName() + '=' +
+                     (st ? '(static)' : '(instance)'));
+        } catch (e) { try { out.push(f.getName() + ':?'); } catch (e2) {} }
+    }
+    return out;
+}
 
 /* ---------------- recorder ----------------
    r11: scoped. Only classes matching the package filter are hooked and
    installation stops at cap methods; the r10 version hooked every
    method of every class in the process (tens of thousands of ArtMethod
    hook slots on a 32-bit process) and died with SIGABRT mid-install. */
-var REC = { on: false, busy: false, ring: [], installed: 0, flushBusy: false };
+var REC = { on: false, busy: false, ring: [], installed: 0, flushBusy: false,
+            lastProg: 0 };
 function rec_wanted(name, filter) {
     if (filter === '.') return true;                 /* everything */
     if (!filter) return true;                        /* agent default */
@@ -244,6 +411,14 @@ function rec_flush() {
 setInterval(rec_flush, 500);
 
 function rec_install_chunk(list, batch) {
+    /* r12: Stop must also abort a still-running installation (the
+       r11 Stop left the loop hooking classes, so the Recorder tab
+       looked stuck on "installing ...") */
+    if (!REC.on) {
+        REC.busy = false;
+        sendMsg('recorderStopped', { installed: REC.installed });
+        return;
+    }
     var done = 0;
     for (var i = 0; i < batch && REC.idx < list.length; i++, REC.idx++) {
         if (REC.installed >= REC.cap) break;
@@ -289,12 +464,19 @@ function rec_install_chunk(list, batch) {
             done++;
         } catch (e3) {}
     }
-    sendMsg('recorderProgress', {
-        installed: REC.installed, total: list.length - REC.idx });
+    /* r12: throttle progress - the r11 log flooded ~200
+       recorderProgress messages for a single install */
+    var now = Date.now();
+    if (now - REC.lastProg > 250) {
+        REC.lastProg = now;
+        sendMsg('recorderProgress', {
+            installed: REC.installed, total: list.length - REC.idx });
+    }
     if (REC.idx < list.length && REC.installed < REC.cap) {
-        setTimeout(function () { rec_install_chunk(list, batch); }, 30);
+        setTimeout(function () { rec_install_chunk(list, batch); }, 25);
     } else {
         REC.busy = false;
+        sendMsg('recorderProgress', { installed: REC.installed, total: 0 });
         sendMsg('recorderStarted', { installed: REC.installed });
     }
 }
@@ -712,14 +894,20 @@ rpc.exports = {
             REC.ring = [];
             REC.installed = 0;
             REC.idx = 0;
+            REC.lastProg = 0;
             sendMsg('recorderProgress', { installed: 0, total: list.length });
             sendMsg('info', { msg: 'recorder scope: filter="' + REC.filter +
                                    '" cap=' + REC.cap });
-            setTimeout(function () { rec_install_chunk(list, 25); }, 50);
+            /* r12: smaller chunks (12 classes) - a chunk of 25 with
+               big classes stalled the JS thread for seconds */
+            setTimeout(function () { rec_install_chunk(list, 12); }, 50);
         });
     },
     stopRecorder: function () {
+        /* r12: REC.on=false now also aborts a still-running install
+           (see rec_install_chunk) */
         REC.on = false;
+        REC.busy = false;
         rec_flush();
         sendMsg('recorderStopped', { installed: REC.installed });
     },
@@ -791,10 +979,16 @@ rpc.exports = {
         Java.perform(function () {
             try {
                 var jc = Java.use(cls);
+                /* r12: field VALUES are no longer read here.
+                   field_lines(jc, null) called f.get(null) on every
+                   static - and a static read can run the class's
+                   <clinit>, which may block forever inside app code.
+                   That was the "tap a class and the app hangs" bug
+                   (together with the menu-side nested lock). */
                 sendMsg('classInfo', {
                     class: cls,
                     methods: method_lines(jc),
-                    fields: field_lines(jc, null)
+                    fields: field_lines_light(jc)
                 });
             } catch (e) {
                 sendMsg('classInfo', { class: cls, methods: [], fields: [] });
@@ -802,6 +996,34 @@ rpc.exports = {
             }
         });
     },
+    /* r12: on-demand static values for the open class (Fields tab
+       "Read static values" button) */
+    readStaticFields: function (cls) {
+        Java.perform(function () {
+            try {
+                var jc = Java.use(cls);
+                var fs = jc.class.getDeclaredFields();
+                var out = [];
+                for (var i = 0; i < fs.length; i++) {
+                    var f = fs[i];
+                    try {
+                        f.setAccessible(true);
+                        if ((f.getModifiers() & 8) === 0) continue;
+                        out.push(f.getName() + ':' +
+                                 f.getType().getName() + '=' +
+                                 jstr(f.get(null)));
+                    } catch (e1) {}
+                }
+                sendMsg('staticValues', { class: cls, fields: out });
+            } catch (e) {
+                sendMsg('error', { fn: 'readStaticFields',
+                                   msg: String(e.message || e) });
+            }
+        });
+    },
+    /* ---- system keyboard (r12) ---- */
+    showIme: function () { ime_show(); },
+    hideIme: function () { ime_hide(); },
     listInstances: function (cls) {
         Java.perform(function () {
             var out = [];
@@ -1016,8 +1238,8 @@ recv(function onMsg(msg) {
             var vals = names.map(function (n) { return a[n]; });
             rpc.exports[msg.fn].apply(rpc.exports, vals);
         }
-        /* r11: show/hideKeyboard are gone; the on-screen keyboard is
-           native. Unknown types fall through silently. */
+        /* r12: showIme/hideIme drive the phone keyboard; fields are
+           in FN_ARGS below. Unknown types fall through silently. */
     } catch (e) {
         sendMsg('error', { fn: 'recv', msg: String(e.message || e) });
     }
@@ -1043,9 +1265,12 @@ var FN_ARGS = {
     evalScript:      ['src'],
     listLoadedClasses: ['filter', 'qid'],
     openClass:       ['class'],
+    readStaticFields: ['class'],
+    showIme:         [],
+    hideIme:         [],
     listInstances:   ['class'],
     setInstanceField:['class', 'index', 'field', 'value'],
     callMethod:      ['class', 'method', 'args']
 };
 
-sendMsg('ready', { msg: 'Dex-tool agent r11 loaded' });
+sendMsg('ready', { msg: 'Dex-tool agent r12 loaded' });
