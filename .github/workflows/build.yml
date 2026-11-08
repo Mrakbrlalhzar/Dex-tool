@@ -2630,7 +2630,7 @@ jobs:
                   ImVec2 d(io.MousePos.x - s_fab_grab.x, io.MousePos.y - s_fab_grab.y);
                   if (fabsf(d.x) > 8.f || fabsf(d.y) > 8.f) s_fab_moved = true;
                   if (s_fab_moved) {
-                      s_fab_pos = s_fab_orig + d;
+                      s_fab_pos = ImVec2(s_fab_orig.x + d.x, s_fab_orig.y + d.y);
                       if (s_fab_pos.x < 0)  s_fab_pos.x = 0;
                       if (s_fab_pos.y < 0)  s_fab_pos.y = 0;
                       if (s_fab_pos.x > ds.x - 80) s_fab_pos.x = ds.x - 80;
