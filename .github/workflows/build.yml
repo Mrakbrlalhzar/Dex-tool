@@ -214,24 +214,24 @@ jobs:
           project(dextool CXX C)
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_C_STANDARD 11)
-          
+
           set(FRIDA_GUM_DIR "${CMAKE_SOURCE_DIR}/deps/frida-gum/${ANDROID_ABI}")
           add_library(frida-gumjs STATIC IMPORTED)
           set_target_properties(frida-gumjs PROPERTIES
               IMPORTED_LOCATION "${FRIDA_GUM_DIR}/libfrida-gumjs.a")
-          
+
           set(DOBBY_DIR "${CMAKE_SOURCE_DIR}/deps/dobby")
           add_library(dobby_static STATIC IMPORTED)
           set_target_properties(dobby_static PROPERTIES
               IMPORTED_LOCATION "${DOBBY_DIR}/${ANDROID_ABI}/libdobby.a")
-          
+
           find_library(lib_egl     EGL)
           find_library(lib_gles2   GLESv2)
           find_library(lib_gles3   GLESv3)
           find_library(lib_log     log)
           find_library(lib_dl      dl)
           find_library(lib_android android)
-          
+
           set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/imgui")
           set(IMGUI_SRC
               ${IMGUI_DIR}/imgui.cpp
@@ -239,7 +239,7 @@ jobs:
               ${IMGUI_DIR}/imgui_tables.cpp
               ${IMGUI_DIR}/imgui_widgets.cpp
               ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp)
-          
+
           add_library(tool SHARED
               src/main.cpp
               src/logger.cpp
@@ -249,20 +249,20 @@ jobs:
               src/smali_runtime.cpp
               src/menu.cpp
               ${IMGUI_SRC})
-          
+
           target_include_directories(tool PRIVATE
               src/
               ${FRIDA_GUM_DIR}/
               ${DOBBY_DIR}/include/
               ${IMGUI_DIR}/
               ${IMGUI_DIR}/backends/)
-          
+
           target_compile_definitions(tool PRIVATE IMGUI_IMPL_OPENGL_ES2=1)
-          
+
           target_compile_options(tool PRIVATE
               -fvisibility=hidden -ffunction-sections -fdata-sections -O2
               -Wno-unused-variable -Wno-unused-function)
-          
+
           target_link_libraries(tool
               frida-gumjs dobby_static
               ${lib_egl} ${lib_gles2} ${lib_gles3} ${lib_log} ${lib_dl} ${lib_android}
@@ -304,15 +304,15 @@ jobs:
           #include <ucontext.h>
           #include <dlfcn.h>
           #include <pthread.h>
-          
+
           static FILE* g_info_fp  = nullptr;
           static FILE* g_debug_fp = nullptr;
           static int   g_crash_fd = -1;
           static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
-          
+
           const char* logger_base_dir() { return g_base_dir; }
           static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-          
+
           static void ts(char* buf, size_t n) {
               time_t t = time(nullptr);
               struct tm tm;
@@ -321,7 +321,7 @@ jobs:
                        tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
                        tm.tm_hour, tm.tm_min, tm.tm_sec);
           }
-          
+
           /* Fatal-signal capture. SA_SIGINFO logs signal/si_code/fault
              addr/PC, then the PREVIOUS handler is restored and the signal
              re-raised so debuggerd still writes its tombstone and the
@@ -330,7 +330,7 @@ jobs:
           static struct sigaction g_prev_act[32];
           static bool             g_prev_set[32];
           static char             g_alt_stack[64 * 1024];
-          
+
           static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
               uintptr_t pc = 0;
               ucontext_t* u = (ucontext_t*)uc;
@@ -362,7 +362,7 @@ jobs:
               }
               raise(sig);
           }
-          
+
           static void install_crash_sig(int sig) {
               struct sigaction sa;
               memset(&sa, 0, sizeof(sa));
@@ -371,7 +371,7 @@ jobs:
               sigemptyset(&sa.sa_mask);
               g_prev_set[sig] = (sigaction(sig, &sa, &g_prev_act[sig]) == 0);
           }
-          
+
           void logger_init(const char* base_dir) {
               mkdir(base_dir, 0755);
               snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
@@ -405,9 +405,9 @@ jobs:
                   snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
                   log_crash_raw(boot);
               }
-              log_info("logger_init done (build r12: system IME input, default class list, safe class open)");
+              log_info("logger_init done (build r13: fixed class sub-tabs, IME activity race, Y-bias default -80)");
           }
-          
+
           void log_info(const char* msg) {
               if (!g_info_fp) return;
               pthread_mutex_lock(&g_mtx);
@@ -416,7 +416,7 @@ jobs:
               fflush(g_info_fp);
               pthread_mutex_unlock(&g_mtx);
           }
-          
+
           void log_debug(const char* msg) {
               if (!g_debug_fp) return;
               pthread_mutex_lock(&g_mtx);
@@ -425,11 +425,11 @@ jobs:
               fflush(g_debug_fp);
               pthread_mutex_unlock(&g_mtx);
           }
-          
+
           void log_crash_raw(const char* msg) {
               if (g_crash_fd >= 0) write(g_crash_fd, msg, strlen(msg));
           }
-          
+
           static void glib_log_capture(const gchar* domain, GLogLevelFlags level,
                                        const gchar* message, gpointer) {
               const char* lv =
@@ -445,7 +445,7 @@ jobs:
                   abort();
               }
           }
-          
+
           static void dt_terminate() {
               log_crash_raw("std::terminate called\n");
               try { std::rethrow_exception(std::current_exception()); }
@@ -458,7 +458,7 @@ jobs:
               }
               abort();
           }
-          
+
           void logger_install_abort_capture() {
               if (g_crash_fd >= 0) {
                   dup2(g_crash_fd, STDOUT_FILENO);
@@ -478,23 +478,23 @@ jobs:
           #include <jni.h>
           #include <string>
           #include <vector>
-          
+
           bool install_swap_hook();
           void overlay_set_java_vm(JavaVM* vm);
           void overlay_start(JavaVM* vm);
-          
+
           /* owner has a live ImGui world and at least one frame has been drawn */
           bool overlay_ready();
           /* last known DisplaySize of the owner surface (0,0 if none) */
           void overlay_get_display_size(float* w, float* h);
           /* rebuild the font atlas at `size` px on the next owner frame */
           void overlay_request_font_rebuild(float size);
-          
+
           /* menu.cpp publishes the scrollable rects of the current frame (owner
              thread only); overlay converts drags inside them into wheel events at
              the given speed, which is what makes the huge lists touch-scrollable */
           void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed);
-          
+
           /* ---- r12 ---- */
           /* manual Y nudge applied after the touch map (Settings slider). With
              the Y rescale gone (map_touch) this bias is what corrects the
@@ -503,7 +503,7 @@ jobs:
           void overlay_set_touch_bias(float dy);
           /* one-line description of the active touch map for the Settings status */
           void overlay_touch_map_desc(char* buf, int n);
-          
+
           #ifdef __cplusplus
           extern "C" {
           #endif
@@ -544,25 +544,25 @@ jobs:
           #include <vector>
           #include <mutex>
           #include <unordered_map>
-          
+
           typedef EGLBoolean (*fn_swap)(EGLDisplay, EGLSurface);
           typedef EGLBoolean (*fn_swap_dmg)(EGLDisplay, EGLSurface, EGLint*, EGLint);
           typedef EGLBoolean (*fn_destroy_ctx)(EGLDisplay, EGLContext);
           typedef EGLBoolean (*fn_terminate)(EGLDisplay);
-          
+
           static fn_swap        g_orig_swap        = nullptr;
           static fn_swap_dmg    g_orig_swap_dmg    = nullptr;
           static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
           static fn_terminate   g_orig_terminate   = nullptr;
-          
+
           static std::atomic<bool> g_gum_inited {false};
           static JavaVM*           g_jvm        = nullptr;
-          
+
           /* ---- single-owner overlay ---------------------------------------- r9
              r7 elected exactly one EGL context as the overlay owner (the
              continuously rendering GL thread of the game/view) and only that
              thread touches ImGui or GL. r9 keeps that, and adds:
-          
+
              PARK + ADOPT. When the owner context dies (app switch: the
              GLSurfaceView destroys its context in onPause; keyboard with
              adjustResize on some devices; activity relayout) r7 destroyed the
@@ -578,7 +578,7 @@ jobs:
              makes NewFrame recreate the font texture and shader on the new
              context. The old context's objects are freed by the driver; we never
              call GL without a current context.
-          
+
              r11 also retires every slot in the eglTerminate hook: terminating a
              display invalidates all of its contexts, and if the driver later hands
              out a new context at the same address, the stale slot would happily
@@ -588,7 +588,7 @@ jobs:
           #define DT_ELECT_MIN_SWAPS 45
           #define DT_ADOPT_MIN_SWAPS  8
           #define DT_OWNER_STALE_MS  1500
-          
+
           struct GlState {
               GLint program = 0;
               GLint vao = 0, ab = 0, eb = 0;
@@ -621,7 +621,7 @@ jobs:
                                             serializes ownership changes, adoption
                                             and slot teardown against frames */
           static std::atomic<bool> g_ready {false};
-          
+
           /* ---- touch mapping ------------------------------------------------
              Events arrive in raw window pixels from both input paths. Two sources
              feed the map, best one wins:
@@ -639,8 +639,8 @@ jobs:
           struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
           static std::mutex g_map_mtx;
           static TouchMap   g_map;
-          static float      g_bias_y = 0.f;      /* manual nudge, under g_map_mtx */
-          
+          static float      g_bias_y = -80.f;    /* manual nudge, under g_map_mtx; r13 default = constant status-bar offset */
+
           /* Touch stream with dedup: a NativeActivity host can deliver the same
              physical tap through BOTH the AInputQueue and the Java bridge; an
              event identical to the previous one within 40 ms is dropped. */
@@ -650,14 +650,14 @@ jobs:
           static TouchEvent              g_touch_last;
           static long                    g_touch_last_ms = 0;
           static std::atomic<bool>       g_want_mouse {false};
-          
+
           static std::mutex            g_char_mtx;
           static std::vector<unsigned>  g_pending_chars;
           static bool                   g_pending_bs    = false;
-          
+
           /* scroll regions published by menu_draw (owner thread) */
           static std::vector<float> g_scroll_regions;
-          
+
           /* font atlas: rebuilt on demand from a system font, so the Font Size
              slider actually changes the glyphs instead of just scaling them */
           static float g_font_size  = 18.0f;
@@ -666,13 +666,13 @@ jobs:
           static std::mutex g_disp_mtx;
           static float g_disp_w = 0.f, g_disp_h = 0.f;
           static float g_max_surf_w = 0.f, g_max_surf_h = 0.f;   /* seen on ANY ctx */
-          
+
           static long now_ms() {
               timespec ts;
               clock_gettime(CLOCK_MONOTONIC, &ts);
               return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
           }
-          
+
           static void touch_push(float x, float y, int phase) {
               std::lock_guard<std::mutex> lk(g_touch_mtx);
               long now = now_ms();
@@ -686,7 +686,7 @@ jobs:
               if (g_touch_q.size() > 96) g_touch_q.erase(g_touch_q.begin());
               g_touch_q.push_back({x, y, phase});
           }
-          
+
           extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
               int a = action & 0xff;
               if      (a == 0)            touch_push(x, y, 0);  /* DOWN */
@@ -694,7 +694,7 @@ jobs:
               else if (a == 2)            touch_push(x, y, 2);  /* MOVE */
               else if (a == 5 || a == 6)  touch_push(x, y, 2);  /* PTR up/dn */
           }
-          
+
           extern "C" JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h) {
               if (w <= 0 || h <= 0) return;
               std::lock_guard<std::mutex> lk(g_map_mtx);
@@ -704,14 +704,14 @@ jobs:
                   LOGI("[overlay] touch map: view rect in window = (%d,%d %dx%d)",
                        x, y, w, h);
           }
-          
+
           void overlay_set_touch_bias(float dy) {
               if (dy < -100.f) dy = -100.f;
               if (dy >  100.f) dy =  100.f;
               std::lock_guard<std::mutex> lk(g_map_mtx);
               g_bias_y = dy;
           }
-          
+
           void overlay_touch_map_desc(char* buf, int n) {
               if (!buf || n <= 0) return;
               std::lock_guard<std::mutex> lk(g_map_mtx);
@@ -722,7 +722,7 @@ jobs:
               else
                   snprintf(buf, n, "none yet (raw passthrough) + Y%+.0f", g_bias_y);
           }
-          
+
           /* native estimate: while the agent has not measured the view rect yet,
              assume the window is as tall as the largest surface we have seen (a
              typical app's HWUI surface spans the full window) and that the GL
@@ -740,63 +740,63 @@ jobs:
               g_map = { 0.f, 0.f, w, h, true, true };
               LOGI("[overlay] touch map: estimate 0,0 %.0fx%.0f (max surface)", w, h);
           }
-          
+
           /* defined further down */
           static ImVec2 map_touch(float x, float y, const ImVec2& ds);
-          
+
           extern "C" JNIEXPORT bool dextool_want_mouse() {
               /* r12: the drawn keyboard is gone (text input is the system IME
                  now, which is its own window - its taps never reach the
                  activity). Only the menu itself claims events. */
               return g_want_mouse.load();
           }
-          
+
           extern "C" JNIEXPORT int dextool_display_size() {
               std::lock_guard<std::mutex> lk(g_disp_mtx);
               if (g_disp_w <= 0 || g_disp_h <= 0) return 0;
               return ((int)g_disp_w << 16) | (int)g_disp_h;
           }
-          
+
           extern "C" JNIEXPORT void dextool_add_char(int cp) {
               std::lock_guard<std::mutex> lk(g_char_mtx);
               g_pending_chars.push_back((unsigned)cp);
           }
-          
+
           extern "C" JNIEXPORT void dextool_backspace() {
               std::lock_guard<std::mutex> lk(g_char_mtx);
               g_pending_bs = true;
           }
-          
+
           bool overlay_ready() { return g_ready.load(); }
-          
+
           void overlay_get_display_size(float* w, float* h) {
               std::lock_guard<std::mutex> lk(g_disp_mtx);
               if (w) *w = g_disp_w;
               if (h) *h = g_disp_h;
           }
-          
+
           void overlay_request_font_rebuild(float size) {
               if (size < 10.f) size = 10.f;
               if (size > 40.f) size = 40.f;
               g_font_size  = size;
               g_font_dirty = true;
           }
-          
+
           void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed) {
               /* publisher (menu_draw) and consumer (replay) are both the owner
                  thread, one frame apart - no lock needed */
               g_scroll_regions = xywh_speed;
           }
-          
+
           static void* frida_thread(void*) {
               frida_bridge_start(g_jvm);
               return nullptr;
           }
-          
+
           /* called from JNI_OnLoad before overlay_start; the frida thread and
              the bridge read g_jvm afterwards */
           void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
-          
+
           void overlay_start(JavaVM*) {
               if (g_gum_inited.exchange(true)) return;
               gum_init_embedded();
@@ -811,19 +811,19 @@ jobs:
               touch_install_hooks();
               log_info("[overlay] touch hooks installed, frida thread started");
           }
-          
+
           static void menu_init_once() {
               static bool done = false;
               if (!done) { done = true; menu_init(); }
           }
-          
+
           static Slot* slot_for(EGLContext ctx) {
               std::lock_guard<std::mutex> lk(g_slots_mtx);
               Slot*& s = g_slots[ctx];
               if (!s) s = new Slot();
               return s;
           }
-          
+
           /* Ownership rules (map work under g_slots_mtx, whole frame under
              g_tick_mtx, so this can never race a draw):
                - fast path: we are already the owner;
@@ -864,7 +864,7 @@ jobs:
               }
               return false;
           }
-          
+
           static void resolve_font_path() {
               if (g_font_path[0]) return;
               const char* cands[] = {
@@ -879,7 +879,7 @@ jobs:
                       return;
                   }
           }
-          
+
           static void build_fonts(ImGuiIO& io) {
               resolve_font_path();
               io.Fonts->Clear();
@@ -894,13 +894,13 @@ jobs:
               io.Fonts->Build();
               g_font_dirty = false;
           }
-          
+
           /* build (or adopt) the ImGui world of a freshly elected slot */
           static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
               EGLint w = 1080, h = 1920;
               eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-          
+
               const GLubyte* ver = glGetString(GL_VERSION);
               if (!ver || !strstr((const char*)ver, "OpenGL ES")) {
                   LOGE("[overlay] not OpenGL ES: %s", ver ? (const char*)ver : "null");
@@ -908,7 +908,7 @@ jobs:
                   return;
               }
               s->es3 = strstr((const char*)ver, "OpenGL ES 3") != nullptr;
-          
+
               if (g_orphan_imgui) {
                   /* adopt the parked world; its backend GL handles are stale, so
                      ShutDown + Init to force CreateDeviceObjects on this context */
@@ -924,7 +924,7 @@ jobs:
                   ImGui::SetCurrentContext(s->imgui);
                   LOGI("[overlay] GL: %s (%dx%d)", (const char*)ver, w, h);
               }
-          
+
               ImGuiIO& io   = ImGui::GetIO();
               io.DisplaySize = ImVec2((float)w, (float)h);
               io.DeltaTime   = 1.0f / 60.0f;
@@ -942,7 +942,7 @@ jobs:
               }
               LOGI("[overlay] ImGui up OK (%dx%d, font %.0fpx)", w, h, g_font_size);
           }
-          
+
           /* eglDestroyContext hook: retire the slot WITH its context. r7 tore the
              whole ImGui world down here, so every activity relayout that recycled
              the GL context (keyboard with adjustResize, app switch, rotation) was
@@ -977,7 +977,7 @@ jobs:
                   }
               }
           }
-          
+
           /* HWUI and several driver wrappers abort the whole process on stray GL
              errors (the "glUseProgram -> GL_INVALID_VALUE (0x501)" SIGABRT seen in
              the field), so every binding the ES2 ImGui backend touches goes back
@@ -1007,7 +1007,7 @@ jobs:
               glGetIntegerv(GL_BLEND_EQUATION_RGB,   &g.blend_eq_rgb);
               glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &g.blend_eq_a);
           }
-          
+
           /* r11: eat whatever the draw left in the error queue and make it
              visible in the debug log - some wrappers abort on a stray sticky
              error at their next check. */
@@ -1021,7 +1021,7 @@ jobs:
               if (first != GL_NO_ERROR)
                   LOGD("[overlay] drained GL error 0x%04x after draw", first);
           }
-          
+
           static void gl_state_restore(Slot* s) {
               GlState& g = s->gl;
               if (s->es3) glBindVertexArray(g.vao);
@@ -1051,7 +1051,7 @@ jobs:
                   glUseProgram(g.program);
               gl_drain_errors();
           }
-          
+
           /* is a display-space point inside one of the published scroll rects? */
           static float region_speed_at(float x, float y) {
               const std::vector<float>& r = g_scroll_regions;
@@ -1062,7 +1062,7 @@ jobs:
               }
               return 0.f;
           }
-          
+
           /* map a raw window position into the overlay surface's coordinate
              space via the measured view rect; falls back to identity. r11 adds
              the manual Y bias on top (Settings). */
@@ -1093,17 +1093,17 @@ jobs:
               if (my > ds.y)  my = ds.y;
               return ImVec2(mx, my);
           }
-          
+
           static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
               static thread_local bool in_tick = false;
               if (in_tick) return;   /* driver re-entry (swap->swapWithDamage) */
               in_tick = true;
               struct TickReset { bool& b; ~TickReset() { b = false; } }
                   tick_reset{in_tick};
-          
+
               EGLContext ctx = eglGetCurrentContext();
               if (ctx == EGL_NO_CONTEXT) return;
-          
+
               /* r11: surface bookkeeping for EVERY context, before ownership
                  gating. The largest surface on any thread (the HWUI window
                  surface spans the whole window) is the best native estimate of
@@ -1118,16 +1118,16 @@ jobs:
                   if ((float)sh > g_max_surf_h) g_max_surf_h = (float)sh;
                   if (g_disp_w <= 0.f) { g_disp_w = (float)sw; g_disp_h = (float)sh; }
               }
-          
+
               /* one drawer at a time; also serializes ownership changes, adoption
                  and slot teardown against in-flight frames */
               std::lock_guard<std::mutex> lk(g_tick_mtx);
-          
+
               Slot* s = slot_for(ctx);
               if (!ensure_ownership(s, ctx)) return;  /* not the owner: no
                                                          ImGui, no GL touched */
               if (s->dead || s->failed) return;
-          
+
               if (!s->imgui) slot_init(dpy, surf, s);
               if (!s->imgui) return;
               ImGui::SetCurrentContext(s->imgui);
@@ -1147,7 +1147,7 @@ jobs:
                   }
                   s->last_frame_ms = nowt;
               }
-          
+
               /* replay queued touch events as real ImGui events. Drags that
                  start inside a published scroll rect additionally become wheel
                  events, scaled by that rect's speed - this is the touch
@@ -1184,7 +1184,7 @@ jobs:
                       have_prev = true;
                   }
               }
-          
+
               {
                   std::lock_guard<std::mutex> lk2(g_char_mtx);
                   for (unsigned cp : g_pending_chars) io.AddInputCharacter(cp);
@@ -1195,7 +1195,7 @@ jobs:
                       g_pending_bs = false;
                   }
               }
-          
+
               menu_init_once();
               maybe_estimate_map();     /* native fallback until the agent measures */
               if (g_font_dirty) {
@@ -1204,7 +1204,7 @@ jobs:
                      new size; the current context is ours and live right here */
                   ImGui_ImplOpenGL3_DestroyDeviceObjects();
               }
-          
+
               gl_state_save(s);
               glBindFramebuffer(GL_FRAMEBUFFER, 0);
               /* the ES2 backend relies on GL_SCISSOR_TEST for clipping; the app
@@ -1220,12 +1220,12 @@ jobs:
               gl_state_restore(s);
               g_ready.store(true);
           }
-          
+
           static EGLBoolean my_destroy_ctx(EGLDisplay dpy, EGLContext ctx) {
               slot_destroy(ctx);
               return g_orig_destroy_ctx ? g_orig_destroy_ctx(dpy, ctx) : EGL_TRUE;
           }
-          
+
           static EGLBoolean my_terminate(EGLDisplay dpy) {
               /* r11: terminating a display invalidates every context of that
                  display. Retire all slots now; otherwise the next eglCreateContext
@@ -1268,19 +1268,19 @@ jobs:
               }
               return g_orig_terminate ? g_orig_terminate(dpy) : EGL_TRUE;
           }
-          
+
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
               overlay_tick(dpy, surf);
               return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
           }
-          
+
           static EGLBoolean my_swap_dmg(EGLDisplay dpy, EGLSurface surf,
                                         EGLint* rects, EGLint n) {
               overlay_tick(dpy, surf);
               return g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
                                      : EGL_FALSE;
           }
-          
+
           bool install_swap_hook() {
               void* egl = dlopen("libEGL.so", RTLD_NOW);
               if (!egl) { LOGE("dlopen libEGL.so: %s", dlerror()); return false; }
@@ -1347,10 +1347,10 @@ jobs:
           #include "dobby.h"
           #include <dlfcn.h>
           #include <android/input.h>
-          
+
           typedef int32_t (*fn_getEvent)(AInputQueue*, AInputEvent**);
           static fn_getEvent g_orig_get = nullptr;
-          
+
           /* Both input paths (this AInputQueue hook for NativeActivity hosts and
              the Java dispatchTouchEvent hook in agent.js) deliver events in the
              SAME coordinate space: raw window pixels. r7/r8 fed them straight into
@@ -1376,7 +1376,7 @@ jobs:
               }
               return rc;
           }
-          
+
           void touch_install_hooks() {
               void* lib = dlopen("libandroid.so", RTLD_NOW);
               if (!lib) { LOGD("touch: libandroid not found (OK for Java apps)"); return; }
@@ -1414,7 +1414,7 @@ jobs:
           #include <string>
           #include <cstdio>
           #include <cstring>
-          
+
           static GumScriptBackend* g_backend = nullptr;
           static GumScript*        g_script  = nullptr;
           static GMainLoop*        g_loop    = nullptr;
@@ -1495,13 +1495,13 @@ jobs:
               g_main_loop_run(g_loop);
               log_info("[frida_bridge] loop exited");
           }
-          
+
           void frida_post(const std::string& json) {
               if (!g_script) return;
               std::lock_guard<std::mutex> lk(g_pmtx);
               gum_script_post(g_script, json.c_str(), nullptr);
           }
-          
+
           void frida_set_message_callback(MsgCallback cb) {
               std::lock_guard<std::mutex> lk(g_pmtx);
               g_cb = cb;
@@ -1530,11 +1530,11 @@ jobs:
           #include <cstdint>
           #include <unistd.h>
           #include <sys/stat.h>
-          
+
           extern JavaVM* g_jvm_global;
           static bool   s_ready    = false;
           static jclass s_main_cls = nullptr;
-          
+
           static std::string extract_jar(JNIEnv* env) {
               jclass   act = env->FindClass("android/app/ActivityThread");
               jobject  app = env->CallStaticObjectMethod(act,
@@ -1562,7 +1562,7 @@ jobs:
               fclose(f); AAsset_close(a);
               return std::string(jar);
           }
-          
+
           static bool ensure_ready(JNIEnv* env) {
               if (s_ready) return true;
               std::string jar = extract_jar(env);
@@ -1584,7 +1584,7 @@ jobs:
               s_ready = true;
               return true;
           }
-          
+
           std::string smali_compile(const std::string& src, const std::string& cname,
                                     std::vector<uint8_t>& out) {
               JNIEnv* env = nullptr;
@@ -1652,7 +1652,7 @@ jobs:
           #include <algorithm>
           #include <pthread.h>
           #include <ctime>
-          
+
           /* =====================================================================
              Dex-tool menu (r12)
              - every tab of the spec: Settings, Patches, Hooks, Tracker, Recorder,
@@ -1675,12 +1675,12 @@ jobs:
                drags inside them into wheel events at the configured speed
              - UI state persists to <logdir>/dextool-ui.conf
              ===================================================================== */
-          
+
           /* recursive: tab_classes / class_tab_content / menu_open_class nest */
           static pthread_mutex_t g_mtx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
           #define MLK()   pthread_mutex_lock(&g_mtx)
           #define MULK()  pthread_mutex_unlock(&g_mtx)
-          
+
           /* ---------------- settings ---------------- */
           static float s_font_size  = 18.0f;
           static float s_opacity    = 0.92f;
@@ -1689,13 +1689,13 @@ jobs:
           static float s_lst_scroll = 1.2f;   /* inner list drag speed */
           static bool  s_visible    = true;
           static bool  s_show_fab   = true;
-          static float s_y_off      = 0.0f;   /* manual touch Y bias (px) */
-          
+          static float s_y_off      = -80.0f; /* manual touch Y bias (px); r13 default = the constant status-bar offset measured on the field device */
+
           /* ---------------- agent / overlay status ---------------- */
           static bool  s_agent_ready = false;
           static char  s_agent_note[160] = "";
           static bool  s_ovl_ready   = false;
-          
+
           /* ---------------- scroll region publication ---------------- */
           static std::vector<float> s_regions;
           static void mark_rect(float x, float y, float w, float h, float speed) {
@@ -1709,7 +1709,7 @@ jobs:
               ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
               mark_rect(a.x, a.y, b.x - a.x, b.y - a.y, speed);
           }
-          
+
           /* ---------------- data model ---------------- */
           struct MethodSig { std::string name, params, ret; };
           struct FieldInfo { std::string name, type, value; };
@@ -1739,7 +1739,7 @@ jobs:
                             std::vector<TrackRow> log; };
           struct RecRow   { std::string cls, method, args, ret, extra; };
           struct MonRow   { std::string kind, url, method, origin, note; };
-          
+
           static std::vector<ClassTab>  s_classes;
           static std::vector<PatchRow>   s_patches;
           static std::vector<HookRow>    s_hooks;
@@ -1747,13 +1747,13 @@ jobs:
           static std::vector<RecRow>     s_rec;
           static std::vector<MonRow>     s_mon;
           static std::vector<std::string> s_cons;      /* script console */
-          
+
           static bool  s_rec_on=false;  static char s_rec_stat[128]="idle";
           static int   s_rec_installed=0, s_rec_total=0;
           static char  s_rec_filter[120]="";           /* empty = host package */
           static int   s_rec_cap=1500;                 /* method cap */
           static bool  s_mon_on=false;  static char s_mon_stat[160]="off";
-          
+
           static char s_pcls[200]={}, s_pfld[128]={}, s_pval[256]={};
           static int  s_pedit=-1;
           static char s_hcls[200]={}, s_hmth[128]={}, s_hcode[4096]={};
@@ -1769,7 +1769,7 @@ jobs:
           static int  s_search_seq=0, s_search_qid=-1;
           static std::string s_focus_cls;          /* class tab to select */
           static std::string s_next_tab;           /* top tab to select */
-          
+
           /* ---------------- JSON helpers ---------------- */
           static std::string jesc(const std::string& s) {
               std::string r;
@@ -1792,7 +1792,7 @@ jobs:
               }
               return r;
           }
-          
+
           /* unescape a JSON string body (agent -> menu direction); r6/r7 fed
              escaped text (with \" and \\n) straight into the UI */
           static std::string junesc(const std::string& s) {
@@ -1838,7 +1838,7 @@ jobs:
               }
               return r;
           }
-          
+
           /* string array; skips \" so values containing quotes survive */
           static std::vector<std::string> jarr(const std::string& j, const char* key) {
               std::vector<std::string> r;
@@ -1864,7 +1864,7 @@ jobs:
               }
               return r;
           }
-          
+
           static std::string jstr(const std::string& j, const char* key) {
               std::string k = std::string("\"")+key+"\":\"";
               auto p = j.find(k);
@@ -1880,7 +1880,7 @@ jobs:
               if (i > p) val = j.substr(p, i - p);
               return junesc(val);
           }
-          
+
           static long jnum(const std::string& j, const char* key, long dflt=0) {
               std::string k = std::string("\"")+key+"\":";
               auto p = j.find(k);
@@ -1895,30 +1895,36 @@ jobs:
               }
               return any ? (neg ? -v : v) : dflt;
           }
-          
+
           static bool jhas(const std::string& j, const char* key) {
               return j.find(std::string("\"")+key+"\"") != std::string::npos;
           }
-          
+
           static void post_rpc(const char* fn, const std::string& args) {
               std::string m = "{\"type\":\"rpc\",\"fn\":\"";
               m += fn; m += "\",\"args\":"; m += args; m += "}";
               frida_post(m);
           }
-          
+
           static void push_console(const char* tag, const std::string& line) {
               char b[256];
               snprintf(b, sizeof(b), "%s %s", tag, line.c_str());
               if (s_cons.size() < 400) s_cons.push_back(b);
           }
-          
+
           /* ---------------- cross-linking ---------------- */
           void menu_open_class(const std::string& name) {
               if (name.empty()) return;
               MLK();
               bool have = false;
-              for (auto& c : s_classes) if (c.cname == name) { have = true; break; }
-              if (!have) s_classes.push_back(ClassTab{name});
+              for (auto& c : s_classes)
+                  if (c.cname == name) { have = true; c.waiting = true; break; }
+              if (!have) {
+                  ClassTab nt{};
+                  nt.cname = name;
+                  nt.waiting = true;
+                  s_classes.push_back(nt);
+              }
               s_focus_cls = name;
               s_next_tab  = "Classes";
               MULK();
@@ -1926,18 +1932,18 @@ jobs:
               std::string a = "{\"class\":\"" + jesc(name) + "\"}";
               post_rpc("openClass", a);
           }
-          
+
           static ClassTab* find_tab(const std::string& n) {
               for (auto& c : s_classes) if (c.cname == n) return &c;
               return nullptr;
           }
-          
+
           static int find_tracker(const std::string& n) {
               for (size_t i = 0; i < s_trackers.size(); i++)
                   if (s_trackers[i].name == n) return (int)i;
               return -1;
           }
-          
+
           /* parse "Class.method(arg,args) -> ret" and "name:type=value" */
           static MethodSig parse_sig(const std::string& s) {
               MethodSig m;
@@ -2017,25 +2023,25 @@ jobs:
               }
               return i;
           }
-          
+
           /* strip the trailing ".method" from a caller string "pkg.Cls.method" */
           static std::string cls_of_member(const std::string& s) {
               auto d = s.rfind('.');
               if (d == std::string::npos || d == 0) return s;
               return s.substr(0, d);
           }
-          
+
           /* ---------------- UI persistence ---------------- */
           static char  s_conf_path[512] = "";
           static bool  s_conf_dirty = false;
           static long  s_conf_last_ms = 0;
-          
+
           static long conf_now_ms() {
               timespec ts;
               clock_gettime(CLOCK_MONOTONIC, &ts);
               return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
           }
-          
+
           static void conf_load() {
               snprintf(s_conf_path, sizeof(s_conf_path), "%s/dextool-ui.conf",
                        logger_base_dir());
@@ -2058,7 +2064,7 @@ jobs:
               }
               fclose(f);
           }
-          
+
           static void conf_save() {
               FILE* f = fopen(s_conf_path, "w");
               if (!f) return;
@@ -2073,7 +2079,7 @@ jobs:
               s_conf_dirty = false;
               s_conf_last_ms = conf_now_ms();
           }
-          
+
           /* ---------------- theme ---------------- */
           static void apply_theme() {
               switch (s_theme) {
@@ -2086,7 +2092,7 @@ jobs:
               ImGui::GetIO().FontGlobalScale = 1.0f;   /* real size comes from the
                                                          atlas, not from scaling */
           }
-          
+
           /* ===================== system keyboard (IME) bridge =====================
              r12. The r11 drawn keyboard is GONE. A text field that gains focus
              asks the agent to pop the PHONE's own soft keyboard: the menu posts
@@ -2099,14 +2105,14 @@ jobs:
              ImGui field - so the next tap on it re-opens the keyboard. */
           static bool s_ime_active = false;   /* a text field owns ImGui focus */
           static bool s_ime_clear  = false;   /* drop active id next frame      */
-          
+
           static void ime_show() { post_rpc("showIme", "{}"); }
           static void ime_hide() { post_rpc("hideIme", "{}"); }
-          
+
           static void ime_close_if_active() {
               if (s_ime_active) { s_ime_active = false; ime_hide(); }
           }
-          
+
           /* once per frame, before the menu window: if the user closed the
              phone keyboard, release the ImGui field as well */
           static void ime_frame_prelude() {
@@ -2118,7 +2124,7 @@ jobs:
               MULK();
               if (clear) ImGui::ClearActiveID();
           }
-          
+
           /* plain InputText wired to the system keyboard */
           static bool ime_textfield(const char* label, char* buf, size_t cap) {
               bool used = ImGui::InputText(label, buf, cap,
@@ -2134,7 +2140,7 @@ jobs:
               }
               return used;
           }
-          
+
           /* same for multiline editors (script editor, hook code) */
           static bool ime_multiline(const char* label, char* buf, size_t cap,
                                     ImVec2 size) {
@@ -2150,8 +2156,8 @@ jobs:
               }
               return used;
           }
-          
-          
+
+
           /* ---------------- message callback (GumJS thread) ---------------- */
           void menu_init() {
               apply_theme();
@@ -2306,7 +2312,7 @@ jobs:
                   MULK();
               });
           }
-          
+
           /* ===================== Settings ===================== */
           static void tab_settings() {
               ImGuiIO& io = ImGui::GetIO();
@@ -2346,7 +2352,7 @@ jobs:
                   ImGui::TextColored(ImVec4(1, .6f, 0, 1),
                       "Menu hidden with no toggle button - it was re-enabled.");
               if (!s_show_fab && !s_visible) { s_show_fab = true; s_conf_dirty = true; }
-          
+
               ImGui::Separator();
               ImGui::TextColored(ImVec4(.5f, .8f, 1.f, 1), "Status");
               s_ovl_ready = overlay_ready();
@@ -2364,7 +2370,7 @@ jobs:
               ImGui::Text("Display: %.0fx%.0f  FPS %.0f", io.DisplaySize.x,
                           io.DisplaySize.y, io.Framerate);
           }
-          
+
           /* ===================== Patches ===================== */
           static void tab_patches() {
               if (s_pedit >= 0 && s_pedit < (int)s_patches.size()) {
@@ -2390,7 +2396,7 @@ jobs:
               ImGui::SameLine();
               if (ImGui::Button("Clear")) s_pcls[0]=s_pfld[0]=s_pval[0]=0;
               ImGui::Separator();
-          
+
               MLK();
               for (int i = 0; i < (int)s_patches.size(); i++) {
                   ImGui::PushID(i);
@@ -2427,7 +2433,7 @@ jobs:
               }
               MULK();
           }
-          
+
           /* ===================== Hooks ===================== */
           static void tab_hooks() {
               const char* modes[] = {"Java(JS)", "Smali", "noop"};
@@ -2459,7 +2465,7 @@ jobs:
                   s_hcls[0] = s_hmth[0] = s_hcode[0] = 0;
               }
               ImGui::Separator();
-          
+
               MLK();
               for (int i = 0; i < (int)s_hooks.size(); i++) {
                   ImGui::PushID(i);
@@ -2496,7 +2502,7 @@ jobs:
               }
               MULK();
           }
-          
+
           /* ===================== Tracker ===================== */
           static void tab_tracker() {
               ime_textfield("Class##tc",  s_tcls, sizeof(s_tcls));
@@ -2544,7 +2550,7 @@ jobs:
               }
               MULK();
           }
-          
+
           /* ===================== Recorder ===================== */
           static void tab_recorder() {
               MLK();
@@ -2611,7 +2617,7 @@ jobs:
                   ImGui::SetScrollHereY(1.f);
               MULK();
           }
-          
+
           /* ===================== Monitor ===================== */
           static void tab_monitor() {
               MLK();
@@ -2660,7 +2666,7 @@ jobs:
               mark_scroll_item(s_lst_scroll);
               MULK();
           }
-          
+
           /* ===================== Script ===================== */
           static void tab_script() {
               ime_multiline("##sc", s_script, sizeof(s_script),
@@ -2682,40 +2688,38 @@ jobs:
                   ImGui::SetScrollHereY(1.f);
               MULK();
           }
-          
+
           /* ===================== Classes ===================== */
           static void class_tab_content(ClassTab& c) {
-              const char* subs[] = {"Instances", "Methods", "Fields"};
-              if (ImGui::BeginTabBar("cls")) {
+              const char* subs[] = {"Instances", "Fields", "Methods"};
+              /* r13: unique tab-bar id - it used to be "cls", the same id as
+                 the outer class-tab bar of tab_classes(); the two bars shared
+                 one ImGuiTabBar state and the selection oscillated every frame
+                 (lists flashed and disappeared). */
+              if (ImGui::BeginTabBar("clssub")) {
                   for (int si = 0; si < 3; si++) {
-                      bool sel = (c.sub == si);
-                      if (ImGui::BeginTabItem(subs[si], nullptr,
-                              sel ? ImGuiTabItemFlags_SetSelected : 0)) {
+                      if (ImGui::BeginTabItem(subs[si], nullptr, 0)) {
                           c.sub = si;
                           ImGui::EndTabItem();
-                      } else if (sel) {
-                          c.sub = si;
                       }
                   }
                   ImGui::EndTabBar();
               }
-              if (c.waiting && !c.got_info)
-                  ImGui::TextDisabled("(waiting for agent...)");
-              if (!c.got_info && !c.waiting)
-                  ImGui::TextDisabled("(no data - tap Refresh)");
-          
+              if (!c.got_info)
+                  ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
+                                                : "(no data - tap Refresh)");
+
               if (ImGui::Button("Refresh"))
                   menu_open_class(c.cname);
-              ImGui::SameLine();
-              if (ImGui::Button("Find instances")) {
-                  std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
-                  post_rpc("listInstances", a);
-              }
               ImGui::Separator();
-          
+
               if (c.sub == 0) {                        /* ---- Instances ---- */
+                  if (ImGui::Button("Find instances##fi")) {
+                      std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
+                      post_rpc("listInstances", a);
+                  }
                   if (c.instances.empty()) {
-                      ImGui::TextDisabled("no instances loaded - Find instances");
+                      ImGui::TextDisabled("no instances loaded - tap Find instances");
                   }
                   for (int i = 0; i < (int)c.instances.size(); i++) {
                       ImGui::PushID(i);
@@ -2773,7 +2777,7 @@ jobs:
                           ImGui::PopID();
                       }
                   }
-              } else if (c.sub == 1) {                 /* ---- Methods ---- */
+              } else if (c.sub == 2) {                 /* ---- Methods ---- */
                   if (c.call_open) {
                       ImGui::TextColored(ImVec4(0, 1, 0, 1), "call %s.%s",
                                          c.cname.c_str(), c.call_sig.name.c_str());
@@ -2852,7 +2856,7 @@ jobs:
                   }
                   ImGui::EndChild();
                   mark_scroll_item(s_lst_scroll);
-              } else {                                 /* ---- Fields ---- */
+              } else if (c.sub == 1) {                 /* ---- Fields ---- */
                   MLK();
                   /* r12: values are NOT read while opening the class anymore
                      (reading a static can run the class's <clinit> and hang
@@ -2886,7 +2890,7 @@ jobs:
                   MULK();
               }
           }
-          
+
           static void tab_classes() {
               /* r12: the full class list loads BY DEFAULT - no "+ search" gate.
                  The agent streams every loaded class in pages of 400; the
@@ -2905,7 +2909,7 @@ jobs:
               if (qid)
                   post_rpc("listLoadedClasses",
                            "{\"filter\":\"\",\"qid\":" + std::to_string(qid) + "}");
-          
+
               bool do_search = false;
               MLK();
               ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 150.f);
@@ -2941,13 +2945,13 @@ jobs:
                   post_rpc("listLoadedClasses", a);
               }
               ImGui::Separator();
-          
+
               MLK();
               if (!s_classes.empty()) {
                   /* which open class is visible? ImGui has no query for "current
                      tab", so remember the last one the user clicked */
                   static int s_cls_cur = 0;
-                  if (ImGui::BeginTabBar("cls")) {
+                  if (ImGui::BeginTabBar("clsTabs")) {
                       for (int i = 0; i < (int)s_classes.size(); i++) {
                           bool open = true;
                           ImGuiTabItemFlags fl = 0;
@@ -2985,8 +2989,8 @@ jobs:
                   MULK();
               }
           }
-          
-          
+
+
           /* ===================== floating toggle button =====================
              Always available (unless disabled in Settings), draggable, and a
              plain tap toggles the menu - r7 only showed it while the menu was
@@ -2995,7 +2999,7 @@ jobs:
           static bool    s_fab_drag = false;
           static bool    s_fab_moved = false;
           static ImVec2  s_fab_grab(0, 0), s_fab_orig(0, 0);
-          
+
           static void draw_fab(ImVec2 ds) {
               if (!s_show_fab) return;
               if (s_fab_pos.x < 0) s_fab_pos = ImVec2(ds.x - 90.f, ds.y - 110.f);
@@ -3043,17 +3047,17 @@ jobs:
               ImGui::PopStyleColor();
               ImGui::PopStyleVar();
           }
-          
+
           /* ===================== main window ===================== */
           void menu_draw() {
               ImGuiIO& io = ImGui::GetIO();
               ImVec2 ds = io.DisplaySize;
               apply_theme();
-          
+
               MLK();
               bool vis = s_visible;
               MULK();
-          
+
               if (!vis) {
                   draw_fab(ds);
                   MLK();
@@ -3071,17 +3075,17 @@ jobs:
               }
               draw_fab(ds);
               ime_frame_prelude();
-          
+
               ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
               ImGui::SetNextWindowSizeConstraints(
                   ImVec2(420, 300), ImVec2(ds.x * .95f, ds.y * .95f));
               ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.2 (r12)", &open,
+              ImGui::Begin("Dex-tool v1.2 (r13)", &open,
                            ImGuiWindowFlags_NoCollapse);
               if (!open) { MLK(); s_visible = false; s_conf_dirty = true; MULK(); }
-          
+
               if (ImGui::BeginTabBar("tb")) {
                   struct TabDef { const char* name; void (*fn)(); };
                   TabDef tabs[] = {
@@ -3110,7 +3114,7 @@ jobs:
               mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
               overlay_publish_scroll_regions(s_regions);
               s_regions.clear();
-          
+
               /* debounce the conf write so sliders do not hit the disk 60x/s */
               if (s_conf_dirty && s_conf_path[0] &&
                   conf_now_ms() - s_conf_last_ms > 700) {
@@ -3120,7 +3124,6 @@ jobs:
                   MULK();
               }
           }
-          
           DXTMNC
 
       - name: Generate main.cpp
@@ -3135,9 +3138,9 @@ jobs:
           #include <cstring>
           #include <ctime>
           #include <cstdio>
-          
+
           JavaVM* g_jvm_global = nullptr;
-          
+
           static void write_marker(const char* path, const char* msg) {
               int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
               if (fd < 0) return;
@@ -3146,7 +3149,7 @@ jobs:
               write(fd, buf, (size_t)n);
               close(fd);
           }
-          
+
           extern "C" JNIEXPORT jint JNICALL
           JNI_OnLoad(JavaVM* vm, void*) {
               g_jvm_global = vm;
@@ -3173,7 +3176,7 @@ jobs:
           /* Dex-tool agent (r12). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
-          
+
              r12 changes (field issues from the r11 run):
              - keyboard: the menu pops the PHONE's own keyboard (system IME).
                showIme/hideIme focus a hidden 1x1 EditText on the resumed
@@ -3195,7 +3198,7 @@ jobs:
              - touch map: measured on Activity.onResume AND on every touch
                (throttled); onWindowFocusChanged never fired on the field host.
           */
-          
+
           function sendMsg(type, payload) { send({ type: type, payload: payload }); }
           function jstr(v) {
               try {
@@ -3229,7 +3232,7 @@ jobs:
                   return s;
               } catch (e) { return '?'; }
           }
-          
+
           /* Java stack of the calling thread, app frames only, capped */
           function jstack(limit) {
               try {
@@ -3245,7 +3248,7 @@ jobs:
                   return out;
               } catch (e) { return []; }
           }
-          
+
           /* rewrite rules: parse tiny-language lines from smali code
              supported:  pN = literal | name  /  R = literal   (literal: number,
              true/false/null/"str"/'char' or an identifier=literal arg) */
@@ -3270,10 +3273,10 @@ jobs:
               if (/^-?0x[0-9a-fA-F]+$/.test(lit)) return parseInt(lit, 16);
               return undefined;              /* treat as identifier: copy-through */
           }
-          
+
           var gAddChar = null, gBackspace = null, gWantMouse = null;
           var gNativeTouch = null, gSetMap = null, gDispSize = null;
-          
+
           function ensure_native_fns() {
               if (gNativeTouch) return true;
               try {
@@ -3293,7 +3296,7 @@ jobs:
                   return true;
               } catch (e) { return false; }
           }
-          
+
           /* measure where the drawing view sits inside the window and tell the
              overlay. r11: also called from Activity.onResume (onWindowFocusChanged
              never fired on the field host) and throttled from every touch, so a
@@ -3321,7 +3324,7 @@ jobs:
                                   .findViewById(0x01020002);
               } catch (e) { return null; }
           }
-          
+
           /* ---------------- system IME bridge (r12) ----------------
              Pops the PHONE's own soft keyboard when a menu field is focused.
              A 1x1 transparent EditText is added to the resumed activity's
@@ -3331,7 +3334,7 @@ jobs:
              libtool.so as dextool_add_char()/dextool_backspace(). */
           var IME = { act: null, edit: null, actHash: 0, prev: '',
                       silent: false, cnt: 0 };
-          
+
           function ime_on_text(ed) {
               try {
                   if (!ensure_native_fns()) return;
@@ -3358,7 +3361,7 @@ jobs:
                   IME.prev = cur;
               } catch (e) {}
           }
-          
+
           function ime_reset_text() {
               try {
                   IME.silent = true;
@@ -3367,7 +3370,7 @@ jobs:
                   IME.silent = false;
               } catch (e) { IME.silent = false; }
           }
-          
+
           function ime_ensure(act) {
               var h = 0;
               try { h = act.hashCode(); } catch (e0) {}
@@ -3416,13 +3419,20 @@ jobs:
                   return null;
               }
           }
-          
+
           function ime_show() {
               Java.perform(function () {
-                  var act = IME.act;
-                  if (!act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
                   Java.scheduleOnMainThread(function () {
                       try {
+                          /* r13: the onResume hook can miss the FIRST resume (it is
+                             installed while the activity is already resuming), which
+                             left IME.act null forever and the keyboard never opened.
+                             Resolve the current activity on the spot instead of just
+                             warning; the lifecycle tracker keeps it fresh afterwards. */
+                          if (!IME.act) {
+                              try { IME.act = find_current_activity(); } catch (e0) {}
+                          }
+                          if (!IME.act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
                           var edit = ime_ensure(IME.act);
                           if (!edit) return;
                           ime_reset_text();
@@ -3448,7 +3458,72 @@ jobs:
                   });
               });
           }
-          
+
+          /* r13: walk ActivityThread.mActivities (IBinder -> ActivityClientRecord)
+             and return a live activity; works with ArrayMap and HashMap because
+             both expose values(). Prefers a record that is neither paused nor
+             stopped. No hook timing involved, so it also covers the very first
+             resume that the onResume hook may have missed. */
+          function find_current_activity() {
+              var at = Java.use('android.app.ActivityThread').currentActivityThread();
+              var acts = at.mActivities.value;
+              var it = acts.values().iterator();
+              var best = null;
+              while (it.hasNext()) {
+                  var rec = it.next();
+                  if (rec === null) continue;
+                  var a = null;
+                  try { a = rec.activity.value; } catch (e1) { continue; }
+                  if (a === null) continue;
+                  best = a;
+                  var paused = false, stopped = false;
+                  try { paused = rec.paused.value; } catch (e2) {}
+                  try { stopped = rec.stopped.value; } catch (e3) {}
+                  if (!paused && !stopped) return a;
+              }
+              return best;
+          }
+
+          /* r13: keep IME.act fresh for every future resume via Application
+             callbacks. Unlike the Activity.onResume implementation hook this
+             fires for all activities even when the agent lost the race with the
+             first resume, and it also tracks activity SWITCHES. It deliberately
+             does NOT call report_map(): the field device calibrated the touch
+             offset against the native estimate, and switching that device to the
+             measured view map would shift taps by the bias it corrected. */
+          function install_lifecycle() {
+              Java.perform(function () {
+                  try {
+                      var app = Java.use('android.app.ActivityThread').currentApplication();
+                      if (!app) throw new Error('Application not up yet');
+                      var CB = Java.registerClass({
+                          name: 'com.dextool.ime.LC' + (Date.now() % 1000000),
+                          implements: [Java.use('android.app.Application$ActivityLifecycleCallbacks')],
+                          methods: {
+                              onActivityCreated: function (a, b) {},
+                              onActivityStarted: function (a) {},
+                              onActivityResumed: function (a) { try { IME.act = a; } catch (e0) {} },
+                              onActivityPaused: function (a) {},
+                              onActivityStopped: function (a) {},
+                              onActivitySaveInstanceState: function (a, b) {},
+                              onActivityDestroyed: function (a) {}
+                          }
+                      });
+                      app.registerActivityLifecycleCallbacks(CB.$new());
+                      sendMsg('info', { msg: 'lifecycle tracker armed' });
+                  } catch (e) {
+                      /* the Application exists before any activity, so a few
+                         short retries always succeed */
+                      if (install_lifecycle.tries === undefined) install_lifecycle.tries = 0;
+                      if (install_lifecycle.tries++ < 20)
+                          setTimeout(install_lifecycle, 250);
+                      else
+                          sendMsg('warn', { msg: 'lifecycle tracker not armed: ' + String(e.message || e) });
+                  }
+              });
+          }
+          install_lifecycle();
+
           function ime_hide() {
               Java.perform(function () {
                   Java.scheduleOnMainThread(function () {
@@ -3462,8 +3537,8 @@ jobs:
                   });
               });
           }
-          
-          
+
+
           /* ---------------- input + view mapping on the host activity -------- */
           function installTouchHook() {
               if (!ensure_native_fns()) {
@@ -3505,7 +3580,7 @@ jobs:
               });
           }
           installTouchHook();
-          
+
           /* ---------------- class info ---------------- */
           function field_lines(jc, inst) {
               var out = [];
@@ -3556,7 +3631,7 @@ jobs:
               }
               return out;
           }
-          
+
           /* ---------------- recorder ----------------
              r11: scoped. Only classes matching the package filter are hooked and
              installation stops at cap methods; the r10 version hooked every
@@ -3580,7 +3655,7 @@ jobs:
               }) });
           }
           setInterval(rec_flush, 500);
-          
+
           function rec_install_chunk(list, batch) {
               /* r12: Stop must also abort a still-running installation (the
                  r11 Stop left the loop hooking classes, so the Recorder tab
@@ -3651,7 +3726,7 @@ jobs:
                   sendMsg('recorderStarted', { installed: REC.installed });
               }
           }
-          
+
           /* ---------------- monitor ---------------- */
           var MON = { on: false, ring: [], origins: {}, okhttp: null };
           function mon_push(kind, url, method, origin, note) {
@@ -3687,7 +3762,7 @@ jobs:
               }) });
           }
           setInterval(function () { if (MON.on) mon_flush(); }, 600);
-          
+
           function mon_install() {
               Java.perform(function () {
                   /* OkHttp: request line at RealCall.execute/enqueue */
@@ -3709,7 +3784,7 @@ jobs:
                       });
                       MON.okhttp = true;
                   } catch (e) { MON.okhttp = false; }
-          
+
                   /* HttpURLConnection: URL at connect time */
                   try {
                       var URL = Java.use('java.net.URL');
@@ -3724,7 +3799,7 @@ jobs:
                           };
                       });
                   } catch (e) {}
-          
+
                   /* SSL: best-effort note only; full plaintext would need
                      SSL_read/SSL_write native hooks */
                   try {
@@ -3732,14 +3807,14 @@ jobs:
                       mon_push('ssl', 'engine', 'note',
                                '', 'SSLSocket reachable');
                   } catch (e) {}
-          
+
                   sendMsg('monitorInfo', {
                       note: 'okhttp ' + (MON.okhttp ? 'hooked' : 'absent') +
                              ', urlconn hooked'
                   });
               });
           }
-          
+
           /* ---------------- helpers for exports ---------------- */
           function use_cls_parts(cls, member) {
               var jc;
@@ -3757,7 +3832,7 @@ jobs:
               }
               return found ? { jc: jc, m: found } : null;
           }
-          
+
           function call_with_args(ov, argStrings, isCtor) {
               /* map the text args onto the overload's parameter types */
               var params = ov.argumentTypes;
@@ -3782,9 +3857,9 @@ jobs:
               }
               return ov.apply(null, real);
           }
-          
+
           var patches = {}, hooks = {}, trackers = {};
-          
+
           /* ---------------- rpc exports (called from the menu) ---------------- */
           rpc.exports = {
               /* ---- patches: static-field value replacement ---- */
@@ -3835,7 +3910,7 @@ jobs:
                   delete patches[cls + '.' + field];
                   sendMsg('info', { msg: 'patch removed ' + cls + '.' + field });
               },
-          
+
               /* ---- hooks: Java(JS) / Smali / noop ---- */
               addHook: function (cls, method, mode, code) {
                   var key = cls + '.' + method;
@@ -3954,7 +4029,7 @@ jobs:
                       sendMsg('info', { msg: 'hook removed ' + key });
                   });
               },
-          
+
               /* ---- trackers ---- */
               addTracker: function (cls, method) {
                   var key = cls + '.' + method;
@@ -4040,7 +4115,7 @@ jobs:
                   delete trackers[name];
                   sendMsg('info', { msg: 'tracker removed ' + name });
               },
-          
+
               /* ---- recorder ---- */
               startRecorder: function (filter, cap) {
                   if (REC.on || REC.busy) return;
@@ -4082,7 +4157,7 @@ jobs:
                   rec_flush();
                   sendMsg('recorderStopped', { installed: REC.installed });
               },
-          
+
               /* ---- monitor ---- */
               startMonitor: function () {
                   if (MON.on) return;
@@ -4096,7 +4171,7 @@ jobs:
                   mon_flush();
                   sendMsg('monitorStopped', {});
               },
-          
+
               /* ---- script console ---- */
               evalScript: function (src) {
                   try {
@@ -4108,7 +4183,7 @@ jobs:
                       sendMsg('scriptError', { msg: String(e && e.stack ? e.stack : e) });
                   }
               },
-          
+
               /* ---- classes ---- */
               listLoadedClasses: function (filter, qid) {
                   Java.perform(function () {
@@ -4276,7 +4351,7 @@ jobs:
                   });
               }
           };
-          
+
           /* console for user scripts: lines are batched to the Script tab */
           var CONS_Lines = [];
           function CONSOLE() {
@@ -4303,7 +4378,7 @@ jobs:
           var CONS_Dummy = {
               log: function () {}, error: function () {}, warn: function () {}
           };
-          
+
           /* ---------------- smali assemble + load (runtime dex) ---------------- */
           function smali_compile(src) {
               var out = { err: '', dex: null };
@@ -4365,7 +4440,7 @@ jobs:
               });
               return out;
           }
-          
+
           function smali_load(art) {
               var r = { ok: false, err: '', hook: null };
               var dexBytes = art && art.dex;
@@ -4398,7 +4473,7 @@ jobs:
               });
               return r;
           }
-          
+
           /* ---------------- receive loop (menu -> agent) ---------------- */
           recv(function onMsg(msg) {
               if (!msg) { recv(onMsg); return; }
@@ -4416,7 +4491,7 @@ jobs:
               }
               recv(onMsg);
           });
-          
+
           /* argument-name table: menu sends {class:..., method:...}; exports
              were declared as function(cls, method, ...) positionally */
           var FN_ARGS = {
@@ -4443,8 +4518,8 @@ jobs:
               setInstanceField:['class', 'index', 'field', 'value'],
               callMethod:      ['class', 'method', 'args']
           };
-          
-          sendMsg('ready', { msg: 'Dex-tool agent r12 loaded' });
+
+          sendMsg('ready', { msg: 'Dex-tool agent r13 loaded' });
           DXTAGNT
 
       - name: Embed agent.js as C array
@@ -4497,7 +4572,7 @@ jobs:
         run: |
           cat > sample-app/app/src/main/java/com/dextool/app/DexToolApp.java << 'DXTAPPJ'
           package com.dextool.app;
-          
+
           import android.app.Application;
           import android.util.Log;
           import java.io.File;
@@ -4506,11 +4581,11 @@ jobs:
           import java.io.IOException;
           import java.io.InputStream;
           import java.io.OutputStream;
-          
+
           public class DexToolApp extends Application {
               private static final String TAG = "DexToolApp";
               private static final String DL  = "/sdcard/Download";
-          
+
               @Override
               public void onCreate() {
                   super.onCreate();
@@ -4526,7 +4601,7 @@ jobs:
                       Log.e(TAG, "loadLibrary failed: " + e.getMessage());
                   }
               }
-          
+
               /* stream this process' logcat (own uid, allowed) so native
                  abort messages that only reach logcat are captured too */
               private void startLogcatThread() {
@@ -4565,7 +4640,7 @@ jobs:
                       }
                   } catch (IOException e) { Log.w(TAG, "boot marker: "+e.getMessage()); }
               }
-          
+
               private void startCopierThread() {
                   Thread t = new Thread(() -> {
                       while (true) {
@@ -4579,7 +4654,7 @@ jobs:
                   t.setDaemon(true);
                   t.start();
               }
-          
+
               private void copyLogs() throws IOException {
                   String[] names = {"dextool.log","dextool-debug.log","dextool-crash.log"};
                   new File(DL).mkdirs();
@@ -4594,7 +4669,7 @@ jobs:
                       }
                   }
               }
-          
+
               private void installUncaughtHandler() {
                   Thread.UncaughtExceptionHandler prev =
                       Thread.getDefaultUncaughtExceptionHandler();
@@ -4613,7 +4688,7 @@ jobs:
         run: |
           cat > sample-app/app/src/main/java/com/dextool/app/MainActivity.java << 'DXTMAINAJ'
           package com.dextool.app;
-          
+
           import android.app.Activity;
           import android.opengl.GLSurfaceView;
           import static android.opengl.GLES20.glClearColor;
@@ -4623,10 +4698,10 @@ jobs:
           import android.os.Bundle;
           import javax.microedition.khronos.egl.EGLConfig;
           import javax.microedition.khronos.opengles.GL10;
-          
+
           public class MainActivity extends Activity {
               private GLSurfaceView mGLView;
-          
+
               @Override
               protected void onCreate(Bundle b) {
                   super.onCreate(b);
@@ -4645,7 +4720,7 @@ jobs:
                   });
                   setContentView(mGLView);
               }
-          
+
               @Override protected void onResume() { super.onResume(); mGLView.onResume(); }
               @Override protected void onPause()  { super.onPause();  mGLView.onPause();  }
           }
@@ -4768,12 +4843,12 @@ jobs:
         run: |
           cat > README.md << 'DXTRDME'
           # Dex-tool
-          
+
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
-          
+
           ## Fixes in this version (r12)
-          
+
           1. "Open a class and the app freezes" - the field log shows the tap on
              a class is the last event the UI ever processed. Two independent
              causes, both fixed:
@@ -4790,7 +4865,7 @@ jobs:
                 loads the values on demand for the open class.
              Tapping a recorded row / tracker caller froze the app through the
              same path (it opens the class tab too).
-          
+
           2. Y-axis scaling mismatch ("must tap above top items / below bottom
              items, only the center is right"). map_touch() scaled Y by
              ds.y / g_map.h - the view rect is TALLER than the GL surface
@@ -4798,7 +4873,7 @@ jobs:
              center. Y is now a pure translation (sy = 1.0); the static
              status-bar offset is handled by the existing "Touch Y offset"
              slider (g_bias_y).
-          
+
           3. The built-in on-screen keyboard is REMOVED. Text fields use the
              PHONE's own keyboard: focusing a field posts showIme to the agent,
              which focuses a hidden 1x1 EditText on the resumed activity and
@@ -4808,35 +4883,35 @@ jobs:
              libtool.so as dextool_add_char()/dextool_backspace(). Done on the
              IME releases the ImGui field, so the next tap re-opens the
              keyboard; tapping the active field again re-opens it too.
-          
+
           4. The Classes tab lists ALL loaded classes BY DEFAULT - no
              "+ search" gate. The agent streams the full list in pages of 400
              with a query id (r11 mechanism, now triggered automatically when
              the tab opens); the filter row re-queries with a substring.
-          
+
           5. Recorder: Stop now also ABORTS a still-running installation (r11
              kept hooking classes after Stop, so the tab looked stuck on
              "installing ..."). Progress messages are throttled to one per
              250 ms (the r11 log flooded ~200 recorderProgress lines per
              install) and install chunks are 12 classes instead of 25, so the
              JS thread never stalls for seconds.
-          
+
           Also (r11, still in): scoped recorder (package filter + method cap),
           eglTerminate slot retirement against the GL_INVALID_VALUE abort
           class, park/adopt of the ImGui world across context death, UI state
           persistence to <logdir>/dextool-ui.conf.
-          
-          
+
+
           ## Usage
-          
+
           1. Drop libtool.so into lib/arm64-v8a/ and lib/armeabi-v7a/.
           2. Inject System.loadLibrary("tool") into Application.onCreate()
              or the launcher Activity.
           3. Copy smali-fat.jar into assets/.
           4. Re-sign and install.
-          
+
           ## Components
-          
+
               frida-gum 16.7.19   QuickJS / GumJS scripting runtime
               Dobby (LSPosed)     inline function hook framework
               ImGui 1.90.4        immediate-mode overlay GUI (ES2 mode)
