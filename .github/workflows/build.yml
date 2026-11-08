@@ -3121,7 +3121,6 @@ jobs:
           }
           
           DXTMNC
-          DXTMNC
 
       - name: Generate main.cpp
         run: |
