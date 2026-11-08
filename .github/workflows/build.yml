@@ -405,7 +405,30 @@ jobs:
                   snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
                   log_crash_raw(boot);
               }
-              log_info("logger_init done (build r13: fixed class sub-tabs, IME activity race, Y-bias default -80)");
+              /* r14: memory snapshot at boot. lmkd kills (the "crash when I
+                 open any app" class) are invisible to signal handlers, so the
+                 field report must show how much headroom the process had. */
+              {
+                  char ln[256];
+                  long avail = -1, rss = -1;
+                  FILE* mf = fopen("/proc/meminfo", "r");
+                  if (mf) {
+                      while (fgets(ln, sizeof(ln), mf))
+                          if (sscanf(ln, "MemAvailable: %ld kB", &avail) == 1) break;
+                      fclose(mf);
+                  }
+                  FILE* sf = fopen("/proc/self/status", "r");
+                  if (sf) {
+                      while (fgets(ln, sizeof(ln), sf))
+                          if (sscanf(ln, "VmRSS: %ld kB", &rss) == 1) break;
+                      fclose(sf);
+                  }
+                  char mm[160];
+                  snprintf(mm, sizeof(mm),
+                           "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
+                  log_info(mm);
+              }
+              log_info("logger_init done (build r14: IME show fix, phased agent init, small-surface ownership gate)");
           }
 
           void log_info(const char* msg) {
@@ -514,6 +537,7 @@ jobs:
           JNIEXPORT void dextool_backspace();
           JNIEXPORT bool dextool_want_mouse();
           JNIEXPORT int  dextool_display_size();  /* (w<<16)|h, 0 until the overlay is up */
+          JNIEXPORT void dextool_agent_log(const char* msg); /* r14: agent phase markers -> logs */
           #ifdef __cplusplus
           }
           #endif
@@ -607,6 +631,7 @@ jobs:
               bool  failed = false;
               bool  es3 = false;
               bool  dead = false;         /* under g_slots_mtx */
+              bool  reject_logged = false;  /* r14: one log per rejection */
               long  swaps = 0;            /* under g_slots_mtx */
               long  last_swap_ms = 0;     /* under g_slots_mtx */
               long  last_frame_ms = 0;    /* owner thread only */
@@ -617,6 +642,9 @@ jobs:
           static std::vector<Slot*> g_graveyard;  /* never freed: no dangling */
           static EGLContext g_owner = nullptr;    /* under g_slots_mtx */
           static ImGuiContext* g_orphan_imgui = nullptr;  /* g_tick_mtx only */
+          /* r14: DisplaySize of the parked world; surfaces far smaller than
+             this must NOT adopt it (the "small clone of our menu" bug) */
+          static float g_orphan_dw = 0.f, g_orphan_dh = 0.f;
           static std::mutex g_tick_mtx;  /* one ImGui drawer at a time; also
                                             serializes ownership changes, adoption
                                             and slot teardown against frames */
@@ -767,6 +795,18 @@ jobs:
               g_pending_bs = true;
           }
 
+          /* r14: the GumJS agent posts phase markers here (NativeFunction on
+             this export) before and around every risky init step. The markers
+             land in dextool-crash.log AND dextool-debug.log, so a field abort
+             pins the exact phase that killed the process. */
+          extern "C" JNIEXPORT void dextool_agent_log(const char* msg) {
+              if (!msg) return;
+              char m[560];
+              snprintf(m, sizeof(m), "[agent] %.500s\n", msg);
+              log_crash_raw(m);
+              log_debug(m);
+          }
+
           bool overlay_ready() { return g_ready.load(); }
 
           void overlay_get_display_size(float* w, float* h) {
@@ -834,7 +874,8 @@ jobs:
                  RenderThread). If an ImGui world is parked from a dead context,
                  DT_ADOPT_MIN_SWAPS is enough - coming back from the background
                  the new context adopts it almost immediately. */
-          static bool ensure_ownership(Slot* s, EGLContext ctx) {
+          static bool ensure_ownership(Slot* s, EGLContext ctx, float sw,
+                                       float sh) {
               std::lock_guard<std::mutex> lk(g_slots_mtx);
               if (s->dead) return false;
               s->swaps++;
@@ -846,6 +887,36 @@ jobs:
                   if (it != g_slots.end() && !it->second->dead) ow = it->second;
               }
               if (ow == s) return true;
+
+              /* r14: never take over a surface far smaller than the menu
+                 world. When the owner context died (app menu, dialog,
+                 keyboard relayout), the parked ImGui world used to be ADOPTED
+                 by the next context to reach 8 swaps - including small popup
+                 surfaces, which then rendered the whole menu inside their
+                 tiny window ("tapping the app's menu spawns a small clone of
+                 our menu"), and the clone ignores taps because the touch map
+                 belongs to the main surface. The real surface re-adopts when
+                 it returns. */
+              if (sw > 0.f && sh > 0.f) {
+                  bool ok;
+                  if (g_orphan_imgui && g_orphan_dw > 0.f && g_orphan_dh > 0.f) {
+                      float pa = g_orphan_dw * g_orphan_dh;
+                      ok = (sw * sh) >= pa * 0.5f &&
+                           sw >= g_orphan_dw * 0.45f &&
+                           sh >= g_orphan_dh * 0.45f;
+                  } else {
+                      ok = sw >= 220.f && sh >= 220.f;
+                  }
+                  if (!ok) {
+                      if (!s->reject_logged) {
+                          s->reject_logged = true;
+                          LOGI("[overlay] skip small surface %.0fx%.0f (%s)",
+                               sw, sh, g_orphan_imgui ?
+                                   "menu parked - not adopting" : "election");
+                      }
+                      return false;
+                  }
+              }
               if (ow) {
                   bool stale = (now - ow->last_swap_ms) > DT_OWNER_STALE_MS &&
                                (now - s->last_swap_ms)  < 600;
@@ -914,6 +985,7 @@ jobs:
                      ShutDown + Init to force CreateDeviceObjects on this context */
                   s->imgui = g_orphan_imgui;
                   g_orphan_imgui = nullptr;
+                  g_orphan_dw = 0.f; g_orphan_dh = 0.f;
                   ImGui::SetCurrentContext(s->imgui);
                   ImGui_ImplOpenGL3_Shutdown();   /* GL deletes: no-ops here, the
                                                      names never existed in this
@@ -966,6 +1038,11 @@ jobs:
                           ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
                       g_orphan_imgui = s->imgui;
                       s->imgui = nullptr;
+                      {
+                          std::lock_guard<std::mutex> lk3(g_disp_mtx);
+                          g_orphan_dw = g_disp_w;
+                          g_orphan_dh = g_disp_h;
+                      }
                       if (eglGetCurrentContext() == ctx) {
                           /* only valid while the dying context is still current;
                              otherwise the driver frees everything with the ctx */
@@ -1124,8 +1201,7 @@ jobs:
               std::lock_guard<std::mutex> lk(g_tick_mtx);
 
               Slot* s = slot_for(ctx);
-              if (!ensure_ownership(s, ctx)) return;  /* not the owner: no
-                                                         ImGui, no GL touched */
+              if (!ensure_ownership(s, ctx, (float)sw, (float)sh)) return;
               if (s->dead || s->failed) return;
 
               if (!s->imgui) slot_init(dpy, surf, s);
@@ -1261,6 +1337,11 @@ jobs:
                           if (g_orphan_imgui)
                               ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
                           g_orphan_imgui = park;
+                          {
+                              std::lock_guard<std::mutex> lk3(g_disp_mtx);
+                              g_orphan_dw = g_disp_w;
+                              g_orphan_dh = g_disp_h;
+                          }
                           LOGI("[overlay] display terminated - ImGui parked, "
                                "waiting for the next GL context");
                       }
@@ -3082,7 +3163,7 @@ jobs:
               ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.2 (r13)", &open,
+              ImGui::Begin("Dex-tool v1.2 (r14)", &open,
                            ImGuiWindowFlags_NoCollapse);
               if (!open) { MLK(); s_visible = false; s_conf_dirty = true; MULK(); }
 
@@ -3173,7 +3254,7 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r12). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r14). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
 
@@ -3197,9 +3278,43 @@ jobs:
                smaller so the JS thread never stalls for seconds.
              - touch map: measured on Activity.onResume AND on every touch
                (throttled); onWindowFocusChanged never fired on the field host.
+
+             r14 changes (field issues from the r13 run):
+             - keyboard never opened: ime_show() called act.getSystemService()
+               with `act` undefined, so EVERY show attempt died with a
+               ReferenceError before showSoftInput, and the retry (scheduled
+               after the throw) never ran. Fixed; the activity is resolved
+               from four sources (lifecycle callbacks, onResume hook,
+               ActivityThread walk, heap-scan fallback) and showSoftInput is
+               retried at 150/450/900 ms.
+             - SIGABRT at agent load in some hosts ("opened and run but no
+               menu", CRASH signal=6 right after "script created"): all Java
+               init is deferred out of gum_script_load_sync and each phase is
+               marked via the native dextool_agent_log export.
+             - "small clone of our menu" in popup surfaces: the overlay
+               refuses to adopt the parked ImGui world into surfaces far
+               smaller than the parked DisplaySize (native side, r14).
           */
 
           function sendMsg(type, payload) { send({ type: type, payload: payload }); }
+
+          /* r14: native phase logging. dextool_agent_log writes straight into
+             dextool-crash.log + dextool-debug.log from libtool.so, so markers
+             survive even when the GumJS message pump never runs again. */
+          var gAgentLog = null;
+          function agentLog(msg) {
+              try {
+                  if (!gAgentLog) {
+                      var p = Module.findExportByName('libtool.so',
+                                                      'dextool_agent_log');
+                      if (!p) return;
+                      gAgentLog = new NativeFunction(p, 'void', ['pointer']);
+                  }
+                  gAgentLog(Memory.allocUtf8String(
+                      String(msg).substring(0, 400)));
+              } catch (e) {}
+          }
+          agentLog('agent: script running (entry)');
           function jstr(v) {
               try {
                   if (v === null || v === undefined) return 'null';
@@ -3333,7 +3448,7 @@ jobs:
              bridge into "[object Object]") and forwards the delta to
              libtool.so as dextool_add_char()/dextool_backspace(). */
           var IME = { act: null, edit: null, actHash: 0, prev: '',
-                      silent: false, cnt: 0 };
+                      silent: false, cnt: 0, everLogged: false };
 
           function ime_on_text(ed) {
               try {
@@ -3430,28 +3545,51 @@ jobs:
                              Resolve the current activity on the spot instead of just
                              warning; the lifecycle tracker keeps it fresh afterwards. */
                           if (!IME.act) {
-                              try { IME.act = find_current_activity(); } catch (e0) {}
+                              try { IME.act = find_current_activity(); }
+                              catch (e0) {
+                                  agentLog('ime: findAct failed: ' + e0);
+                                  sendMsg('error', { fn: 'findAct',
+                                                     msg: String(e0.message || e0) });
+                              }
                           }
                           if (!IME.act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
+                          if (!IME.everLogged) {
+                              IME.everLogged = true;
+                              try {
+                                  sendMsg('info', { msg: 'IME host activity: ' +
+                                      IME.act.getClass().getName() });
+                              } catch (e5) {}
+                          }
                           var edit = ime_ensure(IME.act);
                           if (!edit) return;
                           ime_reset_text();
                           edit.requestFocus();
                           var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
-                          var imm = Java.cast(act.getSystemService('input_method'), IMMgr);
+                          /* r14 FIX: this used to read act.getSystemService(...)
+                             - `act` does not exist in this scope, so the FIRST
+                             (and normally only) showSoftInput always threw
+                             ReferenceError and the retry below was never even
+                             scheduled. That is why the keyboard never opened. */
+                          var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
                           imm.showSoftInput(edit, 0);
+                          agentLog('ime: showSoftInput sent');
                           /* the first show right after focus often loses the
-                             race with the window - retry once */
-                          setTimeout(function () {
-                              Java.scheduleOnMainThread(function () {
-                                  try {
-                                      if (!IME.edit) return;
-                                      var IM2 = Java.use('android.view.inputmethod.InputMethodManager');
-                                      var imm2 = Java.cast(IME.act.getSystemService('input_method'), IM2);
-                                      imm2.showSoftInput(IME.edit, 0);
-                                  } catch (e2) {}
-                              });
-                          }, 150);
+                             race with the window - retry on a ladder; some
+                             hosts also need another requestFocus first */
+                          [150, 450, 900].forEach(function (delay) {
+                              setTimeout(function () {
+                                  Java.scheduleOnMainThread(function () {
+                                      try {
+                                          if (!IME.edit || !IME.act) return;
+                                          IME.edit.requestFocus();
+                                          var IM2 = Java.use('android.view.inputmethod.InputMethodManager');
+                                          var imm2 = Java.cast(IME.act.getSystemService('input_method'), IM2);
+                                          imm2.showSoftInput(IME.edit, 0);
+                                          agentLog('ime: retry show at ' + delay + 'ms');
+                                      } catch (e2) {}
+                                  });
+                              }, delay);
+                          });
                       } catch (e) {
                           sendMsg('error', { fn: 'showIme', msg: String(e.message || e) });
                       }
@@ -3481,6 +3619,20 @@ jobs:
                   try { stopped = rec.stopped.value; } catch (e3) {}
                   if (!paused && !stopped) return a;
               }
+              if (best) return best;
+              /* r14 fallback: the record walk can come up empty on hosts that
+                 recycle ActivityClientRecords; scan the heap for a live one. */
+              try {
+                  var found = null;
+                  Java.choose('android.app.Activity', {
+                      onMatch: function (a) {
+                          if (!found) found = a;
+                          return found ? 'stop' : undefined;
+                      },
+                      onComplete: function () {}
+                  });
+                  if (found) return found;
+              } catch (e4) {}
               return best;
           }
 
@@ -3510,6 +3662,7 @@ jobs:
                           }
                       });
                       app.registerActivityLifecycleCallbacks(CB.$new());
+                      agentLog('phase: lifecycle tracker armed');
                       sendMsg('info', { msg: 'lifecycle tracker armed' });
                   } catch (e) {
                       /* the Application exists before any activity, so a few
@@ -3522,13 +3675,12 @@ jobs:
                   }
               });
           }
-          install_lifecycle();
 
           function ime_hide() {
               Java.perform(function () {
                   Java.scheduleOnMainThread(function () {
                       try {
-                          if (!IME.edit) return;
+                          if (!IME.edit || !IME.act) return;
                           var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
                           var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
                           imm.hideSoftInputFromWindow(IME.edit.getWindowToken(), 0);
@@ -3547,12 +3699,21 @@ jobs:
               }
               Java.perform(function () {
                   var Activity = Java.use('android.app.Activity');
-                  Activity.onResume.implementation = function () {
-                      var r = this.onResume();
-                      try { IME.act = this; } catch (e0) {}   /* for the IME */
-                      try { report_map(content_view(this)); } catch (e) {}
-                      return r;
-                  };
+                  agentLog('phase: hooking Activity.onResume');
+                  try {
+                      Activity.onResume.implementation = function () {
+                          var r = this.onResume();
+                          try { IME.act = this; } catch (e0) {}   /* for the IME */
+                          try { report_map(content_view(this)); } catch (e) {}
+                          return r;
+                      };
+                      agentLog('phase: onResume hook ok');
+                  } catch (e1) {
+                      agentLog('ERR onResume hook: ' + e1);
+                      sendMsg('error', { fn: 'hookOnResume',
+                                         msg: String(e1 && e1.message || e1) });
+                  }
+                  agentLog('phase: hooking Activity.dispatchTouchEvent');
                   Activity.dispatchTouchEvent.implementation = function (ev) {
                       /* MAIN THREAD */
                       try {
@@ -3576,10 +3737,10 @@ jobs:
                       } catch (e) {}
                       return this.dispatchTouchEvent(ev);         /* original call */
                   };
-                  sendMsg('info', { msg: 'touch hook installed (r11)' });
+                  agentLog('phase: dispatchTouchEvent hook ok');
+                  sendMsg('info', { msg: 'touch hook installed (r14)' });
               });
           }
-          installTouchHook();
 
           /* ---------------- class info ---------------- */
           function field_lines(jc, inst) {
@@ -4519,7 +4680,31 @@ jobs:
               callMethod:      ['class', 'method', 'args']
           };
 
-          sendMsg('ready', { msg: 'Dex-tool agent r13 loaded' });
+          /* r14: phased startup. gum_script_load_sync must ALWAYS return:
+             the r13 field crash ("script created, loading agent" then
+             CRASH signal=6 with zero JS messages) died inside top-level
+             Java init. Every Java-touching step now runs from the JS job
+             queue AFTER load completes, and each step is phase-marked into
+             the native logs, so an abort pins the exact phase. */
+          agentLog('phase: deferred init scheduled');
+          setTimeout(function () {
+              try {
+                  install_lifecycle();
+              } catch (eL) {
+                  agentLog('ERR lifecycle: ' + eL);
+                  sendMsg('error', { fn: 'lifecycle',
+                                     msg: String(eL && eL.message || eL) });
+              }
+              try {
+                  installTouchHook();
+              } catch (eT) {
+                  agentLog('ERR touch hook: ' + eT);
+                  sendMsg('error', { fn: 'touchhook',
+                                     msg: String(eT && eT.message || eT) });
+              }
+              sendMsg('ready', { msg: 'Dex-tool agent r14 loaded' });
+              agentLog('phase: ready sent');
+          }, 0);
           DXTAGNT
 
       - name: Embed agent.js as C array
@@ -4847,7 +5032,47 @@ jobs:
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
-          ## Fixes in this version (r12)
+          ## Fixes in this version (r14)
+
+          1. The keyboard never opened. ime_show() dereferenced `act` - a
+             variable that does not exist in that scope - so EVERY attempt to
+             show the system IME died with a ReferenceError before
+             showSoftInput was ever called, and the single 150 ms retry was
+             skipped too (it lives after the throw). Fixed: the IME call uses
+             IME.act; the activity is resolved from four sources (lifecycle
+             callbacks, the onResume hook, the ActivityThread.mActivities
+             walk, and a Java.choose heap-scan fallback); showSoftInput is
+             retried at 150/450/900 ms with a fresh requestFocus; every IME
+             step is written to the logs, so the next field report shows
+             exactly which step failed and on which activity.
+
+          2. SIGABRT during agent load ("opened and run but no menu", crash
+             log: CRASH signal=6 right after "script created, loading agent",
+             with zero JS messages). All Java-touching init (lifecycle
+             tracker, Activity hooks) is deferred out of gum_script_load_sync
+             into the JS job queue, and each step writes a phase marker
+             through the new dextool_agent_log() export into
+             dextool-crash.log + dextool-debug.log. A host that kills itself
+             (anti-tamper) now shows the exact phase that triggered it - and
+             the load itself can no longer abort.
+
+          3. "Tapping the app's own menu spawns a small clone of our menu" +
+             the clone being untouchable. When the owner context died (app
+             menu, dialog, keyboard relayout), the parked ImGui world was
+             ADOPTED by whatever surface reached 8 swaps next - including
+             small popup/dialog surfaces, which rendered the whole menu
+             inside their tiny window (and the clone ignored taps because the
+             touch map belongs to the main surface). ensure_ownership() now
+             refuses ownership for surfaces far smaller than the parked world
+             (area < 50% or a dimension < 45%); tiny surfaces (< 220x220)
+             never win election at all. Rejections are logged
+             ("skip small surface").
+
+          4. Diagnostics: logger_init records VmRSS + MemAvailable (the
+             "crash when I open any app" class - lmkd kills are invisible to
+             signal handlers) and the agent phase markers above.
+
+          ## Fixes in r12-r13 (still in)
 
           1. "Open a class and the app freezes" - the field log shows the tap on
              a class is the last event the UI ever processed. Two independent
@@ -4961,7 +5186,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r12: system IME keyboard, default full class list, recursive-menu-lock + openClass hang fixes, Y-translation touch map, abortable recorder [skip ci]"
+            git commit -m "fix r14: IME show ReferenceError fix + robust activity resolution + show retries, phased agent init with native phase markers, small-surface ownership gate, boot memory diagnostics [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
