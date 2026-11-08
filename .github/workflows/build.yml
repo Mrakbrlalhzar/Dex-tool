@@ -399,7 +399,7 @@ jobs:
                   snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
                   log_crash_raw(boot);
               }
-              log_info("logger_init done (build r9: touch map + park/adopt)");
+              log_info("logger_init done (build r10: tab bodies, safe kbd, native map)");
           }
           
           void log_info(const char* msg) {
@@ -599,14 +599,19 @@ jobs:
           static std::atomic<bool> g_ready {false};
           
           /* ---- touch mapping ------------------------------------------------
-             Events arrive in raw window pixels from both input paths. The agent
-             measured where the overlay's GL view actually sits inside the window
-             (GLSurfaceView rect, content view as fallback) and reported it via
-             dextool_set_touch_map. Replay maps (raw - origin) * DisplaySize/size,
-             which fixes the "must touch above the item" offset no matter how the
-             window is laid out. Without a map we fall back to the raw position
-             (the r7 behaviour), still clamped to the surface. */
-          struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; };
+             Events arrive in raw window pixels from both input paths. Two sources
+             feed the map, best one wins:
+             (a) the agent measured where the overlay's GL view actually sits in
+                 the window (view rect via getLocationInWindow) -> dextool_set_touch_map;
+             (b) native estimate: the largest surface ever seen on ANY context is
+                 ~= the full window (on a typical app the HWUI surface spans the
+                 whole 540x960 window while the game surface is smaller). While no
+                 precise map exists, replay scales raw input by DisplaySize/window.
+             Replay maps (raw - origin) * DisplaySize/size, which fixes the "must
+             touch above the item" offset no matter how the window is laid out.
+             Without any map we fall back to the raw position (the r7 behaviour),
+             still clamped to the surface. */
+          struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
           static std::mutex g_map_mtx;
           static TouchMap   g_map;
           
@@ -635,6 +640,7 @@ jobs:
           static char  g_font_path[128] = "";
           static std::mutex g_disp_mtx;
           static float g_disp_w = 0.f, g_disp_h = 0.f;
+          static float g_max_surf_w = 0.f, g_max_surf_h = 0.f;   /* seen on ANY ctx */
           
           static long now_ms() {
               timespec ts;
@@ -668,10 +674,28 @@ jobs:
               if (w <= 0 || h <= 0) return;
               std::lock_guard<std::mutex> lk(g_map_mtx);
               bool was = g_map.ok;
-              g_map = { (float)x, (float)y, (float)w, (float)h, true };
+              g_map = { (float)x, (float)y, (float)w, (float)h, true, false };
               if (!was)
                   LOGI("[overlay] touch map: view rect in window = (%d,%d %dx%d)",
                        x, y, w, h);
+          }
+          
+          /* native estimate: while the agent has not measured the view rect yet,
+             assume the window is as tall as the largest surface we have seen (a
+             typical app's HWUI surface spans the full window) and that the GL
+             view starts at the top-left. This already corrects the systematic
+             vertical offset; the agent's real measurement replaces it. */
+          static void maybe_estimate_map() {
+              std::lock_guard<std::mutex> lk(g_map_mtx);
+              if (g_map.ok) return;                      /* real map present */
+              float w = 0.f, h = 0.f;
+              {
+                  std::lock_guard<std::mutex> lk2(g_disp_mtx);
+                  w = g_max_surf_w; h = g_max_surf_h;
+              }
+              if (w <= 0.f || h <= 0.f) return;
+              g_map = { 0.f, 0.f, w, h, true, true };
+              LOGI("[overlay] touch map: estimate 0,0 %.0fx%.0f (max surface)", w, h);
           }
           
           extern "C" JNIEXPORT bool dextool_want_mouse() {
@@ -1021,6 +1045,8 @@ jobs:
                   io.DisplaySize = ImVec2((float)w, (float)h);
                   std::lock_guard<std::mutex> lk2(g_disp_mtx);
                   g_disp_w = (float)w; g_disp_h = (float)h;
+                  if ((float)w > g_max_surf_w) g_max_surf_w = (float)w;
+                  if ((float)h > g_max_surf_h) g_max_surf_h = (float)h;
               }
               {
                   long nowt = now_ms();
@@ -1080,6 +1106,7 @@ jobs:
               }
           
               menu_init_once();
+              maybe_estimate_map();     /* native fallback until the agent measures */
               if (g_font_dirty) {
                   build_fonts(io);
                   /* drop the GL font texture so NewFrame re-uploads it at the
@@ -2673,7 +2700,7 @@ jobs:
               ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.2 (r9)", &open,
+              ImGui::Begin("Dex-tool v1.2 (r10)", &open,
                            ImGuiWindowFlags_NoCollapse);
               if (!open) { MLK(); s_visible = false; MULK(); }
           
@@ -2693,6 +2720,7 @@ jobs:
                       ImGuiTabItemFlags fl = 0;
                       if (want == t.name) fl |= ImGuiTabItemFlags_SetSelected;
                       if (ImGui::BeginTabItem(t.name, nullptr, fl)) {
+                          t.fn();          /* the body was missing: tabs drew empty */
                           ImGui::EndTabItem();
                       }
                   }
@@ -2850,7 +2878,6 @@ jobs:
           }
           
           var smali_cache = {};              /* key -> {loader, cls, err, code} */
-          var gET = null, gIMM = null, gClearing = false;
           var gAddChar = null, gBackspace = null, gWantMouse = null;
           var gNativeTouch = null, gSetMap = null, gDispSize = null;
           
@@ -2892,60 +2919,86 @@ jobs:
           }
           
           
-          /* ---------------- keyboard bridge (hidden EditText) ---------------- */
-          function setupKeyboardBridge(activity) {
-              Java.scheduleOnMainThread(function () {
-                  try {
-                      var ET = Java.use('android.widget.EditText');
-                      var FL = Java.use('android.widget.FrameLayout');
-                      var LP = Java.use('android.widget.FrameLayout$LayoutParams');
-                      var TW = Java.use('android.text.TextWatcher');
-                      var IMMCls = Java.use('android.view.inputmethod.InputMethodManager');
-                      var Editable = Java.use('android.text.Editable');
-                      var CS = Java.use('java.lang.CharSequence');
+          /* ---------------- keyboard bridge -----------------------------------
+             r10: no Java.registerClass (fatal "invalid jobject" on 32-bit ART
+             with JNI checks), no Java.scheduleOnMainThread, no TextWatcher.
+             Instead: a hidden EditText is created with plain reflection on the
+             main thread (inside the dispatchTouchEvent hook), the IME is told
+             to show/hide from that same main-thread context, and the frida
+             thread polls the EditText's text and feeds deltas to the overlay
+             (chars + backspaces). */
+          var KBD = {
+              et: null, imm: null, last: '', want: 0, /* 0 none, 1 show, 2 hide */
+              lastPoll: 0
+          };
           
-                      var et = ET.$new(activity);
-                      et.setAlpha(0.0);
-                      et.setFocusableInTouchMode(true);
-                      var params = LP.$new(1, 1);
-                      Java.cast(activity.getWindow().getDecorView(), FL).addView(et, params);
+          function kbd_ensure_views(activity) {
+              /* runs on the main thread (dispatchTouchEvent context) */
+              if (KBD.et) return true;
+              try {
+                  var ET = Java.use('android.widget.EditText');
+                  var LP = Java.use('android.widget.FrameLayout$LayoutParams');
+                  var IMMCls = Java.use('android.view.inputmethod.InputMethodManager');
+                  var VG = Java.use('android.view.ViewGroup');
           
-                      var WatcherCls = Java.registerClass({
-                          name: 'com.dextool.app.DxKbd_' + Date.now(),
-                          implements: [TW],
-                          methods: {
-                              beforeTextChanged: function (s, st, c, a) {},
-                              onTextChanged: function (s, st, before, count) {
-                                  if (gClearing) return;
-                                  try {
-                                      if (count > before) {
-                                          var txt = Java.cast(s, CS).toString();
-                                          var added = txt.substring(st + before, st + count);
-                                          for (var i = 0; i < added.length; i++)
-                                              gAddChar(added.charCodeAt(i));
-                                      } else if (before > count) {
-                                          for (var i2 = 0; i2 < before - count; i2++) gBackspace();
-                                      }
-                                  } catch (e2) {}
-                              },
-                              afterTextChanged: function (e) {
-                                  if (!gClearing) {
-                                      gClearing = true;
-                                      try { Java.cast(e, Editable).clear(); } catch (e2) {}
-                                      gClearing = false;
-                                  }
-                              }
-                          }
-                      });
-                      et.addTextChangedListener(WatcherCls.$new());
-                      gET = et;
-                      gIMM = Java.cast(activity.getSystemService('input_method'), IMMCls);
-                      sendMsg('info', { msg: 'keyboard bridge OK' });
-                  } catch (e) {
-                      sendMsg('warn', { msg: 'kbd: ' + e.message });
-                  }
-              });
+                  var et = ET.$new(activity);
+                  et.setAlpha(0.0);
+                  et.setFocusableInTouchMode(true);
+                  var params = LP.$new(1, 1);
+                  Java.cast(activity.getWindow().getDecorView(), VG)
+                      .addView(et, params);
+                  KBD.et = et;
+                  KBD.imm = Java.cast(activity.getSystemService('input_method'), IMMCls);
+                  sendMsg('info', { msg: 'keyboard bridge OK (r10, no registerClass)' });
+                  return true;
+              } catch (e) {
+                  sendMsg('warn', { msg: 'kbd views: ' + e.message });
+                  return false;
+              }
           }
+          
+          function kbd_apply_want(activity) {
+              /* main thread: honour the pending show/hide request */
+              if (!KBD.want || !activity) return;
+              var req = KBD.want;
+              KBD.want = 0;
+              try {
+                  if (!kbd_ensure_views(activity)) return;
+                  if (req === 1) {
+                      KBD.et.requestFocus();
+                      KBD.imm.showSoftInput(KBD.et, 0);
+                      KBD.last = '';
+                      KBD.et.setText('');
+                  } else {
+                      var b = KBD.et.getWindowToken();
+                      if (b) KBD.imm.hideSoftInputFromWindow(b, 0);
+                      KBD.et.clearFocus();
+                      KBD.et.setText('');
+                      KBD.last = '';
+                  }
+              } catch (e) {
+                  sendMsg('warn', { msg: 'kbd apply: ' + e.message });
+              }
+          }
+          
+          setInterval(function () {
+              /* frida thread: poll IME text and forward the delta */
+              if (!KBD.et || !gAddChar) return;
+              try {
+                  var txt = String(KBD.et.getText());
+                  if (txt !== KBD.last) {
+                      var i = 0;
+                      while (i < txt.length && i < KBD.last.length &&
+                             txt.charAt(i) === KBD.last.charAt(i)) i++;
+                      var removed = KBD.last.length - i;
+                      var added   = txt.substring(i);
+                      for (var r = 0; r < removed; r++) gBackspace();
+                      for (var a = 0; a < added.length; a++)
+                          gAddChar(added.charCodeAt(a));
+                      KBD.last = txt;
+                  }
+              } catch (e) { /* view not attached yet */ }
+          }, 120);
           
           /* ---------------- input + view mapping on the host activity -------- */
           function installTouchHook() {
@@ -2962,22 +3015,20 @@ jobs:
                               var cv = this.getWindow().getDecorView()
                                             .findViewById(contentId);
                               report_map(cv);
-                              if (!gET) setupKeyboardBridge(this);
                           }
                       } catch (e) {}
                       return this.onWindowFocusChanged(has);
                   };
                   Activity.dispatchTouchEvent.implementation = function (ev) {
+                      /* MAIN THREAD: the only safe place for view/IME calls */
+                      try { kbd_apply_want(this); } catch (e0) {}
                       try {
                           /* forward raw window coords; overlay maps them */
                           gNativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
                       } catch (e) {}
                       return this.dispatchTouchEvent(ev);
                   };
-                  /* re-measure after layout changes (keyboard, rotation) happens via
-                     onWindowFocusChanged + the map's own dedup in report_map; nothing
-                     else to hook here */
-                  sendMsg('info', { msg: 'touch + keyboard hooks installed' });
+                  sendMsg('info', { msg: 'touch + keyboard hooks installed (r10)' });
               });
           }
           installTouchHook();
@@ -3793,23 +3844,11 @@ jobs:
                       var vals = names.map(function (n) { return a[n]; });
                       rpc.exports[msg.fn].apply(rpc.exports, vals);
                   } else if (msg.type === 'showKeyboard') {
-                      Java.scheduleOnMainThread(function () {
-                          try {
-                              if (gET && gIMM) {
-                                  gET.requestFocus();
-                                  gIMM.showSoftInput(gET, 0);
-                              }
-                          } catch (e) {}
-                      });
+                      /* r10: no scheduleOnMainThread; the main-thread touch hook
+                         applies the request at its next event */
+                      if (KBD.want === 0) KBD.want = 1;
                   } else if (msg.type === 'hideKeyboard') {
-                      Java.scheduleOnMainThread(function () {
-                          try {
-                              if (gET && gIMM) {
-                                  var b = gET.getWindowToken();
-                                  if (b) gIMM.hideSoftInputFromWindow(b, 0);
-                              }
-                          } catch (e) {}
-                      });
+                      if (KBD.want === 0) KBD.want = 2;
                   }
               } catch (e) {
                   sendMsg('error', { fn: 'recv', msg: String(e.message || e) });
@@ -3841,7 +3880,7 @@ jobs:
               callMethod:      ['class', 'method', 'args']
           };
           
-          sendMsg('ready', { msg: 'Dex-tool agent r9 loaded' });
+          sendMsg('ready', { msg: 'Dex-tool agent r10 loaded' });
           DXTAGNT
 
       - name: Embed agent.js as C array
@@ -4169,35 +4208,32 @@ jobs:
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
           
-          ## Fixes in this version (r9)
+          ## Fixes in this version (r10)
           
-              1. Touch offset: input events arrive in raw window pixels; the
-                 agent now measures the drawing view's rect inside the window
-                 (dextool_set_touch_map) and the overlay maps every event through
-                 it before it reaches ImGui. Taps land where the finger is.
-              2. Keyboard: ImGui's WantTextInput drives a hidden EditText, so
-                 tapping a text field opens the IME and typing reaches ImGui
-                 (chars + backspace). Tapping outside closes it again.
-              3. App switch / relayout: when the owner GL context is destroyed
-                 the ImGui world is parked and adopted by the next context
-                 (8 swaps), so the menu survives coming back from the background
-                 and the soft-keyboard resize instead of the app closing.
-              4. Recorder: hooks are installed in background chunks with a
-                 package skip-list, events go through a bounded ring flushed in
-                 500 ms batches; the list renders with ImGuiListClipper. Starting
-                 a recording no longer hangs the program, and clicking a row
-                 opens that class in the Classes tab.
-              5. Cross-linking everywhere: tracker callers, recorder rows and
-                 monitor rows all open the originating class in Classes.
-              6. Full tab set: Settings (font size via real atlas rebuild from a
-                 system font, opacity, theme, two scroll speeds), Patches
-                 (static fields; edit/delete), Hooks (Java(JS)/Smali/noop - smali
-                 mode assembles with the bundled jar and loads the dex with
-                 InMemoryDexClassLoader), Tracker (callers, field watch), Script
-                 (editor + console), Classes (search over loaded classes, open
-                 tabs, Instances/Methods/Fields, method Call editor).
-              7. Floating toggle button: draggable, tap toggles the menu,
-                 always available.
+              1. All tabs drew empty - the tab loop created the tab items but
+                 never called their body functions (Settings/Patches/Hooks/
+                 Tracker/Recorder/Monitor/Script/Classes are ~500 lines of UI
+                 that simply never ran). The loop now calls each tab's
+                 function between BeginTabItem/EndTabItem.
+          
+              2. App crash right after boot (JNI 'invalid jobject' abort in
+                 nativePollOnce). The keyboard bridge built a TextWatcher with
+                 Java.registerClass and posted it via Java.scheduleOnMainThread
+                 - both are fatal on 32-bit ART with JNI checks. Rewritten -
+                 the hidden EditText and the IME show/hide now happen inside
+                 the main-thread dispatchTouchEvent hook (plain reflection
+                 only), and the frida thread polls the EditText text and feeds
+                 the delta to ImGui (chars + backspace).
+          
+              3. Touch offset still present when the agent died before
+                 measuring. The overlay now derives a native fallback map from
+                 the largest surface ever seen (the HWUI surface spans the full
+                 window), so input is scaled correctly from the first frame;
+                 the agent's real measurement replaces it when it arrives.
+          
+              4. Park/adopt confirmed in the field - the r9 log shows the menu
+                 surviving an app-switch context destroy ('ImGui parked',
+                 'adopted after 8 swaps'). That path is kept as-is.
           
           ## Usage
           
@@ -4258,7 +4294,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r9: touch map, keyboard IME bridge, park/adopt overlay, batched recorder, cross-linking, smali runtime compile [skip ci]"
+            git commit -m "fix r10: tab bodies never drawn, JNI crash in keyboard bridge, native touch-map fallback [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
