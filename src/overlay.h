@@ -20,6 +20,17 @@ void overlay_request_font_rebuild(float size);
    the given speed, which is what makes the huge lists touch-scrollable */
 void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed);
 
+/* ---- r11 ---- */
+/* manual Y nudge applied after the touch map (Settings slider); fixes
+   residual status-bar offsets on hosts where the view rect cannot be
+   measured */
+void overlay_set_touch_bias(float dy);
+/* menu.cpp publishes the on-screen keyboard rect of the current frame;
+   overlay routes taps inside it to menu_kbd_feed() instead of ImGui */
+void overlay_publish_kbd_rect(float x, float y, float w, float h);
+/* one-line description of the active touch map for the Settings status */
+void overlay_touch_map_desc(char* buf, int n);
+
 #ifdef __cplusplus
 extern "C" {
 #endif

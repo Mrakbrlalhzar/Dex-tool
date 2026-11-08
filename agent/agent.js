@@ -1,7 +1,24 @@
 'use strict';
-/* Dex-tool agent (r9). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r11). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
-   send()/recv(); the C++ menu decodes them in menu.cpp. */
+   send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r11 changes (field issues from the r10 run):
+   - keyboard: the hidden-EditText bridge is GONE. String(getText()) is
+     an android.text.Editable, whose String() form is "[object
+     Object]" - which is exactly what got typed into every field. The
+     on-screen keyboard is now drawn natively by libtool.so; this side
+     only consumes kbd-area taps so they do not fall through to the app.
+   - classes: listLoadedClasses streams the FULL result in pages of 400
+     with a qid; the r10 version silently capped at 800 names, so the
+     tab never displayed all classes.
+   - recorder: Start passes {filter, cap}; only classes of the app's
+     own package (or the given prefix) are hooked, and installation
+     stops at cap methods. Hooking every method of every loaded class
+     exhausted the 32-bit process and it died with SIGABRT.
+   - touch map: measured on Activity.onResume AND on every touch
+     (throttled); onWindowFocusChanged never fired on the field host.
+*/
 
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
 function jstr(v) {
@@ -9,7 +26,7 @@ function jstr(v) {
         if (v === null || v === undefined) return 'null';
         var s = String(v);
         if (s.length > 160) s = s.substring(0, 157) + '...';
-        return s.replace(/\|/g, '\u01c2').replace(/#/g, '\u266f');
+        return s.replace(/\|/g, '!').replace(/#/g, '%');
     } catch (e) { return '?'; }
 }
 function jargs(a) {
@@ -53,22 +70,6 @@ function jstack(limit) {
     } catch (e) { return []; }
 }
 
-/* smali-like skeleton of a replacement body for the editor */
-function smali_skel(cls, m) {
-    var name = m.getName(), pn = 0;
-    var ps = m.getParameterTypes(), r = m.getReturnType().getName();
-    var sb = '.class public L' + cls.replace(/\./g, '/') + 'Hook;\n';
-    sb += '.method public static hook(';
-    for (var i = 0; i < ps.length; i++)
-        sb += (i ? ',' : '') + ps[i].getName();
-    sb += ')' + r + '\n.locals 4\n';
-    sb += '    # edit below, then Apply (runtime dex)\n';
-    sb += '    p0 = 1\n';            /* placeholder rewrite rules */
-    sb += '    return 0\n';
-    sb += '.end method';
-    return sb;
-}
-
 /* rewrite rules: parse tiny-language lines from smali code
    supported:  pN = literal | name  /  R = literal   (literal: number,
    true/false/null/"str"/'char' or an identifier=literal arg) */
@@ -94,12 +95,11 @@ function lit_to_java(lit) {        /* literal string -> java value object */
     return undefined;              /* treat as identifier: copy-through */
 }
 
-var smali_cache = {};              /* key -> {loader, cls, err, code} */
 var gAddChar = null, gBackspace = null, gWantMouse = null;
 var gNativeTouch = null, gSetMap = null, gDispSize = null;
 
 function ensure_native_fns() {
-    if (gAddChar) return true;
+    if (gNativeTouch) return true;
     try {
         var m = Module.findExportByName('libtool.so', 'dextool_add_char');
         var b = Module.findExportByName('libtool.so', 'dextool_backspace');
@@ -119,8 +119,11 @@ function ensure_native_fns() {
 }
 
 /* measure where the drawing view sits inside the window and tell the
-   overlay; repeat on layout changes. view id 0x01020002 = android.R.id.content */
+   overlay. r11: also called from Activity.onResume (onWindowFocusChanged
+   never fired on the field host) and throttled from every touch, so a
+   relayout at any point in the app's life still updates the map. */
 var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
+var gMapLastTouch = 0;
 function report_map(view) {
     try {
         if (!view) return;
@@ -129,93 +132,19 @@ function report_map(view) {
         var w = view.getWidth(), h = view.getHeight();
         if (w === gMapSent.w && h === gMapSent.h &&
             loc[0] === gMapSent.x && loc[1] === gMapSent.y) return;
+        if (w <= 0 || h <= 0) return;
         gMapSent = { w: w, h: h, x: loc[0], y: loc[1] };
         gSetMap(loc[0], loc[1], w, h);
         sendMsg('info', { msg: 'touch map ' + loc[0] + ',' + loc[1] + ' ' + w + 'x' + h });
     } catch (e) {}
 }
-
-
-/* ---------------- keyboard bridge -----------------------------------
-   r10: no Java.registerClass (fatal "invalid jobject" on 32-bit ART
-   with JNI checks), no Java.scheduleOnMainThread, no TextWatcher.
-   Instead: a hidden EditText is created with plain reflection on the
-   main thread (inside the dispatchTouchEvent hook), the IME is told
-   to show/hide from that same main-thread context, and the frida
-   thread polls the EditText's text and feeds deltas to the overlay
-   (chars + backspaces). */
-var KBD = {
-    et: null, imm: null, last: '', want: 0, /* 0 none, 1 show, 2 hide */
-    lastPoll: 0
-};
-
-function kbd_ensure_views(activity) {
-    /* runs on the main thread (dispatchTouchEvent context) */
-    if (KBD.et) return true;
+function content_view(activity) {
     try {
-        var ET = Java.use('android.widget.EditText');
-        var LP = Java.use('android.widget.FrameLayout$LayoutParams');
-        var IMMCls = Java.use('android.view.inputmethod.InputMethodManager');
-        var VG = Java.use('android.view.ViewGroup');
-
-        var et = ET.$new(activity);
-        et.setAlpha(0.0);
-        et.setFocusableInTouchMode(true);
-        var params = LP.$new(1, 1);
-        Java.cast(activity.getWindow().getDecorView(), VG)
-            .addView(et, params);
-        KBD.et = et;
-        KBD.imm = Java.cast(activity.getSystemService('input_method'), IMMCls);
-        sendMsg('info', { msg: 'keyboard bridge OK (r10, no registerClass)' });
-        return true;
-    } catch (e) {
-        sendMsg('warn', { msg: 'kbd views: ' + e.message });
-        return false;
-    }
+        /* 0x01020002 = android.R.id.content */
+        return activity.getWindow().getDecorView()
+                        .findViewById(0x01020002);
+    } catch (e) { return null; }
 }
-
-function kbd_apply_want(activity) {
-    /* main thread: honour the pending show/hide request */
-    if (!KBD.want || !activity) return;
-    var req = KBD.want;
-    KBD.want = 0;
-    try {
-        if (!kbd_ensure_views(activity)) return;
-        if (req === 1) {
-            KBD.et.requestFocus();
-            KBD.imm.showSoftInput(KBD.et, 0);
-            KBD.last = '';
-            KBD.et.setText('');
-        } else {
-            var b = KBD.et.getWindowToken();
-            if (b) KBD.imm.hideSoftInputFromWindow(b, 0);
-            KBD.et.clearFocus();
-            KBD.et.setText('');
-            KBD.last = '';
-        }
-    } catch (e) {
-        sendMsg('warn', { msg: 'kbd apply: ' + e.message });
-    }
-}
-
-setInterval(function () {
-    /* frida thread: poll IME text and forward the delta */
-    if (!KBD.et || !gAddChar) return;
-    try {
-        var txt = String(KBD.et.getText());
-        if (txt !== KBD.last) {
-            var i = 0;
-            while (i < txt.length && i < KBD.last.length &&
-                   txt.charAt(i) === KBD.last.charAt(i)) i++;
-            var removed = KBD.last.length - i;
-            var added   = txt.substring(i);
-            for (var r = 0; r < removed; r++) gBackspace();
-            for (var a = 0; a < added.length; a++)
-                gAddChar(added.charCodeAt(a));
-            KBD.last = txt;
-        }
-    } catch (e) { /* view not attached yet */ }
-}, 120);
 
 /* ---------------- input + view mapping on the host activity -------- */
 function installTouchHook() {
@@ -225,27 +154,35 @@ function installTouchHook() {
     }
     Java.perform(function () {
         var Activity = Java.use('android.app.Activity');
-        var contentId = 0x01020002;
-        Activity.onWindowFocusChanged.implementation = function (has) {
-            try {
-                if (has) {
-                    var cv = this.getWindow().getDecorView()
-                                  .findViewById(contentId);
-                    report_map(cv);
-                }
-            } catch (e) {}
-            return this.onWindowFocusChanged(has);
+        Activity.onResume.implementation = function () {
+            var r = this.onResume();
+            try { report_map(content_view(this)); } catch (e) {}
+            return r;
         };
         Activity.dispatchTouchEvent.implementation = function (ev) {
-            /* MAIN THREAD: the only safe place for view/IME calls */
-            try { kbd_apply_want(this); } catch (e0) {}
+            /* MAIN THREAD */
             try {
-                /* forward raw window coords; overlay maps them */
-                gNativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
+                var act = ev.getAction() & 0xff;
+                var down = (act === 0);
+                /* raw window coords first: the overlay maps them */
+                gNativeTouch(ev.getX(), ev.getY(), act);
+                if (act === 2) {          /* throttle map refresh on moves */
+                    var now = Date.now();
+                    if (now - gMapLastTouch > 2000) {
+                        gMapLastTouch = now;
+                        report_map(content_view(this));
+                    }
+                }
+                /* let the overlay decide (menu/keyboard own the tap) */
+                if (gWantMouse && gWantMouse()) {
+                    if (down || act === 1 || act === 3)
+                        this.dispatchTouchEvent(ev);   /* original call */
+                    return true;                        /* consume */
+                }
             } catch (e) {}
-            return this.dispatchTouchEvent(ev);
+            return this.dispatchTouchEvent(ev);         /* original call */
         };
-        sendMsg('info', { msg: 'touch + keyboard hooks installed (r10)' });
+        sendMsg('info', { msg: 'touch hook installed (r11)' });
     });
 }
 installTouchHook();
@@ -283,18 +220,16 @@ function method_lines(jc) {
     return out;
 }
 
-/* ---------------- recorder ---------------- */
+/* ---------------- recorder ----------------
+   r11: scoped. Only classes matching the package filter are hooked and
+   installation stops at cap methods; the r10 version hooked every
+   method of every class in the process (tens of thousands of ArtMethod
+   hook slots on a 32-bit process) and died with SIGABRT mid-install. */
 var REC = { on: false, busy: false, ring: [], installed: 0, flushBusy: false };
-var REC_SKIP = [
-    '^android\\.', '^androidx\\.', '^java\\.', '^javax\\.', '^dalvik\\.',
-    '^kotlin\\.', '^kotlinx\\.', '^libcore\\.', '^org\\.apache\\.',
-    '^com\\.android\\.', '^com\\.google\\.android\\.', '^okhttp3\\.',
-    '^okio\\.', '^org\\.json$', '^com\\.android\\.tools\\.'
-];
-function rec_skip(name) {
-    for (var i = 0; i < REC_SKIP.length; i++)
-        if (name.search(REC_SKIP[i]) === 0) return true;
-    return false;
+function rec_wanted(name, filter) {
+    if (filter === '.') return true;                 /* everything */
+    if (!filter) return true;                        /* agent default */
+    return name.indexOf(filter) === 0;
 }
 function rec_flush() {
     if (REC.flushBusy || !REC.ring.length) return;
@@ -311,18 +246,21 @@ setInterval(rec_flush, 500);
 function rec_install_chunk(list, batch) {
     var done = 0;
     for (var i = 0; i < batch && REC.idx < list.length; i++, REC.idx++) {
+        if (REC.installed >= REC.cap) break;
         var cls = list[REC.idx];
-        if (rec_skip(cls)) continue;
+        if (!rec_wanted(cls, REC.filter)) continue;
         try {
             var jc = Java.use(cls);
             var ms = jc.class.getDeclaredMethods();
             for (var k = 0; k < ms.length; k++) {
+                if (REC.installed >= REC.cap) break;
                 var name = ms[k].getName();
                 var ovl;
                 try { ovl = jc[name].overloads; } catch (e0) { continue; }
                 if (!ovl) continue;
                 var made = 0;
                 for (var oi = 0; oi < ovl.length; oi++) {
+                    if (REC.installed >= REC.cap) break;
                     try {
                         (function (ov, cn, mn) {
                             ov.implementation = function () {
@@ -342,24 +280,24 @@ function rec_install_chunk(list, batch) {
                                 return ov.apply(this, arguments);
                             };
                             made++;
+                            REC.installed++;
                         })(ovl[oi], cls, name);
                     } catch (e2) {}
                 }
-                if (made) REC.installed += made;
+                if (made) REC.installed += 0;   /* counted per overload above */
             }
             done++;
         } catch (e3) {}
     }
     sendMsg('recorderProgress', {
         installed: REC.installed, total: list.length - REC.idx });
-    if (REC.idx < list.length) {
+    if (REC.idx < list.length && REC.installed < REC.cap) {
         setTimeout(function () { rec_install_chunk(list, batch); }, 30);
     } else {
         REC.busy = false;
         sendMsg('recorderStarted', { installed: REC.installed });
     }
 }
-
 
 /* ---------------- monitor ---------------- */
 var MON = { on: false, ring: [], origins: {}, okhttp: null };
@@ -388,7 +326,6 @@ function mon_origin(site) {
     MON.origins[site] = top;
     return top;
 }
-var MON_SITES = 0;
 function mon_flush() {
     if (!MON.ring.length) return;
     var items = MON.ring.splice(0, MON.ring.length);
@@ -435,11 +372,10 @@ function mon_install() {
             });
         } catch (e) {}
 
-        /* SSL: TLS plaintext via SSLSocket startHandshake sites */
+        /* SSL: best-effort note only; full plaintext would need
+           SSL_read/SSL_write native hooks */
         try {
             var SSLSocket = Java.use('javax.net.ssl.SSLSocket');
-            /* best-effort note only; full plaintext would need
-               SSL_read/SSL_write native hooks */
             mon_push('ssl', 'engine', 'note',
                      '', 'SSLSocket reachable');
         } catch (e) {}
@@ -460,7 +396,6 @@ function use_cls_parts(cls, member) {
         if (jc[member]) found = jc[member];
     } catch (e) {}
     if (!found) {
-        /* overloads by exact name exist even without $ overloads attr */
         try {
             var ms = jc.class.getDeclaredMethods();
             for (var i = 0; i < ms.length; i++)
@@ -497,7 +432,6 @@ function call_with_args(ov, argStrings, isCtor) {
 
 var patches = {}, hooks = {}, trackers = {};
 
-
 /* ---------------- rpc exports (called from the menu) ---------------- */
 rpc.exports = {
     /* ---- patches: static-field value replacement ---- */
@@ -509,7 +443,6 @@ rpc.exports = {
                 var f = jc.class.getDeclaredField(field);
                 f.setAccessible(true);
                 var t = f.getType().getName();
-                if (!f.getModifiers) {}
                 var st = (f.getModifiers() & 8) !== 0;
                 if (!st) throw new Error('not a static field (instances: Classes tab)');
                 if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
@@ -541,7 +474,6 @@ rpc.exports = {
                 } catch (e) {}
             });
         } else {
-            /* re-apply: same path as addPatch */
             rpc.exports.addPatch(cls, field, patches[key] ? patches[key].v : '');
         }
         sendMsg('info', { msg: 'patch ' + key + ' -> ' + (en ? 'on' : 'off') });
@@ -601,10 +533,6 @@ rpc.exports = {
                     hooks[key] = { mode: mode, on: true, code: code };
                     sendMsg('hookAdded', { name: key });
                 } else if (mode === 'Smali') {
-                    /* compile the body with the real smali assembler
-                       (bundled jar) and load it with InMemoryDexClassLoader;
-                       the JS hook delegates into the compiled hook. The
-                       generated class name is fixed so smali_load finds it. */
                     var gen = 'H' + (Date.now() % 1000000);
                     var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
                                '.super Ljava/lang/Object;\n' +
@@ -760,11 +688,24 @@ rpc.exports = {
         sendMsg('info', { msg: 'tracker removed ' + name });
     },
 
-
     /* ---- recorder ---- */
-    startRecorder: function () {
+    startRecorder: function (filter, cap) {
         if (REC.on || REC.busy) return;
         Java.perform(function () {
+            var pkg = '';
+            try {
+                var AT = Java.use('android.app.ActivityThread');
+                var app = AT.currentApplication();
+                if (app) pkg = String(app.getPackageName());
+            } catch (e0) {}
+            REC.filter = (filter === undefined || filter === null) ? '' :
+                          String(filter);
+            if (!REC.filter) REC.filter = pkg;   /* default: own package */
+            if (REC.filter === '.') REC.filter = pkg;  /* menu: explicit all */
+            /* '.' sent by the UI means everything; agent: use it directly */
+            if (filter === '.') REC.filter = '.';
+            REC.cap = (typeof cap === 'number' && cap > 0) ?
+                      Math.floor(cap) : 1500;
             var list = Java.enumerateLoadedClassesSync();
             REC.on = true;
             REC.busy = true;
@@ -772,6 +713,8 @@ rpc.exports = {
             REC.installed = 0;
             REC.idx = 0;
             sendMsg('recorderProgress', { installed: 0, total: list.length });
+            sendMsg('info', { msg: 'recorder scope: filter="' + REC.filter +
+                                   '" cap=' + REC.cap });
             setTimeout(function () { rec_install_chunk(list, 25); }, 50);
         });
     },
@@ -808,7 +751,7 @@ rpc.exports = {
     },
 
     /* ---- classes ---- */
-    listLoadedClasses: function (filter) {
+    listLoadedClasses: function (filter, qid) {
         Java.perform(function () {
             try {
                 var all = Java.enumerateLoadedClassesSync();
@@ -817,11 +760,27 @@ rpc.exports = {
                 for (var i = 0; i < all.length; i++) {
                     if (!f || all[i].toLowerCase().indexOf(f) !== -1)
                         out.push(all[i]);
-                    if (out.length >= 800) break;
                 }
-                sendMsg('classList', {
-                    classes: out, total: all.length, shown: out.length
-                });
+                /* r11: stream the FULL result in pages of 400. The r10
+                   version sent one message capped at 800 names, so the
+                   Classes tab never displayed all classes. */
+                var PAGE = 400;
+                var pages = Math.max(1, Math.ceil(out.length / PAGE));
+                var q = (typeof qid === 'number') ? qid : 0;
+                var idx = 0;
+                var send_page = function () {
+                    var chunk = out.slice(idx, idx + PAGE);
+                    idx += PAGE;
+                    sendMsg('classList', {
+                        qid: q, page: Math.floor((idx - PAGE) / PAGE),
+                        pages: pages, total: all.length,
+                        shown: Math.min(idx, out.length),
+                        classes: chunk
+                    });
+                    if (idx < out.length)
+                        setTimeout(send_page, 15);
+                };
+                send_page();
             } catch (e) {
                 sendMsg('error', { fn: 'listLoadedClasses',
                                    msg: String(e.message || e) });
@@ -901,7 +860,7 @@ rpc.exports = {
         Java.perform(function () {
             try {
                 var jc = Java.use(cls);
-                var best = null, bestScore = -1;
+                var best = null;
                 jc[method].overloads.forEach(function (ov) {
                     var np = ov.argumentTypes.length;
                     if (np === (args ? args.length : 0)) { best = ov; }
@@ -957,7 +916,6 @@ function smali_compile(src) {
     var out = { err: '', dex: null };
     Java.perform(function () {
         try {
-            var Path = null;
             var ctx = null;
             try {
                 var AT = Java.use('android.app.ActivityThread');
@@ -992,7 +950,6 @@ function smali_compile(src) {
                 Array.prototype.map.call(src, function (c) { return c.charCodeAt(0) & 0xff; }));
             fos2.write(jb);
             fos2.close();
-            var Str = Java.use('java.lang.String');
             var arr = Java.array('java.lang.String', [
                 'assemble', '-o', outF, inF ]);
             main.main(arr);
@@ -1055,18 +1012,12 @@ recv(function onMsg(msg) {
     try {
         if (msg.type === 'rpc' && msg.fn && rpc.exports[msg.fn]) {
             var a = msg.args || {};
-            /* the menu always sends named args; exports take them
-               positionally in declaration order per fn */
             var names = FN_ARGS[msg.fn] || [];
             var vals = names.map(function (n) { return a[n]; });
             rpc.exports[msg.fn].apply(rpc.exports, vals);
-        } else if (msg.type === 'showKeyboard') {
-            /* r10: no scheduleOnMainThread; the main-thread touch hook
-               applies the request at its next event */
-            if (KBD.want === 0) KBD.want = 1;
-        } else if (msg.type === 'hideKeyboard') {
-            if (KBD.want === 0) KBD.want = 2;
         }
+        /* r11: show/hideKeyboard are gone; the on-screen keyboard is
+           native. Unknown types fall through silently. */
     } catch (e) {
         sendMsg('error', { fn: 'recv', msg: String(e.message || e) });
     }
@@ -1074,7 +1025,7 @@ recv(function onMsg(msg) {
 });
 
 /* argument-name table: menu sends {class:..., method:...}; exports
-   were declared as function(cls, method, ...) */
+   were declared as function(cls, method, ...) positionally */
 var FN_ARGS = {
     addPatch:        ['class', 'field', 'value'],
     setPatchEnabled: ['class', 'field', 'enabled'],
@@ -1085,16 +1036,16 @@ var FN_ARGS = {
     addTracker:      ['class', 'method'],
     trackField:      ['class', 'field'],
     removeTracker:   ['name'],
-    startRecorder:   [],
+    startRecorder:   ['filter', 'cap'],
     stopRecorder:    [],
     startMonitor:    [],
     stopMonitor:     [],
     evalScript:      ['src'],
-    listLoadedClasses: ['filter'],
+    listLoadedClasses: ['filter', 'qid'],
     openClass:       ['class'],
     listInstances:   ['class'],
     setInstanceField:['class', 'index', 'field', 'value'],
     callMethod:      ['class', 'method', 'args']
 };
 
-sendMsg('ready', { msg: 'Dex-tool agent r10 loaded' });
+sendMsg('ready', { msg: 'Dex-tool agent r11 loaded' });

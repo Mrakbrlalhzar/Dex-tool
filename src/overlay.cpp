@@ -24,10 +24,12 @@
 typedef EGLBoolean (*fn_swap)(EGLDisplay, EGLSurface);
 typedef EGLBoolean (*fn_swap_dmg)(EGLDisplay, EGLSurface, EGLint*, EGLint);
 typedef EGLBoolean (*fn_destroy_ctx)(EGLDisplay, EGLContext);
+typedef EGLBoolean (*fn_terminate)(EGLDisplay);
 
 static fn_swap        g_orig_swap        = nullptr;
 static fn_swap_dmg    g_orig_swap_dmg    = nullptr;
 static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
+static fn_terminate   g_orig_terminate   = nullptr;
 
 static std::atomic<bool> g_gum_inited {false};
 static JavaVM*           g_jvm        = nullptr;
@@ -51,7 +53,14 @@ static JavaVM*           g_jvm        = nullptr;
    that were never created in the new context) and Init again, which
    makes NewFrame recreate the font texture and shader on the new
    context. The old context's objects are freed by the driver; we never
-   call GL without a current context. */
+   call GL without a current context.
+
+   r11 also retires every slot in the eglTerminate hook: terminating a
+   display invalidates all of its contexts, and if the driver later hands
+   out a new context at the same address, the stale slot would happily
+   draw with handles that are invalid in it - the classic
+   "glUseProgram -> GL_INVALID_VALUE (0x501)" abort class reported from
+   the field. */
 #define DT_ELECT_MIN_SWAPS 45
 #define DT_ADOPT_MIN_SWAPS  8
 #define DT_OWNER_STALE_MS  1500
@@ -94,17 +103,19 @@ static std::atomic<bool> g_ready {false};
    feed the map, best one wins:
    (a) the agent measured where the overlay's GL view actually sits in
        the window (view rect via getLocationInWindow) -> dextool_set_touch_map;
-   (b) native estimate: the largest surface ever seen on ANY context is
-       ~= the full window (on a typical app the HWUI surface spans the
-       whole 540x960 window while the game surface is smaller). While no
-       precise map exists, replay scales raw input by DisplaySize/window.
-   Replay maps (raw - origin) * DisplaySize/size, which fixes the "must
-   touch above the item" offset no matter how the window is laid out.
-   Without any map we fall back to the raw position (the r7 behaviour),
-   still clamped to the surface. */
+       r11 makes this measurement happen on Activity.onResume and on
+       every touch (throttled), so it no longer depends on
+       onWindowFocusChanged firing, which it never did in the field.
+   (b) native estimate: the largest surface seen on ANY context is
+       ~= the full window (a typical app's HWUI surface spans the whole
+       540x960 window while the game surface is smaller). r11 tracks
+       every swap for this, not just the owner's.
+   On top of the map, overlay_set_touch_bias() adds a manual Y nudge
+   (Settings) for hosts where neither source can be measured. */
 struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
 static std::mutex g_map_mtx;
 static TouchMap   g_map;
+static float      g_bias_y = 0.f;      /* manual nudge, under g_map_mtx */
 
 /* Touch stream with dedup: a NativeActivity host can deliver the same
    physical tap through BOTH the AInputQueue and the Java bridge; an
@@ -116,10 +127,14 @@ static TouchEvent              g_touch_last;
 static long                    g_touch_last_ms = 0;
 static std::atomic<bool>       g_want_mouse {false};
 
+/* rect of the on-screen keyboard as published by menu_draw (owner
+   thread); read back by dextool_want_mouse on the frida thread */
+struct KbdRect { bool visible=false; float x=0, y=0, w=0, h=0; };
+static KbdRect g_kbd;
+
 static std::mutex            g_char_mtx;
 static std::vector<unsigned>  g_pending_chars;
 static bool                   g_pending_bs    = false;
-static bool                   g_want_kbd_prev = false;
 
 /* scroll regions published by menu_draw (owner thread) */
 static std::vector<float> g_scroll_regions;
@@ -171,6 +186,29 @@ extern "C" JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h) {
              x, y, w, h);
 }
 
+void overlay_set_touch_bias(float dy) {
+    if (dy < -100.f) dy = -100.f;
+    if (dy >  100.f) dy =  100.f;
+    std::lock_guard<std::mutex> lk(g_map_mtx);
+    g_bias_y = dy;
+}
+
+void overlay_publish_kbd_rect(float x, float y, float w, float h) {
+    if (w <= 0 || h <= 0) { g_kbd.visible = false; return; }
+    g_kbd = { true, x, y, w, h };
+}
+
+void overlay_touch_map_desc(char* buf, int n) {
+    if (!buf || n <= 0) return;
+    std::lock_guard<std::mutex> lk(g_map_mtx);
+    if (g_map.ok)
+        snprintf(buf, n, "%s view (%.0f,%.0f) %.0fx%.0f + Y%+.0f",
+                 g_map.est ? "est" : "measured",
+                 g_map.x, g_map.y, g_map.w, g_map.h, g_bias_y);
+    else
+        snprintf(buf, n, "none yet (raw passthrough) + Y%+.0f", g_bias_y);
+}
+
 /* native estimate: while the agent has not measured the view rect yet,
    assume the window is as tall as the largest surface we have seen (a
    typical app's HWUI surface spans the full window) and that the GL
@@ -189,8 +227,33 @@ static void maybe_estimate_map() {
     LOGI("[overlay] touch map: estimate 0,0 %.0fx%.0f (max surface)", w, h);
 }
 
+/* defined further down; needed early by dextool_want_mouse */
+static ImVec2 map_touch(float x, float y, const ImVec2& ds);
+
 extern "C" JNIEXPORT bool dextool_want_mouse() {
-    return g_want_mouse.load();
+    if (g_want_mouse.load()) return true;
+    /* r11: the on-screen keyboard is not an ImGui window, so
+       WantCaptureMouse is false over it; report the kbd rect too so the
+       agent-side dispatchTouchEvent hook consumes kbd taps before they
+       reach the app underneath. Decides on the last event this same
+       hook just queued, so it reflects the current tap. */
+    if (!g_kbd.visible) return false;
+    float x, y; int ph;
+    {
+        std::lock_guard<std::mutex> lk(g_touch_mtx);
+        x = g_touch_last.x; y = g_touch_last.y; ph = g_touch_last.phase;
+    }
+    if (ph == 1) return false;               /* releases pass through */
+    float dw, dh;
+    {
+        std::lock_guard<std::mutex> lk(g_disp_mtx);
+        dw = g_disp_w; dh = g_disp_h;
+    }
+    if (dw <= 0 || dh <= 0) return false;
+    ImVec2 ds(dw, dh);
+    ImVec2 p = map_touch(x, y, ds);
+    return p.x >= g_kbd.x && p.x <= g_kbd.x + g_kbd.w &&
+           p.y >= g_kbd.y && p.y <= g_kbd.y + g_kbd.h;
 }
 
 extern "C" JNIEXPORT int dextool_display_size() {
@@ -420,9 +483,10 @@ static void slot_destroy(EGLContext ctx) {
     }
 }
 
-/* HWUI aborts the whole process on GL_INVALID_VALUE, so every binding
-   the ES2 ImGui backend touches goes back exactly the way the app had
-   it before the swap continues. */
+/* HWUI and several driver wrappers abort the whole process on stray GL
+   errors (the "glUseProgram -> GL_INVALID_VALUE (0x501)" SIGABRT seen in
+   the field), so every binding the ES2 ImGui backend touches goes back
+   exactly the way the app had it before the swap continues. */
 static void gl_state_save(Slot* s) {
     GlState& g = s->gl;
     glGetIntegerv(GL_CURRENT_PROGRAM, &g.program);
@@ -449,6 +513,20 @@ static void gl_state_save(Slot* s) {
     glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &g.blend_eq_a);
 }
 
+/* r11: eat whatever the draw left in the error queue and make it
+   visible in the debug log - some wrappers abort on a stray sticky
+   error at their next check. */
+static void gl_drain_errors() {
+    GLenum first = GL_NO_ERROR;
+    for (int i = 0; i < 12; i++) {
+        GLenum e = glGetError();
+        if (e == GL_NO_ERROR) break;
+        if (first == GL_NO_ERROR) first = e;
+    }
+    if (first != GL_NO_ERROR)
+        LOGD("[overlay] drained GL error 0x%04x after draw", first);
+}
+
 static void gl_state_restore(Slot* s) {
     GlState& g = s->gl;
     if (s->es3) glBindVertexArray(g.vao);
@@ -469,30 +547,14 @@ static void gl_state_restore(Slot* s) {
               g.scissor_box[2], g.scissor_box[3]);
     glViewport(g.viewport[0], g.viewport[1],
                g.viewport[2], g.viewport[3]);
-    glUseProgram(g.program);
-    /* never leave a GL error behind: the app's next check would abort */
-    for (int i = 0; i < 8; i++)
-        if (glGetError() == GL_NO_ERROR) break;
-}
-
-/* map a raw window position into the overlay surface's coordinate
-   space via the measured view rect; falls back to identity */
-static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
-    float mx = x, my = y;
-    {
-        std::lock_guard<std::mutex> lk(g_map_mtx);
-        if (g_map.ok && g_map.w > 0 && g_map.h > 0) {
-            float sx = ds.x / g_map.w;
-            float sy = ds.y / g_map.h;
-            mx = (x - g_map.x) * sx;
-            my = (y - g_map.y) * sy;
-        }
-    }
-    if (mx < 0.f)   mx = 0.f;
-    if (my < 0.f)   my = 0.f;
-    if (mx > ds.x)  mx = ds.x;
-    if (my > ds.y)  my = ds.y;
-    return ImVec2(mx, my);
+    /* r11: only restore a real program. Apps that never bind one (the
+       sample host just clears) have 0 current; some ES wrappers raise
+       GL_INVALID_VALUE for glUseProgram(0) and the app's next error
+       check aborts. If the app had none bound it will bind its own
+       before drawing, so leaving ours is safe. */
+    if (g.program != 0)
+        glUseProgram(g.program);
+    gl_drain_errors();
 }
 
 /* is a display-space point inside one of the published scroll rects? */
@@ -506,6 +568,28 @@ static float region_speed_at(float x, float y) {
     return 0.f;
 }
 
+/* map a raw window position into the overlay surface's coordinate
+   space via the measured view rect; falls back to identity. r11 adds
+   the manual Y bias on top (Settings). */
+static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
+    float mx = x, my = y;
+    {
+        std::lock_guard<std::mutex> lk(g_map_mtx);
+        if (g_map.ok && g_map.w > 0 && g_map.h > 0) {
+            float sx = ds.x / g_map.w;
+            float sy = ds.y / g_map.h;
+            mx = (x - g_map.x) * sx;
+            my = (y - g_map.y) * sy;
+        }
+        my += g_bias_y;
+    }
+    if (mx < 0.f)   mx = 0.f;
+    if (my < 0.f)   my = 0.f;
+    if (mx > ds.x)  mx = ds.x;
+    if (my > ds.y)  my = ds.y;
+    return ImVec2(mx, my);
+}
+
 static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     static thread_local bool in_tick = false;
     if (in_tick) return;   /* driver re-entry (swap->swapWithDamage) */
@@ -515,6 +599,21 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
 
     EGLContext ctx = eglGetCurrentContext();
     if (ctx == EGL_NO_CONTEXT) return;
+
+    /* r11: surface bookkeeping for EVERY context, before ownership
+       gating. The largest surface on any thread (the HWUI window
+       surface spans the whole window) is the best native estimate of
+       the full window, so the touch-map fallback no longer depends on
+       this thread being the owner. */
+    EGLint sw = 0, sh = 0;
+    eglQuerySurface(dpy, surf, EGL_WIDTH,  &sw);
+    eglQuerySurface(dpy, surf, EGL_HEIGHT, &sh);
+    if (sw > 0 && sh > 0) {
+        std::lock_guard<std::mutex> lk(g_disp_mtx);
+        if ((float)sw > g_max_surf_w) g_max_surf_w = (float)sw;
+        if ((float)sh > g_max_surf_h) g_max_surf_h = (float)sh;
+        if (g_disp_w <= 0.f) { g_disp_w = (float)sw; g_disp_h = (float)sh; }
+    }
 
     /* one drawer at a time; also serializes ownership changes, adoption
        and slot teardown against in-flight frames */
@@ -529,15 +628,10 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     if (!s->imgui) return;
     ImGui::SetCurrentContext(s->imgui);
     ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)sw, (float)sh);
     {
-        EGLint w = 1080, h = 1920;
-        eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
-        eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-        io.DisplaySize = ImVec2((float)w, (float)h);
         std::lock_guard<std::mutex> lk2(g_disp_mtx);
-        g_disp_w = (float)w; g_disp_h = (float)h;
-        if ((float)w > g_max_surf_w) g_max_surf_w = (float)w;
-        if ((float)h > g_max_surf_h) g_max_surf_h = (float)h;
+        g_disp_w = (float)sw; g_disp_h = (float)sh;
     }
     {
         long nowt = now_ms();
@@ -550,10 +644,12 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         s->last_frame_ms = nowt;
     }
 
-    /* replay queued touch events as real ImGui events; drags that start
-       inside a published scroll rect additionally become wheel events,
-       scaled by that rect's speed - this is the touch scrolling of the
-       recorder/monitor/class lists and of the menu itself */
+    /* replay queued touch events as real ImGui events; taps inside the
+       on-screen keyboard (r11) are routed to menu_kbd_feed() instead.
+       Drags that start inside a published scroll rect additionally
+       become wheel events, scaled by that rect's speed - this is the
+       touch scrolling of the recorder/monitor/class lists and of the
+       menu itself */
     {
         std::vector<TouchEvent> q;
         {
@@ -565,6 +661,8 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         bool   have_prev = false;
         for (const TouchEvent& t : q) {
             ImVec2 p = map_touch(t.x, t.y, ds);
+            if (menu_kbd_feed(t.phase, p.x, p.y))
+                continue;                     /* on-screen keyboard */
             io.AddMousePosEvent(p.x, p.y);
             if (t.phase == 0) io.AddMouseButtonEvent(0, true);
             if (t.phase == 1) io.AddMouseButtonEvent(0, false);
@@ -619,33 +717,66 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     gl_state_restore(s);
     g_ready.store(true);
-
-    /* soft keyboard follows ImGui's text focus; driven by WantTextInput
-       (true only while an InputText is active), so tapping a field pops
-       the IME and tapping elsewhere closes it */
-    bool want_kbd = io.WantTextInput;
-    if (want_kbd != g_want_kbd_prev) {
-        g_want_kbd_prev = want_kbd;
-        frida_post(want_kbd ?
-            "{\"type\":\"showKeyboard\"}" :
-            "{\"type\":\"hideKeyboard\"}");
-    }
 }
 
 static EGLBoolean my_destroy_ctx(EGLDisplay dpy, EGLContext ctx) {
     slot_destroy(ctx);
-    return g_orig_destroy_ctx(dpy, ctx);
+    return g_orig_destroy_ctx ? g_orig_destroy_ctx(dpy, ctx) : EGL_TRUE;
+}
+
+static EGLBoolean my_terminate(EGLDisplay dpy) {
+    /* r11: terminating a display invalidates every context of that
+       display. Retire all slots now; otherwise the next eglCreateContext
+       can land at a recycled address whose stale slot would draw with
+       GL handles that are invalid in the new context (the
+       glUseProgram GL_INVALID_VALUE 0x501 abort class). */
+    {
+        std::lock_guard<std::mutex> lk(g_tick_mtx);
+        std::lock_guard<std::mutex> lk2(g_slots_mtx);
+        ImGuiContext* park = nullptr;
+        bool had_owner = false;
+        for (auto& kv : g_slots) {
+            Slot* s = kv.second;
+            s->dead = true;
+            g_graveyard.push_back(s);
+            if (g_owner == kv.first) {
+                had_owner = true;
+                if (s->imgui) {
+                    if (park) ImGui::DestroyContext(park);
+                    park = s->imgui;
+                    s->imgui = nullptr;
+                }
+            } else if (s->imgui) {
+                ImGui::DestroyContext(s->imgui);
+                s->imgui = nullptr;
+            }
+        }
+        g_slots.clear();
+        if (had_owner) {
+            g_owner = nullptr;
+            g_ready.store(false);
+            if (park) {
+                if (g_orphan_imgui)
+                    ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
+                g_orphan_imgui = park;
+                LOGI("[overlay] display terminated - ImGui parked, "
+                     "waiting for the next GL context");
+            }
+        }
+    }
+    return g_orig_terminate ? g_orig_terminate(dpy) : EGL_TRUE;
 }
 
 static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
     overlay_tick(dpy, surf);
-    return g_orig_swap(dpy, surf);
+    return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
 }
 
 static EGLBoolean my_swap_dmg(EGLDisplay dpy, EGLSurface surf,
                               EGLint* rects, EGLint n) {
     overlay_tick(dpy, surf);
-    return g_orig_swap_dmg(dpy, surf, rects, n);
+    return g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
+                           : EGL_FALSE;
 }
 
 bool install_swap_hook() {
@@ -682,7 +813,20 @@ bool install_swap_hook() {
             reinterpret_cast<dobby_dummy_func_t>(my_destroy_ctx),
             reinterpret_cast<dobby_dummy_func_t*>(&g_orig_destroy_ctx));
         if (r == 0) LOGI("eglDestroyContext hooked OK");
-        else        LOGE("DobbyHook eglDestroyContext: %d", r);
+        else LOGE("DobbyHook eglDestroyContext: %d", r);
+    }
+    void* sym_term = dlsym(egl, "eglTerminate");
+    if (!sym_term) {
+        typedef void* (*PFN)(const char*);
+        PFN gpa = (PFN)dlsym(egl, "eglGetProcAddress");
+        if (gpa) sym_term = gpa("eglTerminate");
+    }
+    if (sym_term) {
+        int r = DobbyHook(sym_term,
+            reinterpret_cast<dobby_dummy_func_t>(my_terminate),
+            reinterpret_cast<dobby_dummy_func_t*>(&g_orig_terminate));
+        if (r == 0) LOGI("eglTerminate hooked OK (r11)");
+        else LOGE("DobbyHook eglTerminate: %d", r);
     }
     return ok;
 }

@@ -16,6 +16,9 @@
 static FILE* g_info_fp  = nullptr;
 static FILE* g_debug_fp = nullptr;
 static int   g_crash_fd = -1;
+static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
+
+const char* logger_base_dir() { return g_base_dir; }
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static void ts(char* buf, size_t n) {
@@ -79,6 +82,7 @@ static void install_crash_sig(int sig) {
 
 void logger_init(const char* base_dir) {
     mkdir(base_dir, 0755);
+    snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
     char p[640];
     snprintf(p, sizeof(p), "%s/dextool.log",       base_dir);
     g_info_fp  = fopen(p, "a");
@@ -109,7 +113,7 @@ void logger_init(const char* base_dir) {
         snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
         log_crash_raw(boot);
     }
-    log_info("logger_init done (build r10: tab bodies, safe kbd, native map)");
+    log_info("logger_init done (build r11: native kbd, paged classes, scoped recorder, Y bias)");
 }
 
 void log_info(const char* msg) {
