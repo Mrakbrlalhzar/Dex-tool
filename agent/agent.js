@@ -95,7 +95,6 @@ function lit_to_java(lit) {        /* literal string -> java value object */
 }
 
 var smali_cache = {};              /* key -> {loader, cls, err, code} */
-var gET = null, gIMM = null, gClearing = false;
 var gAddChar = null, gBackspace = null, gWantMouse = null;
 var gNativeTouch = null, gSetMap = null, gDispSize = null;
 
@@ -137,60 +136,86 @@ function report_map(view) {
 }
 
 
-/* ---------------- keyboard bridge (hidden EditText) ---------------- */
-function setupKeyboardBridge(activity) {
-    Java.scheduleOnMainThread(function () {
-        try {
-            var ET = Java.use('android.widget.EditText');
-            var FL = Java.use('android.widget.FrameLayout');
-            var LP = Java.use('android.widget.FrameLayout$LayoutParams');
-            var TW = Java.use('android.text.TextWatcher');
-            var IMMCls = Java.use('android.view.inputmethod.InputMethodManager');
-            var Editable = Java.use('android.text.Editable');
-            var CS = Java.use('java.lang.CharSequence');
+/* ---------------- keyboard bridge -----------------------------------
+   r10: no Java.registerClass (fatal "invalid jobject" on 32-bit ART
+   with JNI checks), no Java.scheduleOnMainThread, no TextWatcher.
+   Instead: a hidden EditText is created with plain reflection on the
+   main thread (inside the dispatchTouchEvent hook), the IME is told
+   to show/hide from that same main-thread context, and the frida
+   thread polls the EditText's text and feeds deltas to the overlay
+   (chars + backspaces). */
+var KBD = {
+    et: null, imm: null, last: '', want: 0, /* 0 none, 1 show, 2 hide */
+    lastPoll: 0
+};
 
-            var et = ET.$new(activity);
-            et.setAlpha(0.0);
-            et.setFocusableInTouchMode(true);
-            var params = LP.$new(1, 1);
-            Java.cast(activity.getWindow().getDecorView(), FL).addView(et, params);
+function kbd_ensure_views(activity) {
+    /* runs on the main thread (dispatchTouchEvent context) */
+    if (KBD.et) return true;
+    try {
+        var ET = Java.use('android.widget.EditText');
+        var LP = Java.use('android.widget.FrameLayout$LayoutParams');
+        var IMMCls = Java.use('android.view.inputmethod.InputMethodManager');
+        var VG = Java.use('android.view.ViewGroup');
 
-            var WatcherCls = Java.registerClass({
-                name: 'com.dextool.app.DxKbd_' + Date.now(),
-                implements: [TW],
-                methods: {
-                    beforeTextChanged: function (s, st, c, a) {},
-                    onTextChanged: function (s, st, before, count) {
-                        if (gClearing) return;
-                        try {
-                            if (count > before) {
-                                var txt = Java.cast(s, CS).toString();
-                                var added = txt.substring(st + before, st + count);
-                                for (var i = 0; i < added.length; i++)
-                                    gAddChar(added.charCodeAt(i));
-                            } else if (before > count) {
-                                for (var i2 = 0; i2 < before - count; i2++) gBackspace();
-                            }
-                        } catch (e2) {}
-                    },
-                    afterTextChanged: function (e) {
-                        if (!gClearing) {
-                            gClearing = true;
-                            try { Java.cast(e, Editable).clear(); } catch (e2) {}
-                            gClearing = false;
-                        }
-                    }
-                }
-            });
-            et.addTextChangedListener(WatcherCls.$new());
-            gET = et;
-            gIMM = Java.cast(activity.getSystemService('input_method'), IMMCls);
-            sendMsg('info', { msg: 'keyboard bridge OK' });
-        } catch (e) {
-            sendMsg('warn', { msg: 'kbd: ' + e.message });
-        }
-    });
+        var et = ET.$new(activity);
+        et.setAlpha(0.0);
+        et.setFocusableInTouchMode(true);
+        var params = LP.$new(1, 1);
+        Java.cast(activity.getWindow().getDecorView(), VG)
+            .addView(et, params);
+        KBD.et = et;
+        KBD.imm = Java.cast(activity.getSystemService('input_method'), IMMCls);
+        sendMsg('info', { msg: 'keyboard bridge OK (r10, no registerClass)' });
+        return true;
+    } catch (e) {
+        sendMsg('warn', { msg: 'kbd views: ' + e.message });
+        return false;
+    }
 }
+
+function kbd_apply_want(activity) {
+    /* main thread: honour the pending show/hide request */
+    if (!KBD.want || !activity) return;
+    var req = KBD.want;
+    KBD.want = 0;
+    try {
+        if (!kbd_ensure_views(activity)) return;
+        if (req === 1) {
+            KBD.et.requestFocus();
+            KBD.imm.showSoftInput(KBD.et, 0);
+            KBD.last = '';
+            KBD.et.setText('');
+        } else {
+            var b = KBD.et.getWindowToken();
+            if (b) KBD.imm.hideSoftInputFromWindow(b, 0);
+            KBD.et.clearFocus();
+            KBD.et.setText('');
+            KBD.last = '';
+        }
+    } catch (e) {
+        sendMsg('warn', { msg: 'kbd apply: ' + e.message });
+    }
+}
+
+setInterval(function () {
+    /* frida thread: poll IME text and forward the delta */
+    if (!KBD.et || !gAddChar) return;
+    try {
+        var txt = String(KBD.et.getText());
+        if (txt !== KBD.last) {
+            var i = 0;
+            while (i < txt.length && i < KBD.last.length &&
+                   txt.charAt(i) === KBD.last.charAt(i)) i++;
+            var removed = KBD.last.length - i;
+            var added   = txt.substring(i);
+            for (var r = 0; r < removed; r++) gBackspace();
+            for (var a = 0; a < added.length; a++)
+                gAddChar(added.charCodeAt(a));
+            KBD.last = txt;
+        }
+    } catch (e) { /* view not attached yet */ }
+}, 120);
 
 /* ---------------- input + view mapping on the host activity -------- */
 function installTouchHook() {
@@ -207,22 +232,20 @@ function installTouchHook() {
                     var cv = this.getWindow().getDecorView()
                                   .findViewById(contentId);
                     report_map(cv);
-                    if (!gET) setupKeyboardBridge(this);
                 }
             } catch (e) {}
             return this.onWindowFocusChanged(has);
         };
         Activity.dispatchTouchEvent.implementation = function (ev) {
+            /* MAIN THREAD: the only safe place for view/IME calls */
+            try { kbd_apply_want(this); } catch (e0) {}
             try {
                 /* forward raw window coords; overlay maps them */
                 gNativeTouch(ev.getX(), ev.getY(), ev.getAction() & 0xff);
             } catch (e) {}
             return this.dispatchTouchEvent(ev);
         };
-        /* re-measure after layout changes (keyboard, rotation) happens via
-           onWindowFocusChanged + the map's own dedup in report_map; nothing
-           else to hook here */
-        sendMsg('info', { msg: 'touch + keyboard hooks installed' });
+        sendMsg('info', { msg: 'touch + keyboard hooks installed (r10)' });
     });
 }
 installTouchHook();
@@ -1038,23 +1061,11 @@ recv(function onMsg(msg) {
             var vals = names.map(function (n) { return a[n]; });
             rpc.exports[msg.fn].apply(rpc.exports, vals);
         } else if (msg.type === 'showKeyboard') {
-            Java.scheduleOnMainThread(function () {
-                try {
-                    if (gET && gIMM) {
-                        gET.requestFocus();
-                        gIMM.showSoftInput(gET, 0);
-                    }
-                } catch (e) {}
-            });
+            /* r10: no scheduleOnMainThread; the main-thread touch hook
+               applies the request at its next event */
+            if (KBD.want === 0) KBD.want = 1;
         } else if (msg.type === 'hideKeyboard') {
-            Java.scheduleOnMainThread(function () {
-                try {
-                    if (gET && gIMM) {
-                        var b = gET.getWindowToken();
-                        if (b) gIMM.hideSoftInputFromWindow(b, 0);
-                    }
-                } catch (e) {}
-            });
+            if (KBD.want === 0) KBD.want = 2;
         }
     } catch (e) {
         sendMsg('error', { fn: 'recv', msg: String(e.message || e) });
@@ -1086,4 +1097,4 @@ var FN_ARGS = {
     callMethod:      ['class', 'method', 'args']
 };
 
-sendMsg('ready', { msg: 'Dex-tool agent r9 loaded' });
+sendMsg('ready', { msg: 'Dex-tool agent r10 loaded' });

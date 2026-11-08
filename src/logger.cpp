@@ -109,7 +109,7 @@ void logger_init(const char* base_dir) {
         snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
         log_crash_raw(boot);
     }
-    log_info("logger_init done (build r9: touch map + park/adopt)");
+    log_info("logger_init done (build r10: tab bodies, safe kbd, native map)");
 }
 
 void log_info(const char* msg) {

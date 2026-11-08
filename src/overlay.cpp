@@ -90,14 +90,19 @@ static std::mutex g_tick_mtx;  /* one ImGui drawer at a time; also
 static std::atomic<bool> g_ready {false};
 
 /* ---- touch mapping ------------------------------------------------
-   Events arrive in raw window pixels from both input paths. The agent
-   measured where the overlay's GL view actually sits inside the window
-   (GLSurfaceView rect, content view as fallback) and reported it via
-   dextool_set_touch_map. Replay maps (raw - origin) * DisplaySize/size,
-   which fixes the "must touch above the item" offset no matter how the
-   window is laid out. Without a map we fall back to the raw position
-   (the r7 behaviour), still clamped to the surface. */
-struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; };
+   Events arrive in raw window pixels from both input paths. Two sources
+   feed the map, best one wins:
+   (a) the agent measured where the overlay's GL view actually sits in
+       the window (view rect via getLocationInWindow) -> dextool_set_touch_map;
+   (b) native estimate: the largest surface ever seen on ANY context is
+       ~= the full window (on a typical app the HWUI surface spans the
+       whole 540x960 window while the game surface is smaller). While no
+       precise map exists, replay scales raw input by DisplaySize/window.
+   Replay maps (raw - origin) * DisplaySize/size, which fixes the "must
+   touch above the item" offset no matter how the window is laid out.
+   Without any map we fall back to the raw position (the r7 behaviour),
+   still clamped to the surface. */
+struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
 static std::mutex g_map_mtx;
 static TouchMap   g_map;
 
@@ -126,6 +131,7 @@ static bool  g_font_dirty = false;
 static char  g_font_path[128] = "";
 static std::mutex g_disp_mtx;
 static float g_disp_w = 0.f, g_disp_h = 0.f;
+static float g_max_surf_w = 0.f, g_max_surf_h = 0.f;   /* seen on ANY ctx */
 
 static long now_ms() {
     timespec ts;
@@ -159,10 +165,28 @@ extern "C" JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
     std::lock_guard<std::mutex> lk(g_map_mtx);
     bool was = g_map.ok;
-    g_map = { (float)x, (float)y, (float)w, (float)h, true };
+    g_map = { (float)x, (float)y, (float)w, (float)h, true, false };
     if (!was)
         LOGI("[overlay] touch map: view rect in window = (%d,%d %dx%d)",
              x, y, w, h);
+}
+
+/* native estimate: while the agent has not measured the view rect yet,
+   assume the window is as tall as the largest surface we have seen (a
+   typical app's HWUI surface spans the full window) and that the GL
+   view starts at the top-left. This already corrects the systematic
+   vertical offset; the agent's real measurement replaces it. */
+static void maybe_estimate_map() {
+    std::lock_guard<std::mutex> lk(g_map_mtx);
+    if (g_map.ok) return;                      /* real map present */
+    float w = 0.f, h = 0.f;
+    {
+        std::lock_guard<std::mutex> lk2(g_disp_mtx);
+        w = g_max_surf_w; h = g_max_surf_h;
+    }
+    if (w <= 0.f || h <= 0.f) return;
+    g_map = { 0.f, 0.f, w, h, true, true };
+    LOGI("[overlay] touch map: estimate 0,0 %.0fx%.0f (max surface)", w, h);
 }
 
 extern "C" JNIEXPORT bool dextool_want_mouse() {
@@ -512,6 +536,8 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         io.DisplaySize = ImVec2((float)w, (float)h);
         std::lock_guard<std::mutex> lk2(g_disp_mtx);
         g_disp_w = (float)w; g_disp_h = (float)h;
+        if ((float)w > g_max_surf_w) g_max_surf_w = (float)w;
+        if ((float)h > g_max_surf_h) g_max_surf_h = (float)h;
     }
     {
         long nowt = now_ms();
@@ -571,6 +597,7 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     }
 
     menu_init_once();
+    maybe_estimate_map();     /* native fallback until the agent measures */
     if (g_font_dirty) {
         build_fonts(io);
         /* drop the GL font texture so NewFrame re-uploads it at the

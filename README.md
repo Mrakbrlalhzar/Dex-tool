@@ -3,35 +3,32 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
-## Fixes in this version (r9)
+## Fixes in this version (r10)
 
-    1. Touch offset: input events arrive in raw window pixels; the
-       agent now measures the drawing view's rect inside the window
-       (dextool_set_touch_map) and the overlay maps every event through
-       it before it reaches ImGui. Taps land where the finger is.
-    2. Keyboard: ImGui's WantTextInput drives a hidden EditText, so
-       tapping a text field opens the IME and typing reaches ImGui
-       (chars + backspace). Tapping outside closes it again.
-    3. App switch / relayout: when the owner GL context is destroyed
-       the ImGui world is parked and adopted by the next context
-       (8 swaps), so the menu survives coming back from the background
-       and the soft-keyboard resize instead of the app closing.
-    4. Recorder: hooks are installed in background chunks with a
-       package skip-list, events go through a bounded ring flushed in
-       500 ms batches; the list renders with ImGuiListClipper. Starting
-       a recording no longer hangs the program, and clicking a row
-       opens that class in the Classes tab.
-    5. Cross-linking everywhere: tracker callers, recorder rows and
-       monitor rows all open the originating class in Classes.
-    6. Full tab set: Settings (font size via real atlas rebuild from a
-       system font, opacity, theme, two scroll speeds), Patches
-       (static fields; edit/delete), Hooks (Java(JS)/Smali/noop - smali
-       mode assembles with the bundled jar and loads the dex with
-       InMemoryDexClassLoader), Tracker (callers, field watch), Script
-       (editor + console), Classes (search over loaded classes, open
-       tabs, Instances/Methods/Fields, method Call editor).
-    7. Floating toggle button: draggable, tap toggles the menu,
-       always available.
+    1. All tabs drew empty - the tab loop created the tab items but
+       never called their body functions (Settings/Patches/Hooks/
+       Tracker/Recorder/Monitor/Script/Classes are ~500 lines of UI
+       that simply never ran). The loop now calls each tab's
+       function between BeginTabItem/EndTabItem.
+
+    2. App crash right after boot (JNI 'invalid jobject' abort in
+       nativePollOnce). The keyboard bridge built a TextWatcher with
+       Java.registerClass and posted it via Java.scheduleOnMainThread
+       - both are fatal on 32-bit ART with JNI checks. Rewritten -
+       the hidden EditText and the IME show/hide now happen inside
+       the main-thread dispatchTouchEvent hook (plain reflection
+       only), and the frida thread polls the EditText text and feeds
+       the delta to ImGui (chars + backspace).
+
+    3. Touch offset still present when the agent died before
+       measuring. The overlay now derives a native fallback map from
+       the largest surface ever seen (the HWUI surface spans the full
+       window), so input is scaled correctly from the first frame;
+       the agent's real measurement replaces it when it arrives.
+
+    4. Park/adopt confirmed in the field - the r9 log shows the menu
+       surviving an app-switch context destroy ('ImGui parked',
+       'adopted after 8 swaps'). That path is kept as-is.
 
 ## Usage
 
