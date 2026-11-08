@@ -1642,6 +1642,7 @@ jobs:
           #include "frida_bridge.h"
           #include "logger.h"
           #include "imgui.h"
+          #include "imgui_internal.h"
           #include <string>
           #include <vector>
           #include <cstdio>
