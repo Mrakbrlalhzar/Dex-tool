@@ -428,7 +428,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r14: IME show fix, phased agent init, small-surface ownership gate)");
+              log_info("logger_init done (build r15: async IME resolve + retries always armed, screen-space touch map, backspace counter, unified log dir)");
           }
 
           void log_info(const char* msg) {
@@ -518,11 +518,13 @@ jobs:
              the given speed, which is what makes the huge lists touch-scrollable */
           void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed);
 
-          /* ---- r12 ---- */
-          /* manual Y nudge applied after the touch map (Settings slider). With
-             the Y rescale gone (map_touch) this bias is what corrects the
-             residual status-bar offset on hosts where the view rect cannot
-             be measured. */
+          /* ---- r15 ---- */
+          /* manual Y nudge applied after the touch map (Settings slider).
+             Default 0: touches (getRawX/getRawY) and the view rect
+             (getLocationOnScreen) now share ONE coordinate space and both
+             axes are scaled proportionally, so no static offset is needed.
+             The slider only remains for exotic hosts where the view rect
+             cannot be measured. */
           void overlay_set_touch_bias(float dy);
           /* one-line description of the active touch map for the Settings status */
           void overlay_touch_map_desc(char* buf, int n);
@@ -531,8 +533,8 @@ jobs:
           extern "C" {
           #endif
           /* JNI surface used by the JS agent (and by the AInputQueue fallback) */
-          JNIEXPORT void dextool_on_touch(float x, float y, int action);      /* raw window coords */
-          JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h);   /* overlay view rect in window */
+          JNIEXPORT void dextool_on_touch(float x, float y, int action);      /* raw screen coords (getRawX/getRawY) */
+          JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h);   /* overlay view rect ON SCREEN (getLocationOnScreen) */
           JNIEXPORT void dextool_add_char(int codepoint);
           JNIEXPORT void dextool_backspace();
           JNIEXPORT bool dextool_want_mouse();
@@ -651,23 +653,28 @@ jobs:
           static std::atomic<bool> g_ready {false};
 
           /* ---- touch mapping ------------------------------------------------
-             Events arrive in raw window pixels from both input paths. Two sources
-             feed the map, best one wins:
-             (a) the agent measured where the overlay's GL view actually sits in
-                 the window (view rect via getLocationInWindow) -> dextool_set_touch_map;
-                 r11 makes this measurement happen on Activity.onResume and on
-                 every touch (throttled), so it no longer depends on
-                 onWindowFocusChanged firing, which it never did in the field.
+             Events arrive in raw SCREEN pixels from the Java path (r15: the hook
+             forwards getRawX()/getRawY()) and in window-local pixels from the
+             AInputQueue fallback (no Java side - approximate; the Settings Y
+             bias exists for such hosts). Two sources feed the map, best wins:
+             (a) the agent measured where the overlay's GL view actually sits
+                 ON SCREEN (getLocationOnScreen of the largest SurfaceView /
+                 GLSurfaceView / TextureView, content view fallback) ->
+                 dextool_set_touch_map; measured on Activity.onResume and on
+                 every touch (throttled), so a relayout at any point in the
+                 app's life still updates the map.
              (b) native estimate: the largest surface seen on ANY context is
                  ~= the full window (a typical app's HWUI surface spans the whole
                  540x960 window while the game surface is smaller). r11 tracks
-                 every swap for this, not just the owner's.
+                 every swap for this, not just the owner's. Transient only -
+                 the agent's real measurement replaces it within a few frames.
              On top of the map, overlay_set_touch_bias() adds a manual Y nudge
-             (Settings) for hosts where neither source can be measured. */
+             (Settings, default 0 since r15) for hosts where neither source
+             can be measured. */
           struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
           static std::mutex g_map_mtx;
           static TouchMap   g_map;
-          static float      g_bias_y = -80.f;    /* manual nudge, under g_map_mtx; r13 default = constant status-bar offset */
+          static float      g_bias_y = 0.f;      /* manual nudge (Settings), under g_map_mtx; r15: default 0 - the screen-space map is exact, the slider is only for exotic hosts */
 
           /* Touch stream with dedup: a NativeActivity host can deliver the same
              physical tap through BOTH the AInputQueue and the Java bridge; an
@@ -681,7 +688,7 @@ jobs:
 
           static std::mutex            g_char_mtx;
           static std::vector<unsigned>  g_pending_chars;
-          static bool                   g_pending_bs    = false;
+          static int                    g_pending_bs     = 0;       /* r15: counter - the r14 bool collapsed N backspaces in one frame into one */
 
           /* scroll regions published by menu_draw (owner thread) */
           static std::vector<float> g_scroll_regions;
@@ -729,7 +736,7 @@ jobs:
               bool was = g_map.ok;
               g_map = { (float)x, (float)y, (float)w, (float)h, true, false };
               if (!was)
-                  LOGI("[overlay] touch map: view rect in window = (%d,%d %dx%d)",
+                  LOGI("[overlay] touch map: view rect on screen = (%d,%d %dx%d)",
                        x, y, w, h);
           }
 
@@ -792,7 +799,7 @@ jobs:
 
           extern "C" JNIEXPORT void dextool_backspace() {
               std::lock_guard<std::mutex> lk(g_char_mtx);
-              g_pending_bs = true;
+              if (g_pending_bs < 4096) g_pending_bs++;   /* r15: count, do not collapse */
           }
 
           /* r14: the GumJS agent posts phase markers here (NativeFunction on
@@ -1140,25 +1147,27 @@ jobs:
               return 0.f;
           }
 
-          /* map a raw window position into the overlay surface's coordinate
-             space via the measured view rect; falls back to identity. r11 adds
-             the manual Y bias on top (Settings). */
+          /* map a raw SCREEN position into the overlay surface's coordinate
+             space. r15 rebuilds the transform on ONE coordinate space: the
+             hook forwards getRawX()/getRawY() (screen) and the agent measures
+             the GL view with getLocationOnScreen() (screen), so the origin is
+             shared and BOTH axes are scaled proportionally:
+
+                 imgui = (raw - viewOrigin) * (io.DisplaySize / viewSize)
+
+             The r12/r13 scheme mixed view-local getX()/getY() with a
+             window-relative content-view rect, hardcoded sy = 1.0 and patched
+             the residue with a device-specific -80 px Y bias - a workaround,
+             not a fix (the logged surface delta was 128 px, not 80). The bias
+             default is 0 now; the Settings slider remains for hosts where the
+             view rect cannot be measured. */
           static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
               float mx = x, my = y;
               {
                   std::lock_guard<std::mutex> lk(g_map_mtx);
                   if (g_map.ok && g_map.w > 0 && g_map.h > 0) {
-                      /* r12 fix (Y-axis scaling mismatch): sy used to be
-                         ds.y / g_map.h, but the view rect is TALLER than the
-                         GL surface (window 960 vs surface 832), so the false
-                         0.867 scale pulled taps toward the center: taps near
-                         the top landed low, taps near the bottom landed high,
-                         and only the exact center was right. Y is a pure
-                         translation now; the static status-bar offset belongs
-                         to the manual Y bias (g_bias_y, "Touch Y offset" in
-                         Settings). */
                       float sx = ds.x / g_map.w;
-                      float sy = 1.0f;
+                      float sy = ds.y / g_map.h;
                       mx = (x - g_map.x) * sx;
                       my = (y - g_map.y) * sy;
                   }
@@ -1265,11 +1274,11 @@ jobs:
                   std::lock_guard<std::mutex> lk2(g_char_mtx);
                   for (unsigned cp : g_pending_chars) io.AddInputCharacter(cp);
                   g_pending_chars.clear();
-                  if (g_pending_bs) {
+                  for (int i = 0; i < g_pending_bs && i < 4096; i++) {
                       io.AddKeyEvent(ImGuiKey_Backspace, true);
                       io.AddKeyEvent(ImGuiKey_Backspace, false);
-                      g_pending_bs = false;
                   }
+                  g_pending_bs = 0;
               }
 
               menu_init_once();
@@ -1433,14 +1442,17 @@ jobs:
           static fn_getEvent g_orig_get = nullptr;
 
           /* Both input paths (this AInputQueue hook for NativeActivity hosts and
-             the Java dispatchTouchEvent hook in agent.js) deliver events in the
-             SAME coordinate space: raw window pixels. r7/r8 fed them straight into
-             ImGui's DisplaySize, which is the *surface* rect of the GL view - on
-             the sample app that surface (540x832) sits inside a taller window
+             the Java dispatchTouchEvent hook in agent.js) deliver raw event
+             pixels. Since r15 the Java side sends SCREEN coords (getRawX/
+             getRawY) and the map is measured on screen too, so that path is
+             exact on both axes. r7/r8 fed them straight into ImGui's
+             DisplaySize, which is the *surface* rect of the GL view - on the
+             sample app that surface (540x832) sits inside a taller window
              (540x960), so every tap landed above its target. r9 maps the raw
              coords through the rect the agent measured (dextool_set_touch_map)
              before they reach ImGui; this hook therefore forwards untouched
-             window coords and lets overlay.cpp do the mapping. */
+             coords and lets overlay.cpp do the mapping. (AInputQueue coords
+             are window-local - this fallback may need the Settings Y bias.) */
           static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
               int32_t rc = g_orig_get(q, ev);
               if (rc >= 0 && ev && *ev) {
@@ -1623,13 +1635,22 @@ jobs:
               jobject  am  = env->CallObjectMethod(app,
                   env->GetMethodID(env->FindClass("android/content/Context"),
                                    "getAssets","()Landroid/content/res/AssetManager;"));
-              jstring  fds = (jstring)env->CallObjectMethod(app,
+              /* r15 FIX: getFilesDir returns java.io.File, NOT a string.
+                 The r14 code cast that File object straight to jstring and
+                 fed it to GetStringUTFChars - a JNI type mismatch that would
+                 crash the process the moment the native Smali path ran.
+                 Call getAbsolutePath() first; THAT result is the real
+                 jstring. */
+              jobject  fdir = env->CallObjectMethod(app,
                   env->GetMethodID(env->FindClass("android/content/Context"),
                                    "getFilesDir","()Ljava/io/File;"));
-              fds = (jstring)env->CallObjectMethod(fds,
+              if (!fdir || env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
+              jstring  fds = (jstring)env->CallObjectMethod(fdir,
                   env->GetMethodID(env->FindClass("java/io/File"),
                                    "getAbsolutePath","()Ljava/lang/String;"));
+              if (!fds || env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
               const char* fdp = env->GetStringUTFChars(fds, nullptr);
+              if (!fdp) return "";
               char jar[512];
               snprintf(jar, sizeof(jar), "%s/smali-fat.jar", fdp);
               env->ReleaseStringUTFChars(fds, fdp);
@@ -1770,7 +1791,7 @@ jobs:
           static float s_lst_scroll = 1.2f;   /* inner list drag speed */
           static bool  s_visible    = true;
           static bool  s_show_fab   = true;
-          static float s_y_off      = -80.0f; /* manual touch Y bias (px); r13 default = the constant status-bar offset measured on the field device */
+          static float s_y_off      = 0.0f;   /* manual touch Y bias (px); r15: default 0 - the screen-space touch map is mathematically exact, the slider stays for exotic hosts */
 
           /* ---------------- agent / overlay status ---------------- */
           static bool  s_agent_ready = false;
@@ -2140,7 +2161,7 @@ jobs:
                   else if (!strcmp(k, "theme"))  s_theme    = (int)v;
                   else if (!strcmp(k, "ovl"))    s_ovl_scroll = v;
                   else if (!strcmp(k, "lst"))    s_lst_scroll = v;
-                  else if (!strcmp(k, "yoff"))   s_y_off    = v;
+                  else if (!strcmp(k, "ybias"))  s_y_off    = v;   /* r15: key renamed from yoff so a stale saved -80 cannot fight the new mapping */
                   else if (!strcmp(k, "fab"))    s_show_fab = v > 0.5f;
               }
               fclose(f);
@@ -2154,7 +2175,7 @@ jobs:
               fprintf(f, "theme=%d\n",  s_theme);
               fprintf(f, "ovl=%g\n",    s_ovl_scroll);
               fprintf(f, "lst=%g\n",    s_lst_scroll);
-              fprintf(f, "yoff=%g\n",   s_y_off);
+              fprintf(f, "ybias=%g\n",  s_y_off);
               fprintf(f, "fab=%d\n",   s_show_fab ? 1 : 0);
               fclose(f);
               s_conf_dirty = false;
@@ -2846,7 +2867,7 @@ jobs:
                           ImGui::Text("  value:");
                           ImGui::SameLine();
                           ImGui::SetNextItemWidth(140);
-                          ImGui::InputText("##fv", nv[f], sizeof(nv[f]));
+                          ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper - raw InputText never opened the keyboard */
                           ImGui::SameLine();
                           if (ImGui::Button("Set##fs")) {
                               std::string a = "{\"class\":\"" + jesc(c.cname)
@@ -2876,7 +2897,7 @@ jobs:
                           for (int k = 0; k < (int)ps.size() && k < 8; k++) {
                               char lb[64];
                               snprintf(lb, sizeof(lb), "arg%d (%s)", k, ps[k].c_str());
-                              ImGui::InputText(lb, c.call_args[k], sizeof(c.call_args[k]));
+                              ime_textfield(lb, c.call_args[k], sizeof(c.call_args[k]));   /* r15: IME-aware wrapper */
                               na++;
                           }
                       }
@@ -3219,6 +3240,7 @@ jobs:
           #include <cstring>
           #include <ctime>
           #include <cstdio>
+          #include <sys/stat.h>
 
           JavaVM* g_jvm_global = nullptr;
 
@@ -3231,21 +3253,82 @@ jobs:
               close(fd);
           }
 
+          static void write_marker_in(const char* dir, const char* name,
+                                      const char* msg) {
+              char p[600];
+              snprintf(p, sizeof(p), "%s/%s", dir, name);
+              write_marker(p, msg);
+          }
+
+          /* r15: the Java log copier (DexToolApp.copyLogs) reads
+             getFilesDir()/dextool-logs/ - but the native side logged to
+             /sdcard/Download, so the copier never saw the files (and the
+             /sdcard writes themselves fail silently under scoped storage on
+             newer devices). Resolve the app's private dir via JNI and log
+             THERE; /sdcard/Download stays as the fallback when the JVM or
+             the Application is not reachable. */
+          static void resolve_log_dir(char* out, size_t n) {
+              snprintf(out, n, "/sdcard/Download");
+              JNIEnv* env = nullptr;
+              if (!g_jvm_global) return;
+              if (g_jvm_global->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK)
+                  return;
+              if (!env) return;
+              do {
+                  jclass act = env->FindClass("android/app/ActivityThread");
+                  if (!act || env->ExceptionCheck()) break;
+                  jmethodID cur = env->GetStaticMethodID(act,
+                      "currentApplication", "()Landroid/app/Application;");
+                  if (!cur || env->ExceptionCheck()) break;
+                  jobject app = env->CallStaticObjectMethod(act, cur);
+                  if (!app || env->ExceptionCheck()) break;
+                  jclass ctx = env->FindClass("android/content/Context");
+                  if (!ctx || env->ExceptionCheck()) break;
+                  jmethodID gfd = env->GetMethodID(ctx, "getFilesDir",
+                                                   "()Ljava/io/File;");
+                  if (!gfd || env->ExceptionCheck()) break;
+                  jobject fdir = env->CallObjectMethod(app, gfd);
+                  if (!fdir || env->ExceptionCheck()) break;
+                  jclass fio = env->FindClass("java/io/File");
+                  if (!fio || env->ExceptionCheck()) break;
+                  jmethodID gap = env->GetMethodID(fio, "getAbsolutePath",
+                                                   "()Ljava/lang/String;");
+                  if (!gap || env->ExceptionCheck()) break;
+                  jstring js = (jstring)env->CallObjectMethod(fdir, gap);
+                  if (!js || env->ExceptionCheck()) break;
+                  const char* p = env->GetStringUTFChars(js, nullptr);
+                  if (p) {
+                      snprintf(out, n, "%s/dextool-logs", p);
+                      env->ReleaseStringUTFChars(js, p);
+                  }
+              } while (0);
+              if (env->ExceptionCheck()) env->ExceptionClear();
+          }
+
           extern "C" JNIEXPORT jint JNICALL
           JNI_OnLoad(JavaVM* vm, void*) {
               g_jvm_global = vm;
-              write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=entry");
-              logger_init("/sdcard/Download");
+              char base[512];
+              resolve_log_dir(base, sizeof(base));
+              mkdir(base, 0755);       /* entry marker + logs land even on the
+                                          very first boot */
+              write_marker_in(base, "dextool-jni.marker", "checkpoint=entry");
+              logger_init(base);        /* mkdir()s <filesDir>/dextool-logs */
               logger_install_abort_capture();
-              log_info("[JNI_OnLoad] entry");
-              write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=logger_ready");
+              {
+                  char m[600];
+                  snprintf(m, sizeof(m), "[JNI_OnLoad] entry (r15: log dir %s)",
+                           base);
+                  log_info(m);
+              }
+              write_marker_in(base, "dextool-jni.marker", "checkpoint=logger_ready");
               overlay_set_java_vm(vm);
               overlay_start(vm);
               if (!install_swap_hook())
                   log_crash_raw("[JNI_OnLoad] FATAL: install_swap_hook failed\n");
-              write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=hooks_installed");
+              write_marker_in(base, "dextool-jni.marker", "checkpoint=hooks_installed");
               log_info("[JNI_OnLoad] done — awaiting first eglSwapBuffers");
-              write_marker("/sdcard/Download/dextool-jni.marker", "checkpoint=jni_return");
+              write_marker_in(base, "dextool-jni.marker", "checkpoint=jni_return");
               return JNI_VERSION_1_6;
           }
           DXTMAIN
@@ -3254,9 +3337,27 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r14). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r15). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
+
+             r15 changes (code-audit fixes):
+             - IME: activity resolution is now ASYNC-correct. Java.choose
+               fires onMatch LATER - the r14 fallback read the result before
+               the callback ran and always got null. Split into
+               find_current_activity_sync() (ActivityThread walk) and
+               resolve_current_activity(cb) (sync walk first, heap scan
+               second, result consumed strictly inside the callbacks).
+             - IME: the showSoftInput retry ladder is armed even when no
+               activity is known yet; every retry re-resolves and retries,
+               so the hidden EditText + TextWatcher are created as soon as
+               any activity appears (the r14 early return skipped them).
+             - touch: the hook forwards getRawX()/getRawY() (SCREEN coords)
+               and the map is measured with getLocationOnScreen() of the
+               largest SurfaceView/GLSurfaceView/TextureView (content view
+               fallback) - one coordinate space on both sides of the
+               transform; overlay.cpp scales BOTH axes, the -80 px bias
+               default is gone.
 
              r12 changes (field issues from the r11 run):
              - keyboard: the menu pops the PHONE's own keyboard (system IME).
@@ -3412,24 +3513,32 @@ jobs:
               } catch (e) { return false; }
           }
 
-          /* measure where the drawing view sits inside the window and tell the
-             overlay. r11: also called from Activity.onResume (onWindowFocusChanged
-             never fired on the field host) and throttled from every touch, so a
-             relayout at any point in the app's life still updates the map. */
+          /* r15: measure where the overlay's GL view sits ON SCREEN and tell
+             the overlay. Two changes vs r14:
+             - getLocationOnScreen() (screen space) instead of
+               getLocationInWindow() (window space): the hook now forwards
+               getRawX()/getRawY(), so both sides of the transform share the
+               same origin and no device-specific Y bias is needed.
+             - the view measured is the largest SurfaceView / GLSurfaceView /
+               TextureView in the window (that is the surface the overlay
+               actually draws onto); android.R.id.content stays as fallback.
+             Still called from Activity.onResume and throttled from every
+             touch, so a relayout at any point in the app's life still
+             updates the map. */
           var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
           var gMapLastTouch = 0;
           function report_map(view) {
               try {
                   if (!view) return;
                   var loc = Java.array('int', [0, 0]);
-                  view.getLocationInWindow(loc);
+                  view.getLocationOnScreen(loc);
                   var w = view.getWidth(), h = view.getHeight();
+                  if (w <= 0 || h <= 0) return;
                   if (w === gMapSent.w && h === gMapSent.h &&
                       loc[0] === gMapSent.x && loc[1] === gMapSent.y) return;
-                  if (w <= 0 || h <= 0) return;
                   gMapSent = { w: w, h: h, x: loc[0], y: loc[1] };
                   gSetMap(loc[0], loc[1], w, h);
-                  sendMsg('info', { msg: 'touch map ' + loc[0] + ',' + loc[1] + ' ' + w + 'x' + h });
+                  sendMsg('info', { msg: 'touch map (screen): ' + loc[0] + ',' + loc[1] + ' ' + w + 'x' + h });
               } catch (e) {}
           }
           function content_view(activity) {
@@ -3438,6 +3547,41 @@ jobs:
                   return activity.getWindow().getDecorView()
                                   .findViewById(0x01020002);
               } catch (e) { return null; }
+          }
+          /* the view the overlay actually renders onto: the largest
+             SurfaceView / GLSurfaceView / TextureView in the window;
+             falls back to android.R.id.content */
+          function find_gl_view(activity) {
+              try {
+                  var decor = activity.getWindow().getDecorView();
+                  if (!decor) return content_view(activity);
+                  var VG = Java.use('android.view.ViewGroup');
+                  var best = null, bestArea = 0;
+                  var stack = [decor];
+                  while (stack.length) {
+                      var v = stack.pop();
+                      if (v === null || v === undefined) continue;
+                      var cn = '';
+                      try { cn = String(v.getClass().getName()); } catch (e0) {}
+                      if (cn.indexOf('SurfaceView') >= 0 ||
+                          cn.indexOf('GLSurfaceView') >= 0 ||
+                          cn.indexOf('TextureView') >= 0) {
+                          var w = 0, h = 0;
+                          try { w = v.getWidth(); h = v.getHeight(); } catch (e1) {}
+                          if (w > 0 && h > 0 && w * h > bestArea) {
+                              best = v; bestArea = w * h;
+                          }
+                      }
+                      var grp = null;
+                      try { grp = Java.cast(v, VG); } catch (e2) {}
+                      if (grp) {
+                          var n = grp.getChildCount();
+                          for (var i = 0; i < n; i++) stack.push(grp.getChildAt(i));
+                      }
+                  }
+                  if (best) return best;
+              } catch (e3) {}
+              return content_view(activity);
           }
 
           /* ---------------- system IME bridge (r12) ----------------
@@ -3535,57 +3679,81 @@ jobs:
               }
           }
 
+          function ime_try_show() {
+              /* one complete attempt on the main thread: create the hidden
+                 EditText (+ TextWatcher) if needed, focus it, and send
+                 showSoftInput. Returns true only if showSoftInput was sent. */
+              try {
+                  if (!IME.act) return false;
+                  var edit = ime_ensure(IME.act);
+                  if (!edit) return false;
+                  ime_reset_text();
+                  edit.requestFocus();
+                  var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
+                  var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
+                  imm.showSoftInput(edit, 0);
+                  agentLog('ime: showSoftInput sent');
+                  return true;
+              } catch (e) {
+                  sendMsg('error', { fn: 'ime_try_show', msg: String(e.message || e) });
+                  return false;
+              }
+          }
+
           function ime_show() {
               Java.perform(function () {
                   Java.scheduleOnMainThread(function () {
                       try {
-                          /* r13: the onResume hook can miss the FIRST resume (it is
-                             installed while the activity is already resuming), which
-                             left IME.act null forever and the keyboard never opened.
-                             Resolve the current activity on the spot instead of just
-                             warning; the lifecycle tracker keeps it fresh afterwards. */
+                          /* r15: NO early return before the retries. The r14
+                             version bailed out when IME.act was still null and
+                             the whole retry ladder sat behind that return - the
+                             hidden EditText and TextWatcher were never created
+                             and the keyboard never opened. Now: resolve the
+                             activity as far as possible RIGHT NOW (sync walk;
+                             the async heap scan fills IME.act in the
+                             background), then arm the retry ladder
+                             UNCONDITIONALLY - each retry re-resolves and makes
+                             a full attempt, so the bridge comes up as soon as
+                             any activity appears. */
                           if (!IME.act) {
-                              try { IME.act = find_current_activity(); }
-                              catch (e0) {
-                                  agentLog('ime: findAct failed: ' + e0);
-                                  sendMsg('error', { fn: 'findAct',
-                                                     msg: String(e0.message || e0) });
-                              }
+                              try { IME.act = find_current_activity_sync(); }
+                              catch (e0) { agentLog('ime: findAct failed: ' + e0); }
                           }
-                          if (!IME.act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
-                          if (!IME.everLogged) {
+                          if (!IME.act) {
+                              sendMsg('warn', { msg: 'IME: no activity yet - async resolve, retries armed' });
+                              resolve_current_activity(function (a) {
+                                  if (!a) return;
+                                  try { IME.act = a; } catch (e1) {}
+                                  agentLog('ime: activity resolved async');
+                              });
+                          }
+                          if (IME.act && !IME.everLogged) {
                               IME.everLogged = true;
                               try {
                                   sendMsg('info', { msg: 'IME host activity: ' +
                                       IME.act.getClass().getName() });
                               } catch (e5) {}
                           }
-                          var edit = ime_ensure(IME.act);
-                          if (!edit) return;
-                          ime_reset_text();
-                          edit.requestFocus();
-                          var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
-                          /* r14 FIX: this used to read act.getSystemService(...)
-                             - `act` does not exist in this scope, so the FIRST
-                             (and normally only) showSoftInput always threw
-                             ReferenceError and the retry below was never even
-                             scheduled. That is why the keyboard never opened. */
-                          var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
-                          imm.showSoftInput(edit, 0);
-                          agentLog('ime: showSoftInput sent');
+                          ime_try_show();
                           /* the first show right after focus often loses the
-                             race with the window - retry on a ladder; some
-                             hosts also need another requestFocus first */
-                          [150, 450, 900].forEach(function (delay) {
+                             race with the window - retry on a ladder; each
+                             retry also re-resolves the activity (the r14
+                             ladder lived behind the early return and never
+                             ran when IME.act was null) */
+                          [150, 450, 900, 1500].forEach(function (delay) {
                               setTimeout(function () {
                                   Java.scheduleOnMainThread(function () {
                                       try {
-                                          if (!IME.edit || !IME.act) return;
-                                          IME.edit.requestFocus();
-                                          var IM2 = Java.use('android.view.inputmethod.InputMethodManager');
-                                          var imm2 = Java.cast(IME.act.getSystemService('input_method'), IM2);
-                                          imm2.showSoftInput(IME.edit, 0);
-                                          agentLog('ime: retry show at ' + delay + 'ms');
+                                          if (!IME.act) {
+                                              var a = find_current_activity_sync();
+                                              if (a) {
+                                                  IME.act = a;
+                                                  agentLog('ime: activity resolved at retry ' + delay + 'ms');
+                                              }
+                                          }
+                                          if (!IME.act) return;
+                                          if (ime_try_show())
+                                              agentLog('ime: retry ok at ' + delay + 'ms');
                                       } catch (e2) {}
                                   });
                               }, delay);
@@ -3597,52 +3765,64 @@ jobs:
               });
           }
 
-          /* r13: walk ActivityThread.mActivities (IBinder -> ActivityClientRecord)
-             and return a live activity; works with ArrayMap and HashMap because
-             both expose values(). Prefers a record that is neither paused nor
-             stopped. No hook timing involved, so it also covers the very first
-             resume that the onResume hook may have missed. */
-          function find_current_activity() {
-              var at = Java.use('android.app.ActivityThread').currentActivityThread();
-              var acts = at.mActivities.value;
-              var it = acts.values().iterator();
+          /* r15: activity resolution, two layers.
+             find_current_activity_sync(): walk ActivityThread.mActivities
+             (IBinder -> ActivityClientRecord) and return a live activity;
+             works with ArrayMap and HashMap because both expose values().
+             Prefers a record that is neither paused nor stopped. No hook
+             timing involved, so it also covers the very first resume that
+             the onResume hook may have missed. Purely synchronous.
+             resolve_current_activity(cb): sync walk first; if that comes up
+             empty, scan the heap with Java.choose. Java.choose is
+             ASYNCHRONOUS - the r14 fallback read `found` right after the
+             call, before onMatch ever ran, so it ALWAYS returned null. The
+             result is now consumed strictly inside the callbacks: onMatch
+             stores it in IME.act and invokes cb. */
+          function find_current_activity_sync() {
               var best = null;
-              while (it.hasNext()) {
-                  var rec = it.next();
-                  if (rec === null) continue;
-                  var a = null;
-                  try { a = rec.activity.value; } catch (e1) { continue; }
-                  if (a === null) continue;
-                  best = a;
-                  var paused = false, stopped = false;
-                  try { paused = rec.paused.value; } catch (e2) {}
-                  try { stopped = rec.stopped.value; } catch (e3) {}
-                  if (!paused && !stopped) return a;
-              }
-              if (best) return best;
-              /* r14 fallback: the record walk can come up empty on hosts that
-                 recycle ActivityClientRecords; scan the heap for a live one. */
               try {
-                  var found = null;
+                  var at = Java.use('android.app.ActivityThread').currentActivityThread();
+                  var acts = at.mActivities.value;
+                  var it = acts.values().iterator();
+                  while (it.hasNext()) {
+                      var rec = it.next();
+                      if (rec === null) continue;
+                      var a = null;
+                      try { a = rec.activity.value; } catch (e1) { continue; }
+                      if (a === null) continue;
+                      best = a;
+                      var paused = false, stopped = false;
+                      try { paused = rec.paused.value; } catch (e2) {}
+                      try { stopped = rec.stopped.value; } catch (e3) {}
+                      if (!paused && !stopped) return a;
+                  }
+              } catch (e4) {}
+              return best;
+          }
+
+          function resolve_current_activity(cb) {
+              var a = null;
+              try { a = find_current_activity_sync(); } catch (e0) {}
+              if (a) { try { cb(a); } catch (e1) {} return; }
+              /* r15: heap scan - ASYNC; the result is handled in onMatch */
+              try {
                   Java.choose('android.app.Activity', {
-                      onMatch: function (a) {
-                          if (!found) found = a;
-                          return found ? 'stop' : undefined;
+                      onMatch: function (act) {
+                          try { IME.act = act; } catch (e2) {}
+                          try { cb(act); } catch (e3) {}
+                          return 'stop';
                       },
                       onComplete: function () {}
                   });
-                  if (found) return found;
               } catch (e4) {}
-              return best;
           }
 
           /* r13: keep IME.act fresh for every future resume via Application
              callbacks. Unlike the Activity.onResume implementation hook this
              fires for all activities even when the agent lost the race with the
              first resume, and it also tracks activity SWITCHES. It deliberately
-             does NOT call report_map(): the field device calibrated the touch
-             offset against the native estimate, and switching that device to the
-             measured view map would shift taps by the bias it corrected. */
+             does NOT call report_map(): onResume (and the throttled touch
+             path) already re-measure the view rect there. */
           function install_lifecycle() {
               Java.perform(function () {
                   try {
@@ -3704,7 +3884,7 @@ jobs:
                       Activity.onResume.implementation = function () {
                           var r = this.onResume();
                           try { IME.act = this; } catch (e0) {}   /* for the IME */
-                          try { report_map(content_view(this)); } catch (e) {}
+                          try { report_map(find_gl_view(this)); } catch (e) {}
                           return r;
                       };
                       agentLog('phase: onResume hook ok');
@@ -3719,13 +3899,16 @@ jobs:
                       try {
                           var act = ev.getAction() & 0xff;
                           var down = (act === 0);
-                          /* raw window coords first: the overlay maps them */
-                          gNativeTouch(ev.getX(), ev.getY(), act);
+                          /* r15: raw SCREEN coords (getRawX/getRawY) - the
+                             same space the map is measured in
+                             (getLocationOnScreen), so overlay.cpp's transform
+                             is exact on BOTH axes */
+                          gNativeTouch(ev.getRawX(), ev.getRawY(), act);
                           if (act === 2) {          /* throttle map refresh on moves */
                               var now = Date.now();
                               if (now - gMapLastTouch > 2000) {
                                   gMapLastTouch = now;
-                                  report_map(content_view(this));
+                                  report_map(find_gl_view(this));
                               }
                           }
                           /* let the overlay decide (menu/keyboard own the tap) */
@@ -3738,7 +3921,7 @@ jobs:
                       return this.dispatchTouchEvent(ev);         /* original call */
                   };
                   agentLog('phase: dispatchTouchEvent hook ok');
-                  sendMsg('info', { msg: 'touch hook installed (r14)' });
+                  sendMsg('info', { msg: 'touch hook installed (r15, screen coords)' });
               });
           }
 
@@ -5014,11 +5197,19 @@ jobs:
 
       - name: Build sample-nolib-signed.apk (without libtool.so)
         run: |
-          rm -f sample-app/app/src/main/jniLibs/arm64-v8a/libtool.so
-          rm -f sample-app/app/src/main/jniLibs/armeabi-v7a/libtool.so
-          sed -i 's/System\.loadLibrary("tool");//' \
-            sample-app/app/src/main/java/com/dextool/app/DexToolApp.java
-          cd sample-app
+          # r15: build from a scratch copy. The old sed -i stripped
+          # System.loadLibrary from the WORKING TREE, so the commit step
+          # shipped a DexToolApp.java that logs "libtool.so loaded" without
+          # ever calling System.loadLibrary() - exactly what the code audit
+          # flagged. The checked-in source now stays pristine.
+          rm -rf /tmp/nolib-app
+          cp -r sample-app /tmp/nolib-app
+          rm -f /tmp/nolib-app/app/src/main/jniLibs/arm64-v8a/libtool.so
+          rm -f /tmp/nolib-app/app/src/main/jniLibs/armeabi-v7a/libtool.so
+          sed -i -e 's/System\.loadLibrary("tool");//' \
+                 -e 's/Log.i(TAG, "libtool.so loaded");//' \
+            /tmp/nolib-app/app/src/main/java/com/dextool/app/DexToolApp.java
+          cd /tmp/nolib-app
           gradle assembleRelease --no-daemon -q
           cp app/build/outputs/apk/release/app-release.apk \
              "$GITHUB_WORKSPACE/sample-nolib-signed.apk"
@@ -5032,7 +5223,67 @@ jobs:
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
-          ## Fixes in this version (r14)
+          ## Fixes in this version (r15)
+
+          1. The keyboard STILL failed to open on some hosts (code-audit
+             follow-up on r14). Three causes, all fixed:
+             a) the Java.choose heap-scan fallback consumed its result
+                synchronously - Java.choose is ASYNC, onMatch ran after
+                `return found`, so the fallback always returned null.
+                Activity resolution is now callback-based
+                (find_current_activity_sync + resolve_current_activity(cb)).
+             b) ime_show() hit `if (!IME.act) return;` BEFORE the retry
+                ladder, so the hidden EditText + TextWatcher were never
+                created; the showSoftInput retries are armed
+                unconditionally now and each retry re-resolves the
+                activity and retries the keyboard.
+             c) the instance-field editor and the method-call argument
+                fields used raw ImGui::InputText and never asked for the
+                keyboard; every editable field goes through the
+                ime_textfield wrapper now.
+
+          2. Touch mapping rebuilt on ONE coordinate space (the -80 px Y
+             bias is gone): the hook forwards getRawX()/getRawY() (screen
+             coords), the agent measures the GL view (largest
+             SurfaceView/GLSurfaceView/TextureView, content-view fallback)
+             with getLocationOnScreen(), and map_touch() scales BOTH axes
+             proportionally: imgui = (raw - viewOrigin) * (DisplaySize /
+             viewSize). The old scheme mixed view-local getX()/getY() with
+             a window-relative content-view rect, hardcoded the Y scale to
+             1.0 and patched the residue with a device-specific -80 px bias
+             (the logged surface delta was 128 px, so the bias was wrong
+             even on its own terms). Bias default is 0; the Settings slider
+             stays for exotic hosts; the saved-config key was renamed
+             (yoff -> ybias) so a stale -80 cannot fight the new mapping.
+
+          3. Backspace race (overlay.cpp): dextool_backspace() set a single
+             bool, so N backspaces arriving within one frame collapsed into
+             ONE deleted character (characters were queued, backspaces were
+             not). It is a counter now.
+
+          4. smali_runtime.cpp extract_jar(): stored the java.io.File from
+             getFilesDir() in a jstring and fed it to GetStringUTFChars - a
+             JNI type mismatch that would crash the process the moment the
+             native Smali path ran. Calls getAbsolutePath() properly now
+             (with exception checks).
+
+          5. Log paths now MATCH: the native side logs to
+             getFilesDir()/dextool-logs/ - exactly what the DexToolApp
+             copier reads (before: native wrote /sdcard/Download while the
+             copier read the private dir, so neither saw the other; under
+             scoped storage the /sdcard writes failed silently). The JNI
+             markers live in the same folder; /sdcard/Download stays as a
+             fallback when the JVM is not reachable.
+
+          6. Build/git hygiene: the nolib APK is built from a scratch copy,
+             so the committed DexToolApp.java keeps its System.loadLibrary()
+             call (the old sed -i stripped it from the working tree, leaving
+             a misleading "libtool.so loaded" log); the nolib variant also
+             drops that log line. .gitignore covers .gradle/, build/,
+             local.properties, .idea/, captures/ and *.iml, and the commit
+             step untracks them.
+
+          ## Fixes in r14 (still in)
 
           1. The keyboard never opened. ime_show() dereferenced `act` - a
              variable that does not exist in that scope - so EVERY attempt to
@@ -5151,6 +5402,12 @@ jobs:
           dobby-src/
           imgui/
           out/
+          .gradle/
+          build/
+          local.properties
+          .idea/
+          captures/
+          *.iml
           *.zip
           *.tar.*
           DXTGI
@@ -5175,6 +5432,13 @@ jobs:
         run: |
           git fetch origin dev || true
           git checkout -B dev origin/dev 2>/dev/null || git checkout -B dev
+          # r15: untrack the generated build artifacts the audit found in
+          # git (.gradle/, build/, local.properties); .gitignore keeps them
+          # out from now on
+          git rm -r --cached --quiet --ignore-unmatch \
+            sample-app/.gradle sample-app/build sample-app/app/build \
+            sample-app/local.properties sample-app/.idea \
+            sample-app/app/.idea sample-app/captures 2>/dev/null || true
           git add --ignore-errors \
             CMakeLists.txt \
             src/ \
@@ -5186,7 +5450,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r14: IME show ReferenceError fix + robust activity resolution + show retries, phased agent init with native phase markers, small-surface ownership gate, boot memory diagnostics [skip ci]"
+            git commit -m "fix r15: async activity resolution (Java.choose is async) + IME retries armed unconditionally, screen-space touch mapping (rawX/rawY + on-screen origin, both-axis scale, bias default 0), backspace counter, extract_jar JNI type fix, native logs to filesDir/dextool-logs, nolib built from scratch copy, gitignore hygiene [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
