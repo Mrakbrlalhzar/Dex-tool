@@ -3,6 +3,46 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r18)
+
+1. JNI crash / keyboard dead (field report on r17): "JNI DETECTED
+   ERROR IN APPLICATION: use of invalid jobject" -> SIGABRT.
+   Root cause: the r17 touch-hook capture stored `this` RAW in
+   the long-lived IME.act. A Java wrapper handed to a hook
+   implementation is only valid for the duration of that
+   callback - its JNI reference is a LOCAL reference that dies
+   when the callback returns (the frida-java-bridge docs say
+   exactly this and provide Java.retain() for it: "Duplicates a
+   JavaScript wrapper for later use outside replacement
+   method"). The IME logic later calling
+   getSystemService()/showSoftInput() on the stale object aborts
+   the process: the keyboard never opens and the app dies.
+
+2. Fix: every assignment into IME.act now goes through
+   ime_set_act(), which stores a Java.retain()-ed wrapper (a
+   GLOBAL JNI reference - valid after the callback returned,
+   from any thread) and releases the previous retained activity
+   when the tracked one changes, so activity switches never
+   leak global references. The bridge does not export
+   Java.release(), so cleanup calls the wrapper's $dispose()
+   ("eagerly deletes the underlying JNI global reference"),
+   preferring Java.release() if a future bridge provides it.
+
+3. Retention applied to ALL capture sources, not just the touch
+   hook: the onResume hook, the Application lifecycle callback,
+   the ActivityThread.mActivities walk and the Java.choose heap
+   scan all hand out equally callback-scoped wrappers - patching
+   only the touch hook would have left the same SIGABRT one
+   resume away (onResume can even fire before the first touch).
+
+4. Capture logging rebuilt: "ime: activity captured & retained
+   via <source>" fires per NEW activity (identity-checked with
+   .equals - cheap, once per switch, never per touch event), so
+   it covers first capture AND switches. The r17
+   once-per-agent flag is retired, and the "IME host activity"
+   info line moved into ime_set_act so every source reports
+   identically and exactly once.
+
 ## Fixes in this version (r17)
 
 1. IME failure, root cause: missing Activity capture in the touch

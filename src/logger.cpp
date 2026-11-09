@@ -139,7 +139,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r17: touch hook feeds IME.act directly + dead activities filtered from both resolution layers + payload-bearing IME diagnostics; r16 async show + ladder + no-reset kept)");
+    log_info("logger_init done (build r18: IME.act kept as a retained GLOBAL JNI reference - raw hook wrappers are local refs that die with their callback and later use aborted the process with use-of-invalid-jobject; previous ref released on activity change; retention on all capture sources)");
 }
 
 /* r16: re-point the logs at the app's real private dir.

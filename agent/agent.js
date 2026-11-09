@@ -1,7 +1,36 @@
 'use strict';
-/* Dex-tool agent (r17). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r18). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r18 changes (field report: SIGABRT with "JNI DETECTED ERROR IN
+   APPLICATION: use of invalid jobject" - the keyboard never opened
+   and, when the IME path was forced, the app itself crashed):
+   - root cause: the r17 touch-hook capture stored `this` RAW in the
+     long-lived IME.act. A wrapper handed to a hook implementation
+     is only valid for the duration of that callback (its JNI
+     reference is LOCAL and dies when the callback returns); the
+     later getSystemService()/showSoftInput() on the stale object
+     aborts the process. The official bridge docs state exactly
+     this and provide Java.retain() for it: "Duplicates a JavaScript
+     wrapper for later use outside replacement method".
+   - IME.act is stored through ime_set_act() now, which keeps a
+     Java.retain()-ed GLOBAL reference (valid after the callback,
+     on any thread) and releases the previous one when the tracked
+     activity changes, so switches never leak. The bridge does not
+     export Java.release(), so cleanup uses the wrapper's $dispose()
+     ("eagerly deletes the underlying JNI global reference"), with
+     Java.release() preferred if a bridge ever provides it.
+   - retention covers ALL capture sources, not just the touch hook:
+     onResume, the Application lifecycle callback, the
+     ActivityThread walk and the Java.choose heap scan hand out
+     equally callback-scoped wrappers - patching only the touch
+     hook would have left the same crash one resume away.
+   - capture logging: "ime: activity captured & retained via <src>"
+     fires per NEW activity (identity-checked with .equals), i.e.
+     on first capture AND on switches; the r17 once-per-agent flag
+     is retired. The "IME host activity" info line moved into
+     ime_set_act so every source reports identically, exactly once.
 
    r17 changes (field report: on many hosts the touch hook ran but
    no Activity capture ever reached IME.act, so ime_show() fell
@@ -296,9 +325,61 @@ function find_gl_view(activity) {
    one (via .toString() - NOT String(), which is what turned the r10
    bridge into "[object Object]") and forwards the delta to
    libtool.so as dextool_add_char()/dextool_backspace(). */
+/* r18: assign IME.act ONLY through ime_set_act() below. A wrapper
+   handed to a hook or callback is a JNI LOCAL reference - valid
+   for the duration of that callback only; stored raw and used
+   later, it aborts the process with "JNI DETECTED ERROR IN
+   APPLICATION: use of invalid jobject" (SIGABRT). ime_set_act()
+   keeps a retained (global) reference instead and releases the
+   previous one when the tracked activity changes. */
 var IME = { act: null, edit: null, actHash: 0, prev: '',
-            silent: false, cnt: 0, everLogged: false,
-            actFromTouch: false };   /* r17: once-log gate */
+            silent: false, cnt: 0, everLogged: false };
+
+/* r18: release the previous retained activity. The bridge does not
+   export Java.release(), so the documented cleanup is the
+   wrapper's $dispose() ("eagerly deletes the underlying JNI
+   global reference"); Java.release() is preferred if some bridge
+   ever provides it. Best-effort: if neither exists, the JS-GC
+   finalizer releases the ref eventually. */
+function ime_release_act(obj) {
+    try {
+        if (!obj) return;
+        if (typeof Java.release === 'function') { Java.release(obj); return; }
+        if (typeof obj.$dispose === 'function') obj.$dispose();
+    } catch (e) {}
+}
+/* r18: the ONLY writer of IME.act. Stores a Java.retain()-ed
+   wrapper (global reference, valid after the producing callback
+   returned and from any thread), releases the previous retained
+   activity when the tracked one changes, and logs each real
+   capture transition exactly once. */
+function ime_set_act(obj, how) {
+    if (!obj) return false;
+    try {
+        if (IME.act) {
+            var same = false;
+            try { same = IME.act.equals(obj); } catch (eQ) { same = false; }
+            if (same) return false;   /* already tracked - reuse */
+            ime_release_act(IME.act);
+        }
+        try {
+            IME.act = Java.retain(obj);   /* promote to GLOBAL ref */
+        } catch (eT) {
+            IME.act = obj;                /* ancient bridge fallback */
+        }
+        agentLog('ime: activity captured & retained via ' + how);
+        if (!IME.everLogged) {
+            IME.everLogged = true;
+            try {
+                sendMsg('info', { msg: 'IME host activity: ' +
+                    IME.act.getClass().getName() });
+            } catch (eN) {}
+        }
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
 
 function ime_on_text(ed) {
     try {
@@ -432,15 +513,10 @@ function ime_try_show(reset) {
      the user may already be typing. */
 function ime_act_resolved(a, how) {
     if (!a) return;
-    try { IME.act = a; } catch (e0) { return; }
-    agentLog('ime: activity resolved ' + how);
-    if (!IME.everLogged) {
-        IME.everLogged = true;
-        try {
-            sendMsg('info', { msg: 'IME host activity: ' +
-                IME.act.getClass().getName() });
-        } catch (e1) {}
-    }
+    /* r18: retained through ime_set_act, NOT stored raw - the
+       walk/heap-scan wrapper is callback-scoped exactly like the
+       touch hook's `this` (same invalid-jobject abort). */
+    ime_set_act(a, 'async resolve (' + how + ')');
     Java.scheduleOnMainThread(function () {
         try {
             if (ime_try_show(false))
@@ -466,7 +542,8 @@ function ime_show() {
                    any activity appears. */
                 var walkErr = null;   /* r17: warn payload, belt+braces */
                 if (!IME.act) {
-                    try { IME.act = find_current_activity_sync(); }
+                    try { ime_set_act(find_current_activity_sync(),
+                                      'sync walk'); }   /* r18: retained */
                     catch (e0) {
                         walkErr = String(e0.message || e0);
                         agentLog('ime: findAct failed: ' + walkErr);
@@ -492,13 +569,9 @@ function ime_show() {
                         ime_act_resolved(a, 'async');
                     });
                 }
-                if (IME.act && !IME.everLogged) {
-                    IME.everLogged = true;
-                    try {
-                        sendMsg('info', { msg: 'IME host activity: ' +
-                            IME.act.getClass().getName() });
-                    } catch (e5) {}
-                }
+                /* r18: the "IME host activity" info line moved into
+                   ime_set_act (fires on the FIRST capture from any
+                   source); removed here - no double logging. */
                 ime_try_show(true);   /* r16: only the first attempt resets */
                 /* the first show right after focus often loses the
                    race with the window - retry on a ladder; each
@@ -634,7 +707,7 @@ function resolve_current_activity(cb) {
                 try { dead = act.isFinishing() || act.isDestroyed(); }
                 catch (eX) {}
                 if (dead) return;   /* keep scanning */
-                try { IME.act = act; } catch (e2) {}
+                ime_set_act(act, 'heap scan');   /* r18: retained */
                 try { cb(act); } catch (e3) {}
                 return 'stop';
             },
@@ -660,7 +733,12 @@ function install_lifecycle() {
                 methods: {
                     onActivityCreated: function (a, b) {},
                     onActivityStarted: function (a) {},
-                    onActivityResumed: function (a) { try { IME.act = a; } catch (e0) {} },
+                    onActivityResumed: function (a) {
+                        /* r18: retained via ime_set_act - the callback
+                           argument is as callback-scoped as a hook's
+                           `this` (same invalid-jobject abort class) */
+                        try { ime_set_act(a, 'lifecycle'); } catch (e0) {}
+                    },
                     onActivityPaused: function (a) {},
                     onActivityStopped: function (a) {},
                     onActivitySaveInstanceState: function (a, b) {},
@@ -709,7 +787,10 @@ function installTouchHook() {
         try {
             Activity.onResume.implementation = function () {
                 var r = this.onResume();
-                try { IME.act = this; } catch (e0) {}   /* for the IME */
+                /* r18: retained via ime_set_act - raw `this` is a JNI
+                   LOCAL reference that dies when this callback returns;
+                   using it later is the exact r17 crash */
+                try { ime_set_act(this, 'onResume'); } catch (e0) {}
                 try { report_map(find_gl_view(this)); } catch (e) {}
                 return r;
             };
@@ -722,25 +803,26 @@ function installTouchHook() {
         agentLog('phase: hooking Activity.dispatchTouchEvent');
         Activity.dispatchTouchEvent.implementation = function (ev) {
             /* MAIN THREAD */
-            /* r17 FIX (root cause of the r16 field failure): feed
-               the IME context from the touch path. The onResume
-               hook only fires when the agent wins the race with
-               the FIRST resume - on a late-attached agent IME.act
-               stayed null until the NEXT resume and ime_show()
-               was thrown back to the fragile ActivityThread walk /
-               heap scan, which on many hosts never finds the
-               resumed activity, so showSoftInput never ran. A tap
-               on THIS activity's window is itself proof of a live,
-               resumed activity. Assigned on every event (keeps
-               IME.act fresh across activity switches too); logged
-               ONCE - dispatchTouchEvent fires at event rate, so an
-               unconditional log would flood logcat. */
+            /* r18 FIX (root cause of the r17 field crash): the r17
+               capture stored `this` RAW in the long-lived IME.act.
+               A wrapper handed to a hook implementation is only
+               valid for the duration of that callback - its JNI
+               local reference dies when the callback returns, and
+               the later getSystemService()/showSoftInput() on
+               IME.act then aborts the process with "JNI DETECTED
+               ERROR IN APPLICATION: use of invalid jobject"
+               (SIGABRT): keyboard dead AND app dead. ime_set_act()
+               stores a Java.retain()-ed GLOBAL reference instead
+               (valid after the callback, on any thread) and
+               releases the previous retained activity when the
+               tracked one changes, so nothing leaks. The tap that
+               opens the menu is still proof of a live, resumed
+               activity (r17 rationale kept); the identity check
+               keeps this branch cheap and the log per-activity,
+               not per-event. */
             try {
-                IME.act = this;
-                if (!IME.actFromTouch) {
-                    IME.actFromTouch = true;
-                    agentLog('ime: activity captured via touch hook');
-                }
+                if (!IME.act || !IME.act.equals(this))
+                    ime_set_act(this, 'touch hook');
             } catch (eAct) {}
             try {
                 var act = ev.getAction() & 0xff;
