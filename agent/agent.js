@@ -574,11 +574,10 @@ function ime_create_edit(act) {
                     (typeof LP.$new));
             return LP.$new(1, 1);
         });
-        ime_stage('decor.addView', function () {
-            if (typeof decor.addView !== 'function')
-                throw new Error('decor.addView typeof ' +
-                    (typeof decor.addView));
-            decor.addView(edit, lp);
+        ime_stage('act.addContentView', function () { 
+            if (typeof act.addContentView !== 'function') 
+                throw new Error('act.addContentView typeof ' + (typeof act.addContentView)); 
+            act.addContentView(edit, lp); 
         });
         var tag = (++IME.cnt) + '_' + (Date.now() % 1000000);
         var tw = ime_stage('registerClass TextWatcher', function () {
