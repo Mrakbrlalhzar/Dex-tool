@@ -1,7 +1,33 @@
 'use strict';
-/* Dex-tool agent (r19). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r20). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r20 changes (field report on r19: the r19 diagnostics worked -
+   the payload now reads {"fn":"ime_create_edit","msg":"not a
+   function"}, once per ladder attempt. The failure is INSIDE
+   the hidden-EditText factory):
+   - root finding: the GumJS backend is QuickJS, and QuickJS
+     reports any call through a missing/broken callee as a bare
+     "not a function" - NO callee name (V8 would say
+     "x.y is not a function"). Every r19 typeof guard passed
+     silently (no "lacks act.getWindow", no probe/rewrap
+     failure, no "no background-clear API"), so the dying call
+     is one of the unguarded ones between act.getWindow() and
+     setOnEditorActionListener() - indistinguishable from a
+     bare message.
+   - fix: ime_stage(name, fn) wraps EVERY call in the IME path
+     (factory + ime_try_show); each callee is typeof-verified
+     BEFORE the call and each failure rethrows as
+     "stage <name>: <original>", so the next [agent error]
+     names the exact call, e.g. "stage decor.addView: not a
+     function". No behavior change on success.
+   - one-shot view-map probe after the first activity capture:
+     report_map()/find_gl_view() swallow their own errors, so
+     the same failure class could hide there; the probe logs
+     "view map probe ok/failed: <reason>" once.
+   - everything from r19 (retain + probe/rewrap, defensive
+     factory resolution, delegating ime_ensure alias) is kept.
 
    r19 changes (field report: tapping a text field logged
    "[agent error] ... ime_ensure ... not a function" and the
@@ -362,7 +388,8 @@ function find_gl_view(activity) {
    keeps a retained (global) reference instead and releases the
    previous one when the tracked activity changes. */
 var IME = { act: null, edit: null, actHash: 0, prev: '',
-            silent: false, cnt: 0, everLogged: false };
+            silent: false, cnt: 0, everLogged: false,
+            mapProbed: false };   /* r20: one-shot view-map probe */
 
 /* r18: release the previous retained activity. The bridge does not
    export Java.release(), so the documented cleanup is the
@@ -467,6 +494,23 @@ function ime_reset_text() {
     } catch (e) { IME.silent = false; }
 }
 
+/* r20: QuickJS (the GumJS QJS backend) reports ANY call through a
+   missing or non-callable value as a bare "not a function" -
+   WITHOUT the callee name (V8 says "x.y is not a function",
+   QuickJS does not). The r19 field log ("msg":"not a function"
+   under fn:ime_create_edit, 5x per tap = the whole retry
+   ladder) therefore proved the failure is inside the factory
+   but not WHICH call dies. Every risky call in the IME path is
+   wrapped in a stage tag now: the next error payload reads
+   "stage <name>: <original message>" and pins the exact call. */
+function ime_stage(name, fn) {
+    try { return fn(); }
+    catch (eS) {
+        throw new Error('stage ' + name + ': ' +
+            String((eS && eS.message) || eS));
+    }
+}
+
 /* r19: renamed from ime_ensure() to ime_create_edit() - the
    canonical factory name. Every Activity/View method touched
    here is typeof-guarded now: if a bridge or OEM build lacks a
@@ -485,48 +529,104 @@ function ime_create_edit(act) {
         }
         IME.edit = null;               /* activity switched */
         IME.prev = '';
-        var decor = act.getWindow().getDecorView();
-        var ET = Java.use('android.widget.EditText');
-        var edit = ET.$new(act);
-        /* r19: setBackgroundDrawable is deprecated-but-present on
-           every current API; setBackground is the modern name.
-           Use whichever this bridge exposes; if neither exists,
-           say so instead of throwing. */
-        if (typeof edit.setBackgroundDrawable === 'function')
-            edit.setBackgroundDrawable(null);   /* 1x1, transparent */
-        else if (typeof edit.setBackground === 'function')
-            edit.setBackground(null);
-        else
-            agentLog('ime: no background-clear API on EditText (skipped)');
-        if (typeof edit.setAlpha === 'function') edit.setAlpha(0);
-        var LP = Java.use('android.widget.FrameLayout$LayoutParams');
-        var lp = LP.$new(1, 1);
-        decor.addView(edit, lp);
+        /* r20: every step below is stage-tagged - see ime_stage().
+           Each callee is typeof-verified BEFORE the call, so a
+           missing member is named exactly; a present-but-throwing
+           member surfaces as "stage <name>: <original>". */
+        var win = ime_stage('act.getWindow', function () {
+            var w = act.getWindow();
+            if (w === null || w === undefined)
+                throw new Error('act.getWindow() returned ' + w);
+            return w;
+        });
+        var decor = ime_stage('window.getDecorView', function () {
+            if (typeof win.getDecorView !== 'function')
+                throw new Error('window.getDecorView typeof ' +
+                    (typeof win.getDecorView));
+            return win.getDecorView();
+        });
+        var edit = ime_stage('EditText.$new', function () {
+            var ET = Java.use('android.widget.EditText');
+            if (typeof ET.$new !== 'function')
+                throw new Error('EditText.$new typeof ' +
+                    (typeof ET.$new));
+            return ET.$new(act);
+        });
+        ime_stage('clear background', function () {
+            /* r19: setBackgroundDrawable is deprecated-but-present on
+               every current API; setBackground is the modern name.
+               Use whichever this bridge exposes; if neither exists,
+               say so instead of throwing. */
+            if (typeof edit.setBackgroundDrawable === 'function')
+                edit.setBackgroundDrawable(null);   /* 1x1, transparent */
+            else if (typeof edit.setBackground === 'function')
+                edit.setBackground(null);
+            else
+                agentLog('ime: no background-clear API on EditText (skipped)');
+        });
+        ime_stage('set alpha', function () {
+            if (typeof edit.setAlpha === 'function') edit.setAlpha(0);
+        });
+        var lp = ime_stage('FrameLayout$LayoutParams.$new', function () {
+            var LP = Java.use('android.widget.FrameLayout$LayoutParams');
+            if (typeof LP.$new !== 'function')
+                throw new Error('LayoutParams.$new typeof ' +
+                    (typeof LP.$new));
+            return LP.$new(1, 1);
+        });
+        ime_stage('decor.addView', function () {
+            if (typeof decor.addView !== 'function')
+                throw new Error('decor.addView typeof ' +
+                    (typeof decor.addView));
+            decor.addView(edit, lp);
+        });
         var tag = (++IME.cnt) + '_' + (Date.now() % 1000000);
-        var TW = Java.registerClass({
-            name: 'com.dextool.ime.W' + tag,
-            implements: [Java.use('android.text.TextWatcher')],
-            methods: {
-                beforeTextChanged: function (s, a, b, c) {},
-                onTextChanged: function (s, a, b, c) {},
-                afterTextChanged: function (ed) { ime_on_text(ed); }
-            }
-        });
-        edit.addTextChangedListener(TW.$new());
-        var EA = Java.registerClass({
-            name: 'com.dextool.ime.E' + tag,
-            implements: [Java.use('android.widget.TextView$OnEditorActionListener')],
-            methods: {
-                onEditorAction: function (v, actionId, ev) {
-                    /* Done/Next on the IME: release the menu field so
-                       the next tap on it re-opens the keyboard */
-                    sendMsg('imeHidden', {});
-                    ime_reset_text();
-                    return false;
+        var tw = ime_stage('registerClass TextWatcher', function () {
+            var TW = Java.registerClass({
+                name: 'com.dextool.ime.W' + tag,
+                implements: [Java.use('android.text.TextWatcher')],
+                methods: {
+                    beforeTextChanged: function (s, a, b, c) {},
+                    onTextChanged: function (s, a, b, c) {},
+                    afterTextChanged: function (ed) { ime_on_text(ed); }
                 }
-            }
+            });
+            if (typeof TW.$new !== 'function')
+                throw new Error('watcher class $new typeof ' +
+                    (typeof TW.$new));
+            return TW.$new();
         });
-        edit.setOnEditorActionListener(EA.$new());
+        ime_stage('addTextChangedListener', function () {
+            if (typeof edit.addTextChangedListener !== 'function')
+                throw new Error('edit.addTextChangedListener typeof ' +
+                    (typeof edit.addTextChangedListener));
+            edit.addTextChangedListener(tw);
+        });
+        var ea = ime_stage('registerClass EditorActionListener', function () {
+            var EA = Java.registerClass({
+                name: 'com.dextool.ime.E' + tag,
+                implements: [Java.use('android.widget.TextView$OnEditorActionListener')],
+                methods: {
+                    onEditorAction: function (v, actionId, ev) {
+                        /* Done/Next on the IME: release the menu field so
+                           the next tap on it re-opens the keyboard */
+                        sendMsg('imeHidden', {});
+                        ime_reset_text();
+                        return false;
+                    }
+                }
+            });
+            if (typeof EA.$new !== 'function')
+                throw new Error('editor-action class $new typeof ' +
+                    (typeof EA.$new));
+            return EA.$new();
+        });
+        ime_stage('setOnEditorActionListener', function () {
+            if (typeof edit.setOnEditorActionListener !== 'function')
+                throw new Error('edit.setOnEditorActionListener typeof ' +
+                    (typeof edit.setOnEditorActionListener));
+            edit.setOnEditorActionListener(ea);
+        });
         IME.edit = edit;
         IME.actHash = h;
         return edit;
@@ -577,15 +677,24 @@ function ime_try_show(reset) {
         var edit = makeEdit(IME.act);
         if (!edit) return false;
         if (reset !== false) ime_reset_text();
-        edit.requestFocus();
-        var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
-        var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
-        var sent = imm.showSoftInput(edit, 0);
-        /* r17: log the REAL result - false here (window token not
-           ready, focus not granted yet) was invisible before and
-           is the classic "sent but nothing happened" failure that
-           the retry ladder exists for */
-        agentLog('ime: showSoftInput sent -> ' + sent);
+        /* r20: same stage tagging as the factory - if the factory
+           ever passes and the next failure lands here, the payload
+           names the exact call instead of a bare TypeError. */
+        ime_stage('edit.requestFocus', function () {
+            edit.requestFocus();
+        });
+        var imm = ime_stage('getSystemService(input_method)', function () {
+            var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
+            return Java.cast(IME.act.getSystemService('input_method'), IMMgr);
+        });
+        ime_stage('showSoftInput', function () {
+            var sent = imm.showSoftInput(edit, 0);
+            /* r17: log the REAL result - false here (window token not
+               ready, focus not granted yet) was invisible before and
+               is the classic "sent but nothing happened" failure that
+               the retry ladder exists for */
+            agentLog('ime: showSoftInput sent -> ' + sent);
+        });
         return true;
     } catch (e) {
         sendMsg('error', { fn: 'ime_try_show', msg: String(e.message || e) });
@@ -916,6 +1025,21 @@ function installTouchHook() {
                 if (!IME.act || !IME.act.equals(this))
                     ime_set_act(this, 'touch hook');
             } catch (eAct) {}
+            /* r20: one-shot view-map probe. report_map() and
+               find_gl_view() swallow their own errors, so the same
+               failure class that kills the IME factory would hide
+               here. Run the measurement once after the first
+               capture and log the outcome verbatim. */
+            if (IME.act && !IME.mapProbed) {
+                IME.mapProbed = true;
+                try {
+                    report_map(find_gl_view(this));
+                    agentLog('ime: view map probe ok');
+                } catch (eM) {
+                    agentLog('ime: view map probe failed: ' +
+                        String((eM && eM.message) || eM));
+                }
+            }
             try {
                 var act = ev.getAction() & 0xff;
                 var down = (act === 0);
@@ -941,7 +1065,7 @@ function installTouchHook() {
             return this.dispatchTouchEvent(ev);         /* original call */
         };
         agentLog('phase: dispatchTouchEvent hook ok');
-        sendMsg('info', { msg: 'touch hook installed (r19, screen coords + IME activity capture)' });
+        sendMsg('info', { msg: 'touch hook installed (r20, screen coords + IME activity capture)' });
     });
 }
 
@@ -1905,6 +2029,6 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r19 loaded' });
+    sendMsg('ready', { msg: 'Dex-tool agent r20 loaded' });
     agentLog('phase: ready sent');
 }, 0);

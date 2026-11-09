@@ -139,7 +139,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r19: IME factory renamed to ime_create_edit with legacy ime_ensure alias, ime_try_show resolves the factory defensively and logs typeof diagnostics instead of a bare TypeError, Java.retain result verified for method access and re-wrapped via Java.cast when needed, EditText method calls typeof-guarded with exact-member diagnostics)");
+    log_info("logger_init done (build r20: IME path stage-tagged - every call in ime_create_edit/ime_try_show is typeof-verified and wrapped in ime_stage() so the next failure reports 'stage <name>: <original>' instead of QuickJS's bare 'not a function', one-shot view-map probe after first capture, r19 retain/alias/guards kept)");
 }
 
 /* r16: re-point the logs at the app's real private dir.

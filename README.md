@@ -3,6 +3,35 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r20)
+
+1. Field evidence (r19 build, device logs): capture and retention
+   work ("activity captured & retained via touch hook"), every
+   r19 typeof guard passed silently, and each ladder attempt
+   dies inside the hidden-EditText factory with
+   {"fn":"ime_create_edit","msg":"not a function"}.
+
+2. Why the exact call was still unknown: the GumJS backend is
+   QuickJS, and QuickJS reports any broken call as a bare
+   "not a function" WITHOUT the callee name (unlike V8's
+   "x.y is not a function"). A bare message cannot distinguish
+   window.getDecorView() from EditText.$new(),
+   FrameLayout$LayoutParams.$new(), decor.addView(),
+   Java.registerClass() or the listener installs.
+
+3. Fix: ime_stage(name, fn) wraps every call in the IME path
+   (factory + ime_try_show). Each callee is typeof-verified
+   before the call and every failure rethrows as
+   "stage <name>: <original>", so the next [agent error]
+   payload names the exact call (e.g. "stage decor.addView:
+   not a function"). Zero behavior change on success.
+
+4. One-shot view-map probe: after the first activity capture the
+   touch hook measures the overlay view once and logs
+   "ime: view map probe ok" or the exact failure - report_map()
+   and find_gl_view() swallow their own errors, so the same
+   failure class used to hide there.
+
 ## Fixes in this version (r19)
 
 1. Symptom (field report on r18): tapping a text field logged
