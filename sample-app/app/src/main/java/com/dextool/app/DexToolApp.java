@@ -22,7 +22,7 @@ public class DexToolApp extends Application {
         try { Thread.sleep(500); } catch (InterruptedException ignored) {}
         installUncaughtHandler();
         try {
-            
+            System.loadLibrary("tool");
             Log.i(TAG, "libtool.so loaded");
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "loadLibrary failed: " + e.getMessage());

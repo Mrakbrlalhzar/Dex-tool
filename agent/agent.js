@@ -1,7 +1,25 @@
 'use strict';
-/* Dex-tool agent (r14). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r15). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r15 changes (code-audit fixes):
+   - IME: activity resolution is now ASYNC-correct. Java.choose
+     fires onMatch LATER - the r14 fallback read the result before
+     the callback ran and always got null. Split into
+     find_current_activity_sync() (ActivityThread walk) and
+     resolve_current_activity(cb) (sync walk first, heap scan
+     second, result consumed strictly inside the callbacks).
+   - IME: the showSoftInput retry ladder is armed even when no
+     activity is known yet; every retry re-resolves and retries,
+     so the hidden EditText + TextWatcher are created as soon as
+     any activity appears (the r14 early return skipped them).
+   - touch: the hook forwards getRawX()/getRawY() (SCREEN coords)
+     and the map is measured with getLocationOnScreen() of the
+     largest SurfaceView/GLSurfaceView/TextureView (content view
+     fallback) - one coordinate space on both sides of the
+     transform; overlay.cpp scales BOTH axes, the -80 px bias
+     default is gone.
 
    r12 changes (field issues from the r11 run):
    - keyboard: the menu pops the PHONE's own keyboard (system IME).
@@ -157,24 +175,32 @@ function ensure_native_fns() {
     } catch (e) { return false; }
 }
 
-/* measure where the drawing view sits inside the window and tell the
-   overlay. r11: also called from Activity.onResume (onWindowFocusChanged
-   never fired on the field host) and throttled from every touch, so a
-   relayout at any point in the app's life still updates the map. */
+/* r15: measure where the overlay's GL view sits ON SCREEN and tell
+   the overlay. Two changes vs r14:
+   - getLocationOnScreen() (screen space) instead of
+     getLocationInWindow() (window space): the hook now forwards
+     getRawX()/getRawY(), so both sides of the transform share the
+     same origin and no device-specific Y bias is needed.
+   - the view measured is the largest SurfaceView / GLSurfaceView /
+     TextureView in the window (that is the surface the overlay
+     actually draws onto); android.R.id.content stays as fallback.
+   Still called from Activity.onResume and throttled from every
+   touch, so a relayout at any point in the app's life still
+   updates the map. */
 var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
 var gMapLastTouch = 0;
 function report_map(view) {
     try {
         if (!view) return;
         var loc = Java.array('int', [0, 0]);
-        view.getLocationInWindow(loc);
+        view.getLocationOnScreen(loc);
         var w = view.getWidth(), h = view.getHeight();
+        if (w <= 0 || h <= 0) return;
         if (w === gMapSent.w && h === gMapSent.h &&
             loc[0] === gMapSent.x && loc[1] === gMapSent.y) return;
-        if (w <= 0 || h <= 0) return;
         gMapSent = { w: w, h: h, x: loc[0], y: loc[1] };
         gSetMap(loc[0], loc[1], w, h);
-        sendMsg('info', { msg: 'touch map ' + loc[0] + ',' + loc[1] + ' ' + w + 'x' + h });
+        sendMsg('info', { msg: 'touch map (screen): ' + loc[0] + ',' + loc[1] + ' ' + w + 'x' + h });
     } catch (e) {}
 }
 function content_view(activity) {
@@ -183,6 +209,41 @@ function content_view(activity) {
         return activity.getWindow().getDecorView()
                         .findViewById(0x01020002);
     } catch (e) { return null; }
+}
+/* the view the overlay actually renders onto: the largest
+   SurfaceView / GLSurfaceView / TextureView in the window;
+   falls back to android.R.id.content */
+function find_gl_view(activity) {
+    try {
+        var decor = activity.getWindow().getDecorView();
+        if (!decor) return content_view(activity);
+        var VG = Java.use('android.view.ViewGroup');
+        var best = null, bestArea = 0;
+        var stack = [decor];
+        while (stack.length) {
+            var v = stack.pop();
+            if (v === null || v === undefined) continue;
+            var cn = '';
+            try { cn = String(v.getClass().getName()); } catch (e0) {}
+            if (cn.indexOf('SurfaceView') >= 0 ||
+                cn.indexOf('GLSurfaceView') >= 0 ||
+                cn.indexOf('TextureView') >= 0) {
+                var w = 0, h = 0;
+                try { w = v.getWidth(); h = v.getHeight(); } catch (e1) {}
+                if (w > 0 && h > 0 && w * h > bestArea) {
+                    best = v; bestArea = w * h;
+                }
+            }
+            var grp = null;
+            try { grp = Java.cast(v, VG); } catch (e2) {}
+            if (grp) {
+                var n = grp.getChildCount();
+                for (var i = 0; i < n; i++) stack.push(grp.getChildAt(i));
+            }
+        }
+        if (best) return best;
+    } catch (e3) {}
+    return content_view(activity);
 }
 
 /* ---------------- system IME bridge (r12) ----------------
@@ -280,57 +341,81 @@ function ime_ensure(act) {
     }
 }
 
+function ime_try_show() {
+    /* one complete attempt on the main thread: create the hidden
+       EditText (+ TextWatcher) if needed, focus it, and send
+       showSoftInput. Returns true only if showSoftInput was sent. */
+    try {
+        if (!IME.act) return false;
+        var edit = ime_ensure(IME.act);
+        if (!edit) return false;
+        ime_reset_text();
+        edit.requestFocus();
+        var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
+        var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
+        imm.showSoftInput(edit, 0);
+        agentLog('ime: showSoftInput sent');
+        return true;
+    } catch (e) {
+        sendMsg('error', { fn: 'ime_try_show', msg: String(e.message || e) });
+        return false;
+    }
+}
+
 function ime_show() {
     Java.perform(function () {
         Java.scheduleOnMainThread(function () {
             try {
-                /* r13: the onResume hook can miss the FIRST resume (it is
-                   installed while the activity is already resuming), which
-                   left IME.act null forever and the keyboard never opened.
-                   Resolve the current activity on the spot instead of just
-                   warning; the lifecycle tracker keeps it fresh afterwards. */
+                /* r15: NO early return before the retries. The r14
+                   version bailed out when IME.act was still null and
+                   the whole retry ladder sat behind that return - the
+                   hidden EditText and TextWatcher were never created
+                   and the keyboard never opened. Now: resolve the
+                   activity as far as possible RIGHT NOW (sync walk;
+                   the async heap scan fills IME.act in the
+                   background), then arm the retry ladder
+                   UNCONDITIONALLY - each retry re-resolves and makes
+                   a full attempt, so the bridge comes up as soon as
+                   any activity appears. */
                 if (!IME.act) {
-                    try { IME.act = find_current_activity(); }
-                    catch (e0) {
-                        agentLog('ime: findAct failed: ' + e0);
-                        sendMsg('error', { fn: 'findAct',
-                                           msg: String(e0.message || e0) });
-                    }
+                    try { IME.act = find_current_activity_sync(); }
+                    catch (e0) { agentLog('ime: findAct failed: ' + e0); }
                 }
-                if (!IME.act) { sendMsg('warn', { msg: 'IME: no activity seen yet' }); return; }
-                if (!IME.everLogged) {
+                if (!IME.act) {
+                    sendMsg('warn', { msg: 'IME: no activity yet - async resolve, retries armed' });
+                    resolve_current_activity(function (a) {
+                        if (!a) return;
+                        try { IME.act = a; } catch (e1) {}
+                        agentLog('ime: activity resolved async');
+                    });
+                }
+                if (IME.act && !IME.everLogged) {
                     IME.everLogged = true;
                     try {
                         sendMsg('info', { msg: 'IME host activity: ' +
                             IME.act.getClass().getName() });
                     } catch (e5) {}
                 }
-                var edit = ime_ensure(IME.act);
-                if (!edit) return;
-                ime_reset_text();
-                edit.requestFocus();
-                var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
-                /* r14 FIX: this used to read act.getSystemService(...)
-                   - `act` does not exist in this scope, so the FIRST
-                   (and normally only) showSoftInput always threw
-                   ReferenceError and the retry below was never even
-                   scheduled. That is why the keyboard never opened. */
-                var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
-                imm.showSoftInput(edit, 0);
-                agentLog('ime: showSoftInput sent');
+                ime_try_show();
                 /* the first show right after focus often loses the
-                   race with the window - retry on a ladder; some
-                   hosts also need another requestFocus first */
-                [150, 450, 900].forEach(function (delay) {
+                   race with the window - retry on a ladder; each
+                   retry also re-resolves the activity (the r14
+                   ladder lived behind the early return and never
+                   ran when IME.act was null) */
+                [150, 450, 900, 1500].forEach(function (delay) {
                     setTimeout(function () {
                         Java.scheduleOnMainThread(function () {
                             try {
-                                if (!IME.edit || !IME.act) return;
-                                IME.edit.requestFocus();
-                                var IM2 = Java.use('android.view.inputmethod.InputMethodManager');
-                                var imm2 = Java.cast(IME.act.getSystemService('input_method'), IM2);
-                                imm2.showSoftInput(IME.edit, 0);
-                                agentLog('ime: retry show at ' + delay + 'ms');
+                                if (!IME.act) {
+                                    var a = find_current_activity_sync();
+                                    if (a) {
+                                        IME.act = a;
+                                        agentLog('ime: activity resolved at retry ' + delay + 'ms');
+                                    }
+                                }
+                                if (!IME.act) return;
+                                if (ime_try_show())
+                                    agentLog('ime: retry ok at ' + delay + 'ms');
                             } catch (e2) {}
                         });
                     }, delay);
@@ -342,52 +427,64 @@ function ime_show() {
     });
 }
 
-/* r13: walk ActivityThread.mActivities (IBinder -> ActivityClientRecord)
-   and return a live activity; works with ArrayMap and HashMap because
-   both expose values(). Prefers a record that is neither paused nor
-   stopped. No hook timing involved, so it also covers the very first
-   resume that the onResume hook may have missed. */
-function find_current_activity() {
-    var at = Java.use('android.app.ActivityThread').currentActivityThread();
-    var acts = at.mActivities.value;
-    var it = acts.values().iterator();
+/* r15: activity resolution, two layers.
+   find_current_activity_sync(): walk ActivityThread.mActivities
+   (IBinder -> ActivityClientRecord) and return a live activity;
+   works with ArrayMap and HashMap because both expose values().
+   Prefers a record that is neither paused nor stopped. No hook
+   timing involved, so it also covers the very first resume that
+   the onResume hook may have missed. Purely synchronous.
+   resolve_current_activity(cb): sync walk first; if that comes up
+   empty, scan the heap with Java.choose. Java.choose is
+   ASYNCHRONOUS - the r14 fallback read `found` right after the
+   call, before onMatch ever ran, so it ALWAYS returned null. The
+   result is now consumed strictly inside the callbacks: onMatch
+   stores it in IME.act and invokes cb. */
+function find_current_activity_sync() {
     var best = null;
-    while (it.hasNext()) {
-        var rec = it.next();
-        if (rec === null) continue;
-        var a = null;
-        try { a = rec.activity.value; } catch (e1) { continue; }
-        if (a === null) continue;
-        best = a;
-        var paused = false, stopped = false;
-        try { paused = rec.paused.value; } catch (e2) {}
-        try { stopped = rec.stopped.value; } catch (e3) {}
-        if (!paused && !stopped) return a;
-    }
-    if (best) return best;
-    /* r14 fallback: the record walk can come up empty on hosts that
-       recycle ActivityClientRecords; scan the heap for a live one. */
     try {
-        var found = null;
+        var at = Java.use('android.app.ActivityThread').currentActivityThread();
+        var acts = at.mActivities.value;
+        var it = acts.values().iterator();
+        while (it.hasNext()) {
+            var rec = it.next();
+            if (rec === null) continue;
+            var a = null;
+            try { a = rec.activity.value; } catch (e1) { continue; }
+            if (a === null) continue;
+            best = a;
+            var paused = false, stopped = false;
+            try { paused = rec.paused.value; } catch (e2) {}
+            try { stopped = rec.stopped.value; } catch (e3) {}
+            if (!paused && !stopped) return a;
+        }
+    } catch (e4) {}
+    return best;
+}
+
+function resolve_current_activity(cb) {
+    var a = null;
+    try { a = find_current_activity_sync(); } catch (e0) {}
+    if (a) { try { cb(a); } catch (e1) {} return; }
+    /* r15: heap scan - ASYNC; the result is handled in onMatch */
+    try {
         Java.choose('android.app.Activity', {
-            onMatch: function (a) {
-                if (!found) found = a;
-                return found ? 'stop' : undefined;
+            onMatch: function (act) {
+                try { IME.act = act; } catch (e2) {}
+                try { cb(act); } catch (e3) {}
+                return 'stop';
             },
             onComplete: function () {}
         });
-        if (found) return found;
     } catch (e4) {}
-    return best;
 }
 
 /* r13: keep IME.act fresh for every future resume via Application
    callbacks. Unlike the Activity.onResume implementation hook this
    fires for all activities even when the agent lost the race with the
    first resume, and it also tracks activity SWITCHES. It deliberately
-   does NOT call report_map(): the field device calibrated the touch
-   offset against the native estimate, and switching that device to the
-   measured view map would shift taps by the bias it corrected. */
+   does NOT call report_map(): onResume (and the throttled touch
+   path) already re-measure the view rect there. */
 function install_lifecycle() {
     Java.perform(function () {
         try {
@@ -449,7 +546,7 @@ function installTouchHook() {
             Activity.onResume.implementation = function () {
                 var r = this.onResume();
                 try { IME.act = this; } catch (e0) {}   /* for the IME */
-                try { report_map(content_view(this)); } catch (e) {}
+                try { report_map(find_gl_view(this)); } catch (e) {}
                 return r;
             };
             agentLog('phase: onResume hook ok');
@@ -464,13 +561,16 @@ function installTouchHook() {
             try {
                 var act = ev.getAction() & 0xff;
                 var down = (act === 0);
-                /* raw window coords first: the overlay maps them */
-                gNativeTouch(ev.getX(), ev.getY(), act);
+                /* r15: raw SCREEN coords (getRawX/getRawY) - the
+                   same space the map is measured in
+                   (getLocationOnScreen), so overlay.cpp's transform
+                   is exact on BOTH axes */
+                gNativeTouch(ev.getRawX(), ev.getRawY(), act);
                 if (act === 2) {          /* throttle map refresh on moves */
                     var now = Date.now();
                     if (now - gMapLastTouch > 2000) {
                         gMapLastTouch = now;
-                        report_map(content_view(this));
+                        report_map(find_gl_view(this));
                     }
                 }
                 /* let the overlay decide (menu/keyboard own the tap) */
@@ -483,7 +583,7 @@ function installTouchHook() {
             return this.dispatchTouchEvent(ev);         /* original call */
         };
         agentLog('phase: dispatchTouchEvent hook ok');
-        sendMsg('info', { msg: 'touch hook installed (r14)' });
+        sendMsg('info', { msg: 'touch hook installed (r15, screen coords)' });
     });
 }
 

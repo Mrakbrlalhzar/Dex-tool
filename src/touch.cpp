@@ -9,14 +9,17 @@ typedef int32_t (*fn_getEvent)(AInputQueue*, AInputEvent**);
 static fn_getEvent g_orig_get = nullptr;
 
 /* Both input paths (this AInputQueue hook for NativeActivity hosts and
-   the Java dispatchTouchEvent hook in agent.js) deliver events in the
-   SAME coordinate space: raw window pixels. r7/r8 fed them straight into
-   ImGui's DisplaySize, which is the *surface* rect of the GL view - on
-   the sample app that surface (540x832) sits inside a taller window
+   the Java dispatchTouchEvent hook in agent.js) deliver raw event
+   pixels. Since r15 the Java side sends SCREEN coords (getRawX/
+   getRawY) and the map is measured on screen too, so that path is
+   exact on both axes. r7/r8 fed them straight into ImGui's
+   DisplaySize, which is the *surface* rect of the GL view - on the
+   sample app that surface (540x832) sits inside a taller window
    (540x960), so every tap landed above its target. r9 maps the raw
    coords through the rect the agent measured (dextool_set_touch_map)
    before they reach ImGui; this hook therefore forwards untouched
-   window coords and lets overlay.cpp do the mapping. */
+   coords and lets overlay.cpp do the mapping. (AInputQueue coords
+   are window-local - this fallback may need the Settings Y bias.) */
 static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
     int32_t rc = g_orig_get(q, ev);
     if (rc >= 0 && ev && *ev) {

@@ -6,5 +6,11 @@ frida-dist-arm64/
 dobby-src/
 imgui/
 out/
+.gradle/
+build/
+local.properties
+.idea/
+captures/
+*.iml
 *.zip
 *.tar.*

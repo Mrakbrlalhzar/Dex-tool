@@ -20,11 +20,13 @@ void overlay_request_font_rebuild(float size);
    the given speed, which is what makes the huge lists touch-scrollable */
 void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed);
 
-/* ---- r12 ---- */
-/* manual Y nudge applied after the touch map (Settings slider). With
-   the Y rescale gone (map_touch) this bias is what corrects the
-   residual status-bar offset on hosts where the view rect cannot
-   be measured. */
+/* ---- r15 ---- */
+/* manual Y nudge applied after the touch map (Settings slider).
+   Default 0: touches (getRawX/getRawY) and the view rect
+   (getLocationOnScreen) now share ONE coordinate space and both
+   axes are scaled proportionally, so no static offset is needed.
+   The slider only remains for exotic hosts where the view rect
+   cannot be measured. */
 void overlay_set_touch_bias(float dy);
 /* one-line description of the active touch map for the Settings status */
 void overlay_touch_map_desc(char* buf, int n);
@@ -33,8 +35,8 @@ void overlay_touch_map_desc(char* buf, int n);
 extern "C" {
 #endif
 /* JNI surface used by the JS agent (and by the AInputQueue fallback) */
-JNIEXPORT void dextool_on_touch(float x, float y, int action);      /* raw window coords */
-JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h);   /* overlay view rect in window */
+JNIEXPORT void dextool_on_touch(float x, float y, int action);      /* raw screen coords (getRawX/getRawY) */
+JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h);   /* overlay view rect ON SCREEN (getLocationOnScreen) */
 JNIEXPORT void dextool_add_char(int codepoint);
 JNIEXPORT void dextool_backspace();
 JNIEXPORT bool dextool_want_mouse();

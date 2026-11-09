@@ -3,7 +3,67 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
-## Fixes in this version (r14)
+## Fixes in this version (r15)
+
+1. The keyboard STILL failed to open on some hosts (code-audit
+   follow-up on r14). Three causes, all fixed:
+   a) the Java.choose heap-scan fallback consumed its result
+      synchronously - Java.choose is ASYNC, onMatch ran after
+      `return found`, so the fallback always returned null.
+      Activity resolution is now callback-based
+      (find_current_activity_sync + resolve_current_activity(cb)).
+   b) ime_show() hit `if (!IME.act) return;` BEFORE the retry
+      ladder, so the hidden EditText + TextWatcher were never
+      created; the showSoftInput retries are armed
+      unconditionally now and each retry re-resolves the
+      activity and retries the keyboard.
+   c) the instance-field editor and the method-call argument
+      fields used raw ImGui::InputText and never asked for the
+      keyboard; every editable field goes through the
+      ime_textfield wrapper now.
+
+2. Touch mapping rebuilt on ONE coordinate space (the -80 px Y
+   bias is gone): the hook forwards getRawX()/getRawY() (screen
+   coords), the agent measures the GL view (largest
+   SurfaceView/GLSurfaceView/TextureView, content-view fallback)
+   with getLocationOnScreen(), and map_touch() scales BOTH axes
+   proportionally: imgui = (raw - viewOrigin) * (DisplaySize /
+   viewSize). The old scheme mixed view-local getX()/getY() with
+   a window-relative content-view rect, hardcoded the Y scale to
+   1.0 and patched the residue with a device-specific -80 px bias
+   (the logged surface delta was 128 px, so the bias was wrong
+   even on its own terms). Bias default is 0; the Settings slider
+   stays for exotic hosts; the saved-config key was renamed
+   (yoff -> ybias) so a stale -80 cannot fight the new mapping.
+
+3. Backspace race (overlay.cpp): dextool_backspace() set a single
+   bool, so N backspaces arriving within one frame collapsed into
+   ONE deleted character (characters were queued, backspaces were
+   not). It is a counter now.
+
+4. smali_runtime.cpp extract_jar(): stored the java.io.File from
+   getFilesDir() in a jstring and fed it to GetStringUTFChars - a
+   JNI type mismatch that would crash the process the moment the
+   native Smali path ran. Calls getAbsolutePath() properly now
+   (with exception checks).
+
+5. Log paths now MATCH: the native side logs to
+   getFilesDir()/dextool-logs/ - exactly what the DexToolApp
+   copier reads (before: native wrote /sdcard/Download while the
+   copier read the private dir, so neither saw the other; under
+   scoped storage the /sdcard writes failed silently). The JNI
+   markers live in the same folder; /sdcard/Download stays as a
+   fallback when the JVM is not reachable.
+
+6. Build/git hygiene: the nolib APK is built from a scratch copy,
+   so the committed DexToolApp.java keeps its System.loadLibrary()
+   call (the old sed -i stripped it from the working tree, leaving
+   a misleading "libtool.so loaded" log); the nolib variant also
+   drops that log line. .gitignore covers .gradle/, build/,
+   local.properties, .idea/, captures/ and *.iml, and the commit
+   step untracks them.
+
+## Fixes in r14 (still in)
 
 1. The keyboard never opened. ime_show() dereferenced `act` - a
    variable that does not exist in that scope - so EVERY attempt to

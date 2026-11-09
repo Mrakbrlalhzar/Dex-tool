@@ -50,7 +50,7 @@ static float s_ovl_scroll = 1.5f;   /* whole-menu drag speed */
 static float s_lst_scroll = 1.2f;   /* inner list drag speed */
 static bool  s_visible    = true;
 static bool  s_show_fab   = true;
-static float s_y_off      = -80.0f; /* manual touch Y bias (px); r13 default = the constant status-bar offset measured on the field device */
+static float s_y_off      = 0.0f;   /* manual touch Y bias (px); r15: default 0 - the screen-space touch map is mathematically exact, the slider stays for exotic hosts */
 
 /* ---------------- agent / overlay status ---------------- */
 static bool  s_agent_ready = false;
@@ -420,7 +420,7 @@ static void conf_load() {
         else if (!strcmp(k, "theme"))  s_theme    = (int)v;
         else if (!strcmp(k, "ovl"))    s_ovl_scroll = v;
         else if (!strcmp(k, "lst"))    s_lst_scroll = v;
-        else if (!strcmp(k, "yoff"))   s_y_off    = v;
+        else if (!strcmp(k, "ybias"))  s_y_off    = v;   /* r15: key renamed from yoff so a stale saved -80 cannot fight the new mapping */
         else if (!strcmp(k, "fab"))    s_show_fab = v > 0.5f;
     }
     fclose(f);
@@ -434,7 +434,7 @@ static void conf_save() {
     fprintf(f, "theme=%d\n",  s_theme);
     fprintf(f, "ovl=%g\n",    s_ovl_scroll);
     fprintf(f, "lst=%g\n",    s_lst_scroll);
-    fprintf(f, "yoff=%g\n",   s_y_off);
+    fprintf(f, "ybias=%g\n",  s_y_off);
     fprintf(f, "fab=%d\n",   s_show_fab ? 1 : 0);
     fclose(f);
     s_conf_dirty = false;
@@ -1126,7 +1126,7 @@ static void class_tab_content(ClassTab& c) {
                 ImGui::Text("  value:");
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(140);
-                ImGui::InputText("##fv", nv[f], sizeof(nv[f]));
+                ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper - raw InputText never opened the keyboard */
                 ImGui::SameLine();
                 if (ImGui::Button("Set##fs")) {
                     std::string a = "{\"class\":\"" + jesc(c.cname)
@@ -1156,7 +1156,7 @@ static void class_tab_content(ClassTab& c) {
                 for (int k = 0; k < (int)ps.size() && k < 8; k++) {
                     char lb[64];
                     snprintf(lb, sizeof(lb), "arg%d (%s)", k, ps[k].c_str());
-                    ImGui::InputText(lb, c.call_args[k], sizeof(c.call_args[k]));
+                    ime_textfield(lb, c.call_args[k], sizeof(c.call_args[k]));   /* r15: IME-aware wrapper */
                     na++;
                 }
             }

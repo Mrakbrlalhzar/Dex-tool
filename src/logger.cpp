@@ -136,7 +136,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r14: IME show fix, phased agent init, small-surface ownership gate)");
+    log_info("logger_init done (build r15: async IME resolve + retries always armed, screen-space touch map, backspace counter, unified log dir)");
 }
 
 void log_info(const char* msg) {

@@ -20,13 +20,22 @@ static std::string extract_jar(JNIEnv* env) {
     jobject  am  = env->CallObjectMethod(app,
         env->GetMethodID(env->FindClass("android/content/Context"),
                          "getAssets","()Landroid/content/res/AssetManager;"));
-    jstring  fds = (jstring)env->CallObjectMethod(app,
+    /* r15 FIX: getFilesDir returns java.io.File, NOT a string.
+       The r14 code cast that File object straight to jstring and
+       fed it to GetStringUTFChars - a JNI type mismatch that would
+       crash the process the moment the native Smali path ran.
+       Call getAbsolutePath() first; THAT result is the real
+       jstring. */
+    jobject  fdir = env->CallObjectMethod(app,
         env->GetMethodID(env->FindClass("android/content/Context"),
                          "getFilesDir","()Ljava/io/File;"));
-    fds = (jstring)env->CallObjectMethod(fds,
+    if (!fdir || env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
+    jstring  fds = (jstring)env->CallObjectMethod(fdir,
         env->GetMethodID(env->FindClass("java/io/File"),
                          "getAbsolutePath","()Ljava/lang/String;"));
+    if (!fds || env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
     const char* fdp = env->GetStringUTFChars(fds, nullptr);
+    if (!fdp) return "";
     char jar[512];
     snprintf(jar, sizeof(jar), "%s/smali-fat.jar", fdp);
     env->ReleaseStringUTFChars(fds, fdp);

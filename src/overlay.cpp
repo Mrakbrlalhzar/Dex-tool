@@ -103,23 +103,28 @@ static std::mutex g_tick_mtx;  /* one ImGui drawer at a time; also
 static std::atomic<bool> g_ready {false};
 
 /* ---- touch mapping ------------------------------------------------
-   Events arrive in raw window pixels from both input paths. Two sources
-   feed the map, best one wins:
-   (a) the agent measured where the overlay's GL view actually sits in
-       the window (view rect via getLocationInWindow) -> dextool_set_touch_map;
-       r11 makes this measurement happen on Activity.onResume and on
-       every touch (throttled), so it no longer depends on
-       onWindowFocusChanged firing, which it never did in the field.
+   Events arrive in raw SCREEN pixels from the Java path (r15: the hook
+   forwards getRawX()/getRawY()) and in window-local pixels from the
+   AInputQueue fallback (no Java side - approximate; the Settings Y
+   bias exists for such hosts). Two sources feed the map, best wins:
+   (a) the agent measured where the overlay's GL view actually sits
+       ON SCREEN (getLocationOnScreen of the largest SurfaceView /
+       GLSurfaceView / TextureView, content view fallback) ->
+       dextool_set_touch_map; measured on Activity.onResume and on
+       every touch (throttled), so a relayout at any point in the
+       app's life still updates the map.
    (b) native estimate: the largest surface seen on ANY context is
        ~= the full window (a typical app's HWUI surface spans the whole
        540x960 window while the game surface is smaller). r11 tracks
-       every swap for this, not just the owner's.
+       every swap for this, not just the owner's. Transient only -
+       the agent's real measurement replaces it within a few frames.
    On top of the map, overlay_set_touch_bias() adds a manual Y nudge
-   (Settings) for hosts where neither source can be measured. */
+   (Settings, default 0 since r15) for hosts where neither source
+   can be measured. */
 struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
 static std::mutex g_map_mtx;
 static TouchMap   g_map;
-static float      g_bias_y = -80.f;    /* manual nudge, under g_map_mtx; r13 default = constant status-bar offset */
+static float      g_bias_y = 0.f;      /* manual nudge (Settings), under g_map_mtx; r15: default 0 - the screen-space map is exact, the slider is only for exotic hosts */
 
 /* Touch stream with dedup: a NativeActivity host can deliver the same
    physical tap through BOTH the AInputQueue and the Java bridge; an
@@ -133,7 +138,7 @@ static std::atomic<bool>       g_want_mouse {false};
 
 static std::mutex            g_char_mtx;
 static std::vector<unsigned>  g_pending_chars;
-static bool                   g_pending_bs    = false;
+static int                    g_pending_bs     = 0;       /* r15: counter - the r14 bool collapsed N backspaces in one frame into one */
 
 /* scroll regions published by menu_draw (owner thread) */
 static std::vector<float> g_scroll_regions;
@@ -181,7 +186,7 @@ extern "C" JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h) {
     bool was = g_map.ok;
     g_map = { (float)x, (float)y, (float)w, (float)h, true, false };
     if (!was)
-        LOGI("[overlay] touch map: view rect in window = (%d,%d %dx%d)",
+        LOGI("[overlay] touch map: view rect on screen = (%d,%d %dx%d)",
              x, y, w, h);
 }
 
@@ -244,7 +249,7 @@ extern "C" JNIEXPORT void dextool_add_char(int cp) {
 
 extern "C" JNIEXPORT void dextool_backspace() {
     std::lock_guard<std::mutex> lk(g_char_mtx);
-    g_pending_bs = true;
+    if (g_pending_bs < 4096) g_pending_bs++;   /* r15: count, do not collapse */
 }
 
 /* r14: the GumJS agent posts phase markers here (NativeFunction on
@@ -592,25 +597,27 @@ static float region_speed_at(float x, float y) {
     return 0.f;
 }
 
-/* map a raw window position into the overlay surface's coordinate
-   space via the measured view rect; falls back to identity. r11 adds
-   the manual Y bias on top (Settings). */
+/* map a raw SCREEN position into the overlay surface's coordinate
+   space. r15 rebuilds the transform on ONE coordinate space: the
+   hook forwards getRawX()/getRawY() (screen) and the agent measures
+   the GL view with getLocationOnScreen() (screen), so the origin is
+   shared and BOTH axes are scaled proportionally:
+
+       imgui = (raw - viewOrigin) * (io.DisplaySize / viewSize)
+
+   The r12/r13 scheme mixed view-local getX()/getY() with a
+   window-relative content-view rect, hardcoded sy = 1.0 and patched
+   the residue with a device-specific -80 px Y bias - a workaround,
+   not a fix (the logged surface delta was 128 px, not 80). The bias
+   default is 0 now; the Settings slider remains for hosts where the
+   view rect cannot be measured. */
 static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
     float mx = x, my = y;
     {
         std::lock_guard<std::mutex> lk(g_map_mtx);
         if (g_map.ok && g_map.w > 0 && g_map.h > 0) {
-            /* r12 fix (Y-axis scaling mismatch): sy used to be
-               ds.y / g_map.h, but the view rect is TALLER than the
-               GL surface (window 960 vs surface 832), so the false
-               0.867 scale pulled taps toward the center: taps near
-               the top landed low, taps near the bottom landed high,
-               and only the exact center was right. Y is a pure
-               translation now; the static status-bar offset belongs
-               to the manual Y bias (g_bias_y, "Touch Y offset" in
-               Settings). */
             float sx = ds.x / g_map.w;
-            float sy = 1.0f;
+            float sy = ds.y / g_map.h;
             mx = (x - g_map.x) * sx;
             my = (y - g_map.y) * sy;
         }
@@ -717,11 +724,11 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         std::lock_guard<std::mutex> lk2(g_char_mtx);
         for (unsigned cp : g_pending_chars) io.AddInputCharacter(cp);
         g_pending_chars.clear();
-        if (g_pending_bs) {
+        for (int i = 0; i < g_pending_bs && i < 4096; i++) {
             io.AddKeyEvent(ImGuiKey_Backspace, true);
             io.AddKeyEvent(ImGuiKey_Backspace, false);
-            g_pending_bs = false;
         }
+        g_pending_bs = 0;
     }
 
     menu_init_once();
