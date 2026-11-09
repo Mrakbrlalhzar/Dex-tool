@@ -1,7 +1,36 @@
 'use strict';
-/* Dex-tool agent (r18). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r19). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r19 changes (field report: tapping a text field logged
+   "[agent error] ... ime_ensure ... not a function" and the
+   keyboard never opened):
+   - the truncated log line cannot distinguish a TypeError thrown
+     AT the ime_ensure() call site from one thrown INSIDE
+     ime_ensure() and reported through its own {fn:'ime_ensure'}
+     error channel. Both shapes are now impossible, and any future
+     failure names the exact missing member:
+     - the EditText factory is renamed to ime_create_edit() (the
+       canonical name) and the bare ime_ensure() INVOCATION is
+       replaced: ime_try_show() resolves the factory through
+       typeof checks and, if a binding were ever lost, logs BOTH
+       typeofs instead of throwing a bare "ime_ensure is not a
+       function" that halts the IME flow.
+     - ime_ensure() stays defined as a DELEGATING legacy alias ->
+       ime_create_edit(), so stale references in any build of
+       this script resolve to the REAL factory (an EMPTY stub
+       would make ime_try_show() bail and the keyboard would
+       never open - do not replace the alias with a no-op).
+     - ime_set_act() VERIFIES the Java.retain() result before
+       trusting it: probes the retained wrapper for a real
+       Activity method and, if a bridge ever returned a bare
+       handle object, re-wraps it through Java.cast() (which
+       also promotes the handle to a global reference).
+     - ime_create_edit() typeof-guards the Activity/View methods
+       it touches (act.getWindow, setBackgroundDrawable/
+       setBackground, setAlpha): if a member is missing the log
+       names it exactly, no more bare "X is not a function".
 
    r18 changes (field report: SIGABRT with "JNI DETECTED ERROR IN
    APPLICATION: use of invalid jobject" - the keyboard never opened
@@ -362,11 +391,32 @@ function ime_set_act(obj, how) {
             if (same) return false;   /* already tracked - reuse */
             ime_release_act(IME.act);
         }
+        /* r19: retain, then VERIFY the retained wrapper actually
+           exposes Activity methods before trusting it. Every
+           bridge checked (frida-java-bridge 5.x) returns a full
+           method-capable Proxy from retain(), but if any build
+           ever handed back a bare handle object, the first
+           method call in the factory below would throw
+           "X is not a function" and the keyboard would die
+           with an undiagnosable log. The probe is one typeof;
+           the re-wrap goes through Java.cast(), which promotes
+           the handle to a global reference again. */
+        var kept = null;
         try {
-            IME.act = Java.retain(obj);   /* promote to GLOBAL ref */
+            kept = Java.retain(obj);   /* promote to GLOBAL ref */
         } catch (eT) {
-            IME.act = obj;                /* ancient bridge fallback */
+            kept = obj;                /* ancient bridge fallback */
         }
+        try {
+            if (typeof kept.getWindow !== 'function') {
+                var ACTc = Java.use('android.app.Activity');
+                kept = Java.cast(kept, ACTc);
+            }
+        } catch (eW) {
+            agentLog('ime: retained-wrapper probe/rewrap failed: ' +
+                String(eW.message || eW));
+        }
+        IME.act = kept;
         agentLog('ime: activity captured & retained via ' + how);
         if (!IME.everLogged) {
             IME.everLogged = true;
@@ -417,18 +467,38 @@ function ime_reset_text() {
     } catch (e) { IME.silent = false; }
 }
 
-function ime_ensure(act) {
+/* r19: renamed from ime_ensure() to ime_create_edit() - the
+   canonical factory name. Every Activity/View method touched
+   here is typeof-guarded now: if a bridge or OEM build lacks a
+   member, the log names the exact member instead of a bare
+   "X is not a function" that is impossible to triage. */
+function ime_create_edit(act) {
     var h = 0;
     try { h = act.hashCode(); } catch (e0) {}
     if (IME.edit && IME.actHash === h) return IME.edit;
     try {
+        if (typeof act.getWindow !== 'function') {
+            sendMsg('error', { fn: 'ime_create_edit',
+                msg: 'retained activity lacks act.getWindow (typeof ' +
+                    (typeof act.getWindow) + ')' });
+            return null;
+        }
         IME.edit = null;               /* activity switched */
         IME.prev = '';
         var decor = act.getWindow().getDecorView();
         var ET = Java.use('android.widget.EditText');
         var edit = ET.$new(act);
-        edit.setBackgroundDrawable(null);   /* 1x1, transparent */
-        edit.setAlpha(0);
+        /* r19: setBackgroundDrawable is deprecated-but-present on
+           every current API; setBackground is the modern name.
+           Use whichever this bridge exposes; if neither exists,
+           say so instead of throwing. */
+        if (typeof edit.setBackgroundDrawable === 'function')
+            edit.setBackgroundDrawable(null);   /* 1x1, transparent */
+        else if (typeof edit.setBackground === 'function')
+            edit.setBackground(null);
+        else
+            agentLog('ime: no background-clear API on EditText (skipped)');
+        if (typeof edit.setAlpha === 'function') edit.setAlpha(0);
         var LP = Java.use('android.widget.FrameLayout$LayoutParams');
         var lp = LP.$new(1, 1);
         decor.addView(edit, lp);
@@ -461,9 +531,17 @@ function ime_ensure(act) {
         IME.actHash = h;
         return edit;
     } catch (e) {
-        sendMsg('error', { fn: 'ime_ensure', msg: String(e.message || e) });
+        sendMsg('error', { fn: 'ime_create_edit', msg: String(e.message || e) });
         return null;
     }
+}
+/* r19: legacy alias (fix-spec step 3) - delegates to the canonical
+   ime_create_edit() factory so any leftover ime_ensure() reference
+   in any build of this script resolves to the REAL factory. An
+   EMPTY stub here would make ime_try_show() bail (edit === null)
+   and the keyboard would never open - keep the delegation. */
+function ime_ensure(act) {
+    return ime_create_edit(act);
 }
 
 function ime_try_show(reset) {
@@ -482,7 +560,21 @@ function ime_try_show(reset) {
             agentLog('ime: try_show skipped - no activity yet');
             return false;
         }
-        var edit = ime_ensure(IME.act);
+        /* r19 (fix-spec step 2): the bare ime_ensure() INVOCATION
+           is replaced by the canonical ime_create_edit() factory,
+           resolved defensively - if either binding were ever lost
+           the log names both typeofs instead of throwing a bare
+           "ime_ensure is not a function" that halts the flow. */
+        var makeEdit = (typeof ime_create_edit === 'function')
+            ? ime_create_edit : ime_ensure;
+        if (typeof makeEdit !== 'function') {
+            sendMsg('error', { fn: 'ime_try_show',
+                msg: 'ime factory unavailable: ime_create_edit typeof=' +
+                    (typeof ime_create_edit) + ', ime_ensure typeof=' +
+                    (typeof ime_ensure) });
+            return false;
+        }
+        var edit = makeEdit(IME.act);
         if (!edit) return false;
         if (reset !== false) ime_reset_text();
         edit.requestFocus();
@@ -507,7 +599,7 @@ function ime_try_show(reset) {
    heap scan landed AFTER the retry ladder had finished, nothing
    ever called showSoftInput and the keyboard never opened. The
    callback now attempts the show itself:
-   - the UI work (ime_ensure creates a view) must run on the
+   - the UI work (ime_create_edit creates a view) must run on the
      main thread, hence Java.scheduleOnMainThread;
    - no ime_reset_text() here: by the time the async scan lands
      the user may already be typing. */
@@ -849,7 +941,7 @@ function installTouchHook() {
             return this.dispatchTouchEvent(ev);         /* original call */
         };
         agentLog('phase: dispatchTouchEvent hook ok');
-        sendMsg('info', { msg: 'touch hook installed (r17, screen coords + IME activity capture)' });
+        sendMsg('info', { msg: 'touch hook installed (r19, screen coords + IME activity capture)' });
     });
 }
 
@@ -1813,6 +1905,6 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r14 loaded' });
+    sendMsg('ready', { msg: 'Dex-tool agent r19 loaded' });
     agentLog('phase: ready sent');
 }, 0);

@@ -139,7 +139,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r18: IME.act kept as a retained GLOBAL JNI reference - raw hook wrappers are local refs that die with their callback and later use aborted the process with use-of-invalid-jobject; previous ref released on activity change; retention on all capture sources)");
+    log_info("logger_init done (build r19: IME factory renamed to ime_create_edit with legacy ime_ensure alias, ime_try_show resolves the factory defensively and logs typeof diagnostics instead of a bare TypeError, Java.retain result verified for method access and re-wrapped via Java.cast when needed, EditText method calls typeof-guarded with exact-member diagnostics)");
 }
 
 /* r16: re-point the logs at the app's real private dir.

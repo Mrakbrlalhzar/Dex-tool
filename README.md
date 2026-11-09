@@ -3,6 +3,49 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r19)
+
+1. Symptom (field report on r18): tapping a text field logged
+   `[agent error] ... ime_ensure ... not a function` and the
+   keyboard never opened.
+
+2. What the truncated log could not say: the verbatim payload is
+   {"type":"error","fn":"<name>","msg":"<message>"}, so it is
+   ambiguous whether the TypeError was thrown AT the ime_ensure()
+   call site or INSIDE ime_ensure() and reported through its own
+   {fn:'ime_ensure'} channel. r19 makes both shapes impossible
+   and turns every remaining failure into a named-member report.
+
+3. Factory rename + legacy alias: the hidden-EditText factory is
+   now ime_create_edit() (canonical name); ime_ensure() stays
+   defined as a DELEGATING alias to it, so any stale ime_ensure()
+   reference in any build resolves to the REAL factory. Note:
+   an EMPTY stub (function ime_ensure() {}) would make
+   ime_try_show() bail on edit === null and the keyboard would
+   never open - the alias must delegate.
+
+4. Defensive invocation (fix-spec step 2): ime_try_show() no
+   longer calls ime_ensure() directly - it resolves the factory
+   through typeof checks (ime_create_edit, falling back to the
+   alias) and, if both bindings were ever lost, logs BOTH
+   typeofs through the {fn:'ime_try_show'} channel instead of
+   throwing a bare "ime_ensure is not a function".
+
+5. Retained-wrapper verification: ime_set_act() probes the
+   Java.retain() result for a real Activity method and re-wraps
+   it through Java.cast() (global reference + full method
+   dispatch) if a bridge ever returned a bare handle object.
+   Verified against the frida-java-bridge 5.x sources:
+   retain() returns obj.$clone(env) -> new C($h, $t, env) with
+   owned=true -> newGlobalRef + method-capable Proxy wrapper,
+   so current builds are unaffected by the probe (one typeof).
+
+6. Exact-member diagnostics: ime_create_edit() typeof-guards
+   act.getWindow, setBackgroundDrawable/setBackground and
+   setAlpha. If a member is missing, the error payload names it
+   (e.g. "retained activity lacks act.getWindow (typeof
+   undefined)") instead of a bare "X is not a function".
+
 ## Fixes in this version (r18)
 
 1. JNI crash / keyboard dead (field report on r17): "JNI DETECTED
