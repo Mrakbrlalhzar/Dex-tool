@@ -139,7 +139,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r16: async-resolved activity shows the IME itself + both-layer retry ladder + no reset on retries, atomic log copy, log dir handed over by Java)");
+    log_info("logger_init done (build r17: touch hook feeds IME.act directly + dead activities filtered from both resolution layers + payload-bearing IME diagnostics; r16 async show + ladder + no-reset kept)");
 }
 
 /* r16: re-point the logs at the app's real private dir.

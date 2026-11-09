@@ -3,6 +3,48 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r17)
+
+1. IME failure, root cause: missing Activity capture in the touch
+   hook (field report on r16). The dispatchTouchEvent hook
+   intercepted taps, forwarded them to native and could even
+   CONSUME them - but it never assigned IME.act. Only the
+   onResume hook did, and that hook is lost when the agent
+   attaches after the first resume (hot start: no further resume
+   fires until the user leaves and returns). ime_show() was then
+   thrown back to the fragile ActivityThread.mActivities walk /
+   Java.choose heap scan, which on many hosts fails to find the
+   resumed activity, so showSoftInput was never called. The
+   touch hook now assigns IME.act = this on every event: the tap
+   that opens the menu is itself proof of a live, resumed
+   activity. Logged once per agent ("ime: activity captured via
+   touch hook"), not at event rate.
+
+2. Stale activity selection: find_current_activity_sync() only
+   checked the paused/stopped record flags - a finishing or
+   destroyed Activity passed, and getSystemService() then
+   succeeded while showSoftInput silently no-opped. The walk
+   filters dead activities out now (isFinishing()/isDestroyed(),
+   not even eligible as the last-resort fallback), and the
+   Java.choose heap scan does the same: destroyed instances
+   linger until GC, so onMatch now keeps scanning past them and
+   only stops at a live one.
+
+3. Weak diagnostics fixed: the "no activity yet" warning
+   carries its payload now (walk threw <exception> vs. walk
+   empty vs. only dead/paused records), an empty walk logs what
+   it saw, ime_try_show() logs a skipped attempt instead of
+   returning false silently, showSoftInput's real return value
+   is logged, and a final stage line 2.2 s after the ladder
+   reports whether the bridge is up - with the reason when it
+   is not (no activity captured vs. show kept failing).
+
+4. Kept from r16: the async resolver callback performs the show
+   itself (ime_act_resolved -> ime_try_show(false),
+   main-thread scheduled, no text reset), and the retry ladder
+   resolves through BOTH layers (sync walk first, heap scan
+   second).
+
 ## Fixes in this version (r16)
 
 1. The keyboard STILL failed to open on some hosts (field report

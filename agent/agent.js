@@ -1,7 +1,35 @@
 'use strict';
-/* Dex-tool agent (r16). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r17). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r17 changes (field report: on many hosts the touch hook ran but
+   no Activity capture ever reached IME.act, so ime_show() fell
+   back to the fragile ActivityThread walk / heap scan, those
+   fallbacks failed to find the resumed activity, and
+   showSoftInput was never called):
+   - the dispatchTouchEvent hook forwarded taps to native but never
+     assigned IME.act - only the onResume hook did, and that hook
+     is lost when the agent attaches after the first resume (hot
+     start: no further resume fires until the user leaves and
+     returns). The touch hook assigns IME.act = this on EVERY
+     event now - the tap that opens the menu is itself proof of a
+     live, resumed activity. Logged once ("ime: activity captured
+     via touch hook"), not at event rate.
+   - find_current_activity_sync() checked only the paused/stopped
+     record flags: a finishing or destroyed Activity passed, then
+     getSystemService() succeeded but showSoftInput silently
+     no-opped - indistinguishable from "keyboard broken". The walk
+     skips dead activities now (not even eligible as the
+     last-resort fallback), and so does the Java.choose heap scan,
+     which can surface destroyed-but-not-yet-collected instances.
+   - diagnostics rebuilt: the "no activity yet" warning carries the
+     walk's diagnosis as payload, ime_try_show() logs a skipped
+     attempt instead of a silent false, showSoftInput's real
+     return value is logged, and a final stage line reports the
+     post-ladder bridge state with the reason when it stayed down.
+   - kept from r16: the async resolver callback performs the show
+     itself (ime_act_resolved -> ime_try_show(false)).
 
    r16 changes (field report: the keyboard STILL failed to open):
    - the async resolve_current_activity() callback stored IME.act
@@ -269,7 +297,8 @@ function find_gl_view(activity) {
    bridge into "[object Object]") and forwards the delta to
    libtool.so as dextool_add_char()/dextool_backspace(). */
 var IME = { act: null, edit: null, actHash: 0, prev: '',
-            silent: false, cnt: 0, everLogged: false };
+            silent: false, cnt: 0, everLogged: false,
+            actFromTouch: false };   /* r17: once-log gate */
 
 function ime_on_text(ed) {
     try {
@@ -366,15 +395,24 @@ function ime_try_show(reset) {
        input when a retry landed while typing was already under
        way. */
     try {
-        if (!IME.act) return false;
+        if (!IME.act) {
+            /* r17: stage log - the silent false return made "why
+               did the keyboard not show" undiagnosable */
+            agentLog('ime: try_show skipped - no activity yet');
+            return false;
+        }
         var edit = ime_ensure(IME.act);
         if (!edit) return false;
         if (reset !== false) ime_reset_text();
         edit.requestFocus();
         var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
         var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
-        imm.showSoftInput(edit, 0);
-        agentLog('ime: showSoftInput sent');
+        var sent = imm.showSoftInput(edit, 0);
+        /* r17: log the REAL result - false here (window token not
+           ready, focus not granted yet) was invisible before and
+           is the classic "sent but nothing happened" failure that
+           the retry ladder exists for */
+        agentLog('ime: showSoftInput sent -> ' + sent);
         return true;
     } catch (e) {
         sendMsg('error', { fn: 'ime_try_show', msg: String(e.message || e) });
@@ -426,12 +464,25 @@ function ime_show() {
                    UNCONDITIONALLY - each retry re-resolves and makes
                    a full attempt, so the bridge comes up as soon as
                    any activity appears. */
+                var walkErr = null;   /* r17: warn payload, belt+braces */
                 if (!IME.act) {
                     try { IME.act = find_current_activity_sync(); }
-                    catch (e0) { agentLog('ime: findAct failed: ' + e0); }
+                    catch (e0) {
+                        walkErr = String(e0.message || e0);
+                        agentLog('ime: findAct failed: ' + walkErr);
+                    }
                 }
                 if (!IME.act) {
-                    sendMsg('warn', { msg: 'IME: no activity yet - async resolve, retries armed' });
+                    /* r17 FIX: the warning carries its payload now -
+                       WHY no activity was found (the walk's own
+                       diagnosis: exception / no records / only dead
+                       or paused ones) instead of a bare "[msg]" that
+                       made IME failures impossible to triage */
+                    sendMsg('warn', { msg: 'IME: no activity yet (' +
+                        (walkErr ? 'walk threw: ' + walkErr
+                                 : String(find_current_activity_sync.lastDiag ||
+                                          'unknown')) +
+                        ') - async resolve, retries armed' });
                     /* r16 CRITICAL FIX: the r15 callback only stored
                        the activity and returned - if the heap scan
                        landed after the retries were exhausted,
@@ -481,6 +532,20 @@ function ime_show() {
                         });
                     }, delay);
                 });
+                /* r17: final stage line - one entry that says whether
+                   the bridge actually came up once the ladder is
+                   done, with the reason when it did not. Without it
+                   "keyboard never opened" arrived with zero clues. */
+                setTimeout(function () {
+                    Java.perform(function () {
+                        if (IME.edit)
+                            agentLog('ime: bridge up after ladder');
+                        else
+                            sendMsg('warn', { msg: 'IME: bridge still down after retries (' +
+                                (IME.act ? 'activity captured, showSoftInput kept failing'
+                                         : 'no activity captured at all') + ')' });
+                    });
+                }, 2200);
             } catch (e) {
                 sendMsg('error', { fn: 'showIme', msg: String(e.message || e) });
             }
@@ -503,6 +568,7 @@ function ime_show() {
    stores it in IME.act and invokes cb. */
 function find_current_activity_sync() {
     var best = null;
+    var seen = 0, deadSkipped = 0, threw = null;
     try {
         var at = Java.use('android.app.ActivityThread').currentActivityThread();
         var acts = at.mActivities.value;
@@ -513,13 +579,41 @@ function find_current_activity_sync() {
             var a = null;
             try { a = rec.activity.value; } catch (e1) { continue; }
             if (a === null) continue;
+            seen++;
+            /* r17 FIX: skip dying activities. The r16 walk checked
+               only paused/stopped from the client record - a
+               finishing or destroyed Activity passed, and ime_show()
+               then called getSystemService() on a dead window: no
+               throw, but showSoftInput silently no-ops. Dead
+               records are not even eligible for the last-resort
+               fallback; paused/stopped still are. */
+            var dead = false;
+            try { dead = a.isFinishing() || a.isDestroyed(); }
+            catch (eZ) {}
+            if (dead) { deadSkipped++; continue; }
             best = a;
             var paused = false, stopped = false;
             try { paused = rec.paused.value; } catch (e2) {}
             try { stopped = rec.stopped.value; } catch (e3) {}
             if (!paused && !stopped) return a;
         }
-    } catch (e4) {}
+    } catch (e4) { threw = String(e4.message || e4); }
+    /* r17: stage diagnostics - an empty walk explains itself, and
+       the reason is exposed on the function object so the "no
+       activity yet" warning can carry it as real payload */
+    var diag;
+    if (threw !== null) {
+        diag = 'walk threw: ' + threw;
+    } else if (seen > 0 && !best) {
+        diag = 'walk saw ' + seen + ' act(s), ' + deadSkipped +
+               ' dead, none usable';
+    } else if (seen === 0) {
+        diag = 'walk empty (no mActivities records)';
+    } else {
+        diag = 'only paused/stopped records';
+    }
+    agentLog('ime: ' + diag);
+    find_current_activity_sync.lastDiag = diag;
     return best;
 }
 
@@ -531,6 +625,15 @@ function resolve_current_activity(cb) {
     try {
         Java.choose('android.app.Activity', {
             onMatch: function (act) {
+                /* r17 FIX (same defect as the sync walk): the heap
+                   also holds DESTROYED activities until GC collects
+                   them. Handing ime_show() one of those reproduces
+                   the exact field failure - so keep scanning past
+                   dead instances and only stop at a live one. */
+                var dead = false;
+                try { dead = act.isFinishing() || act.isDestroyed(); }
+                catch (eX) {}
+                if (dead) return;   /* keep scanning */
                 try { IME.act = act; } catch (e2) {}
                 try { cb(act); } catch (e3) {}
                 return 'stop';
@@ -619,6 +722,26 @@ function installTouchHook() {
         agentLog('phase: hooking Activity.dispatchTouchEvent');
         Activity.dispatchTouchEvent.implementation = function (ev) {
             /* MAIN THREAD */
+            /* r17 FIX (root cause of the r16 field failure): feed
+               the IME context from the touch path. The onResume
+               hook only fires when the agent wins the race with
+               the FIRST resume - on a late-attached agent IME.act
+               stayed null until the NEXT resume and ime_show()
+               was thrown back to the fragile ActivityThread walk /
+               heap scan, which on many hosts never finds the
+               resumed activity, so showSoftInput never ran. A tap
+               on THIS activity's window is itself proof of a live,
+               resumed activity. Assigned on every event (keeps
+               IME.act fresh across activity switches too); logged
+               ONCE - dispatchTouchEvent fires at event rate, so an
+               unconditional log would flood logcat. */
+            try {
+                IME.act = this;
+                if (!IME.actFromTouch) {
+                    IME.actFromTouch = true;
+                    agentLog('ime: activity captured via touch hook');
+                }
+            } catch (eAct) {}
             try {
                 var act = ev.getAction() & 0xff;
                 var down = (act === 0);
@@ -644,7 +767,7 @@ function installTouchHook() {
             return this.dispatchTouchEvent(ev);         /* original call */
         };
         agentLog('phase: dispatchTouchEvent hook ok');
-        sendMsg('info', { msg: 'touch hook installed (r15, screen coords)' });
+        sendMsg('info', { msg: 'touch hook installed (r17, screen coords + IME activity capture)' });
     });
 }
 
