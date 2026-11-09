@@ -3,6 +3,54 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r16)
+
+1. The keyboard STILL failed to open on some hosts (field report
+   on r15). Three residual timing defects, all fixed:
+   a) the async resolve_current_activity() callback stored
+      IME.act but never attempted the show - when every sync
+      retry missed and the heap scan landed after the retry
+      ladder was done, showSoftInput never ran. The callback
+      performs the show itself now (ime_act_resolved),
+      scheduled on the main thread, without resetting text.
+   b) the retry ladder ran the SYNCHRONOUS ActivityThread walk
+      only, so an activity found only by the async heap scan
+      was never picked up. The ladder calls
+      resolve_current_activity() now (sync walk first, heap
+      scan second).
+   c) ime_try_show() called ime_reset_text() on EVERY attempt;
+      a retry landing while the user was already typing wiped
+      the hidden EditText (and the TextWatcher diff then
+      re-sent the surviving text as fresh insertions). Only
+      the first attempt of a focus session resets now.
+
+2. Crash-log plumbing (duplicated blocks / wrong directory):
+   a) the Java copier appended the WHOLE source file every 5s
+      (FileOutputStream(d, true)) - every pulled log held one
+      copy per 5s of uptime. It now writes a temp file and
+      rename(2)s it over the target: atomic, no duplication,
+      no torn reads; files unchanged since the last pass are
+      skipped.
+   b) JNI_OnLoad runs inside System.loadLibrary, BEFORE
+      Application.onCreate finishes - currentApplication() was
+      null there, so native logs landed in /sdcard/Download
+      (unwritable under scoped storage on modern devices) while
+      the copier read filesDir/dextool-logs. DexToolApp now
+      hands getFilesDir()/dextool-logs to the native logger
+      right after loadLibrary (nativeSetLogDir ->
+      logger_retarget; files reopened append-only, so nothing
+      already written is lost).
+   c) the uncaught-exception handler appends JAVA_CRASH to the
+      SOURCE log now (an entry written straight to the
+      Download copy was clobbered by the next copier pass) and
+      pushes an immediate copy pass.
+   d) the native crash fd opens with O_APPEND - concurrent
+      writes (native signal handler, Java handler, copier)
+      cannot clobber each other's offsets. Fatal-signal capture
+      (SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE: signal, si_code,
+      fault addr, PC, module+offset) and the streamed logcat
+      tombstone backtrace were already in place from r15.
+
 ## Fixes in this version (r15)
 
 1. The keyboard STILL failed to open on some hosts (code-audit

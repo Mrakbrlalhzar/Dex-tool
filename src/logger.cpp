@@ -94,7 +94,10 @@ void logger_init(const char* base_dir) {
     snprintf(pprev, sizeof(pprev), "%s/dextool-crash.prev.log", base_dir);
     snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
     rename(p, pprev);
-    g_crash_fd = open(p, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    /* r16: O_APPEND - every write lands atomically at EOF,
+       so concurrent appends (Java uncaught-exception handler,
+       copier) can never clobber an offset */
+    g_crash_fd = open(p, O_WRONLY|O_CREAT|O_TRUNC|O_APPEND, 0644);
     {
         stack_t ss;
         memset(&ss, 0, sizeof(ss));
@@ -136,7 +139,54 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r15: async IME resolve + retries always armed, screen-space touch map, backspace counter, unified log dir)");
+    log_info("logger_init done (build r16: async-resolved activity shows the IME itself + both-layer retry ladder + no reset on retries, atomic log copy, log dir handed over by Java)");
+}
+
+/* r16: re-point the logs at the app's real private dir.
+   JNI_OnLoad runs inside System.loadLibrary from
+   Application.onCreate - before onCreate has finished - and on
+   many Android versions ActivityThread.currentApplication() is
+   still null there, so resolve_log_dir() fell back to
+   /sdcard/Download (unwritable under scoped storage on modern
+   devices) while the Java copier read
+   getFilesDir()/dextool-logs. DexToolApp knows its own dir with
+   certainty and hands it over right after loadLibrary. Files are
+   reopened APPEND-ONLY (no truncate, no rename) so everything
+   written to the fallback dir earlier stays intact and nothing
+   already logged is lost. */
+void logger_retarget(const char* base_dir) {
+    if (!base_dir || !base_dir[0]) return;
+    if (strcmp(base_dir, g_base_dir) == 0) return;
+    pthread_mutex_lock(&g_mtx);
+    if (g_info_fp)  { fclose(g_info_fp);  g_info_fp  = nullptr; }
+    if (g_debug_fp) { fclose(g_debug_fp); g_debug_fp = nullptr; }
+    snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
+    char p[640];
+    snprintf(p, sizeof(p), "%s/dextool.log", base_dir);
+    g_info_fp = fopen(p, "a");
+    snprintf(p, sizeof(p), "%s/dextool-debug.log", base_dir);
+    g_debug_fp = fopen(p, "a");
+    if (g_crash_fd >= 0) {
+        /* r16: dup2 replaces the descriptor ATOMICALLY in the fd
+           table - a concurrent log_crash_raw() (no mutex: it runs
+           in signal handlers) hits either the old or the new file,
+           never a closed or recycled descriptor */
+        snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
+        int nfd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if (nfd >= 0) {
+            dup2(nfd, g_crash_fd);
+            close(nfd);
+        }
+    } else {
+        snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
+        g_crash_fd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
+    }
+    pthread_mutex_unlock(&g_mtx);
+    {
+        char m[128];
+        snprintf(m, sizeof(m), "[logger] retargeted to %s", base_dir);
+        log_info(m);
+    }
 }
 
 void log_info(const char* msg) {

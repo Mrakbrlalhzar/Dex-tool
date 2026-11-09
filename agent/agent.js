@@ -1,7 +1,22 @@
 'use strict';
-/* Dex-tool agent (r15). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r16). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r16 changes (field report: the keyboard STILL failed to open):
+   - the async resolve_current_activity() callback stored IME.act
+     but never attempted the show: when every synchronous retry
+     missed and the heap scan landed after the retry ladder was
+     done, showSoftInput never ran. The callback performs the show
+     itself now (ime_act_resolved), scheduled on the main thread,
+     without touching any text.
+   - the retry ladder resolved the activity SYNCHRONOUSLY only;
+     an activity found only by the async heap scan was never
+     picked up. The ladder runs resolve_current_activity() now
+     (sync walk first, heap scan second).
+   - ime_try_show() reset the hidden EditText on EVERY attempt;
+     a retry landing while the user was already typing wiped the
+     field. Only the first attempt of a focus session resets.
 
    r15 changes (code-audit fixes):
    - IME: activity resolution is now ASYNC-correct. Java.choose
@@ -341,15 +356,20 @@ function ime_ensure(act) {
     }
 }
 
-function ime_try_show() {
+function ime_try_show(reset) {
     /* one complete attempt on the main thread: create the hidden
        EditText (+ TextWatcher) if needed, focus it, and send
-       showSoftInput. Returns true only if showSoftInput was sent. */
+       showSoftInput. Returns true only if showSoftInput was sent.
+       r16: reset only when the caller says so - the first attempt
+       of a focus session passes true, retries and async-resolved
+       shows pass false. Resetting on every attempt wiped user
+       input when a retry landed while typing was already under
+       way. */
     try {
         if (!IME.act) return false;
         var edit = ime_ensure(IME.act);
         if (!edit) return false;
-        ime_reset_text();
+        if (reset !== false) ime_reset_text();
         edit.requestFocus();
         var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
         var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
@@ -360,6 +380,35 @@ function ime_try_show() {
         sendMsg('error', { fn: 'ime_try_show', msg: String(e.message || e) });
         return false;
     }
+}
+
+/* r16: shared handler for an asynchronously resolved activity.
+   The r15 callback only stored IME.act - when every sync retry
+   missed (ActivityThread walk empty right after resume) and the
+   heap scan landed AFTER the retry ladder had finished, nothing
+   ever called showSoftInput and the keyboard never opened. The
+   callback now attempts the show itself:
+   - the UI work (ime_ensure creates a view) must run on the
+     main thread, hence Java.scheduleOnMainThread;
+   - no ime_reset_text() here: by the time the async scan lands
+     the user may already be typing. */
+function ime_act_resolved(a, how) {
+    if (!a) return;
+    try { IME.act = a; } catch (e0) { return; }
+    agentLog('ime: activity resolved ' + how);
+    if (!IME.everLogged) {
+        IME.everLogged = true;
+        try {
+            sendMsg('info', { msg: 'IME host activity: ' +
+                IME.act.getClass().getName() });
+        } catch (e1) {}
+    }
+    Java.scheduleOnMainThread(function () {
+        try {
+            if (ime_try_show(false))
+                agentLog('ime: show ok after ' + how);
+        } catch (e2) {}
+    });
 }
 
 function ime_show() {
@@ -383,10 +432,13 @@ function ime_show() {
                 }
                 if (!IME.act) {
                     sendMsg('warn', { msg: 'IME: no activity yet - async resolve, retries armed' });
+                    /* r16 CRITICAL FIX: the r15 callback only stored
+                       the activity and returned - if the heap scan
+                       landed after the retries were exhausted,
+                       showSoftInput never ran. The callback attempts
+                       the show itself now. */
                     resolve_current_activity(function (a) {
-                        if (!a) return;
-                        try { IME.act = a; } catch (e1) {}
-                        agentLog('ime: activity resolved async');
+                        ime_act_resolved(a, 'async');
                     });
                 }
                 if (IME.act && !IME.everLogged) {
@@ -396,7 +448,7 @@ function ime_show() {
                             IME.act.getClass().getName() });
                     } catch (e5) {}
                 }
-                ime_try_show();
+                ime_try_show(true);   /* r16: only the first attempt resets */
                 /* the first show right after focus often loses the
                    race with the window - retry on a ladder; each
                    retry also re-resolves the activity (the r14
@@ -407,15 +459,24 @@ function ime_show() {
                         Java.scheduleOnMainThread(function () {
                             try {
                                 if (!IME.act) {
-                                    var a = find_current_activity_sync();
-                                    if (a) {
-                                        IME.act = a;
-                                        agentLog('ime: activity resolved at retry ' + delay + 'ms');
-                                    }
-                                }
-                                if (!IME.act) return;
-                                if (ime_try_show())
+                                    /* r16: BOTH resolution layers run
+                                       in the ladder. resolve_current_
+                                       activity walks ActivityThread
+                                       synchronously first and only
+                                       falls back to the async heap
+                                       scan; the callback attempts the
+                                       show itself when it wins. The
+                                       r15 ladder ran the sync walk
+                                       only, so an activity that was
+                                       heap-scan-only was never found
+                                       here. */
+                                    resolve_current_activity(function (a) {
+                                        ime_act_resolved(a,
+                                            'retry ' + delay + 'ms');
+                                    });
+                                } else if (ime_try_show(false)) {
                                     agentLog('ime: retry ok at ' + delay + 'ms');
+                                }
                             } catch (e2) {}
                         });
                     }, delay);

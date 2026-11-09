@@ -33,7 +33,13 @@ static void write_marker_in(const char* dir, const char* name,
    /sdcard writes themselves fail silently under scoped storage on
    newer devices). Resolve the app's private dir via JNI and log
    THERE; /sdcard/Download stays as the fallback when the JVM or
-   the Application is not reachable. */
+   the Application is not reachable.
+   r16: currentApplication() is frequently still NULL during
+   Application.onCreate (JNI_OnLoad runs inside
+   System.loadLibrary), so the fallback wins exactly when the
+   logs matter most. DexToolApp now calls nativeSetLogDir() right
+   after loadLibrary; this JNI resolution remains the safety net
+   for other entry points. */
 static void resolve_log_dir(char* out, size_t n) {
     snprintf(out, n, "/sdcard/Download");
     JNIEnv* env = nullptr;
@@ -72,6 +78,20 @@ static void resolve_log_dir(char* out, size_t n) {
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
+/* r16: called by DexToolApp right after System.loadLibrary. That
+   is the one moment the Java side knows getFilesDir() for certain
+   and the native logger can still be re-pointed cheaply (see
+   logger_retarget). */
+extern "C" JNIEXPORT void JNICALL
+Java_com_dextool_app_DexToolApp_nativeSetLogDir(JNIEnv* env, jclass,
+                                                jstring path) {
+    if (!path) return;
+    const char* p = env->GetStringUTFChars(path, nullptr);
+    if (!p) return;
+    logger_retarget(p);
+    env->ReleaseStringUTFChars(path, p);
+}
+
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void*) {
     g_jvm_global = vm;
@@ -84,7 +104,7 @@ JNI_OnLoad(JavaVM* vm, void*) {
     logger_install_abort_capture();
     {
         char m[600];
-        snprintf(m, sizeof(m), "[JNI_OnLoad] entry (r15: log dir %s)",
+        snprintf(m, sizeof(m), "[JNI_OnLoad] entry (r16: log dir %s)",
                  base);
         log_info(m);
     }
