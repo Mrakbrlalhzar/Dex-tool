@@ -3,6 +3,41 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r21)
+
+1. Field evidence (r20 build, device logs, both failures pinned by
+   the r20 stage tags): tap 1 dies with "stage decor.addView:
+   decor.addView typeof undefined" on every ladder attempt - the
+   wrapper returned by win.getDecorView() does not resolve
+   ViewGroup methods on this bridge, so the hidden EditText could
+   never be attached. After the addContentView patch the keyboard
+   opens and the ladder completes ("bridge up after ladder").
+
+2. Second symptom: the first keystroke typed the literal
+   "[object Object]" into the menu, then nothing. The Editable
+   handed to afterTextChanged() had no bridged toString either,
+   so ed.toString() fell through to QuickJS's
+   Object.prototype.toString - it does NOT throw, it silently
+   returns that constant, the watcher stores it as IME.prev and
+   every later diff comes out empty.
+
+3. Fix 1 (per field fix-spec): the hidden EditText is attached
+   via act.addContentView(edit, lp) - a plain public Activity
+   method on the same wrapper whose hashCode/getWindow/
+   getSystemService all work. The win/decor stages are gone;
+   the r19 early guard now probes BOTH act.getWindow and
+   act.addContentView before any state mutation.
+
+4. Fix 2 (per field fix-spec, hardened): ime_read_text() re-wraps
+   the Editable through Java.cast(ed, CharSequence).toString()
+   (the same cast machinery as the proven InputMethodManager
+   cast), falls back to a java.lang.Object cast, then to
+   CharSequence.toString.call(ed). Every path rejects the
+   "[object Object]" poison literal, and a total read failure
+   returns null so ime_on_text() SKIPS the delta - the naive
+   fallback (cur = '') would have fired backspaces for the whole
+   field.
+
 ## Fixes in this version (r20)
 
 1. Field evidence (r19 build, device logs): capture and retention

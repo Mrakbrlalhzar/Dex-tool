@@ -139,7 +139,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r20: IME path stage-tagged - every call in ime_create_edit/ime_try_show is typeof-verified and wrapped in ime_stage() so the next failure reports 'stage <name>: <original>' instead of QuickJS's bare 'not a function', one-shot view-map probe after first capture, r19 retain/alias/guards kept)");
+    log_info("logger_init done (build r21: IME host fixes - hidden EditText attached via act.addContentView (the DecorView wrapper lacks addView on this bridge), Editable read via Java.cast to CharSequence + poison guard so a failed read can no longer type '[object Object]' or backspace the field, r20 stage tags kept)");
 }
 
 /* r16: re-point the logs at the app's real private dir.

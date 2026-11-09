@@ -1,7 +1,38 @@
 'use strict';
-/* Dex-tool agent (r20). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r21). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r21 changes (two field reports on the r20 build, both pinned by
+   the r20 stage tags):
+   - "stage decor.addView: decor.addView typeof undefined": on this
+     bridge the wrapper returned by win.getDecorView() does not
+     resolve ViewGroup methods, so the hidden EditText could never
+     be attached. Fix per field fix-spec: attach through
+     act.addContentView(edit, lp) instead - a plain public Activity
+     method on the same wrapper whose hashCode/getWindow/
+     getSystemService all work (proven by the successful r20 run
+     that opened the keyboard). The win/decor stages are gone; the
+     r19 early guard now probes BOTH act.getWindow and
+     act.addContentView before any state mutation.
+   - first keystroke typed "[object Object]" into the menu and then
+     nothing: the Editable handed to afterTextChanged() had no
+     bridged toString either, so ed.toString() fell through to
+     QuickJS's Object.prototype.toString - it does NOT throw, it
+     silently returns that constant, the watcher stores it as
+     IME.prev and every later diff comes out empty. Fix:
+     ime_read_text() re-wraps the Editable through
+     Java.cast(ed, CharSequence).toString() (the same cast
+     machinery as the proven cast to InputMethodManager), falls
+     back to a java.lang.Object cast, then to
+     CharSequence.toString.call(ed); every path rejects the
+     "[object Object]" poison literal and a total read failure
+     returns null - ime_on_text() then SKIPS the delta (the
+     fix-spec fallback cur = '' would have fired backspaces for
+     the whole field).
+   - everything from r20 (stage tags, one-shot view-map probe) and
+     r19 (retain + probe/rewrap, defensive factory resolution,
+     delegating ime_ensure alias) is kept.
 
    r20 changes (field report on r19: the r19 diagnostics worked -
    the payload now reads {"fn":"ime_create_edit","msg":"not a
@@ -458,11 +489,53 @@ function ime_set_act(obj, how) {
     }
 }
 
+/* r21: read the watcher's Editable as a JS string. The r12-era
+   ed.toString() is POISON on this bridge: the Editable handed to
+   afterTextChanged() gets no bridged toString, so QuickJS falls
+   through to Object.prototype.toString - no exception, just the
+   constant "[object Object]" (the same poison the r10 String()
+   bug produced, now through a third path). Every path here
+   either returns a real string or null; the poison literal is
+   rejected as well. */
+var imeReadWarned = false;
+function ime_read_text(ed) {
+    try {
+        if (typeof ed === 'string') return ed;
+    } catch (eS) {}
+    try {
+        var seq = Java.cast(ed, Java.use('java.lang.CharSequence'));
+        var s1 = seq.toString();
+        if (typeof s1 === 'string' && s1 !== '[object Object]')
+            return s1;
+    } catch (e0) {}
+    try {
+        var s2 = Java.cast(ed, Java.use('java.lang.Object')).toString();
+        if (typeof s2 === 'string' && s2 !== '[object Object]')
+            return s2;
+    } catch (e1) {}
+    try {
+        var s3 = Java.use('java.lang.CharSequence').toString.call(ed);
+        if (typeof s3 === 'string' && s3 !== '[object Object]')
+            return s3;
+    } catch (e2) {}
+    if (!imeReadWarned) {
+        imeReadWarned = true;
+        agentLog('ime: Editable unreadable (typeof ed=' + (typeof ed) +
+            ', all CharSequence casts failed) - text updates skipped');
+    }
+    return null;
+}
+
 function ime_on_text(ed) {
     try {
         if (!ensure_native_fns()) return;
-        var cur = '';
-        try { cur = ed.toString(); } catch (e0) { return; }
+        /* r21: a failed read must NOT run the delta - diffing
+           against '' would fire backspaces for the whole field
+           (the fix-spec fallback had exactly that hazard). Skip
+           this change and keep IME.prev; the next successful read
+           diffs against the last KNOWN text and recovers. */
+        var cur = ime_read_text(ed);
+        if (cur === null) return;
         cur = String(cur);
         if (IME.silent) { IME.prev = cur; return; }   /* programmatic */
         var prev = IME.prev;
@@ -521,10 +594,18 @@ function ime_create_edit(act) {
     try { h = act.hashCode(); } catch (e0) {}
     if (IME.edit && IME.actHash === h) return IME.edit;
     try {
-        if (typeof act.getWindow !== 'function') {
+        /* r21: sanity-probe the retained wrapper BEFORE any
+           mutation. getWindow is the r19 Activity probe (kept);
+           addContentView is now the attach call itself, so a
+           missing member is caught here - before IME.edit and
+           IME.prev are wiped - instead of on every ladder
+           attempt. */
+        if (typeof act.getWindow !== 'function' ||
+            typeof act.addContentView !== 'function') {
             sendMsg('error', { fn: 'ime_create_edit',
-                msg: 'retained activity lacks act.getWindow (typeof ' +
-                    (typeof act.getWindow) + ')' });
+                msg: 'retained activity missing members: getWindow typeof ' +
+                    (typeof act.getWindow) + ', addContentView typeof ' +
+                    (typeof act.addContentView) });
             return null;
         }
         IME.edit = null;               /* activity switched */
@@ -532,19 +613,12 @@ function ime_create_edit(act) {
         /* r20: every step below is stage-tagged - see ime_stage().
            Each callee is typeof-verified BEFORE the call, so a
            missing member is named exactly; a present-but-throwing
-           member surfaces as "stage <name>: <original>". */
-        var win = ime_stage('act.getWindow', function () {
-            var w = act.getWindow();
-            if (w === null || w === undefined)
-                throw new Error('act.getWindow() returned ' + w);
-            return w;
-        });
-        var decor = ime_stage('window.getDecorView', function () {
-            if (typeof win.getDecorView !== 'function')
-                throw new Error('window.getDecorView typeof ' +
-                    (typeof win.getDecorView));
-            return win.getDecorView();
-        });
+           member surfaces as "stage <name>: <original>".
+           r21: the win/getDecorView stages are GONE - on this
+           bridge the DecorView wrapper does not resolve ViewGroup
+           methods (decor.addView typeof undefined, 35x in the
+           field log), so the EditText is attached through
+           act.addContentView() below instead. */
         var edit = ime_stage('EditText.$new', function () {
             var ET = Java.use('android.widget.EditText');
             if (typeof ET.$new !== 'function')
@@ -574,10 +648,16 @@ function ime_create_edit(act) {
                     (typeof LP.$new));
             return LP.$new(1, 1);
         });
-        ime_stage('act.addContentView', function () { 
-            if (typeof act.addContentView !== 'function') 
-                throw new Error('act.addContentView typeof ' + (typeof act.addContentView)); 
-            act.addContentView(edit, lp); 
+        ime_stage('act.addContentView', function () {
+            if (typeof act.addContentView !== 'function')
+                throw new Error('act.addContentView typeof ' +
+                    (typeof act.addContentView));
+            /* lands the edit in android.R.id.content - the same
+               attached window hierarchy a decor.addView() used to
+               reach, but through the Activity methods this bridge
+               resolves; lp (FrameLayout.LayoutParams) matches
+               that container exactly. */
+            act.addContentView(edit, lp);
         });
         var tag = (++IME.cnt) + '_' + (Date.now() % 1000000);
         var tw = ime_stage('registerClass TextWatcher', function () {
@@ -1064,7 +1144,7 @@ function installTouchHook() {
             return this.dispatchTouchEvent(ev);         /* original call */
         };
         agentLog('phase: dispatchTouchEvent hook ok');
-        sendMsg('info', { msg: 'touch hook installed (r20, screen coords + IME activity capture)' });
+        sendMsg('info', { msg: 'touch hook installed (r21, screen coords + IME activity capture)' });
     });
 }
 
@@ -2028,6 +2108,6 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r20 loaded' });
+    sendMsg('ready', { msg: 'Dex-tool agent r21 loaded' });
     agentLog('phase: ready sent');
 }, 0);
