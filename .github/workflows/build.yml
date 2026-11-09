@@ -285,6 +285,10 @@ jobs:
           /* r11: base dir captured at init, for menu.cpp config IO */
           const char* logger_base_dir();
           void logger_install_abort_capture();
+          /* r16: re-point the log files at the app's real private dir after
+             JNI_OnLoad (DexToolApp.nativeSetLogDir). Append-only: nothing
+             already written is lost. */
+          void logger_retarget(const char* base_dir);
           DXTLOGH
 
       - name: Generate logger.cpp
@@ -386,7 +390,10 @@ jobs:
               snprintf(pprev, sizeof(pprev), "%s/dextool-crash.prev.log", base_dir);
               snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
               rename(p, pprev);
-              g_crash_fd = open(p, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+              /* r16: O_APPEND - every write lands atomically at EOF,
+                 so concurrent appends (Java uncaught-exception handler,
+                 copier) can never clobber an offset */
+              g_crash_fd = open(p, O_WRONLY|O_CREAT|O_TRUNC|O_APPEND, 0644);
               {
                   stack_t ss;
                   memset(&ss, 0, sizeof(ss));
@@ -428,7 +435,54 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r15: async IME resolve + retries always armed, screen-space touch map, backspace counter, unified log dir)");
+              log_info("logger_init done (build r16: async-resolved activity shows the IME itself + both-layer retry ladder + no reset on retries, atomic log copy, log dir handed over by Java)");
+          }
+
+          /* r16: re-point the logs at the app's real private dir.
+             JNI_OnLoad runs inside System.loadLibrary from
+             Application.onCreate - before onCreate has finished - and on
+             many Android versions ActivityThread.currentApplication() is
+             still null there, so resolve_log_dir() fell back to
+             /sdcard/Download (unwritable under scoped storage on modern
+             devices) while the Java copier read
+             getFilesDir()/dextool-logs. DexToolApp knows its own dir with
+             certainty and hands it over right after loadLibrary. Files are
+             reopened APPEND-ONLY (no truncate, no rename) so everything
+             written to the fallback dir earlier stays intact and nothing
+             already logged is lost. */
+          void logger_retarget(const char* base_dir) {
+              if (!base_dir || !base_dir[0]) return;
+              if (strcmp(base_dir, g_base_dir) == 0) return;
+              pthread_mutex_lock(&g_mtx);
+              if (g_info_fp)  { fclose(g_info_fp);  g_info_fp  = nullptr; }
+              if (g_debug_fp) { fclose(g_debug_fp); g_debug_fp = nullptr; }
+              snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
+              char p[640];
+              snprintf(p, sizeof(p), "%s/dextool.log", base_dir);
+              g_info_fp = fopen(p, "a");
+              snprintf(p, sizeof(p), "%s/dextool-debug.log", base_dir);
+              g_debug_fp = fopen(p, "a");
+              if (g_crash_fd >= 0) {
+                  /* r16: dup2 replaces the descriptor ATOMICALLY in the fd
+                     table - a concurrent log_crash_raw() (no mutex: it runs
+                     in signal handlers) hits either the old or the new file,
+                     never a closed or recycled descriptor */
+                  snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
+                  int nfd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
+                  if (nfd >= 0) {
+                      dup2(nfd, g_crash_fd);
+                      close(nfd);
+                  }
+              } else {
+                  snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
+                  g_crash_fd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
+              }
+              pthread_mutex_unlock(&g_mtx);
+              {
+                  char m[128];
+                  snprintf(m, sizeof(m), "[logger] retargeted to %s", base_dir);
+                  log_info(m);
+              }
           }
 
           void log_info(const char* msg) {
@@ -3266,7 +3320,13 @@ jobs:
              /sdcard writes themselves fail silently under scoped storage on
              newer devices). Resolve the app's private dir via JNI and log
              THERE; /sdcard/Download stays as the fallback when the JVM or
-             the Application is not reachable. */
+             the Application is not reachable.
+             r16: currentApplication() is frequently still NULL during
+             Application.onCreate (JNI_OnLoad runs inside
+             System.loadLibrary), so the fallback wins exactly when the
+             logs matter most. DexToolApp now calls nativeSetLogDir() right
+             after loadLibrary; this JNI resolution remains the safety net
+             for other entry points. */
           static void resolve_log_dir(char* out, size_t n) {
               snprintf(out, n, "/sdcard/Download");
               JNIEnv* env = nullptr;
@@ -3305,6 +3365,20 @@ jobs:
               if (env->ExceptionCheck()) env->ExceptionClear();
           }
 
+          /* r16: called by DexToolApp right after System.loadLibrary. That
+             is the one moment the Java side knows getFilesDir() for certain
+             and the native logger can still be re-pointed cheaply (see
+             logger_retarget). */
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_dextool_app_DexToolApp_nativeSetLogDir(JNIEnv* env, jclass,
+                                                          jstring path) {
+              if (!path) return;
+              const char* p = env->GetStringUTFChars(path, nullptr);
+              if (!p) return;
+              logger_retarget(p);
+              env->ReleaseStringUTFChars(path, p);
+          }
+
           extern "C" JNIEXPORT jint JNICALL
           JNI_OnLoad(JavaVM* vm, void*) {
               g_jvm_global = vm;
@@ -3317,7 +3391,7 @@ jobs:
               logger_install_abort_capture();
               {
                   char m[600];
-                  snprintf(m, sizeof(m), "[JNI_OnLoad] entry (r15: log dir %s)",
+                  snprintf(m, sizeof(m), "[JNI_OnLoad] entry (r16: log dir %s)",
                            base);
                   log_info(m);
               }
@@ -3337,9 +3411,24 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r15). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r16). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
+
+             r16 changes (field report: the keyboard STILL failed to open):
+             - the async resolve_current_activity() callback stored IME.act
+               but never attempted the show: when every synchronous retry
+               missed and the heap scan landed after the retry ladder was
+               done, showSoftInput never ran. The callback performs the show
+               itself now (ime_act_resolved), scheduled on the main thread,
+               without touching any text.
+             - the retry ladder resolved the activity SYNCHRONOUSLY only;
+               an activity found only by the async heap scan was never
+               picked up. The ladder runs resolve_current_activity() now
+               (sync walk first, heap scan second).
+             - ime_try_show() reset the hidden EditText on EVERY attempt;
+               a retry landing while the user was already typing wiped the
+               field. Only the first attempt of a focus session resets.
 
              r15 changes (code-audit fixes):
              - IME: activity resolution is now ASYNC-correct. Java.choose
@@ -3679,15 +3768,20 @@ jobs:
               }
           }
 
-          function ime_try_show() {
+          function ime_try_show(reset) {
               /* one complete attempt on the main thread: create the hidden
                  EditText (+ TextWatcher) if needed, focus it, and send
-                 showSoftInput. Returns true only if showSoftInput was sent. */
+                 showSoftInput. Returns true only if showSoftInput was sent.
+                 r16: reset only when the caller says so - the first attempt
+                 of a focus session passes true, retries and async-resolved
+                 shows pass false. Resetting on every attempt wiped user
+                 input when a retry landed while typing was already under
+                 way. */
               try {
                   if (!IME.act) return false;
                   var edit = ime_ensure(IME.act);
                   if (!edit) return false;
-                  ime_reset_text();
+                  if (reset !== false) ime_reset_text();
                   edit.requestFocus();
                   var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
                   var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
@@ -3698,6 +3792,35 @@ jobs:
                   sendMsg('error', { fn: 'ime_try_show', msg: String(e.message || e) });
                   return false;
               }
+          }
+
+          /* r16: shared handler for an asynchronously resolved activity.
+             The r15 callback only stored IME.act - when every sync retry
+             missed (ActivityThread walk empty right after resume) and the
+             heap scan landed AFTER the retry ladder had finished, nothing
+             ever called showSoftInput and the keyboard never opened. The
+             callback now attempts the show itself:
+             - the UI work (ime_ensure creates a view) must run on the
+               main thread, hence Java.scheduleOnMainThread;
+             - no ime_reset_text() here: by the time the async scan lands
+               the user may already be typing. */
+          function ime_act_resolved(a, how) {
+              if (!a) return;
+              try { IME.act = a; } catch (e0) { return; }
+              agentLog('ime: activity resolved ' + how);
+              if (!IME.everLogged) {
+                  IME.everLogged = true;
+                  try {
+                      sendMsg('info', { msg: 'IME host activity: ' +
+                          IME.act.getClass().getName() });
+                  } catch (e1) {}
+              }
+              Java.scheduleOnMainThread(function () {
+                  try {
+                      if (ime_try_show(false))
+                          agentLog('ime: show ok after ' + how);
+                  } catch (e2) {}
+              });
           }
 
           function ime_show() {
@@ -3721,10 +3844,13 @@ jobs:
                           }
                           if (!IME.act) {
                               sendMsg('warn', { msg: 'IME: no activity yet - async resolve, retries armed' });
+                              /* r16 CRITICAL FIX: the r15 callback only stored
+                                 the activity and returned - if the heap scan
+                                 landed after the retries were exhausted,
+                                 showSoftInput never ran. The callback attempts
+                                 the show itself now. */
                               resolve_current_activity(function (a) {
-                                  if (!a) return;
-                                  try { IME.act = a; } catch (e1) {}
-                                  agentLog('ime: activity resolved async');
+                                  ime_act_resolved(a, 'async');
                               });
                           }
                           if (IME.act && !IME.everLogged) {
@@ -3734,7 +3860,7 @@ jobs:
                                       IME.act.getClass().getName() });
                               } catch (e5) {}
                           }
-                          ime_try_show();
+                          ime_try_show(true);   /* r16: only the first attempt resets */
                           /* the first show right after focus often loses the
                              race with the window - retry on a ladder; each
                              retry also re-resolves the activity (the r14
@@ -3745,15 +3871,24 @@ jobs:
                                   Java.scheduleOnMainThread(function () {
                                       try {
                                           if (!IME.act) {
-                                              var a = find_current_activity_sync();
-                                              if (a) {
-                                                  IME.act = a;
-                                                  agentLog('ime: activity resolved at retry ' + delay + 'ms');
-                                              }
-                                          }
-                                          if (!IME.act) return;
-                                          if (ime_try_show())
+                                              /* r16: BOTH resolution layers run
+                                                 in the ladder. resolve_current_
+                                                 activity walks ActivityThread
+                                                 synchronously first and only
+                                                 falls back to the async heap
+                                                 scan; the callback attempts the
+                                                 show itself when it wins. The
+                                                 r15 ladder ran the sync walk
+                                                 only, so an activity that was
+                                                 heap-scan-only was never found
+                                                 here. */
+                                              resolve_current_activity(function (a) {
+                                                  ime_act_resolved(a,
+                                                      'retry ' + delay + 'ms');
+                                              });
+                                          } else if (ime_try_show(false)) {
                                               agentLog('ime: retry ok at ' + delay + 'ms');
+                                          }
                                       } catch (e2) {}
                                   });
                               }, delay);
@@ -4968,7 +5103,32 @@ jobs:
                   } catch (UnsatisfiedLinkError e) {
                       Log.e(TAG, "loadLibrary failed: " + e.getMessage());
                   }
+                  /* r16: hand THIS app's private log dir to the native logger.
+                     JNI_OnLoad runs inside System.loadLibrary, i.e. while
+                     Application.onCreate is still running - on many Android
+                     versions ActivityThread.currentApplication() is null
+                     there, so the native side fell back to /sdcard/Download
+                     (unwritable under scoped storage on modern devices) while
+                     this copier read getFilesDir()/dextool-logs. The Java
+                     side knows its own dir with certainty. */
+                  retargetNativeLogs();
               }
+
+              private void retargetNativeLogs() {
+                  try {
+                      File d = new File(getFilesDir(), "dextool-logs");
+                      d.mkdirs();
+                      nativeSetLogDir(d.getAbsolutePath());
+                      Log.i(TAG, "native log dir: " + d.getAbsolutePath());
+                  } catch (Throwable t) {
+                      Log.w(TAG, "retarget logs: " + t.getMessage());
+                  }
+              }
+
+              /* implemented in main.cpp (JNI_OnLoad's library): calls
+                 logger_retarget() - files are reopened append-only in the
+                 new dir, so anything already logged is kept */
+              private static native void nativeSetLogDir(String path);
 
               /* stream this process' logcat (own uid, allowed) so native
                  abort messages that only reach logcat are captured too */
@@ -5024,17 +5184,30 @@ jobs:
               }
 
               private void copyLogs() throws IOException {
-                  String[] names = {"dextool.log","dextool-debug.log","dextool-crash.log"};
+                  String[] names = {"dextool.log", "dextool-debug.log", "dextool-crash.log"};
+                  File srcDir = new File(getFilesDir(), "dextool-logs");
                   new File(DL).mkdirs();
                   for (String n : names) {
-                      File s = new File(getFilesDir(), "dextool-logs/"+n);
+                      File s = new File(srcDir, n);
                       if (!s.exists()) continue;
                       File d = new File(DL, n);
+                      /* unchanged since the last pass -> skip the rewrite */
+                      if (d.exists() && d.length() == s.length() &&
+                              s.lastModified() <= d.lastModified()) continue;
+                      /* r16: ATOMIC copy. The r15 version appended the WHOLE
+                         source file every 5s (FileOutputStream(d, true)), so
+                         every cycle duplicated the entire log again - a pulled
+                         log held one copy per 5s of uptime. Write a temp file
+                         and rename(2) it over the target: atomic, no
+                         duplication, no torn reads. */
+                      File t = new File(DL, n + ".tmp");
                       try (InputStream  is = new FileInputStream(s);
-                           OutputStream os = new FileOutputStream(d, true)) {
+                           OutputStream os = new FileOutputStream(t, false)) {
                           byte[] buf = new byte[8192]; int len;
-                          while ((len=is.read(buf))!=-1) os.write(buf,0,len);
+                          while ((len = is.read(buf)) != -1) os.write(buf, 0, len);
+                          os.flush();
                       }
+                      if (!t.renameTo(d)) t.delete();
                   }
               }
 
@@ -5042,11 +5215,27 @@ jobs:
                   Thread.UncaughtExceptionHandler prev =
                       Thread.getDefaultUncaughtExceptionHandler();
                   Thread.setDefaultUncaughtExceptionHandler((thr, ex) -> {
-                      try (FileOutputStream f =
-                               new FileOutputStream(DL+"/dextool-crash.log",true)) {
-                          f.write(("JAVA_CRASH thr="+thr.getName()+" "+ex+"\n").getBytes());
-                      } catch (IOException ignored) {}
-                      if (prev!=null) prev.uncaughtException(thr, ex);
+                      /* r16: append to the SOURCE log (filesDir/dextool-logs),
+                         not to the /sdcard/Download copy - the copier now
+                         overwrites that copy atomically, so an entry written
+                         straight there was clobbered within one 5s cycle. A
+                         single append to the source file cannot duplicate
+                         anything (the native crash fd writes with O_APPEND
+                         too); an immediate copy pass lands the entry in
+                         Download even if the process dies before the next
+                         scheduled pass. */
+                      try {
+                          File srcDir = new File(getFilesDir(), "dextool-logs");
+                          srcDir.mkdirs();
+                          try (FileOutputStream f =
+                                   new FileOutputStream(
+                                       new File(srcDir, "dextool-crash.log"), true)) {
+                              f.write(("JAVA_CRASH thr=" + thr.getName()
+                                       + " " + ex + "\n").getBytes());
+                          }
+                          copyLogs();
+                      } catch (Throwable ignored) {}
+                      if (prev != null) prev.uncaughtException(thr, ex);
                   });
               }
           }
@@ -5222,6 +5411,54 @@ jobs:
 
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+          ## Fixes in this version (r16)
+
+          1. The keyboard STILL failed to open on some hosts (field report
+             on r15). Three residual timing defects, all fixed:
+             a) the async resolve_current_activity() callback stored
+                IME.act but never attempted the show - when every sync
+                retry missed and the heap scan landed after the retry
+                ladder was done, showSoftInput never ran. The callback
+                performs the show itself now (ime_act_resolved),
+                scheduled on the main thread, without resetting text.
+             b) the retry ladder ran the SYNCHRONOUS ActivityThread walk
+                only, so an activity found only by the async heap scan
+                was never picked up. The ladder calls
+                resolve_current_activity() now (sync walk first, heap
+                scan second).
+             c) ime_try_show() called ime_reset_text() on EVERY attempt;
+                a retry landing while the user was already typing wiped
+                the hidden EditText (and the TextWatcher diff then
+                re-sent the surviving text as fresh insertions). Only
+                the first attempt of a focus session resets now.
+
+          2. Crash-log plumbing (duplicated blocks / wrong directory):
+             a) the Java copier appended the WHOLE source file every 5s
+                (FileOutputStream(d, true)) - every pulled log held one
+                copy per 5s of uptime. It now writes a temp file and
+                rename(2)s it over the target: atomic, no duplication,
+                no torn reads; files unchanged since the last pass are
+                skipped.
+             b) JNI_OnLoad runs inside System.loadLibrary, BEFORE
+                Application.onCreate finishes - currentApplication() was
+                null there, so native logs landed in /sdcard/Download
+                (unwritable under scoped storage on modern devices) while
+                the copier read filesDir/dextool-logs. DexToolApp now
+                hands getFilesDir()/dextool-logs to the native logger
+                right after loadLibrary (nativeSetLogDir ->
+                logger_retarget; files reopened append-only, so nothing
+                already written is lost).
+             c) the uncaught-exception handler appends JAVA_CRASH to the
+                SOURCE log now (an entry written straight to the
+                Download copy was clobbered by the next copier pass) and
+                pushes an immediate copy pass.
+             d) the native crash fd opens with O_APPEND - concurrent
+                writes (native signal handler, Java handler, copier)
+                cannot clobber each other's offsets. Fatal-signal capture
+                (SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE: signal, si_code,
+                fault addr, PC, module+offset) and the streamed logcat
+                tombstone backtrace were already in place from r15.
 
           ## Fixes in this version (r15)
 
@@ -5450,7 +5687,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r15: async activity resolution (Java.choose is async) + IME retries armed unconditionally, screen-space touch mapping (rawX/rawY + on-screen origin, both-axis scale, bias default 0), backspace counter, extract_jar JNI type fix, native logs to filesDir/dextool-logs, nolib built from scratch copy, gitignore hygiene [skip ci]"
+            git commit -m "fix r16: async-resolved activity now attempts the IME show itself + retry ladder uses both sync and async resolution + no text reset on retries (was wiping input), atomic log copy (temp+rename, was append-duplicating), DexToolApp hands filesDir/dextool-logs to the native logger (JNI_OnLoad currentApplication null), JAVA_CRASH to the source log, O_APPEND crash fd [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
