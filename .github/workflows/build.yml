@@ -165,12 +165,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: deps/dobby
-          key: dobby-lsposed-v2
+          key: dobby-lsposed-v3-pinned
 
       - name: Build Dobby for both ABIs
         if: "${{ steps.cache-dobby.outputs.cache-hit != 'true' }}"
         run: |
-          git clone --depth 1 https://github.com/LSPosed/Dobby.git dobby-src
+          # r23/audit: pin Dobby to a specific commit - a moving master
+          # once changed hook internals under a cached build. The cache
+          # key was bumped so the pinned build replaces the old one.
+          git clone https://github.com/LSPosed/Dobby.git dobby-src
+          git -C dobby-src checkout c1da0315d7a2069bde2ab432e45d4ab6df91237a
           mkdir -p deps/dobby
           cp -r dobby-src/include deps/dobby/
           for ABI in arm64-v8a armeabi-v7a; do
@@ -189,6 +193,29 @@ jobs:
           git clone --depth 1 --branch v1.90.4 \
             https://github.com/ocornut/imgui.git imgui
           ls imgui/backends/imgui_impl_opengl3.cpp
+          # r23/audit: parked ImGui worlds must be able to FORGET their
+          # backend GL names WITHOUT any GL calls - deleting stale names
+          # in a NEW context can hit objects the driver recycled the
+          # name for. The function is appended to the backend itself
+          # (ImGui_ImplOpenGL3_Data and its static accessor are
+          # file-local, so this is the only place it can live).
+          cat >> imgui/backends/imgui_impl_opengl3.cpp << 'DXTIMGI'
+
+          /* --- DexTool r23: forget stored GL names without GL calls ---
+             Zeroes the guarded handles so DestroyDeviceObjects /
+             DestroyFontsTexture become no-ops; the next Init rebuilds
+             everything on the live context. */
+          IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects()
+          {
+              ImGui_ImplOpenGL3_Data* bd =
+                  ImGui_ImplOpenGL3_GetBackendData();
+              if (!bd) return;
+              bd->FontTexture    = 0;
+              bd->ShaderHandle   = 0;
+              bd->VboHandle      = 0;
+              bd->ElementsHandle = 0;
+          }
+          DXTIMGI
 
       - name: Build smali 3.0.7 dex jar
         run: |
@@ -472,7 +499,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r22: third-party audit fixes - ONE ordered input queue with UTF-16 surrogate recombination, double-draw guard spans the real eglSwapBuffers, texture binding restored on unit 0, logger FILE* checked under the lock + private crash log rotated on retarget + existing sigaltstack kept + terminate survives no-exception, bridge queues early agent messages + logs uncaught JS errors, r21 IME host fixes kept)");
+              log_info("logger_init done (build r23: audit patch 2 - exact JSON message routing + dextool_hit_test click-through + ONE hook-layering registry for Hook/Tracker/Recorder/Monitor (stop really unhooks) + retained instance handles with structured instance protocol + loadClass-deferred installs (no forced <clinit>) + toString-safe field tracking + vertex-attrib state saved/restored + eglTerminate scoped to its own display + parked worlds forget stale GL names + agent-start failures shown in the UI, r22 ordered-input/audit fixes kept)");
           }
 
           /* r16: re-point the logs at the app's real private dir.
@@ -657,6 +684,10 @@ jobs:
           JNIEXPORT void dextool_add_char(int codepoint);
           JNIEXPORT void dextool_backspace();
           JNIEXPORT bool dextool_want_mouse();
+          /* r23: click-through filter. Called by the Java touch hook BEFORE the
+             gesture reaches the host app; true = the tap mapped onto one of the
+             live ImGui windows of the last frame and must be consumed. */
+          JNIEXPORT bool dextool_hit_test(float x, float y);
           JNIEXPORT int  dextool_display_size();  /* (w<<16)|h, 0 until the overlay is up */
           JNIEXPORT void dextool_agent_log(const char* msg); /* r14: agent phase markers -> logs */
           #ifdef __cplusplus
@@ -673,6 +704,7 @@ jobs:
           #include "frida_bridge.h"
           #include "touch.h"
           #include "imgui.h"
+          #include "imgui_internal.h"   /* r23: live window list for the hit test */
           #include "imgui_impl_opengl3.h"
           #include "dobby.h"
           #include "frida-gumjs.h"
@@ -699,6 +731,14 @@ jobs:
           static fn_swap_dmg    g_orig_swap_dmg    = nullptr;
           static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
           static fn_terminate   g_orig_terminate   = nullptr;
+
+          /* r23: appended to the cloned backend by the CI build (see the ImGui
+             step in build.yml). Zeroes the stored GL object names WITHOUT any
+             GL calls - the guarded deletes in DestroyDeviceObjects become
+             no-ops, so a parked world can never delete stale names that a
+             recycled name in the NEW context now owns (the r22 residual of
+             the 0x501 abort class). */
+          IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects();
 
           static std::atomic<bool> g_gum_inited {false};
           static JavaVM*           g_jvm        = nullptr;
@@ -739,6 +779,11 @@ jobs:
               GLint vao = 0, ab = 0, eb = 0;
               GLint fb = 0;                     /* r9: app FBO restored too */
               GLint active_tex = GL_TEXTURE0, tex2d = 0;
+              /* r23: vertex-attrib-array ENABLE flags are global context state
+                 on ES2 (VAO state on ES3, but we run the ES2 backend path) -
+                 the ImGui draw leaves attribs 0/1 enabled; apps that never
+                 re-enable their own attribs drew garbage after our frame. */
+              GLboolean attrib_en[8] = {GL_FALSE};
               GLint viewport[4]    = {0, 0, 0, 0};
               GLint scissor_box[4] = {0, 0, 0, 0};
               GLboolean scissor = GL_FALSE, depth = GL_FALSE,
@@ -756,6 +801,7 @@ jobs:
               long  swaps = 0;            /* under g_slots_mtx */
               long  last_swap_ms = 0;     /* under g_slots_mtx */
               long  last_frame_ms = 0;    /* owner thread only */
+              EGLDisplay dpy = nullptr;   /* r23: which display this context belongs to - eglTerminate(dpy) may only retire THESE slots */
               GlState gl;
           };
           static std::mutex g_slots_mtx;
@@ -816,6 +862,24 @@ jobs:
 
           /* scroll regions published by menu_draw (owner thread) */
           static std::vector<float> g_scroll_regions;
+
+          /* r23: rects of every LIVE ImGui window of the last frame (owner
+             thread collects them right after menu_draw; the Java touch hook
+             reads them from dextool_hit_test() on a binder/UI thread - the
+             only cross-thread contact, guarded here). */
+          static std::mutex           g_win_mtx;
+          static std::vector<float>   g_window_rects;   /* x,y,w,h quads */
+
+          /* r23: the rects must not outlive the world that drew them -
+             after a park (owner death / display terminate / migration)
+             NOTHING is drawn until a new context adopts, so a frozen
+             rect would make dextool_hit_test() eat taps aimed at
+             whatever is on screen now. The next owner frame rebuilds
+             the snapshot. */
+          static void clear_window_rects() {
+              std::lock_guard<std::mutex> lk(g_win_mtx);
+              g_window_rects.clear();
+          }
 
           /* font atlas: rebuilt on demand from a system font, so the Font Size
              slider actually changes the glyphs instead of just scaling them */
@@ -1009,10 +1073,11 @@ jobs:
                  RenderThread). If an ImGui world is parked from a dead context,
                  DT_ADOPT_MIN_SWAPS is enough - coming back from the background
                  the new context adopts it almost immediately. */
-          static bool ensure_ownership(Slot* s, EGLContext ctx, float sw,
-                                       float sh) {
+          static bool ensure_ownership(Slot* s, EGLContext ctx, EGLDisplay dpy,
+                                       float sw, float sh) {
               std::lock_guard<std::mutex> lk(g_slots_mtx);
               if (s->dead) return false;
+              s->dpy = dpy;              /* r23: recorded for my_terminate */
               s->swaps++;
               long now = now_ms();
               /* r22/audit: remember the PREVIOUS swap time - the stale-owner
@@ -1060,6 +1125,28 @@ jobs:
                   bool stale = (now - ow->last_swap_ms) > DT_OWNER_STALE_MS &&
                                (now - prev_swap)        < 600;
                   if (!stale) return false;     /* healthy owner elsewhere */
+                  /* r23: the migration PARKED nothing before - the old owner's
+                     slot kept its whole ImGui world (layouts, lists, fonts)
+                     alive even though that context is gone: the leak the audit
+                     flagged. Park it as the orphan (the next context adopts
+                     it), and Forget its backend GL names - the old context is
+                     not current here (we are on the NEW owner's thread), so
+                     Shutdown/delete would hit whatever owns those names now. */
+                  if (ow->imgui && !g_orphan_imgui) {
+                      g_orphan_imgui = ow->imgui;
+                      ow->imgui = nullptr;
+                      {
+                          std::lock_guard<std::mutex> lk3(g_disp_mtx);
+                          g_orphan_dw = g_disp_w;
+                          g_orphan_dh = g_disp_h;
+                      }
+                      ImGui::SetCurrentContext(g_orphan_imgui);
+                      ImGui_ImplOpenGL3_ForgetDeviceObjects();
+                      clear_window_rects();   /* nothing draws for this world
+                                                 until a context adopts it */
+                      LOGI("[overlay] owner migrated - old ImGui world parked "
+                           "(not leaked)");
+                  }
                   g_owner = nullptr;
                   LOGI("[overlay] owner migrated (previous went quiet)");
               }
@@ -1126,12 +1213,13 @@ jobs:
                   g_orphan_imgui = nullptr;
                   g_orphan_dw = 0.f; g_orphan_dh = 0.f;
                   ImGui::SetCurrentContext(s->imgui);
-                  /* r22/audit: a world parked by slot_destroy() was ALREADY
-                     shut down (backend data freed) - a second Shutdown
-                     dereferences null. NOTE: worlds parked by my_terminate
-                     keep the old context's GL names - deleting them here can
-                     hit the app's own objects; zeroing them without GL calls
-                     needs a backend patch. */
+                  /* r23: every park path either already ran a real Shutdown
+                     (dying context was current) or called ForgetDeviceObjects
+                     (backend patch appended by CI) first - the stored GL
+                     names are zeroed, so this Shutdown's glDelete* calls are
+                     no-ops and can never hit a name the new context recycled
+                     for one of the app's own objects. Shutdown still frees
+                     the backend data struct, which the raw Forget cannot. */
                   if (ImGui::GetIO().BackendRendererUserData)
                       ImGui_ImplOpenGL3_Shutdown();
                   LOGI("[overlay] ImGui world adopted after context switch");
@@ -1192,7 +1280,17 @@ jobs:
                              otherwise the driver frees everything with the ctx */
                           ImGui::SetCurrentContext(g_orphan_imgui);
                           ImGui_ImplOpenGL3_Shutdown();
+                      } else {
+                          /* r23: the names belong to the dying context, but the
+                             stored slots must not survive into a NEW context:
+                             zero them with no GL calls (Shutdown here would
+                             delete in whatever context is current - the r22
+                             residual 0x501 class). */
+                          ImGui::SetCurrentContext(g_orphan_imgui);
+                          ImGui_ImplOpenGL3_ForgetDeviceObjects();
                       }
+                      clear_window_rects();   /* r23: this world draws nothing
+                                                 until a new context adopts it */
                       LOGI("[overlay] owner context destroyed - ImGui parked, "
                            "waiting for the next GL context");
                   }
@@ -1216,6 +1314,13 @@ jobs:
               glGetIntegerv(GL_TEXTURE_BINDING_2D, &g.tex2d);
               glGetIntegerv(GL_VIEWPORT,    g.viewport);
               glGetIntegerv(GL_SCISSOR_BOX, g.scissor_box);
+              /* r23: vertex-attrib enable flags (ES2 global state; 8 is the
+                 ES2 guaranteed minimum) */
+              for (int i = 0; i < 8; i++) {
+                  GLint en = 0;
+                  glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en);
+                  g.attrib_en[i] = en ? GL_TRUE : GL_FALSE;
+              }
               g.scissor = glIsEnabled(GL_SCISSOR_TEST);
               g.depth   = glIsEnabled(GL_DEPTH_TEST);
               g.stencil = glIsEnabled(GL_STENCIL_TEST);
@@ -1248,6 +1353,12 @@ jobs:
               if (s->es3) glBindVertexArray(g.vao);
               glBindBuffer(GL_ARRAY_BUFFER,         g.ab);
               glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.eb);
+              /* r23: put the app's vertex-attrib enable flags back - right
+                 after the buffer bindings, before anything else may bind */
+              for (int i = 0; i < 8; i++) {
+                  if (g.attrib_en[i]) glEnableVertexAttribArray(i);
+                  else                glDisableVertexAttribArray(i);
+              }
               glBindFramebuffer(GL_FRAMEBUFFER,     g.fb);
               /* r22/audit: tex2d was captured with unit 0 active - restore it
                  on unit 0, then put the app's active unit back */
@@ -1313,11 +1424,63 @@ jobs:
                   }
                   my += g_bias_y;
               }
-              if (mx < 0.f)   mx = 0.f;
-              if (my < 0.f)   my = 0.f;
-              if (mx > ds.x)  mx = ds.x;
-              if (my > ds.y)  my = ds.y;
+              /* r23: NO clamping. Clamping to the display rect pushed taps that
+                 landed OUTSIDE the measured view (letterboxed games, split
+                 screen, free-form windows) onto the edge widgets - a tap below
+                 the view hit the bottom row of the menu. Off-view taps now map
+                 off-canvas and simply hit nothing. */
               return ImVec2(mx, my);
+          }
+
+          /* r23: owner thread, right after menu_draw()/Render() - snapshot the
+             rects of every live ImGui window for dextool_hit_test(). */
+          static void collect_window_rects() {
+              ImGuiContext* g = ImGui::GetCurrentContext();
+              std::vector<float> wr;
+              if (g) {
+                  for (int i = 0; i < g->Windows.Size; i++) {
+                      ImGuiWindow* w = g->Windows[i];
+                      if (!w || !w->Active || w->Hidden) continue;
+                      if (w->Flags & ImGuiWindowFlags_NoInputs) continue;
+                      ImRect r = w->Rect();
+                      wr.push_back(r.Min.x);
+                      wr.push_back(r.Min.y);
+                      wr.push_back(r.Max.x - r.Min.x);
+                      wr.push_back(r.Max.y - r.Min.y);
+                  }
+              }
+              std::lock_guard<std::mutex> lk(g_win_mtx);
+              g_window_rects.swap(wr);
+          }
+
+          /* r23: click-through filter, called by the Java touch hook BEFORE the
+             gesture reaches the host app: true = the tap maps onto a live ImGui
+             window and must be consumed. The window-rect snapshot IS the source
+             of truth: io.WantCaptureMouse (g_want_mouse) was tried as a gate
+             here, but it is computed from the PREVIOUS event's position - the
+             FIRST tap on the menu after any passthrough tap (e.g. the FAB tap
+             that opens the menu) still leaked to the app below it. Rects are
+             refreshed every frame by collect_window_rects() and cleared on
+             every park, so a hit here always means "a window was really drawn
+             at this point last frame". Runs on the app's UI thread: only
+             touches mutex-guarded snapshots. */
+          extern "C" JNIEXPORT bool dextool_hit_test(float x, float y) {
+              float dw = 0.f, dh = 0.f;
+              {
+                  std::lock_guard<std::mutex> lk(g_disp_mtx);
+                  dw = g_disp_w;
+                  dh = g_disp_h;
+              }
+              if (dw <= 0.f || dh <= 0.f) return false;
+              ImVec2 p = map_touch(x, y, ImVec2(dw, dh));
+              std::lock_guard<std::mutex> lk(g_win_mtx);
+              const std::vector<float>& r = g_window_rects;
+              for (size_t i = 0; i + 3 < r.size(); i += 4) {
+                  if (p.x >= r[i] && p.x <= r[i] + r[i + 2] &&
+                      p.y >= r[i + 1] && p.y <= r[i + 1] + r[i + 3])
+                      return true;
+              }
+              return false;
           }
 
           static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
@@ -1350,7 +1513,7 @@ jobs:
               std::lock_guard<std::mutex> lk(g_tick_mtx);
 
               Slot* s = slot_for(ctx);
-              if (!ensure_ownership(s, ctx, (float)sw, (float)sh)) return;
+              if (!ensure_ownership(s, ctx, dpy, (float)sw, (float)sh)) return;
               if (s->dead || s->failed) return;
 
               if (!s->imgui) slot_init(dpy, surf, s);
@@ -1444,6 +1607,7 @@ jobs:
               ImGui_ImplOpenGL3_NewFrame();
               ImGui::NewFrame();
               menu_draw();
+              collect_window_rects();   /* r23: snapshot for the hit test */
               g_want_mouse.store(io.WantCaptureMouse);
               ImGui::Render();
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -1458,18 +1622,25 @@ jobs:
 
           static EGLBoolean my_terminate(EGLDisplay dpy) {
               /* r11: terminating a display invalidates every context of that
-                 display. Retire all slots now; otherwise the next eglCreateContext
-                 can land at a recycled address whose stale slot would draw with
-                 GL handles that are invalid in the new context (the
-                 glUseProgram GL_INVALID_VALUE 0x501 abort class). */
+                 display. r23: retire ONLY the slots that belong to THIS display
+                 (recorded at swap time in Slot.dpy) - a second display's
+                 contexts stay valid, and slots never drawn on have no recorded
+                 display and are retired conservatively; otherwise the next
+                 eglCreateContext can land at a recycled address whose stale
+                 slot would draw with GL handles that are invalid in the new
+                 context (the glUseProgram GL_INVALID_VALUE 0x501 abort class). */
               {
                   std::lock_guard<std::mutex> lk(g_tick_mtx);
                   std::lock_guard<std::mutex> lk2(g_slots_mtx);
                   ImGuiContext* park = nullptr;
                   bool had_owner = false;
+                  bool retired_any = false;
                   for (auto& kv : g_slots) {
                       Slot* s = kv.second;
+                      if (s->dpy != nullptr && s->dpy != dpy)
+                          continue;               /* another display - still live */
                       s->dead = true;
+                      retired_any = true;
                       g_graveyard.push_back(s);
                       if (g_owner == kv.first) {
                           had_owner = true;
@@ -1483,7 +1654,12 @@ jobs:
                           s->imgui = nullptr;
                       }
                   }
-                  g_slots.clear();
+                  if (retired_any) {
+                      for (auto it = g_slots.begin(); it != g_slots.end(); ) {
+                          if (it->second->dead) it = g_slots.erase(it);
+                          else ++it;
+                      }
+                  }
                   if (had_owner) {
                       g_owner = nullptr;
                       g_ready.store(false);
@@ -1496,6 +1672,14 @@ jobs:
                               g_orphan_dw = g_disp_w;
                               g_orphan_dh = g_disp_h;
                           }
+                          /* r23: the terminated display's contexts are gone -
+                             the parked backend names are stale; zero them with
+                             NO GL calls so adoption can never delete a recycled
+                             name in the new context (audit item: stale GL
+                             names deleted in the new context) */
+                          ImGui::SetCurrentContext(g_orphan_imgui);
+                          ImGui_ImplOpenGL3_ForgetDeviceObjects();
+                          clear_window_rects();
                           LOGI("[overlay] display terminated - ImGui parked, "
                                "waiting for the next GL context");
                       }
@@ -1614,7 +1798,14 @@ jobs:
              coords through the rect the agent measured (dextool_set_touch_map)
              before they reach ImGui; this hook therefore forwards untouched
              coords and lets overlay.cpp do the mapping. (AInputQueue coords
-             are window-local - this fallback may need the Settings Y bias.) */
+             are window-local - this fallback may need the Settings Y bias.)
+
+             r23 click-through: the JAVA path consumes menu taps before the host
+             app sees them (dextool_hit_test in the dispatchTouchEvent hook).
+             THIS path only READS events - the app's AInputQueue poll loop owns
+             dispatch, so consuming here is not possible without rewriting the
+             app's input loop; NativeActivity hosts still receive taps that land
+             on the menu (documented limitation, unchanged from r22). */
           static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
               int32_t rc = g_orig_get(q, ev);
               if (rc >= 0 && ev && *ev) {
@@ -1716,6 +1907,23 @@ jobs:
 
           static const char kErrEnvelope[] = "{\"type\":\"error\"";
 
+          /* r23: shared delivery to the menu (callback if registered, backlog
+             otherwise) - also used by the START-FAILURE paths below, so a
+             GumJS backend/script failure reaches the UI as an agentStatus
+             message instead of dying silently in the crash log. */
+          static void deliver(const std::string& pl) {
+              MsgCallback local;
+              {
+                  std::lock_guard<std::mutex> lk(g_pmtx);
+                  local = g_cb;
+                  if (!local && !pl.empty()) {       /* menu not up yet: keep for it */
+                      if (g_backlog.size() < 256) g_backlog.push_back(pl);
+                      return;
+                  }
+              }
+              if (local && !pl.empty()) local(pl);
+          }
+
           static void on_message(const gchar* msg, GBytes*, gpointer) {
               if (!msg) return;
               std::string pl = extract_payload(msg);
@@ -1747,16 +1955,7 @@ jobs:
                       }
                   }
               }
-              MsgCallback local;
-              {
-                  std::lock_guard<std::mutex> lk(g_pmtx);
-                  local = g_cb;
-                  if (!local && !pl.empty()) {       /* menu not up yet: keep for it */
-                      if (g_backlog.size() < 256) g_backlog.push_back(pl);
-                      return;
-                  }
-              }
-              if (local && !pl.empty()) local(pl);
+              deliver(pl);
           }
           void frida_bridge_start(JavaVM*) {
               log_info("[frida_bridge] starting GumJS");
@@ -1766,6 +1965,9 @@ jobs:
               g_backend = gum_script_backend_obtain_qjs();
               if (!g_backend) {
                   log_crash_raw("[frida_bridge] FATAL: no QJS backend\n");
+                  /* r23: tell the menu instead of leaving it on "waiting" forever */
+                  deliver("{\"type\":\"agentStatus\",\"payload\":{\"ok\":0,"
+                          "\"msg\":\"no GumJS QuickJS backend (gum_init failed?)\"}}");
                   return;
               }
               log_info("[frida_bridge] QJS backend obtained");
@@ -1778,6 +1980,13 @@ jobs:
                   snprintf(m, sizeof(m), "[frida_bridge] create: %s\n",
                            err ? err->message : "(null)");
                   log_crash_raw(m);
+                  /* r23: the Settings tab now shows WHY the agent is not coming up */
+                  char jm[640];
+                  snprintf(jm, sizeof(jm),
+                           "{\"type\":\"agentStatus\",\"payload\":{\"ok\":0,"
+                           "\"msg\":\"script create failed: %s\"}}",
+                           err ? err->message : "(null)");
+                  deliver(jm);
                   if (err) g_error_free(err);
                   return;
               }
@@ -1907,7 +2116,11 @@ jobs:
           /* ---------------- data model ---------------- */
           struct MethodSig { std::string name, params, ret; };
           struct FieldInfo { std::string name, type, value; };
-          struct InstInfo  { std::string str; std::vector<FieldInfo> fields; };
+          /* r23: instances arrive as structured JSON objects (see jobjarr);
+             handle is the agent's retained-instance id for setInstanceField /
+             callMethod - the old index-only addressing had no receiver at all */
+          struct InstInfo  { std::string str; long handle = -1;
+                             std::vector<FieldInfo> fields; };
           struct ClassTab {
               std::string cname;
               bool got_info = false, waiting = false;
@@ -1915,6 +2128,7 @@ jobs:
               std::vector<FieldInfo> fields;
               std::vector<InstInfo>  instances;
               int  sel_inst = -1;
+              int  gen = -1;                      /* r23: instance-list generation; part of the editor buffer key */
               int  sub = 0;                       /* 0 Instances 1 Methods 2 Fields */
               /* inline method-call editor */
               bool call_open = false;
@@ -1961,6 +2175,10 @@ jobs:
           static int  s_search_total=0, s_search_shown=0;
           static bool s_search_wait=false;
           static int  s_search_seq=0, s_search_qid=-1;
+          static bool s_search_page0=false;    /* r23: set when a NEW qid is sent;
+                                                  the first page OF THAT QID clears
+                                                  the list - stale pages of an older
+                                                  qid are dropped, not mixed in */
           static std::string s_focus_cls;          /* class tab to select */
           static std::string s_next_tab;           /* top tab to select */
 
@@ -2091,7 +2309,67 @@ jobs:
           }
 
           static bool jhas(const std::string& j, const char* key) {
-              return j.find(std::string("\"")+key+"\"") != std::string::npos;
+              /* r23: colon-anchored - the old substring test matched "key"
+                 INSIDE string values (a class named ...ok... satisfied
+                 jhas(j,"ok")); the key must now be followed by ':' to count */
+              return j.find(std::string("\"") + key + "\":") != std::string::npos;
+          }
+
+          /* r23: EXACT value of the top-level "type" field. The whole message
+             dispatch used to be a chain of jhas() substring tests, so a payload
+             that merely CONTAINED the word ("...ready...", a URL holding
+             "info", a class name ending in "error") hijacked the branch meant
+             for another message. Every branch now compares this exact string. */
+          static std::string jtype(const std::string& j) {
+              const std::string k = "\"type\":\"";
+              auto p = j.find(k);
+              if (p == std::string::npos) return "";
+              p += k.size();
+              size_t i = p;
+              while (i < j.size() && j[i] != '"') {
+                  if (j[i] == '\\' && i + 1 < j.size()) i++;
+                  i++;
+              }
+              return j.substr(p, i - p);
+          }
+
+          /* r23: array of JSON OBJECTS; each element is returned as its
+             balanced {...} substring (nesting + quoted braces handled).
+             The instance list used a "toString##name=value;name=value" string
+             protocol whose | # ; delimiters corrupted every value that
+             contained those characters - the audit's "value corruption on
+             edit". Fields now travel as structured JSON. */
+          static std::vector<std::string> jobjarr(const std::string& j,
+                                                  const char* key) {
+              std::vector<std::string> r;
+              std::string k = std::string("\"") + key + "\":[";
+              auto p = j.find(k);
+              if (p == std::string::npos) return r;
+              p += k.size();
+              while (p < j.size()) {
+                  while (p < j.size() && (j[p] == ' ' || j[p] == ',')) p++;
+                  if (p >= j.size() || j[p] != '{') break;
+                  size_t s = p;
+                  int depth = 0;
+                  bool instr = false;
+                  while (p < j.size()) {
+                      char c = j[p];
+                      if (instr) {
+                          if (c == '\\') p++;
+                          else if (c == '"') instr = false;
+                      } else {
+                          if (c == '"') instr = true;
+                          else if (c == '{') depth++;
+                          else if (c == '}') {
+                              depth--;
+                              if (depth == 0) { p++; break; }
+                          }
+                      }
+                      p++;
+                  }
+                  r.push_back(j.substr(s, p - s));
+              }
+              return r;
           }
 
           static void post_rpc(const char* fn, const std::string& args) {
@@ -2200,23 +2478,8 @@ jobs:
               m.note = s.substr(p4+1);
               return m;
           }
-          /* instance string "toString##name=value;name=value" */
-          static InstInfo parse_inst(const std::string& s) {
-              InstInfo i;
-              auto h = s.find("##");
-              if (h == std::string::npos) { i.str = s; return i; }
-              i.str = s.substr(0, h);
-              std::string rest = s.substr(h + 2), cur;
-              size_t st = 0;
-              while (st < rest.size()) {
-                  auto e = rest.find(';', st);
-                  cur = rest.substr(st, (e == std::string::npos ? rest.size() : e) - st);
-                  if (!cur.empty()) i.fields.push_back(parse_field(cur));
-                  if (e == std::string::npos) break;
-                  st = e + 1;
-              }
-              return i;
-          }
+          /* (r23: parse_inst() removed with the "a##n=v;n=v" instance protocol -
+             instances are structured JSON now, see the instanceList branch) */
 
           /* strip the trailing ".method" from a caller string "pkg.Cls.method" */
           static std::string cls_of_member(const std::string& s) {
@@ -2299,6 +2562,7 @@ jobs:
              ImGui field - so the next tap on it re-opens the keyboard. */
           static bool s_ime_active = false;   /* a text field owns ImGui focus */
           static bool s_ime_clear  = false;   /* drop active id next frame      */
+          static ImGuiID s_ime_owner = 0;     /* r23: WHICH field owns the IME */
 
           static void ime_show() { post_rpc("showIme", "{}"); }
           static void ime_hide() { post_rpc("hideIme", "{}"); }
@@ -2319,17 +2583,30 @@ jobs:
               if (clear) ImGui::ClearActiveID();
           }
 
-          /* plain InputText wired to the system keyboard */
-          static bool ime_textfield(const char* label, char* buf, size_t cap) {
+          /* plain InputText wired to the system keyboard. r23: `extra` lets a
+             caller add flags (the class filter uses EnterReturnsTrue so a
+             keystroke no longer re-queries enumerateLoadedClasses). */
+          static bool ime_textfield(const char* label, char* buf, size_t cap,
+                                    ImGuiInputTextFlags extra = 0) {
               bool used = ImGui::InputText(label, buf, cap,
-                                           ImGuiInputTextFlags_AutoSelectAll);
+                                           ImGuiInputTextFlags_AutoSelectAll | extra);
               if (ImGui::IsItemActivated()) {
                   s_ime_active = true;
+                  s_ime_owner  = ImGui::GetItemID();
                   ime_show();
               } else if (ImGui::IsItemDeactivated()) {
-                  ime_close_if_active();
-              } else if (s_ime_active && ImGui::IsItemActive() &&
-                         ImGui::IsMouseClicked(0)) {
+                  /* r23 IME focus order: ImGui fires the OLD field's deactivation
+                     one frame AFTER the NEW field activated - the old code called
+                     ime_close_if_active() then, which hid the keyboard the new
+                     field had just opened ("tapping a field while another is
+                     active closes the keyboard"). Only the OWNING field
+                     deactivating releases the IME. */
+                  if (s_ime_active && ImGui::GetItemID() == s_ime_owner) {
+                      s_ime_active = false;
+                      ime_hide();
+                  }
+              } else if (s_ime_active && ImGui::GetItemID() == s_ime_owner &&
+                         ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
                   ime_show();     /* re-tap while active: keyboard was closed */
               }
               return used;
@@ -2341,11 +2618,15 @@ jobs:
               bool used = ImGui::InputTextMultiline(label, buf, cap, size);
               if (ImGui::IsItemActivated()) {
                   s_ime_active = true;
+                  s_ime_owner  = ImGui::GetItemID();
                   ime_show();
               } else if (ImGui::IsItemDeactivated()) {
-                  ime_close_if_active();
-              } else if (s_ime_active && ImGui::IsItemActive() &&
-                         ImGui::IsMouseClicked(0)) {
+                  if (s_ime_active && ImGui::GetItemID() == s_ime_owner) {
+                      s_ime_active = false;
+                      ime_hide();
+                  }
+              } else if (s_ime_active && ImGui::GetItemID() == s_ime_owner &&
+                         ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
                   ime_show();
               }
               return used;
@@ -2360,16 +2641,19 @@ jobs:
               overlay_request_font_rebuild(s_font_size);
               frida_set_message_callback([](const std::string& j) {
                   MLK();
-                  if (jhas(j, "ready")) {
+                  /* r23: dispatch on the EXACT "type" value (jtype) instead of
+                     jhas() substring tests - see jtype() above. */
+                  std::string ty = jtype(j);
+                  if (ty == "ready") {
                       s_agent_ready = true;
                       s_cls_auto_done = false;  /* new agent: re-list classes */
                       snprintf(s_agent_note, sizeof(s_agent_note), "%s",
                                jstr(j, "msg").c_str());
-                  } else if (jhas(j, "imeHidden")) {
+                  } else if (ty == "imeHidden") {
                       /* user closed the phone keyboard (Done / back):
                          drop ImGui focus so the next tap re-opens it */
                       if (s_ime_active) { s_ime_active = false; s_ime_clear = true; }
-                  } else if (jhas(j, "staticValues")) {
+                  } else if (ty == "staticValues") {
                       /* r12: static values are read on demand only - reading
                          them during openClass() ran <clinit> of arbitrary
                          classes and could block the agent forever */
@@ -2381,7 +2665,7 @@ jobs:
                                   if (old.name == nf.name) { old.value = nf.value; break; }
                           }
                       }
-                  } else if (jhas(j, "classInfo")) {
+                  } else if (ty == "classInfo") {
                       ClassTab* c = find_tab(jstr(j, "class"));
                       if (c) {
                           c->got_info = true; c->waiting = false;
@@ -2392,36 +2676,61 @@ jobs:
                           for (auto& f : jarr(j, "fields"))
                               c->fields.push_back(parse_field(f));
                       }
-                  } else if (jhas(j, "classList")) {
+                  } else if (ty == "classList") {
                       /* r11: the agent streams the full result in pages of 400;
                          the r10 single message was capped at 800 names, which is
                          why "Classes" never displayed all classes */
                       long qid  = jnum(j, "qid");
                       long page = jnum(j, "page");
-                      if (qid != s_search_qid || page == 0) {
-                          s_search_res.clear();
-                          s_search_qid = (int)qid;
+                      /* r23: generation counter - pages of an OUTDATED qid are
+                         DROPPED, never mixed in. The old `page == 0` force-adopt
+                         let a slow first page of an older query clobber the
+                         fresh list (stale search pages). The first page of the
+                         CURRENT qid clears the buffer once. */
+                      if (qid == (long)s_search_qid) {
+                          if (!s_search_page0) {
+                              s_search_res.clear();
+                              s_search_page0 = true;
+                          }
+                          for (auto& c : jarr(j, "classes")) s_search_res.push_back(c);
+                          s_search_total = (int)jnum(j, "total");
+                          s_search_shown = (int)jnum(j, "shown");
+                          if (page + 1 >= jnum(j, "pages")) s_search_wait = false;
                       }
-                      for (auto& c : jarr(j, "classes")) s_search_res.push_back(c);
-                      s_search_total = (int)jnum(j, "total");
-                      s_search_shown = (int)jnum(j, "shown");
-                      if (page + 1 >= jnum(j, "pages")) s_search_wait = false;
-                  } else if (jhas(j, "instanceList")) {
+                  } else if (ty == "instanceList") {
+                      /* r23: structured instances - {str, handle, fields:[{n,t,v}]}.
+                         The old "##"/";" string protocol corrupted every value
+                         containing | # or ;, and index-only addressing gave
+                         setInstanceField/callMethod NO receiver at all. gen keys
+                         the editor buffers; handle addresses the retained
+                         instance on the agent side. */
                       ClassTab* c = find_tab(jstr(j, "class"));
                       if (c) {
                           c->instances.clear();
-                          for (auto& i : jarr(j, "instances"))
-                              c->instances.push_back(parse_inst(i));
+                          c->gen = (int)jnum(j, "gen");
+                          for (auto& o : jobjarr(j, "instances")) {
+                              InstInfo in;
+                              in.str    = jstr(o, "str");
+                              in.handle = jnum(o, "handle", -1);
+                              for (auto& fo : jobjarr(o, "fields")) {
+                                  FieldInfo fi;
+                                  fi.name  = jstr(fo, "n");
+                                  fi.type  = jstr(fo, "t");
+                                  fi.value = jstr(fo, "v");
+                                  in.fields.push_back(std::move(fi));
+                              }
+                              c->instances.push_back(std::move(in));
+                          }
                           c->sel_inst = -1;
                       }
-                  } else if (jhas(j, "callResult")) {
+                  } else if (ty == "callResult") {
                       ClassTab* c = find_tab(jstr(j, "class"));
                       if (c) {
                           c->call_result = jhas(j, "ok") && jnum(j, "ok") ?
                               jstr(j, "result") :
                               ("ERR: " + jstr(j, "error"));
                       }
-                  } else if (jhas(j, "trackerEvent")) {
+                  } else if (ty == "trackerEvent") {
                       std::string n = jstr(j, "name");
                       int ti = find_tracker(n);
                       if (ti >= 0) {
@@ -2434,58 +2743,58 @@ jobs:
                           t.log.push_back(std::move(r));
                           if (t.log.size() > 200) t.log.erase(t.log.begin());
                       }
-                  } else if (jhas(j, "recBatch")) {
+                  } else if (ty == "recBatch") {
                       for (auto& it : jarr(j, "items")) {
                           if (s_rec.size() >= 600) s_rec.erase(s_rec.begin(),
                                                                s_rec.begin() + 100);
                           s_rec.push_back(parse_rec(it));
                       }
-                  } else if (jhas(j, "recorderProgress")) {
+                  } else if (ty == "recorderProgress") {
                       s_rec_installed = (int)jnum(j, "installed");
                       s_rec_total     = (int)jnum(j, "total");
                       snprintf(s_rec_stat, sizeof(s_rec_stat), "installing %ld/%ld",
                                (long)s_rec_installed, (long)s_rec_total);
-                  } else if (jhas(j, "recorderStarted")) {
+                  } else if (ty == "recorderStarted") {
                       snprintf(s_rec_stat, sizeof(s_rec_stat), "live (%ld hooks)",
                                (long)jnum(j, "installed"));
-                  } else if (jhas(j, "recorderStopped")) {
+                  } else if (ty == "recorderStopped") {
                       snprintf(s_rec_stat, sizeof(s_rec_stat), "stopped");
-                  } else if (jhas(j, "monitorEvent")) {
+                  } else if (ty == "monitorEvent") {
                       for (auto& it : jarr(j, "items")) {
                           if (s_mon.size() >= 400) s_mon.erase(s_mon.begin(),
                                                                s_mon.begin() + 100);
                           s_mon.push_back(parse_mon(it));
                       }
-                  } else if (jhas(j, "monitorInfo") || jhas(j, "sslInit")) {
+                  } else if (ty == "monitorInfo" || ty == "sslInit") {
                       snprintf(s_mon_stat, sizeof(s_mon_stat), "%s",
                                jstr(j, "note").c_str());
-                  } else if (jhas(j, "monitorStarted")) {
+                  } else if (ty == "monitorStarted") {
                       snprintf(s_mon_stat, sizeof(s_mon_stat), "on");
-                  } else if (jhas(j, "monitorStopped")) {
+                  } else if (ty == "monitorStopped") {
                       snprintf(s_mon_stat, sizeof(s_mon_stat), "off");
-                  } else if (jhas(j, "console")) {
+                  } else if (ty == "console") {
                       push_console("[js]", jstr(j, "line"));
-                  } else if (jhas(j, "scriptResult")) {
+                  } else if (ty == "scriptResult") {
                       push_console("=>", jstr(j, "result"));
-                  } else if (jhas(j, "scriptError")) {
+                  } else if (ty == "scriptError") {
                       push_console("ERR", jstr(j, "msg"));
-                  } else if (jhas(j, "patchApplied")) {
+                  } else if (ty == "patchApplied") {
                       std::string n = jstr(j, "name");
                       for (auto& p : s_patches)
                           if (p.cls + "." + p.field == n) p.note = "";
-                  } else if (jhas(j, "patchFailed")) {
+                  } else if (ty == "patchFailed") {
                       std::string n = jstr(j, "name");
                       for (auto& p : s_patches)
                           if (p.cls + "." + p.field == n) p.note = jstr(j, "error");
-                  } else if (jhas(j, "hookAdded")) {
+                  } else if (ty == "hookAdded") {
                       std::string n = jstr(j, "name");
                       for (auto& h : s_hooks)
                           if (h.cls + "." + h.method == n) h.note = "";
-                  } else if (jhas(j, "hookFailed")) {
+                  } else if (ty == "hookFailed") {
                       std::string n = jstr(j, "name");
                       for (auto& h : s_hooks)
                           if (h.cls + "." + h.method == n) h.note = jstr(j, "error");
-                  } else if (jhas(j, "smaliReady")) {
+                  } else if (ty == "smaliReady") {
                       char b[200];
                       snprintf(b, sizeof(b), "smali %s: %s",
                                jnum(j, "ok") ? "OK" : "FAILED",
@@ -2496,11 +2805,22 @@ jobs:
                           for (auto& h : s_hooks)
                               if (h.cls + "." + h.method == n) h.note = jstr(j, "error");
                       }
-                  } else if (jhas(j, "warn")) {
+                  } else if (ty == "agentStatus") {
+                      /* r23: the native bridge posts this when the GumJS script
+                         itself failed to start - it used to only land in the
+                         crash log while the menu kept saying "waiting" forever. */
+                      if (!jnum(j, "ok")) {
+                          s_agent_ready = false;
+                          snprintf(s_agent_note, sizeof(s_agent_note), "FAILED: %.120s",
+                                   jstr(j, "msg").c_str());
+                          push_console("[agent]", std::string("start failed: ") +
+                                       jstr(j, "msg").c_str());
+                      }
+                  } else if (ty == "warn") {
                       push_console("[warn]", jstr(j, "msg"));
-                  } else if (jhas(j, "error")) {
+                  } else if (ty == "error") {
                       push_console("[agent-err]", jstr(j, "msg"));
-                  } else if (jhas(j, "info")) {
+                  } else if (ty == "info") {
                       push_console("[info]", jstr(j, "msg"));
                   }
                   MULK();
@@ -2555,9 +2875,16 @@ jobs:
               ImGui::Text("Overlay: %s (%.0fx%.0f)",
                           s_ovl_ready ? "up" : "waiting",
                           dw, dh);
-              ImGui::Text("Agent:   %s %s",
-                          s_agent_ready ? "ready" : "waiting",
-                          s_agent_note);
+              /* r23: failed agent starts are visible now (frida_bridge posts
+                 agentStatus) - it used to stay "waiting" forever */
+              if (!s_agent_ready && s_agent_note[0] &&
+                  strncmp(s_agent_note, "FAILED", 6) == 0)
+                  ImGui::TextColored(ImVec4(1, .4f, .4f, 1),
+                                     "Agent:   %s", s_agent_note);
+              else
+                  ImGui::Text("Agent:   %s %s",
+                              s_agent_ready ? "ready" : "waiting",
+                              s_agent_note);
               char mb[128];
               overlay_touch_map_desc(mb, sizeof(mb));
               ImGui::Text("Input:   %s", mb);
@@ -2930,16 +3257,25 @@ jobs:
                       ImGui::Text("fields of #%d:", c.sel_inst);
                       /* edit buffers are (re)filled only when a different instance
                          is picked, not every frame - otherwise the user's typing
-                         would be overwritten before it ever reaches the agent */
-                      static char nv[32][128];
-                      static int  nv_for = -1;
-                      if (nv_for != c.sel_inst) {
-                          nv_for = c.sel_inst;
-                          for (int f = 0; f < 32; f++) {
-                              nv[f][0] = 0;
-                              if (f < (int)in.fields.size())
-                                  snprintf(nv[f], sizeof(nv[f]), "%s",
-                                           in.fields[f].value.c_str());
+                         would be overwritten before it ever reaches the agent.
+                         r23: the key used to be the BARE index - picking instance
+                         0 of another class kept the stale text of the previous
+                         class (nv_for still matched). The key is class + list
+                         generation + index now. */
+                      static char        nv[32][128];
+                      static std::string nv_key;
+                      static int         nv_idx = -1;
+                      {
+                          std::string key = c.cname + "#" + std::to_string(c.gen);
+                          if (key != nv_key || nv_idx != c.sel_inst) {
+                              nv_key = key;
+                              nv_idx = c.sel_inst;
+                              for (int f = 0; f < 32; f++) {
+                                  nv[f][0] = 0;
+                                  if (f < (int)in.fields.size())
+                                      snprintf(nv[f], sizeof(nv[f]), "%s",
+                                               in.fields[f].value.c_str());
+                              }
                           }
                       }
                       for (int f = 0; f < (int)in.fields.size() && f < 32; f++) {
@@ -2962,8 +3298,14 @@ jobs:
                           ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper - raw InputText never opened the keyboard */
                           ImGui::SameLine();
                           if (ImGui::Button("Set##fs")) {
+                              /* r23: address the instance by the agent's retained
+                                 handle when one exists - the index-only request
+                                 had NO receiver, so f.set() failed on every
+                                 instance field (same fix as callMethod below) */
+                              long h = in.handle;
                               std::string a = "{\"class\":\"" + jesc(c.cname)
-                                            + "\",\"index\":" + std::to_string(c.sel_inst)
+                                            + "\",\"handle\":" + std::to_string(h)
+                                            + ",\"index\":" + std::to_string(c.sel_inst)
                                             + ",\"field\":\"" + jesc(fi.name)
                                             + "\",\"value\":\"" + jesc(nv[f]) + "\"}";
                               post_rpc("setInstanceField", a);
@@ -2994,9 +3336,18 @@ jobs:
                           }
                       }
                       if (ImGui::Button("Invoke")) {
+                          /* r23: instance methods need a RECEIVER - when an
+                             instance is selected its retained handle rides along
+                             (Java.retain-ed on the agent side), otherwise the
+                             agent refuses a non-static call with a hint instead
+                             of the old silent ov.apply(null) failure */
+                          long h = (c.sel_inst >= 0 &&
+                                    c.sel_inst < (int)c.instances.size())
+                                       ? c.instances[c.sel_inst].handle : -1;
                           std::string a = "{\"class\":\"" + jesc(c.cname)
                                         + "\",\"method\":\"" + jesc(c.call_sig.name)
-                                        + "\",\"args\":[";
+                                        + "\",\"handle\":" + std::to_string(h)
+                                        + ",\"args\":[";
                           for (int k = 0; k < na; k++) {
                               if (k) a += ",";
                               a += "\"" + jesc(c.call_args[k]) + "\"";
@@ -3098,6 +3449,8 @@ jobs:
                   s_cls_auto_done = true;
                   s_search_wait   = true;
                   qid = ++s_search_seq;
+                  s_search_qid   = qid;      /* r23: generation armed at SEND time */
+                  s_search_page0 = false;
               }
               MULK();
               if (qid)
@@ -3107,7 +3460,11 @@ jobs:
               bool do_search = false;
               MLK();
               ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 150.f);
-              do_search |= ime_textfield("Filter##sf", s_search, sizeof(s_search));
+              /* r23: search on Enter / button ONLY - every keystroke used to
+                 re-run enumerateLoadedClasses on the agent (30k+ names per
+                 letter, flooding the bridge while typing). */
+              do_search |= ime_textfield("Filter##sf", s_search, sizeof(s_search),
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
               ImGui::PopItemWidth();
               ImGui::SameLine();
               if (ImGui::Button("Search##cls")) do_search = true;
@@ -3133,6 +3490,8 @@ jobs:
                   MLK();
                   s_search_wait = true;
                   int sqid = ++s_search_seq;
+                  s_search_qid   = sqid;     /* r23: generation armed at SEND time */
+                  s_search_page0 = false;
                   MULK();
                   std::string a = "{\"filter\":\"" + jesc(s_search)
                                  + "\",\"qid\":" + std::to_string(sqid) + "}";
@@ -3274,11 +3633,23 @@ jobs:
               ImGui::SetNextWindowSizeConstraints(
                   ImVec2(420, 300), ImVec2(ds.x * .95f, ds.y * .95f));
               ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
-              ImGui::SetNextWindowBgAlpha(s_opacity);
+              /* r23 UI polish: opacity was applied TWICE - apply_theme() already
+                 sets style.Alpha, and the SetNextWindowBgAlpha(s_opacity) here
+                 multiplied the window background by the same value again
+                 (0.92 rendered as ~0.85). style.Alpha is the single source. */
               bool open = vis;
               ImGui::Begin("Dex-tool v1.2 (r14)", &open,
                            ImGuiWindowFlags_NoCollapse);
-              if (!open) { MLK(); s_visible = false; s_conf_dirty = true; MULK(); }
+              if (!open) {
+                  MLK();
+                  s_visible = false;
+                  s_conf_dirty = true;
+                  /* r23 UI polish: pressing the window X with the toggle button
+                     disabled stranded the menu (nothing could bring it back) -
+                     the FAB force-returns, same policy as the Settings rescue */
+                  if (!s_show_fab) s_show_fab = true;
+                  MULK();
+              }
 
               if (ImGui::BeginTabBar("tb")) {
                   struct TabDef { const char* name; void (*fn)(); };
@@ -3449,9 +3820,59 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r22). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r23). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
+
+             r23 changes (patch #2 of the 47-item audit - 22 open + 7 partial
+             items finished):
+             - ONE layering registry (LAYERS) per class+method: Hook, Tracker,
+               field-Tracker, Recorder and Monitor now STACK on the same method
+               instead of overwriting each other's ov.implementation. A single
+               dispatcher runs recorder -> monitor -> tracker -> field-diff ->
+               user hook; removing the last layer of a method restores the
+               original implementation.
+             - Recorder Stop and Monitor Stop really UNHOOK: their layer is
+               removed and the method's original implementation returns (the
+               r22 stop only flipped a flag and left every hook installed).
+             - listInstances retains every instance (Java.retain) and returns a
+               structured protocol {str, handle, fields:[{n,t,v}]} - the old
+               "toString##name=value;name=value" string corrupted every value
+               containing | # or ;. setInstanceField/callMethod address the
+               instance by HANDLE, so instance methods finally have a receiver
+               (callMethod without a handle now refuses non-static calls with a
+               hint instead of failing on ov.apply(null)).
+             - Class access avoids premature <clinit> where possible: hook and
+               tracker installs only Java.use classes that are ALREADY loaded;
+               anything else is DEFERRED and installed by a loadClass watcher
+               when the target loads the class (frida-java-bridge always runs
+               ensureClassInitialized in use(), so "not loaded yet" is the one
+               case we can avoid triggering).
+             - trackField/tracker values no longer call toString() inside
+               hooks: field_repr() stringifies primitives and boxes only, and
+               reports '@class#identityHashCode' for anything else - no more
+               recursion/crash through an app's own toString (which this agent
+               may itself be recording).
+             - Click-through: the dispatchTouchEvent hook asks
+               dextool_hit_test(rawX, rawY) BEFORE the app sees the gesture and
+               consumes the whole gesture when it starts on a live menu window
+               (menu.cpp publishes every ImGui window rect each frame; the old
+               gWantMouse path still called the app's dispatch and leaked taps).
+             - Touch map view choice: the probe now scores SurfaceView/
+               TextureView candidates against the overlay's ACTUAL GL surface
+               size (dextool_display_size) instead of blindly taking the
+               largest, and overlay.cpp dropped its coordinate clamping - taps
+               outside the view no longer snap onto edge widgets (both axes
+               were already proportional since r15).
+             - IME focus: before the hidden EditText takes focus the app's
+               currently-focused view is retained; ime_hide / Done / imeHidden
+               restore focus to it and clear the EditText - the app gets its
+               focus state back instead of the 1x1 view keeping it forever.
+             - Everything from r22 (script new Function fix, mode
+               normalisation, orig() receiver/args, patch snapshot/restore,
+               ordered input queue + UTF-16, code-point deletions, OkHttp
+               enqueue, readable console, smali loader hardening) and r21
+               (addContentView host attach, ime_read_text cast chain) is kept.
 
              r22 changes (third-party audit, the 18 patch-fixed items ported
              here and MERGED with the r21 IME code - the audit's raw patch
@@ -3739,23 +4160,8 @@ jobs:
                   return Array.prototype.map.call(a, jstr).join(',').substring(0, 240);
               } catch (e) { return '?'; }
           }
-          function describe(a) {           /* deep values for trackers (capped) */
-              try {
-                  var s = '';
-                  for (var i = 0; i < a.length && i < 8; i++) {
-                      var v = a[i], d;
-                      try {
-                          if (v === null || v === undefined) d = 'null';
-                          else if (v.$className) d = String(v) + '@' + v.$className;
-                          else d = String(v);
-                      } catch (e) { d = '?'; }
-                      if (d.length > 60) d = d.substring(0, 57) + '...';
-                      s += (i ? ',' : '') + d;
-                  }
-                  if (s.length > 240) s = s.substring(0, 237) + '...';
-                  return s;
-              } catch (e) { return '?'; }
-          }
+          /* (r23: describe() removed - describe_safe()/field_repr() render
+             tracker values without calling the app's toString()) */
 
           /* Java stack of the calling thread, app frames only, capped */
           function jstack(limit) {
@@ -3773,11 +4179,46 @@ jobs:
               } catch (e) { return []; }
           }
 
+          /* r23: recursion-safe value renderer for tracker/field reads.
+             jstr()/String(v) call the app's toString() INSIDE our hooks - when
+             the recorded/tracked class's own toString (or something it calls)
+             comes back through a hook, that recurses, floods the ring and can
+             crash (the audit's "Tracker Side Effects" item). Only primitives
+             and their boxes get real text here; every other object is reported
+             as '@class#identityHashCode'. */
+          var gSysCls = null;
+          function field_repr(v) {
+              try {
+                  if (v === null || v === undefined) return 'null';
+                  if (typeof v === 'string') return v.substring(0, 160);
+                  if (typeof v === 'number' || typeof v === 'boolean')
+                      return String(v);
+                  var cn = '';
+                  try { cn = String(v.$className || ''); } catch (e0) {}
+                  if (cn === 'java.lang.String' || cn === 'java.lang.Integer' ||
+                      cn === 'java.lang.Long'    || cn === 'java.lang.Boolean' ||
+                      cn === 'java.lang.Short'   || cn === 'java.lang.Byte' ||
+                      cn === 'java.lang.Float'   || cn === 'java.lang.Double' ||
+                      cn === 'java.lang.Character')
+                      return String(v).substring(0, 160);   /* boxes: toString is safe */
+                  if (cn) {
+                      var id = '?';
+                      try {
+                          if (!gSysCls) gSysCls = Java.use('java.lang.System');
+                          id = String(gSysCls.identityHashCode(v));
+                      } catch (e1) {}
+                      return '@' + cn + '#' + id;
+                  }
+                  return String(v).substring(0, 160);   /* plain JS values */
+              } catch (e) { return '?'; }
+          }
+
           /* r22/audit: parse_rules()/lit_to_java() removed - dead code,
              nothing called them */
 
           var gAddChar = null, gBackspace = null, gWantMouse = null;
           var gNativeTouch = null, gSetMap = null;
+          var gHitTest = null, gDisplaySize = null;   /* r23 */
 
           function ensure_native_fns() {
               if (gNativeTouch) return true;
@@ -3793,6 +4234,13 @@ jobs:
                   gNativeTouch = new NativeFunction(t, 'void', ['float', 'float', 'int']);
                   gSetMap    = new NativeFunction(s, 'void', ['int', 'int', 'int', 'int']);
                   if (w) gWantMouse = new NativeFunction(w, 'bool', []);
+                  /* r23: click-through filter + the owner surface's real size
+                     (both exports exist since r23; older libtool builds simply
+                     leave them null and the hooks fall back to r22 behaviour) */
+                  var h = Module.findExportByName('libtool.so', 'dextool_hit_test');
+                  if (h) gHitTest = new NativeFunction(h, 'bool', ['float', 'float']);
+                  var d = Module.findExportByName('libtool.so', 'dextool_display_size');
+                  if (d) gDisplaySize = new NativeFunction(d, 'int', []);
                   return true;
               } catch (e) { return false; }
           }
@@ -3811,6 +4259,7 @@ jobs:
              updates the map. */
           var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
           var gMapLastTouch = 0;
+          var gTouchEat = false;   /* r23: the current gesture started on the menu */
           function report_map(view) {
               try {
                   if (!view) return;
@@ -3832,15 +4281,27 @@ jobs:
                                   .findViewById(0x01020002);
               } catch (e) { return null; }
           }
-          /* the view the overlay actually renders onto: the largest
-             SurfaceView / GLSurfaceView / TextureView in the window;
-             falls back to android.R.id.content */
+          /* the view the overlay actually renders onto. r23: candidates are
+             SCORED against the overlay's real GL surface size
+             (dextool_display_size) instead of blindly taking the largest - an
+             ad/video SurfaceView bigger than the game surface used to win and
+             the map then belonged to the wrong view. Falls back to the largest
+             candidate, then to android.R.id.content. */
+          function gl_surface_hint() {
+              try {
+                  if (!gDisplaySize && !ensure_native_fns()) return null;
+                  if (!gDisplaySize) return null;
+                  var v = gDisplaySize();
+                  if (!v || v <= 0) return null;
+                  return { w: (v >>> 16) & 0xffff, h: v & 0xffff };
+              } catch (e) { return null; }
+          }
           function find_gl_view(activity) {
               try {
                   var decor = activity.getWindow().getDecorView();
                   if (!decor) return content_view(activity);
                   var VG = Java.use('android.view.ViewGroup');
-                  var best = null, bestArea = 0;
+                  var cands = [];
                   var stack = [decor];
                   while (stack.length) {
                       var v = stack.pop();
@@ -3852,9 +4313,8 @@ jobs:
                           cn.indexOf('TextureView') >= 0) {
                           var w = 0, h = 0;
                           try { w = v.getWidth(); h = v.getHeight(); } catch (e1) {}
-                          if (w > 0 && h > 0 && w * h > bestArea) {
-                              best = v; bestArea = w * h;
-                          }
+                          if (w > 0 && h > 0)
+                              cands.push({ v: v, w: w, h: h });
                       }
                       var grp = null;
                       try { grp = Java.cast(v, VG); } catch (e2) {}
@@ -3863,7 +4323,23 @@ jobs:
                           for (var i = 0; i < n; i++) stack.push(grp.getChildAt(i));
                       }
                   }
-                  if (best) return best;
+                  if (!cands.length) return content_view(activity);
+                  var hint = gl_surface_hint();
+                  var best = null, bestScore = -1e30;
+                  for (var k = 0; k < cands.length; k++) {
+                      var c = cands[k];
+                      var score = -Math.abs(c.w * c.h);
+                      if (hint && hint.w > 0 && hint.h > 0) {
+                          /* closest total area wins, aspect-compatible preferred */
+                          score = -Math.abs(Math.log((c.w * c.h + 1) /
+                                                     (hint.w * hint.h + 1))) * 100;
+                          var ar1 = c.w / c.h, ar2 = hint.w / hint.h;
+                          if (Math.abs(ar1 - ar2) / ar2 < 0.25) score += 50;
+                      }
+                      if (score > bestScore) { bestScore = score; best = c; }
+                  }
+                  if (best) return best.v;
+                  return content_view(activity);
               } catch (e3) {}
               return content_view(activity);
           }
@@ -3884,7 +4360,8 @@ jobs:
              previous one when the tracked activity changes. */
           var IME = { act: null, edit: null, actHash: 0, prev: '',
                       silent: false, cnt: 0, everLogged: false,
-                      mapProbed: false };   /* r20: one-shot view-map probe */
+                      mapProbed: false,                   /* r20: one-shot view-map probe */
+                      restore: null };                    /* r23: app view whose focus we borrowed */
 
           /* r18: release the previous retained activity. The bridge does not
              export Java.release(), so the documented cleanup is the
@@ -3899,6 +4376,30 @@ jobs:
                   if (typeof obj.$dispose === 'function') obj.$dispose();
               } catch (e) {}
           }
+          /* r23: the hidden EditText STEALS focus from the app while the
+             keyboard is open (unavoidable - the IME needs a focused view) -
+             the fix is to give it BACK: remember the app's focused view before
+             ours takes it, and restore + clearFocus when the keyboard closes
+             (ime_hide, the IME's Done button, or the menu closing). Retained
+             like IME.act: the wrapper is callback-scoped otherwise. */
+          function ime_set_restore(v) {
+              try {
+                  if (IME.restore && v) {
+                      try { if (IME.restore.equals(v)) return; } catch (eQ) {}
+                  }
+                  if (IME.restore) ime_release_act(IME.restore);
+                  IME.restore = v ? Java.retain(v) : null;
+              } catch (e) { IME.restore = null; }
+          }
+          function ime_restore_focus() {
+              try {
+                  if (IME.edit) IME.edit.clearFocus();
+              } catch (e0) {}
+              try {
+                  if (IME.restore) IME.restore.requestFocus();
+              } catch (e1) {}
+          }
+
           /* r18: the ONLY writer of IME.act. Stores a Java.retain()-ed
              wrapper (global reference, valid after the producing callback
              returned and from any thread), releases the previous retained
@@ -3912,6 +4413,8 @@ jobs:
                       try { same = IME.act.equals(obj); } catch (eQ) { same = false; }
                       if (same) return false;   /* already tracked - reuse */
                       ime_release_act(IME.act);
+                      /* r23: the saved focus view belonged to the OLD activity */
+                      if (IME.restore) { ime_release_act(IME.restore); IME.restore = null; }
                   }
                   /* r19: retain, then VERIFY the retained wrapper actually
                      exposes Activity methods before trusting it. Every
@@ -4162,6 +4665,8 @@ jobs:
                                      the next tap on it re-opens the keyboard */
                                   sendMsg('imeHidden', {});
                                   ime_reset_text();
+                                  /* r23: give the app its focused view back */
+                                  ime_restore_focus();
                                   return false;
                               }
                           }
@@ -4227,8 +4732,19 @@ jobs:
                   var edit = makeEdit(IME.act);
                   if (!edit) return false;
                   if (reset !== false) ime_reset_text();
+                  /* r23: remember which app view currently holds focus BEFORE our
+                     hidden EditText steals it, so it can be handed back later */
+                  try {
+                      var cur = IME.act.getWindow().getCurrentFocus();
+                      if (cur) {
+                          var isOurs = false;
+                          try { if (IME.edit && cur.equals(IME.edit)) isOurs = true; }
+                          catch (eC) {}
+                          if (!isOurs) ime_set_restore(cur);
+                      }
+                  } catch (eF) {}
                   /* r20: same stage tagging as the factory - if the factory
-                     ever passes and the next failure lands here, the payload
+                     passes and the next failure lands here, the payload
                      names the exact call instead of a bare TypeError. */
                   ime_stage('edit.requestFocus', function () {
                       edit.requestFocus();
@@ -4520,6 +5036,9 @@ jobs:
                           var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
                           imm.hideSoftInputFromWindow(IME.edit.getWindowToken(), 0);
                           ime_reset_text();
+                          /* r23: the hidden 1x1 EditText used to KEEP the app's
+                             focus forever - hand the previously focused view back */
+                          ime_restore_focus();
                       } catch (e) {}
                   });
               });
@@ -4597,7 +5116,21 @@ jobs:
                              same space the map is measured in
                              (getLocationOnScreen), so overlay.cpp's transform
                              is exact on BOTH axes */
-                          gNativeTouch(ev.getRawX(), ev.getRawY(), act);
+                          var rx = ev.getRawX(), ry = ev.getRawY();
+                          gNativeTouch(rx, ry, act);
+                          /* r23 click-through: ask the overlay whether this
+                             gesture STARTS on a live menu window BEFORE the app
+                             sees anything. The r22 attempt returned true when
+                             WantCaptureMouse was set but still CALLED
+                             this.dispatchTouchEvent(ev) for down/up first - the
+                             tap reached the app anyway (the audit's
+                             "taps on the menu still leak to the host app").
+                             The hit test reads the window rects menu.cpp/overlay
+                             publish each frame, mapped through the touch map. */
+                          if (down && gHitTest) {
+                              try { gTouchEat = !!gHitTest(rx, ry); } catch (eH) {}
+                          }
+                          if (act === 1 || act === 3) gTouchEat = false;  /* UP/CANCEL */
                           if (act === 0 || act === 2) {   /* r22/audit: throttled map
                                                              refresh on DOWN + MOVE */
                               var now = Date.now();
@@ -4606,40 +5139,24 @@ jobs:
                                   report_map(find_gl_view(this));
                               }
                           }
-                          /* let the overlay decide (menu/keyboard own the tap) */
-                          if (gWantMouse && gWantMouse()) {
-                              if (down || act === 1 || act === 3)
-                                  this.dispatchTouchEvent(ev);   /* original call */
-                              return true;                        /* consume */
+                          if (gTouchEat) {
+                              /* menu owns the whole gesture: ImGui already got
+                                 every event via gNativeTouch above; the app
+                                 never does. MOVE/UP keep flowing to ImGui so
+                                 drags and button releases work. */
+                              return true;                     /* consume */
                           }
                       } catch (e) {}
                       return this.dispatchTouchEvent(ev);         /* original call */
                   };
                   agentLog('phase: dispatchTouchEvent hook ok');
-                  sendMsg('info', { msg: 'touch hook installed (r22, screen coords + IME activity capture + map refresh on DOWN)' });
+                  sendMsg('info', { msg: 'touch hook installed (r23, screen coords + hit-test click-through + IME activity capture + map refresh on DOWN)' });
               });
           }
 
           /* ---------------- class info ---------------- */
-          function field_lines(jc, inst) {
-              var out = [];
-              var fs = jc.class.getDeclaredFields();
-              for (var i = 0; i < fs.length; i++) {
-                  var f = fs[i];
-                  try {
-                      f.setAccessible(true);
-                      var t = f.getType().getName();
-                      var val = '?';
-                      if (inst) val = jstr(f.get(inst));
-                      else {
-                          var st = (f.getModifiers() & 8) !== 0;   /* STATIC */
-                          val = st ? jstr(f.get(null)) : '(instance)';
-                      }
-                      out.push(f.getName() + ':' + t + '=' + val);
-                  } catch (e) { out.push(f.getName() + ':?'); }
-              }
-              return out;
-          }
+          /* (r23: field_lines() removed with the "n:t=v;n=v" instance protocol;
+             instances now use the structured field_rows() below) */
           function method_lines(jc) {
               var out = [];
               var ms = jc.class.getDeclaredMethods();
@@ -4671,6 +5188,28 @@ jobs:
               return out;
           }
 
+          /* r23: structured instance fields - values through field_repr()
+             (toString-safe); replaces the mangled "n:t=v;n:t=v" protocol whose
+             delimiters corrupted values containing | # or ; */
+          function field_rows(jc, inst) {
+              var out = [];
+              try {
+                  var fs = jc.class.getDeclaredFields();
+                  for (var i = 0; i < fs.length; i++) {
+                      var f = fs[i];
+                      var nm = '?';
+                      try { nm = String(f.getName()); } catch (e0) {}
+                      try {
+                          f.setAccessible(true);
+                          out.push({ n: nm,
+                                     t: String(f.getType().getName()),
+                                     v: field_repr(f.get(inst)) });
+                      } catch (e1) { out.push({ n: nm, t: '?', v: '?' }); }
+                  }
+              } catch (e2) {}
+              return out;
+          }
+
           /* ---------------- recorder ----------------
              r11: scoped. Only classes matching the package filter are hooked and
              installation stops at cap methods; the r10 version hooked every
@@ -4698,7 +5237,9 @@ jobs:
           function rec_install_chunk(list, batch) {
               /* r12: Stop must also abort a still-running installation (the
                  r11 Stop left the loop hooking classes, so the Recorder tab
-                 looked stuck on "installing ...") */
+                 looked stuck on "installing ...").
+                 r23: every method goes through the layering registry, so
+                 stopRecorder can remove all recorder layers again. */
               if (!REC.on) {
                   REC.busy = false;
                   sendMsg('recorderStopped', { installed: REC.installed });
@@ -4707,42 +5248,19 @@ jobs:
               for (var i = 0; i < batch && REC.idx < list.length; i++, REC.idx++) {
                   if (REC.installed >= REC.cap) break;
                   var cls = list[REC.idx];
-                  if (!rec_wanted(cls, REC.filter)) continue;
                   try {
                       var jc = Java.use(cls);
                       var ms = jc.class.getDeclaredMethods();
+                      var seen = {};
                       for (var k = 0; k < ms.length; k++) {
                           if (REC.installed >= REC.cap) break;
-                          var name = ms[k].getName();
-                          var ovl;
-                          try { ovl = jc[name].overloads; } catch (e0) { continue; }
-                          if (!ovl) continue;
-                          var made = 0;
-                          for (var oi = 0; oi < ovl.length; oi++) {
-                              if (REC.installed >= REC.cap) break;
-                              try {
-                                  (function (ov, cn, mn) {
-                                      ov.implementation = function () {
-                                          if (!REC.on) {
-                                              /* pass-through, no cost when stopped */
-                                              return ov.apply(this, arguments);
-                                          }
-                                          if (REC.ring.length < 4000) {
-                                              var ret, err = '';
-                                              try { ret = ov.apply(this, arguments); }
-                                              catch (e1) { err = String(e1).substring(0, 80); throw e1; }
-                                              REC.ring.push({ cls: cn, m: mn,
-                                                  a: jargs(arguments),
-                                                  r: jstr(ret), x: err });
-                                              return ret;
-                                          }
-                                          return ov.apply(this, arguments);
-                                      };
-                                      made++;
-                                      REC.installed++;
-                                  })(ovl[oi], cls, name);
-                              } catch (e2) {}
-                          }
+                          var name;
+                          try { name = String(ms[k].getName()); } catch (eN) { continue; }
+                          if (seen[name]) continue;
+                          seen[name] = 1;
+                          try {
+                              REC.installed += install_layer(cls, name, 'rec', {});
+                          } catch (e0) {}
                       }
                   } catch (e3) {}
               }
@@ -4801,92 +5319,74 @@ jobs:
 
           function mon_install() {
               Java.perform(function () {
-                  /* OkHttp: request line at RealCall.execute/enqueue */
+                  /* r23: monitor hooks go through the layering registry, so
+                     stopMonitor removes them again (r22 left them installed
+                     forever - the audit's "stopMonitor doesn't unhook") */
+                  var okhttpOk = false;
                   try {
-                      var RealCall = Java.use('okhttp3.RealCall');
-                      RealCall.execute.overloads.forEach(function (ov) {
-                          ov.implementation = function () {
-                              try {
-                                  if (MON.on) {
-                                      var req = this.request();
+                      if (dt_is_loaded('okhttp3.RealCall')) {
+                          install_layer('okhttp3.RealCall', 'execute', 'mon', {
+                              fn: function (self) {
+                                  try {
+                                      var req = self.request();
                                       var url = String(req.url());
                                       mon_push('http', url, String(req.method()),
                                                mon_origin('okhttp:' + url),
                                                'headers ' + req.headers().size());
-                                  }
-                              } catch (e) {}
-                              return ov.apply(this, arguments);
-                          };
-                      });
-                      /* r22/audit: enqueue too - most apps issue async calls,
-                         hooking only execute() saw nothing */
-                      RealCall.enqueue.overloads.forEach(function (ov) {
-                          ov.implementation = function () {
-                              try {
-                                  if (MON.on) {
-                                      var req = this.request();
+                                  } catch (e) {}
+                              }
+                          });
+                          install_layer('okhttp3.RealCall', 'enqueue', 'mon', {
+                              fn: function (self) {
+                                  try {
+                                      var req = self.request();
                                       var url = String(req.url());
                                       mon_push('http', url, String(req.method()),
                                                mon_origin('okhttp:' + url),
                                                'async, headers ' + req.headers().size());
-                                  }
-                              } catch (e) {}
-                              return ov.apply(this, arguments);
-                          };
-                      });
-                      MON.okhttp = true;
-                  } catch (e) { MON.okhttp = false; }
+                                  } catch (e) {}
+                              }
+                          });
+                          okhttpOk = true;
+                      }
+                  } catch (e) { okhttpOk = false; }
 
                   /* HttpURLConnection: URL at connect time */
                   try {
-                      var URL = Java.use('java.net.URL');
-                      URL.openConnection.overloads.forEach(function (ov) {
-                          ov.implementation = function () {
+                      install_layer('java.net.URL', 'openConnection', 'mon', {
+                          fn: function (self) {
                               try {
-                                  if (MON.on)
-                                      mon_push('urlconn', String(this.toString()), 'open',
-                                               mon_origin('url:' + this.toString()), '');
+                                  mon_push('urlconn', String(self.toString()), 'open',
+                                           mon_origin('url:' + self.toString()), '');
                               } catch (e) {}
-                              return ov.apply(this, arguments);
-                          };
+                          }
                       });
                   } catch (e) {}
 
                   /* SSL: best-effort note only; full plaintext would need
                      SSL_read/SSL_write native hooks */
                   try {
-                      var SSLSocket = Java.use('javax.net.ssl.SSLSocket');
+                      Java.use('javax.net.ssl.SSLSocket');
                       mon_push('ssl', 'engine', 'note',
                                '', 'SSLSocket reachable');
                   } catch (e) {}
 
                   sendMsg('monitorInfo', {
-                      note: 'okhttp ' + (MON.okhttp ? 'hooked' : 'absent') +
+                      note: 'okhttp ' + (okhttpOk ? 'hooked' : 'absent') +
                              ', urlconn hooked'
                   });
               });
           }
 
           /* ---------------- helpers for exports ---------------- */
-          function use_cls_parts(cls, member) {
-              var jc;
-              try { jc = Java.use(cls); } catch (e) { return null; }
-              var found = null;
-              try {
-                  if (jc[member]) found = jc[member];
-              } catch (e) {}
-              if (!found) {
-                  try {
-                      var ms = jc.class.getDeclaredMethods();
-                      for (var i = 0; i < ms.length; i++)
-                          if (ms[i].getName() === member) { found = jc[member]; break; }
-                  } catch (e2) {}
-              }
-              return found ? { jc: jc, m: found } : null;
-          }
+          /* (r23: use_cls_parts() removed - layer installs resolve the member
+             themselves) */
 
-          function call_with_args(ov, argStrings, isCtor) {
-              /* map the text args onto the overload's parameter types */
+          function call_with_args(ov, argStrings, isCtor, recv) {
+              /* map the text args onto the overload's parameter types.
+                 r23: `recv` is the retained-instance receiver for instance
+                 methods (the old call was ov.apply(null, ...) - no receiver,
+                 so instance methods could never be invoked). */
               var params = ov.argumentTypes;
               var real = [];
               for (var i = 0; i < params.length; i++) {
@@ -4895,7 +5395,7 @@ jobs:
                       if (t === 'int' || t === 'short' || t === 'byte' ||
                           t === 'long' || t === 'float' || t === 'double') { real.push(0); continue; }
                       if (t === 'boolean') { real.push(false); continue; }
-                      if (t === 'char') { real.push('a'); continue; }
+                      if (t === 'char') { real.push('\u0000'); continue; }
                       real.push(null); continue;
                   }
                   if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
@@ -4903,14 +5403,425 @@ jobs:
                   else if (t === 'float' || t === 'double')
                       real.push(parseFloat(s) || 0.0);
                   else if (t === 'boolean') real.push(s === 'true');
-                  else if (t === 'char') real.push(s.length ? s.charCodeAt(0) : 'a');
+                  else if (t === 'char') real.push(s.length ? s.charCodeAt(0) : '\u0000');
                   else if (t.lastIndexOf('[') === 0) real.push(null);
                   else real.push(s);
               }
-              return ov.apply(null, real);
+              return ov.apply(recv || null, real);
+          }
+
+          var gModCls = null;
+          function is_static_method(jc, method) {
+              try {
+                  var ms = jc.class.getDeclaredMethods();
+                  for (var i = 0; i < ms.length; i++) {
+                      if (String(ms[i].getName()) !== method) continue;
+                      try {
+                          if (!gModCls) gModCls = Java.use('java.lang.reflect.Modifier');
+                          if (gModCls.isStatic(ms[i].getModifiers())) return true;
+                      } catch (e0) {}
+                  }
+              } catch (e1) {}
+              return false;
+          }
+
+          /* r23: recursion-safe args renderer for tracker events (field_repr
+             per value instead of String(v) - see the note above field_repr) */
+          function describe_safe(a) {
+              try {
+                  var s = '';
+                  for (var i = 0; i < a.length && i < 8; i++) {
+                      var d = field_repr(a[i]);
+                      if (d.length > 60) d = d.substring(0, 57) + '...';
+                      s += (i ? ',' : '') + d;
+                  }
+                  if (s.length > 240) s = s.substring(0, 237) + '...';
+                  return s;
+              } catch (e) { return '?'; }
+          }
+
+          /* r23: retained-instance registry (the audit's "Instance-method
+             Call": callMethod/setInstanceField had NO receiver - instances
+             were addressed by a bare scan index that died when the scan
+             returned). Handles are Java.retain()ed global references; the
+             table is capped and evicts oldest-first. */
+          var gInstHandles = {};     /* id -> retained wrapper */
+          var INST_ID = 0, INST_GEN = 0;
+          var INST_LIMIT = 200;
+          function inst_put(inst) {
+              var id = ++INST_ID;
+              try {
+                  gInstHandles[id] = Java.retain(inst);
+                  var keys = Object.keys(gInstHandles);
+                  if (keys.length > INST_LIMIT) {
+                      keys.sort(function (a, b) { return (a | 0) - (b | 0); });
+                      while (keys.length > INST_LIMIT) {
+                          var old = keys.shift();
+                          try { if (gInstHandles[old]) ime_release_act(gInstHandles[old]); }
+                          catch (e0) {}
+                          delete gInstHandles[old];
+                      }
+                  }
+                  return id;
+              } catch (e) { return -1; }
+          }
+          function inst_get(handle) {
+              if (typeof handle !== 'number' || handle <= 0) return null;
+              return gInstHandles[handle] || null;
+          }
+
+          function set_field_value(f, recv, value) {
+              var t = String(f.getType().getName());
+              if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
+                  f.set(recv, parseInt(value, 10) || 0);
+              else if (t === 'boolean') f.set(recv, value === 'true');
+              else if (t === 'float' || t === 'double')
+                  f.set(recv, parseFloat(value) || 0.0);
+              else if (t === 'char')
+                  f.set(recv, (value || 'a').charCodeAt(0));
+              else f.set(recv, value);
+          }
+
+          /* ---------------- unified hook layering registry (r23) ----------------
+             Hook, Tracker, field-Tracker, Recorder and Monitor used to assign
+             ov.implementation INDEPENDENTLY - the last install silently
+             replaced every previous one (audit: "Hook, Tracker, and Recorder
+             overwrite each other's ov.implementation"). Every layer of a
+             class+method now lives in ONE registry entry; a single dispatcher
+             per overload runs all active layers around exactly ONE call into
+             the original. Removing the last layer of a method restores the
+             original implementation - which is what makes Recorder/Monitor
+             Stop really unhook this time. */
+          var LAYERS = {};   /* 'cls!method' -> { ovs: [overloads], parts: {kind: state} } */
+
+          function noop_ret(ov) {
+              var rt = ov.returnType.name;
+              if (rt === 'int' || rt === 'long' || rt === 'short' || rt === 'byte')
+                  return 0;
+              if (rt === 'float' || rt === 'double') return 0;
+              if (rt === 'boolean') return false;
+              if (rt === 'char') return '\u0000';
+              return null;
+          }
+
+          function dispatch_layers(K, ov, self, args) {
+              var i = K.indexOf('!');
+              var cls = K.substring(0, i), mn = K.substring(i + 1);
+              var L = LAYERS[K];
+              var p = L ? L.parts : {};
+              var hk = p.hook;
+              var out;
+              try {
+                  if (hk && hk.on && hk.mode === 'noop') {
+                      out = noop_ret(ov);
+                  } else if (hk && hk.on) {
+                      /* r22 semantics kept: the user fn gets receiver/args/orig();
+                         a throw falls back to the original call */
+                      try {
+                          out = hk.fn(Java, send, CONSOLE(), self,
+                                      Array.prototype.slice.call(args),
+                                      function () {
+                                          return ov.apply(self,
+                                              arguments.length ? arguments : args);
+                                      });
+                      } catch (e1) {
+                          sendMsg('error', { fn: 'hook:' + K,
+                                             msg: String(e1.message || e1) });
+                          out = ov.apply(self, args);
+                      }
+                      /* smali hooks return null to mean "default value" (r22) */
+                      if (hk.mode === 'Smali' && out === null)
+                          out = noop_ret(ov);
+                  } else {
+                      out = ov.apply(self, args);
+                  }
+              } catch (e2) {
+                  /* recorder row for the failing call, then rethrow (r22) */
+                  try {
+                      if (p.rec && REC.on && REC.ring.length < 4000)
+                          REC.ring.push({ cls: cls, m: mn, a: jargs(args),
+                                          r: '', x: String(e2).substring(0, 80) });
+                  } catch (e3) {}
+                  throw e2;
+              }
+              /* observer layers see the FINAL result; each is isolated */
+              try {
+                  if (p.rec && REC.on && REC.ring.length < 4000)
+                      REC.ring.push({ cls: cls, m: mn, a: jargs(args),
+                                      r: jstr(out), x: '' });
+              } catch (e4) {}
+              try {
+                  if (p.mon && MON.on) p.mon.fn(self, args);
+              } catch (e5) {}
+              try {
+                  if (p.trk) {
+                      var tk = trackers[p.trk.key];
+                      if (tk && tk.on) {
+                          sendMsg('trackerEvent', {
+                              name: p.trk.key,
+                              callers: jstack(5).filter(function (c) {
+                                  return c !== p.trk.key;
+                              }).slice(0, 4),
+                              args: describe_safe(args),
+                              ret: field_repr(out), err: ''
+                          });
+                      }
+                  }
+              } catch (e6) {}
+              try {
+                  if (p.fld) field_layer_emit(p.fld, self);
+              } catch (e7) {}
+              return out;
+          }
+
+          /* field-tracker emission - r23: values through field_repr(), never
+             the app's toString() (the audit's Tracker Side Effects item) */
+          function field_layer_emit(st, self) {
+              var tk = trackers[st.key];
+              if (!tk || !tk.on) return;
+              var v = st.stat ? field_repr(st.f.get(null))
+                              : (self ? field_repr(st.f.get(self)) : '?');
+              if (v !== st.last) {
+                  sendMsg('trackerEvent', { name: st.key, callers: jstack(3),
+                                            args: st.last + ' -> ' + v,
+                                            ret: '', err: '' });
+                  st.last = v;
+              } else {
+                  sendMsg('trackerEvent', { name: st.key, callers: [],
+                                            args: v, ret: '', err: '' });
+              }
+          }
+
+          /* returns the number of overloads carrying this method's layers */
+          function install_layer(cls, mn, kind, state) {
+              var K = cls + '!' + mn;
+              var L = LAYERS[K];
+              if (!L) {
+                  var jc = Java.use(cls);   /* caller decides the <clinit> policy */
+                  var node = null;
+                  try { node = jc[mn]; } catch (eN) {}
+                  var ovs = node && node.overloads;
+                  if (!ovs || !ovs.length) return 0;
+                  L = { ovs: ovs, parts: {} };
+                  LAYERS[K] = L;
+                  ovs.forEach(function (ov) {
+                      ov.implementation = function () {
+                          return dispatch_layers(K, ov, this, arguments);
+                      };
+                  });
+              }
+              L.parts[kind] = state || {};
+              return L.ovs.length;
+          }
+
+          function uninstall_layer(cls, mn, kind) {
+              var K = cls + '!' + mn;
+              var L = LAYERS[K];
+              if (!L) return;
+              delete L.parts[kind];
+              if (!Object.keys(L.parts).length) {
+                  try {
+                      L.ovs.forEach(function (ov) { ov.implementation = null; });
+                  } catch (e) {}
+                  delete LAYERS[K];
+              }
+          }
+
+          function uninstall_all(kind) {
+              Object.keys(LAYERS).forEach(function (K) {
+                  var i = K.indexOf('!');
+                  uninstall_layer(K.substring(0, i), K.substring(i + 1), kind);
+              });
+          }
+
+          /* ---------------- class access without premature <clinit> (r23) ------
+             frida-java-bridge runs ensureClassInitialized() on EVERY fresh
+             Java.use(), so hooking a class the app has not initialized yet
+             force-runs its static initializer (audit: "Class Initialization").
+             The bridge exposes no non-initializing path, so the agent only
+             Java.use()s classes that are ALREADY LOADED and defers everything
+             else: a one-time loadClass watcher installs the queued install the
+             moment the target app loads the class. */
+          var gLoadedSet = null, gLoadedAt = 0;
+          function dt_is_loaded(cls) {
+              var now = Date.now();
+              if (!gLoadedSet || now - gLoadedAt > 3000) {
+                  try {
+                      var all = Java.enumerateLoadedClassesSync();
+                      var set = {};
+                      for (var i = 0; i < all.length; i++) set[all[i]] = 1;
+                      gLoadedSet = set;
+                      gLoadedAt = now;
+                  } catch (e0) {}
+              }
+              return !!(gLoadedSet && gLoadedSet[cls]);
+          }
+
+          function use_loaded(cls) {
+              if (!dt_is_loaded(cls))
+                  throw new Error('class not loaded yet: ' + cls +
+                                  ' (its <clinit> will not be forced)');
+              return Java.use(cls);
+          }
+
+          var gDeferred = [];        /* queued installs: {kind, cls, fn} */
+          var gWatcherOvs = null;    /* loadClass overloads we hooked, for restore */
+          function defer_install(kind, cls, fn) {
+              gDeferred.push({ kind: kind, cls: cls, fn: fn });
+              if (!gWatcherOvs) install_load_watcher();
+              sendMsg('info', { msg: 'class ' + cls + ' not loaded yet - ' + kind +
+                                     ' deferred until it loads' });
+          }
+          function install_load_watcher() {
+              Java.perform(function () {
+                  try {
+                      var CL = Java.use('java.lang.ClassLoader');
+                      var ovs = [];
+                      CL.loadClass.overloads.forEach(function (ov) {
+                          if (ov.argumentTypes.length !== 1) return;   /* name only */
+                          ov.implementation = function (name) {
+                              var c = ov.apply(this, [name]);
+                              try { pump_deferred(String(name)); } catch (e0) {}
+                              return c;
+                          };
+                          ovs.push(ov);
+                      });
+                      gWatcherOvs = ovs;
+                      agentLog('phase: loadClass watcher armed (' +
+                               ovs.length + ' overloads)');
+                  } catch (e) {
+                      gWatcherOvs = null;
+                      sendMsg('warn', { msg: 'loadClass watcher failed: ' +
+                                            String(e.message || e) });
+                  }
+              });
+          }
+          function stop_load_watcher() {
+              if (!gWatcherOvs) return;
+              try {
+                  gWatcherOvs.forEach(function (ov) { ov.implementation = null; });
+              } catch (e0) {}
+              gWatcherOvs = null;
+              agentLog('phase: loadClass watcher removed (queue empty)');
+          }
+          function pump_deferred(loadedName) {
+              if (!gDeferred.length) { stop_load_watcher(); return; }
+              /* r23: entries are removed from the queue BEFORE they run - the
+                 install itself calls Java.use(), which goes through the
+                 loadClass hook again, and a re-entrant pump must never re-run
+                 the same install (infinite recursion). */
+              var run = [], stay = [];
+              for (var i = 0; i < gDeferred.length; i++) {
+                  (gDeferred[i].cls === loadedName ? run : stay).push(gDeferred[i]);
+              }
+              gDeferred = stay;
+              if (!gDeferred.length) stop_load_watcher();
+              for (var j = 0; j < run.length; j++) {
+                  try { run[j].fn(); } catch (e1) {
+                      sendMsg('error', { fn: 'deferred:' + run[j].kind,
+                                         msg: String(e1.message || e1) });
+                  }
+              }
           }
 
           var patches = {}, hooks = {}, trackers = {};
+
+          /* r23: hook/tracker install bodies, factored out so the deferred
+             loader can run them when the target class finally loads */
+          function do_addHook(cls, method, mode, code) {
+              var key = cls + '.' + method;
+              var jc = Java.use(cls);
+              var node = null;
+              try { node = jc[method]; } catch (eN) {}
+              if (!node || !node.overloads || !node.overloads.length) {
+                  sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+                  return;
+              }
+              if (mode === 'Java') {
+                  var fn = new Function('Java', 'send', 'console', 'thiz',
+                                        'args', 'orig', code);
+                  var st = { mode: mode, on: true, code: code, fn: fn };
+                  if (!install_layer(cls, method, 'hook', st)) {
+                      sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+                      return;
+                  }
+                  hooks[key] = st;
+                  sendMsg('hookAdded', { name: key });
+              } else if (mode === 'noop') {
+                  var st2 = { mode: mode, on: true, code: code, fn: null };
+                  if (!install_layer(cls, method, 'hook', st2)) {
+                      sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+                      return;
+                  }
+                  hooks[key] = st2;
+                  sendMsg('hookAdded', { name: key });
+              } else if (mode === 'Smali') {
+                  var gen = 'H' + (Date.now() % 1000000);
+                  var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
+                             '.super Ljava/lang/Object;\n' +
+                             '.method public static hook(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;\n' +
+                             /* r22/audit: default .locals - user code without a
+                                registers directive died in the assembler */
+                             (/^\s*\.(locals|registers)\b/m.test(code) ? '' : '    .locals 4\n') +
+                             code + '\n' +
+                             '.end method\n';
+                  var art = smali_compile(skel);
+                  if (art.err) {
+                      sendMsg('hookFailed', { name: key, error: art.err });
+                      return;
+                  }
+                  art.cls = 'com.dextool.hook.' + gen;
+                  var loaded = smali_load(art);
+                  if (!loaded.ok) {
+                      sendMsg('hookFailed', { name: key, error: loaded.err });
+                      return;
+                  }
+                  var st3 = { mode: mode, on: true, code: code,
+                              fn: function (J, S, C, thiz, a) {
+                                  var arr = Java.array('java.lang.Object', a);
+                                  return loaded.hook(thiz, arr);
+                              } };
+                  if (!install_layer(cls, method, 'hook', st3)) {
+                      sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+                      return;
+                  }
+                  hooks[key] = st3;
+                  sendMsg('smaliReady', { name: key, ok: 1, error: '' });
+                  sendMsg('hookAdded', { name: key });
+              }
+          }
+
+          function do_addTracker(cls, method) {
+              var key = cls + '.' + method;
+              if (!install_layer(cls, method, 'trk', { key: key }))
+                  throw new Error('method not found: ' + method);
+              trackers[key] = { on: true };
+              sendMsg('info', { msg: 'tracker added ' + key });
+          }
+
+          function do_trackField(cls, field) {
+              var key = cls + '.' + field;
+              var jc = Java.use(cls);
+              var f = jc.class.getDeclaredField(field);
+              f.setAccessible(true);
+              var stat = (f.getModifiers() & 8) !== 0;
+              var last = stat ? field_repr(f.get(null)) : '(instance)';
+              var ms = jc.class.getDeclaredMethods();
+              var installed = 0;
+              for (var i = 0; i < ms.length; i++) {
+                  var mn;
+                  try { mn = String(ms[i].getName()); } catch (e0) { continue; }
+                  try {
+                      installed += install_layer(cls, mn, 'fld',
+                                                 { key: key, f: f, stat: stat,
+                                                   last: last });
+                  } catch (e1) {}
+              }
+              if (!installed) throw new Error('no hookable methods on ' + cls);
+              trackers[key] = { on: true };
+              sendMsg('info', { msg: 'field tracker added ' + key +
+                                     ' (approximation, toString-safe)' });
+          }
 
           /* r22/audit: static-field patch helpers - the ORIGINAL value is
              captured before the first write so OFF / delete can put it back */
@@ -5002,125 +5913,38 @@ jobs:
                   else if (ml === 'smali') mode = 'Smali';
                   else if (ml === 'noop') mode = 'noop';
                   Java.perform(function () {
-                      var hit = use_cls_parts(cls, method);
-                      if (!hit) {
-                          sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+                      /* r23: never force <clinit> - defer until the class loads */
+                      if (!dt_is_loaded(cls)) {
+                          defer_install('hook', cls, function () {
+                              try { do_addHook(cls, method, mode, code); }
+                              catch (eD) {
+                                  sendMsg('hookFailed', { name: key,
+                                                          error: String(eD.message || eD) });
+                              }
+                          });
                           return;
                       }
-                      var jc = hit.jc;
-                      try {
-                          if (mode === 'Java') {
-                              var fn = new Function('Java', 'send', 'console', 'thiz',
-                                                    'args', 'orig', code);
-                              jc[method].overloads.forEach(function (ov) {
-                                  ov.implementation = function () {
-                                      if (!hooks[key] || !hooks[key].on)
-                                          return ov.apply(this, arguments);
-                                      /* r22/audit: keep the receiver + args for
-                                         orig() - `this` inside the closure is
-                                         NOT the intercepted call's receiver */
-                                      var self = this, orig_args = arguments;
-                                      try {
-                                          return fn(Java, send, CONSOLE(),
-                                                    self, Array.prototype.slice.call(orig_args),
-                                                    function () {
-                                                        return ov.apply(self,
-                                                            arguments.length ? arguments : orig_args);
-                                                    });
-                                      } catch (e1) {
-                                          sendMsg('error', { fn: 'hook:' + key,
-                                                             msg: String(e1.message || e1) });
-                                          return ov.apply(this, arguments);
-                                      }
-                                  };
-                              });
-                              hooks[key] = { mode: mode, on: true, code: code };
-                              sendMsg('hookAdded', { name: key });
-                          } else if (mode === 'noop') {
-                              jc[method].overloads.forEach(function (ov) {
-                                  ov.implementation = function () {
-                                      if (!hooks[key] || !hooks[key].on)
-                                          return ov.apply(this, arguments);
-                                      var rt = ov.returnType.name;
-                                      if (rt === 'int' || rt === 'long' || rt === 'short' ||
-                                          rt === 'byte') return 0;
-                                      if (rt === 'float' || rt === 'double') return 0;
-                                      if (rt === 'boolean') return false;
-                                      if (rt === 'char') return '\u0000';
-                                      return null;
-                                  };
-                              });
-                              hooks[key] = { mode: mode, on: true, code: code };
-                              sendMsg('hookAdded', { name: key });
-                          } else if (mode === 'Smali') {
-                              var gen = 'H' + (Date.now() % 1000000);
-                              var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
-                                         '.super Ljava/lang/Object;\n' +
-                                         '.method public static hook(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;\n' +
-                                         /* r22/audit: default .locals - user code
-                                            without a registers directive died in
-                                            the assembler */
-                                         (/^\s*\.(locals|registers)\b/m.test(code) ? '' : '    .locals 4\n') +
-                                         code + '\n' +
-                                         '.end method\n';
-                              var art = smali_compile(skel);
-                              if (art.err) {
-                                  sendMsg('hookFailed', { name: key, error: art.err });
-                                  return;
-                              }
-                              art.cls = 'com.dextool.hook.' + gen;
-                              var loaded = smali_load(art);
-                              if (!loaded.ok) {
-                                  sendMsg('hookFailed', { name: key, error: loaded.err });
-                                  return;
-                              }
-                              jc[method].overloads.forEach(function (ov) {
-                                  ov.implementation = function () {
-                                      if (!hooks[key] || !hooks[key].on)
-                                          return ov.apply(this, arguments);
-                                      try {
-                                          var arr = Java.array('java.lang.Object',
-                                              Array.prototype.slice.call(arguments));
-                                          var r = loaded.hook(this, arr);
-                                          if (r === null) {
-                                              var rt = ov.returnType.name;
-                                              if (rt === 'int' || rt === 'long' || rt === 'short' ||
-                                                  rt === 'byte') return 0;
-                                              if (rt === 'boolean') return false;
-                                              if (rt === 'char') return '\u0000';
-                                              if (rt === 'float' || rt === 'double') return 0;
-                                          }
-                                          return r;
-                                      } catch (e1) {
-                                          sendMsg('error', { fn: 'smali-hook:' + key,
-                                                             msg: String(e1.message || e1) });
-                                          return ov.apply(this, arguments);
-                                      }
-                                  };
-                              });
-                              hooks[key] = { mode: mode, on: true, code: code };
-                              sendMsg('smaliReady', { name: key, ok: 1, error: '' });
-                              sendMsg('hookAdded', { name: key });
-                          }
-                      } catch (e) {
-                          sendMsg('hookFailed', { name: key, error: String(e.message || e) });
+                      try { do_addHook(cls, method, mode, code); }
+                      catch (e0) {
+                          sendMsg('hookFailed', { name: key,
+                                                  error: String(e0.message || e0) });
                       }
                   });
               },
               setHookEnabled: function (cls, method, en) {
                   var key = cls + '.' + method;
+                  /* r23: hooks[key] IS the LAYERS part object - flipping .on is
+                     enough, the dispatcher reads it live */
                   if (hooks[key]) hooks[key].on = en;
                   sendMsg('info', { msg: 'hook ' + key + ' -> ' + (en ? 'on' : 'off') });
               },
               removeHook: function (cls, method) {
                   var key = cls + '.' + method;
                   Java.perform(function () {
-                      try {
-                          var hit = use_cls_parts(cls, method);
-                          if (hit) hit.jc[method].overloads.forEach(function (ov) {
-                              ov.implementation = null;
-                          });
-                      } catch (e) {}
+                      /* r23: remove the layer - other layers on the same method
+                         (tracker/recorder) survive, and the original
+                         implementation returns when this was the last one */
+                      uninstall_layer(cls, method, 'hook');
                       delete hooks[key];
                       sendMsg('info', { msg: 'hook removed ' + key });
                   });
@@ -5131,90 +5955,67 @@ jobs:
                   var key = cls + '.' + method;
                   Java.perform(function () {
                       try {
-                          var jc = Java.use(cls);
-                          jc[method].overloads.forEach(function (ov) {
-                              ov.implementation = function () {
-                                  var out, err = '';
-                                  try { out = ov.apply(this, arguments); }
-                                  catch (e1) { err = String(e1).substring(0, 100); throw e1; }
-                                  if (trackers[key] && trackers[key].on) {
-                                      /* r22/audit: exclude the tracked method
-                                         from its own callers list */
-                                      var ev = { name: key,
-                                                 callers: jstack(5).filter(function (c) {
-                                                     return c !== key;
-                                                 }).slice(0, 4),
-                                                 args: describe(arguments), ret: jstr(out),
-                                                 err: err };
-                                      sendMsg('trackerEvent', ev);
+                          if (!dt_is_loaded(cls)) {
+                              defer_install('tracker', cls, function () {
+                                  try { do_addTracker(cls, method); }
+                                  catch (eD) {
+                                      sendMsg('error', { fn: 'addTracker',
+                                                         msg: String(eD.message || eD) });
                                   }
-                                  return out;
-                              };
-                          });
-                          trackers[key] = { on: true };
-                          sendMsg('info', { msg: 'tracker added ' + key });
+                              });
+                              return;
+                          }
+                          do_addTracker(cls, method);
                       } catch (e) {
-                          sendMsg('error', { fn: 'addTracker', msg: String(e.message || e) });
+                          sendMsg('error', { fn: 'addTracker',
+                                             msg: String(e.message || e) });
                       }
                   });
               },
               trackField: function (cls, field) {
-                  /* ART has no field read/write barriers: approximate by watching
-                     the value before/after every declared method call of the class */
+                  /* ART has no field read/write barriers: approximate by
+                     watching the value before/after every declared method call
+                     of the class. r23: values go through field_repr() - the old
+                     jstr(f.get(...)) called the app's toString() INSIDE our
+                     hooks (recursion/crash when toString is itself recorded). */
                   var key = cls + '.' + field;
                   Java.perform(function () {
                       try {
-                          var jc = Java.use(cls);
-                          var f = jc.class.getDeclaredField(field);
-                          f.setAccessible(true);
-                          var st = (f.getModifiers() & 8) !== 0;
-                          var last = st ? jstr(f.get(null)) : '(instance)';
-                          jc.class.getDeclaredMethods().forEach(function (md) {
-                              var mn;
-                              try { mn = md.getName(); } catch (e0) { return; }
-                              var m;
-                              try { m = jc[mn]; } catch (e1) { return; }
-                              if (!m || !m.overloads) return;
-                              m.overloads.forEach(function (ov) {
-                                  try {
-                                      ov.implementation = function () {
-                                          var r = ov.apply(this, arguments);
-                                          try {
-                                              if (trackers[key] && trackers[key].on) {
-                                                  var v = st ?
-                                                      jstr(f.get(null)) :
-                                                      (this ? jstr(f.get(this)) : '?');
-                                                  if (v !== last) {
-                                                      sendMsg('trackerEvent', {
-                                                          name: key,
-                                                          callers: jstack(3),
-                                                          args: last + ' -> ' + v,
-                                                          ret: '', err: ''
-                                                      });
-                                                      last = v;
-                                                  } else {
-                                                      sendMsg('trackerEvent', {
-                                                          name: key, callers: [],
-                                                          args: v, ret: '', err: ''
-                                                      });
-                                                  }
-                                              }
-                                          } catch (e2) {}
-                                          return r;
-                                      };
-                                  } catch (e3) {}
+                          if (!dt_is_loaded(cls)) {
+                              defer_install('field tracker', cls, function () {
+                                  try { do_trackField(cls, field); }
+                                  catch (eD) {
+                                      sendMsg('error', { fn: 'trackField',
+                                                         msg: String(eD.message || eD) });
+                                  }
                               });
-                          });
-                          trackers[key] = { on: true };
-                          sendMsg('info', { msg: 'field tracker added ' + key + ' (approximation)' });
+                              return;
+                          }
+                          do_trackField(cls, field);
                       } catch (e) {
-                          sendMsg('error', { fn: 'trackField', msg: String(e.message || e) });
+                          sendMsg('error', { fn: 'trackField',
+                                             msg: String(e.message || e) });
                       }
                   });
               },
               removeTracker: function (name) {
-                  delete trackers[name];
-                  sendMsg('info', { msg: 'tracker removed ' + name });
+                  Java.perform(function () {
+                      /* r23: the layer(s) are removed for real; the class's
+                         methods return to their original implementations when
+                         nothing else tracks/records/hooks them */
+                      Object.keys(LAYERS).forEach(function (K) {
+                          var L = LAYERS[K];
+                          if (!L) return;
+                          var i = K.indexOf('!');
+                          var cls = K.substring(0, i), mn = K.substring(i + 1);
+                          if (L.parts.trk && L.parts.trk.key === name)
+                              uninstall_layer(cls, mn, 'trk');
+                          if (L.parts.fld && L.parts.fld.key === name)
+                              uninstall_layer(cls, mn, 'fld');
+                      });
+                      delete trackers[name];
+                      sendMsg('info', { msg: 'tracker removed ' + name });
+                  });
               },
 
               /* ---- recorder ---- */
@@ -5254,10 +6055,14 @@ jobs:
                   });
               },
               stopRecorder: function () {
-                  /* r12: REC.on=false now also aborts a still-running install
-                     (see rec_install_chunk) */
+                  /* r12: REC.on=false also aborts a still-running install
+                     (see rec_install_chunk).
+                     r23: uninstall_all('rec') removes the recorder layer from
+                     every method - hooks are GONE, not just silent (the audit's
+                     "hooks are never removed on stop"). */
                   REC.on = false;
                   REC.busy = false;
+                  Java.perform(function () { uninstall_all('rec'); });
                   rec_flush();
                   sendMsg('recorderStopped', { installed: REC.installed });
               },
@@ -5273,6 +6078,9 @@ jobs:
               stopMonitor: function () {
                   MON.on = false;
                   mon_flush();
+                  Java.perform(function () {
+                      uninstall_all('mon');    /* r23: really unhook */
+                  });
                   sendMsg('monitorStopped', {});
               },
 
@@ -5331,13 +6139,12 @@ jobs:
               openClass: function (cls) {
                   Java.perform(function () {
                       try {
-                          var jc = Java.use(cls);
-                          /* r12: field VALUES are no longer read here.
-                             field_lines(jc, null) called f.get(null) on every
-                             static - and a static read can run the class's
-                             <clinit>, which may block forever inside app code.
-                             That was the "tap a class and the app hangs" bug
-                             (together with the menu-side nested lock). */
+                          /* r12: field VALUES are no longer read here - a static
+                             read can run the class's <clinit> and block forever.
+                             r23: use_loaded() also refuses UNLOADED classes -
+                             Java.use() itself runs <clinit> through the bridge's
+                             ensureClassInitialized. */
+                          var jc = use_loaded(cls);
                           sendMsg('classInfo', {
                               class: cls,
                               methods: method_lines(jc),
@@ -5354,7 +6161,7 @@ jobs:
               readStaticFields: function (cls) {
                   Java.perform(function () {
                       try {
-                          var jc = Java.use(cls);
+                          var jc = use_loaded(cls);   /* r23: no forced <clinit> */
                           var fs = jc.class.getDeclaredFields();
                           var out = [];
                           for (var i = 0; i < fs.length; i++) {
@@ -5379,25 +6186,61 @@ jobs:
               hideIme: function () { ime_hide(); },
               listInstances: function (cls) {
                   Java.perform(function () {
-                      var out = [];
+                      var rows = [];
+                      var gen = ++INST_GEN;
                       try {
+                          var jc = Java.use(cls);
                           Java.choose(cls, {
                               onMatch: function (inst) {
-                                  var fl = field_lines(Java.use(cls), inst);
-                                  out.push(jstr(inst) + '##' + fl.join(';'));
-                                  if (out.length >= 20) return 'stop';
+                                  try {
+                                      /* r23: retain + structured fields; the old
+                                         "##"/";" protocol corrupted values and
+                                         the bare scan index gave later calls no
+                                         receiver at all. The label is NOT run
+                                         through jstr() - its | -> ! and # -> %
+                                         rewrites were only needed by the old
+                                         delimiter protocol. */
+                                      var h = inst_put(inst);
+                                      var lbl = '';
+                                      try { lbl = String(inst); }
+                                      catch (eL) { lbl = '(toString failed)'; }
+                                      if (lbl.length > 160)
+                                          lbl = lbl.substring(0, 157) + '...';
+                                      rows.push({ str: lbl, handle: h,
+                                                  fields: field_rows(jc, inst) });
+                                  } catch (e0) {}
+                                  if (rows.length >= 20) return 'stop';
                               },
                               onComplete: function () {
-                                  sendMsg('instanceList', { class: cls, instances: out });
+                                  sendMsg('instanceList', { class: cls, gen: gen,
+                                                            instances: rows });
                               }
                           });
                       } catch (e) {
-                          sendMsg('instanceList', { class: cls, instances: out });
+                          sendMsg('instanceList', { class: cls, gen: gen,
+                                                    instances: rows });
                       }
                   });
               },
-              setInstanceField: function (cls, index, field, value) {
+              setInstanceField: function (cls, index, field, value, handle) {
                   Java.perform(function () {
+                      var key = cls + '.' + field;
+                      /* r23: a retained handle addresses the instance directly
+                         (the scan-index path is only the fallback now) */
+                      var recv = inst_get(handle);
+                      if (recv) {
+                          try {
+                              var jc = Java.use(cls);
+                              var f = jc.class.getDeclaredField(field);
+                              f.setAccessible(true);
+                              set_field_value(f, recv, value);
+                              sendMsg('patchApplied', { name: key });
+                          } catch (e1) {
+                              sendMsg('patchFailed', { name: key,
+                                                       error: String(e1.message || e1) });
+                          }
+                          return;
+                      }
                       try {
                           var found = [];
                           Java.choose(cls, {
@@ -5412,47 +6255,60 @@ jobs:
                                       var jc = Java.use(cls);
                                       var f = jc.class.getDeclaredField(field);
                                       f.setAccessible(true);
-                                      var t = f.getType().getName();
-                                      if (t === 'int' || t === 'long' || t === 'short' ||
-                                          t === 'byte') f.set(inst, parseInt(value, 10) || 0);
-                                      else if (t === 'boolean') f.set(inst, value === 'true');
-                                      else if (t === 'float' || t === 'double')
-                                          f.set(inst, parseFloat(value) || 0.0);
-                                      else if (t === 'char')
-                                          f.set(inst, (value || 'a').charCodeAt(0));
-                                      else f.set(inst, value);
-                                      sendMsg('patchApplied', { name: cls + '.' + field });
-                                  } catch (e1) {
-                                      sendMsg('patchFailed', { name: cls + '.' + field,
-                                                               error: String(e1.message || e1) });
+                                      set_field_value(f, inst, value);
+                                      sendMsg('patchApplied', { name: key });
+                                  } catch (e2) {
+                                      sendMsg('patchFailed', { name: key,
+                                                               error: String(e2.message || e2) });
                                   }
                               }
                           });
                       } catch (e) {}
                   });
               },
-              callMethod: function (cls, method, args) {
+              callMethod: function (cls, method, args, handle) {
                   Java.perform(function () {
                       try {
-                          var jc = Java.use(cls);
+                          /* r23: use_loaded - no forced <clinit> on unloaded
+                             classes */
+                          var jc = use_loaded(cls);
+                          var recv = inst_get(handle);
+                          var node = null;
+                          try { node = jc[method]; } catch (e0) {}
+                          if (!node || !node.overloads || !node.overloads.length)
+                              throw new Error('method not found: ' + method);
+                          var ovs = node.overloads;
+                          var want = args ? args.length : 0;
                           var best = null;
-                          jc[method].overloads.forEach(function (ov) {
-                              var np = ov.argumentTypes.length;
-                              if (np === (args ? args.length : 0)) { best = ov; }
-                          });
-                          if (!best) {
-                              jc[method].overloads.forEach(function (ov) {
-                                  if (!best) best = ov;
-                              });
+                          for (var i = 0; i < ovs.length; i++) {
+                              if (ovs[i].argumentTypes.length === want) {
+                                  best = ovs[i];
+                                  break;
+                              }
                           }
-                          if (!best) throw new Error('no overload');
-                          var r = call_with_args(best, args || [], false);
+                          if (!best) best = ovs[0];
+                          if (recv) {
+                              /* r23: instance-method call WITH a receiver (the
+                                 audit's "callMethod fails because it has no
+                                 receiver") */
+                              var r = call_with_args(best, args || [], false, recv);
+                              sendMsg('callResult', {
+                                  class: cls, ok: 1, result: jstr(r), error: ''
+                              });
+                              return;
+                          }
+                          if (!is_static_method(jc, method))
+                              throw new Error('instance method - Find instances, ' +
+                                  'pick one, then Call (a retained handle is ' +
+                                  'required as the receiver)');
+                          var r2 = call_with_args(best, args || [], false, null);
                           sendMsg('callResult', {
-                              class: cls, ok: 1, result: jstr(r), error: ''
+                              class: cls, ok: 1, result: jstr(r2), error: ''
                           });
                       } catch (e) {
                           sendMsg('callResult', {
-                              class: cls, ok: 0, result: '', error: String(e.message || e)
+                              class: cls, ok: 0, result: '',
+                              error: String(e.message || e)
                           });
                       }
                   });
@@ -5638,8 +6494,8 @@ jobs:
               showIme:         [],
               hideIme:         [],
               listInstances:   ['class'],
-              setInstanceField:['class', 'index', 'field', 'value'],
-              callMethod:      ['class', 'method', 'args']
+              setInstanceField:['class', 'index', 'field', 'value', 'handle'],
+              callMethod:      ['class', 'method', 'args', 'handle']
           };
 
           /* r14: phased startup. gum_script_load_sync must ALWAYS return:
@@ -5664,7 +6520,7 @@ jobs:
                   sendMsg('error', { fn: 'touchhook',
                                      msg: String(eT && eT.message || eT) });
               }
-              sendMsg('ready', { msg: 'Dex-tool agent r22 loaded' });
+              sendMsg('ready', { msg: 'Dex-tool agent r23 loaded' });
               agentLog('phase: ready sent');
           }, 0);
           DXTAGNT
@@ -5739,7 +6595,12 @@ jobs:
                   startLogcatThread();
                   writeBootMarker();
                   startCopierThread();
-                  try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                  /* r23: the Thread.sleep(500) that ran HERE blocked the MAIN
+                     thread half a second on every app start (the audit's
+                     "Thread.sleep(500) on the main thread" item). Nothing below
+                     depends on the daemon threads being up - the logcat process
+                     and the copier start on their own threads - so the sleep is
+                     simply gone. */
                   installUncaughtHandler();
                   try {
                       System.loadLibrary("tool");
@@ -6084,6 +6945,71 @@ jobs:
 
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+          ## Fixes in this version (r23)
+
+          Patch #2 of the 47-item audit: the 22 open items plus the 7 partial
+          ones finished.
+
+          - **Message routing (menu.cpp):** every agent message is dispatched on
+            the EXACT `"type"` value (`jtype()`); `jhas()` is colon-anchored, so
+            a payload that merely contains a word can no longer hijack another
+            branch.
+          - **Click-through (overlay.cpp + agent):** menu.cpp/overlay publish the
+            rects of every live ImGui window each frame; the Java touch hook asks
+            `dextool_hit_test(rawX, rawY)` BEFORE the app sees the gesture and
+            consumes the whole gesture when it starts on the menu - taps no
+            longer leak to the host app.
+          - **Touch map:** the view probe scores SurfaceView/TextureView
+            candidates against the overlay's REAL GL surface size
+            (`dextool_display_size`); overlay.cpp dropped its clamping, so taps
+            outside the view no longer snap onto edge widgets.
+          - **Hook layering (agent):** one registry (`LAYERS`) per
+            class+method - Hook, Tracker, field-Tracker, Recorder and Monitor
+            stack on the same method through a single dispatcher instead of
+            overwriting each other's `ov.implementation`.
+          - **Recorder/Monitor Stop really unhooks:** stopping removes the
+            layer and restores the original implementation.
+          - **Instance-method Call:** `listInstances` retains every instance
+            (`Java.retain`) and returns `{str, handle, fields:[{n,t,v}]}`;
+            `callMethod`/`setInstanceField` address instances by handle - real
+            receivers. Static-only calls without a handle are refused with a
+            hint. The old `"##"/";"` value protocol (which corrupted values
+            containing `|`, `#`, `;`) is gone.
+          - **Instance editor:** buffers are keyed by class + list generation +
+            index - no more stale text across classes.
+          - **Class initialization:** hooks/trackers only `Java.use` classes
+            that are ALREADY loaded; anything else is deferred and installed by
+            a `loadClass` watcher when the app loads the class (no forced
+            `<clinit>`).
+          - **Tracker side effects:** field/tracker values go through
+            `field_repr()` - primitives and boxes only, everything else is
+            `@class#identityHashCode`; the app's `toString()` is never called
+            inside hooks (no more recursion/crash).
+          - **Search:** class filter searches on Enter/button only (no more
+            per-keystroke `enumerateLoadedClasses`); stale pages of an older
+            query are dropped via the qid generation counter.
+          - **IME focus order:** the OLD field's deferred deactivation no longer
+            closes the keyboard of the NEW field (owner-ID check).
+          - **IME focus restore:** the app's previously focused view is
+            remembered and gets focus back when the keyboard closes (Done/back/
+            hide) - the hidden EditText no longer keeps focus forever.
+          - **UI polish:** window opacity applied once (was squared); the X
+            button force-returns the toggle FAB when it was disabled.
+          - **Agent status:** failed GumJS starts are delivered to the menu
+            (`agentStatus`) and shown in Settings instead of "waiting" forever.
+          - **Main thread:** the 500 ms `Thread.sleep` in DexToolApp.onCreate is
+            gone.
+          - **GL state:** vertex-attrib enable flags (0..7) are saved and
+            restored around the overlay draw alongside the VAO binding.
+          - **`my_terminate`:** retires only the slots belonging to the
+            terminated display (slots record their `dpy`).
+          - **Stale GL names:** parked worlds "forget" their backend GL handles
+            (`ImGui_ImplOpenGL3_ForgetDeviceObjects`, appended to the backend by
+            CI) so adoption can never delete a name the new context recycled;
+            owner migration now PARKS the old world instead of leaking it.
+          - **Build:** Dobby is pinned to a specific commit; `.so`/`.jar`
+            binaries and the generated embed header are no longer committed.
 
           ## Fixes in this version (r22)
 
@@ -6566,6 +7492,14 @@ jobs:
           *.iml
           *.zip
           *.tar.*
+          # r23/audit: binaries and generated files are no longer committed -
+          # the sample APK build copies libtool.so into jniLibs and smali-fat.jar
+          # into assets BEFORE the commit step, and agent_bundle_embed.h is
+          # regenerated by CI on every run
+          *.so
+          *.jar
+          deps/
+          src/agent_bundle_embed.h
           DXTGI
 
       - name: Upload libtool.so artifacts
@@ -6595,6 +7529,16 @@ jobs:
             sample-app/.gradle sample-app/build sample-app/app/build \
             sample-app/local.properties sample-app/.idea \
             sample-app/app/.idea sample-app/captures 2>/dev/null || true
+          # r23/audit: stop committing BINARIES - the APK step copies
+          # libtool.so into jniLibs and smali-fat.jar into assets before
+          # this step, and agent_bundle_embed.h is regenerated by CI;
+          # every one of them bloats the repo
+          git rm -r --cached --quiet --ignore-unmatch \
+            sample-app/app/src/main/jniLibs \
+            sample-app/app/src/main/assets/smali-fat.jar \
+            src/agent_bundle_embed.h 2>/dev/null || true
+          git rm -r --cached --quiet --ignore-unmatch \
+            '*.so' '*.jar' 2>/dev/null || true
           git add --ignore-errors \
             CMakeLists.txt \
             src/ \
@@ -6606,7 +7550,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r22: port third-party audit fixes (18 items) into the generated sources - overlay ONE ordered input queue + UTF-16 surrogate recombination (IME deletions now counted in code points), double-draw guard spans the real eglSwapBuffers, texture binding restored on unit 0, logger FILE* under lock + private crash log rotated on retarget + sigaltstack preserved + terminate survives no-exception, bridge queues early agent messages + logs uncaught JS errors, agent Script tab runs code + Java(JS) hooks install + orig() keeps receiver/args + patch OFF/delete restores + recorder pre-filter + OkHttp enqueue + readable console + smali loader hardening (atomic extract, read-only, ClassFactory, single ByteBuffer), d8-dexed smali jar with antlr-runtime, 16KB page alignment, cached debug keystore, dead smali_runtime.cpp removed [skip ci]"
+            git commit -m "fix r23: audit patch 2 (29 items) - exact JSON message routing (jtype + colon-anchored jhas), dextool_hit_test click-through consumes menu gestures before the app sees them, touch map scored against the real GL surface + clamping dropped, ONE hook-layering registry for Hook/Tracker/Recorder/Monitor (stop really unhooks), retained instance handles + structured instance protocol (| # ; corruption gone), instance editor keyed by class+generation, loadClass-deferred installs (no forced <clinit>), toString-safe field tracking, class search on Enter + stale-page generation guard, IME focus order fixed + app focus restored on keyboard close, opacity applied once + X-button FAB recovery, agent-start failures shown in the menu, main-thread Thread.sleep(500) removed, vertex-attrib state saved/restored, eglTerminate scoped to its own display, parked worlds forget stale GL names (recycled-name deletes impossible), owner migration parks the old world, Dobby pinned to c1da0315, .so/.jar/embed header no longer committed [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
