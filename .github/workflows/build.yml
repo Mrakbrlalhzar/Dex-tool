@@ -3,7 +3,9 @@ name: Build Dex-tool
 
 on:
   push:
-    branches: ["**"]
+    # r24: was ["**"] - the workflow pushed to dev from every branch;
+    # only dev pushes may publish
+    branches: ["dev"]
   workflow_dispatch:
 
 permissions:
@@ -499,7 +501,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r23: audit patch 2 - exact JSON message routing + dextool_hit_test click-through + ONE hook-layering registry for Hook/Tracker/Recorder/Monitor (stop really unhooks) + retained instance handles with structured instance protocol + loadClass-deferred installs (no forced <clinit>) + toString-safe field tracking + vertex-attrib state saved/restored + eglTerminate scoped to its own display + parked worlds forget stale GL names + agent-start failures shown in the UI, r22 ordered-input/audit fixes kept)");
+              log_info("logger_init done (build r24: audit patch 3 - field-tracker emits only on value change with 20 ms poll + 100 ms emit throttles (menu-freeze fix), dt_is_loaded forces one rebuild on cache miss, lazy LAYERS key parsing in the dispatcher, eaten gestures no longer leak UP, IME Enter forwarded to ImGui so the class filter searches, background-only opacity via SetNextWindowBgAlpha, escaped agentStatus JSON, IME ladder stops when the keyboard is up (isAcceptingText + session token), console keeps the newest 400 lines, child-scoped auto-scroll, dev-only push trigger, r23 click-through/layering/instance protocol kept)");
           }
 
           /* r16: re-point the logs at the app's real private dir.
@@ -1905,6 +1907,25 @@ jobs:
               return j.substr(p, i - p);
           }
 
+          /* r24: escape a C string for inline embedding into a JSON envelope.
+             The GumJS failure text (err->message) is arbitrary text - pasted
+             in raw, quotes/backslashes inside it produced an INVALID envelope
+             the menu's jstr() then failed to parse (Settings stayed
+             "waiting" even though a message had arrived). */
+          static std::string jesc_bridge(const char* s) {
+              std::string o;
+              for (; s && *s; s++) {
+                  char c = *s;
+                  if (c == '"' || c == '\\') { o += '\\'; o += c; }
+                  else if ((unsigned char)c < 0x20) {
+                      char b[8];
+                      snprintf(b, sizeof(b), "\\u%04x", (unsigned char)c);
+                      o += b;
+                  } else o += c;
+              }
+              return o;
+          }
+
           static const char kErrEnvelope[] = "{\"type\":\"error\"";
 
           /* r23: shared delivery to the menu (callback if registered, backlog
@@ -1980,12 +2001,19 @@ jobs:
                   snprintf(m, sizeof(m), "[frida_bridge] create: %s\n",
                            err ? err->message : "(null)");
                   log_crash_raw(m);
-                  /* r23: the Settings tab now shows WHY the agent is not coming up */
-                  char jm[640];
+                  /* r23: the Settings tab now shows WHY the agent is not coming up.
+                     r24: the message is JSON-escaped - err->message is arbitrary
+                     text and the raw paste could break the envelope. */
+                  char jm[768];
+                  std::string em = jesc_bridge(err ? err->message : "(null)");
+                  /* escape expansion can be 6x - cap the text so the envelope
+                     is ALWAYS closed (a truncated tail would be invalid JSON
+                     and the menu would drop the message) */
+                  if (em.size() > 400) em = em.substr(0, 400);
                   snprintf(jm, sizeof(jm),
                            "{\"type\":\"agentStatus\",\"payload\":{\"ok\":0,"
                            "\"msg\":\"script create failed: %s\"}}",
-                           err ? err->message : "(null)");
+                           em.c_str());
                   deliver(jm);
                   if (err) g_error_free(err);
                   return;
@@ -2381,7 +2409,10 @@ jobs:
           static void push_console(const char* tag, const std::string& line) {
               char b[256];
               snprintf(b, sizeof(b), "%s %s", tag, line.c_str());
-              if (s_cons.size() < 400) s_cons.push_back(b);
+              /* r24: keep the NEWEST 400 lines - the old guard DROPPED every
+                 line past 400, so the console simply appeared to stop */
+              s_cons.push_back(b);
+              if (s_cons.size() > 400) s_cons.erase(s_cons.begin());
           }
 
           /* ---------------- cross-linking ---------------- */
@@ -2544,8 +2575,10 @@ jobs:
                   case 1: ImGui::StyleColorsLight();   break;
                   case 2: ImGui::StyleColorsClassic(); break;
               }
-              ImGuiStyle& st = ImGui::GetStyle();
-              st.Alpha = s_opacity;
+              /* r24: style.Alpha is GONE - it faded EVERYTHING (text, child
+                 windows, the FAB) while the spec wants only the window
+                 BACKGROUND transparent. menu_draw() uses
+                 SetNextWindowBgAlpha(s_opacity), the single opacity source. */
               ImGui::GetIO().FontGlobalScale = 1.0f;   /* real size comes from the
                                                          atlas, not from scaling */
           }
@@ -2563,6 +2596,8 @@ jobs:
           static bool s_ime_active = false;   /* a text field owns ImGui focus */
           static bool s_ime_clear  = false;   /* drop active id next frame      */
           static ImGuiID s_ime_owner = 0;     /* r23: WHICH field owns the IME */
+          static int  s_ime_enter = 0;        /* r24: 2 = inject Enter DOWN, 1 = UP */
+          static bool s_ime_enter_rel = false; /* r24: release the field after the key */
 
           static void ime_show() { post_rpc("showIme", "{}"); }
           static void ime_hide() { post_rpc("hideIme", "{}"); }
@@ -2572,15 +2607,32 @@ jobs:
           }
 
           /* once per frame, before the menu window: if the user closed the
-             phone keyboard, release the ImGui field as well */
+             phone keyboard, release the ImGui field as well. r24: forward the
+             phone IME's Enter (Done/Search) as a real ImGui key press - DOWN
+             this frame, UP the next (both in one frame would be swallowed,
+             key state is sampled once per frame). The active InputText sees
+             the DOWN and, with EnterReturnsTrue (the class filter), fires
+             its search. */
           static void ime_frame_prelude() {
-              bool clear = false;
+              bool clear = false, enter_down = false, enter_up = false;
               MLK();
               clear = s_ime_clear;
               s_ime_clear = false;
               if (clear) s_ime_active = false;
+              if (s_ime_enter == 2) { s_ime_enter = 1; enter_down = true; }
+              else if (s_ime_enter == 1) {
+                  s_ime_enter = 0; enter_up = true;
+                  if (s_ime_enter_rel) {
+                      s_ime_enter_rel = false;
+                      if (s_ime_active) { s_ime_active = false; clear = true; }
+                  }
+              }
               MULK();
               if (clear) ImGui::ClearActiveID();
+              if (enter_down || enter_up) {
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.AddKeyEvent(ImGuiKey_Enter, enter_down);
+              }
           }
 
           /* plain InputText wired to the system keyboard. r23: `extra` lets a
@@ -2649,10 +2701,21 @@ jobs:
                       s_cls_auto_done = false;  /* new agent: re-list classes */
                       snprintf(s_agent_note, sizeof(s_agent_note), "%s",
                                jstr(j, "msg").c_str());
+                  } else if (ty == "imeEnter") {
+                      /* r24: the phone IME's Enter/Search - the menu injects a
+                         real Enter key press over the next two frames so
+                         fields with EnterReturnsTrue (class filter) search */
+                      s_ime_enter = 2;
                   } else if (ty == "imeHidden") {
                       /* user closed the phone keyboard (Done / back):
-                         drop ImGui focus so the next tap re-opens it */
-                      if (s_ime_active) { s_ime_active = false; s_ime_clear = true; }
+                         drop ImGui focus so the next tap re-opens it.
+                         r24: with an Enter forward in flight the release is
+                         DEFERRED - clearing now would deactivate the field
+                         before the key arrives and the search would be lost. */
+                      if (s_ime_active) {
+                          if (s_ime_enter > 0) s_ime_enter_rel = true;
+                          else { s_ime_active = false; s_ime_clear = true; }
+                      }
                   } else if (ty == "staticValues") {
                       /* r12: static values are read on demand only - reading
                          them during openClass() ran <clinit> of arbitrary
@@ -3132,10 +3195,14 @@ jobs:
                       ImGui::PopID();
                   }
               }
-              ImGui::EndChild();
-              mark_scroll_item(s_lst_scroll);
+              /* r24: auto-scroll must run INSIDE the child - after EndChild()
+                 the GetScrollY/SetScrollHereY pair operated on the PARENT
+                 window (the whole menu jumped instead of the list following
+                 the new rows) */
               if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
                   ImGui::SetScrollHereY(1.f);
+              ImGui::EndChild();
+              mark_scroll_item(s_lst_scroll);
               MULK();
           }
 
@@ -3203,10 +3270,11 @@ jobs:
               MLK();
               ImGui::BeginChild("consl", ImVec2(0, 200), true);
               for (auto& l : s_cons) ImGui::TextUnformatted(l.c_str());
-              ImGui::EndChild();
-              mark_scroll_item(s_lst_scroll);
+              /* r24: auto-scroll inside the child (see the Recorder tab) */
               if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
                   ImGui::SetScrollHereY(1.f);
+              ImGui::EndChild();
+              mark_scroll_item(s_lst_scroll);
               MULK();
           }
 
@@ -3633,12 +3701,14 @@ jobs:
               ImGui::SetNextWindowSizeConstraints(
                   ImVec2(420, 300), ImVec2(ds.x * .95f, ds.y * .95f));
               ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
-              /* r23 UI polish: opacity was applied TWICE - apply_theme() already
-                 sets style.Alpha, and the SetNextWindowBgAlpha(s_opacity) here
-                 multiplied the window background by the same value again
-                 (0.92 rendered as ~0.85). style.Alpha is the single source. */
+              /* r24: the r23 "style.Alpha is the single source" call was wrong -
+                 style.Alpha faded EVERYTHING (text included) while the spec
+                 wants only the window BACKGROUND transparent. apply_theme() no
+                 longer touches style.Alpha; SetNextWindowBgAlpha(s_opacity)
+                 here is the single opacity source. */
+              ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.2 (r14)", &open,
+              ImGui::Begin("Dex-tool v1.2 (r24)", &open,
                            ImGuiWindowFlags_NoCollapse);
               if (!open) {
                   MLK();
@@ -3820,9 +3890,42 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r23). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r24). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
+
+             r24 changes (patch #3 - performance on heavy apps + logic/CI
+             leftovers from the latest static audit; the menu froze and
+             logcat showed "Skipped 40 frames! The application may be doing
+             too much work on its main thread"):
+             - Field-tracker flooding fixed: field_layer_emit() sent a
+               trackerEvent on EVERY method call of the tracked class,
+               changed or not (the old else-branch). Values are polled at
+               most every 20 ms, emitted only when the value actually
+               changed, and at most once per 100 ms per field - hot classes
+               no longer flood the bridge.
+             - dt_is_loaded() race fixed: the 3 s loaded-class cache could
+               predate a class actually loading, and loadClass would never
+               fire again - the queued install waited forever. A cache miss
+               now forces ONE rebuild of the set (once per cache
+               generation) before the class is declared unloaded.
+             - Dispatcher overhead: cls/mn are parsed from the LAYERS key
+               LAZILY (only recorder rows need them) instead of substring'ing
+               the key on every hooked call; the dispatchTouchEvent hook
+               keeps doing the minimum on the main thread.
+             - Eaten gestures no longer leak UP: gTouchEat was cleared on
+               UP/CANCEL BEFORE the consume check, so the app received an
+               UP for a gesture whose DOWN the menu had consumed. The flag
+               is captured first and consumed after.
+             - IME ladder stops when the keyboard is already up: retries
+               now check isAcceptingText() (logged once), and every show
+               request carries a session token - newer requests and
+               Done/hide invalidate the pending ladder instead of
+               re-sending showSoftInput 4x per tap.
+             - Enter is forwarded to ImGui: onEditorAction sends an
+               "imeEnter" message BEFORE imeHidden; the menu injects
+               ImGuiKey_Enter (DOWN, then UP next frame) so fields with
+               EnterReturnsTrue (the class filter) actually search.
 
              r23 changes (patch #2 of the 47-item audit - 22 open + 7 partial
              items finished):
@@ -4361,7 +4464,9 @@ jobs:
           var IME = { act: null, edit: null, actHash: 0, prev: '',
                       silent: false, cnt: 0, everLogged: false,
                       mapProbed: false,                   /* r20: one-shot view-map probe */
-                      restore: null };                    /* r23: app view whose focus we borrowed */
+                      restore: null,                      /* r23: app view whose focus we borrowed */
+                      showSeq: 0,                         /* r24: show-request session token */
+                      upLogged: false };                  /* r24: "already up" logged once per session */
 
           /* r18: release the previous retained activity. The bridge does not
              export Java.release(), so the documented cleanup is the
@@ -4661,8 +4766,14 @@ jobs:
                           implements: [Java.use('android.widget.TextView$OnEditorActionListener')],
                           methods: {
                               onEditorAction: function (v, actionId, ev) {
-                                  /* Done/Next on the IME: release the menu field so
-                                     the next tap on it re-opens the keyboard */
+                                  /* r24: Done/Search on the phone IME now SEARCHES -
+                                     the filter field declares EnterReturnsTrue but the
+                                     old handler only hid the keyboard. Forward a real
+                                     Enter key press FIRST (the menu injects it as a
+                                     two-frame key event), then release the field so
+                                     the next tap on it re-opens the keyboard. */
+                                  IME.showSeq++;            /* keyboard closing: ladder stops */
+                                  sendMsg('imeEnter', {});
                                   sendMsg('imeHidden', {});
                                   ime_reset_text();
                                   /* r23: give the app its focused view back */
@@ -4793,6 +4904,12 @@ jobs:
           }
 
           function ime_show() {
+              /* r24: every show request starts a NEW session - pending retries
+                 of an older ladder are invalidated (they used to pile up when
+                 fields were tapped quickly and kept re-sending showSoftInput
+                 long after their keyboard was gone) */
+              var seq = ++IME.showSeq;
+              IME.upLogged = false;
               Java.perform(function () {
                   Java.scheduleOnMainThread(function () {
                       try {
@@ -4849,6 +4966,9 @@ jobs:
                               setTimeout(function () {
                                   Java.scheduleOnMainThread(function () {
                                       try {
+                                          /* r24: stale ladder (a newer show request
+                                             or Done/hide superseded it) - stop */
+                                          if (seq !== IME.showSeq) return;
                                           if (!IME.act) {
                                               /* r16: BOTH resolution layers run
                                                  in the ladder. resolve_current_
@@ -4865,9 +4985,29 @@ jobs:
                                                   ime_act_resolved(a,
                                                       'retry ' + delay + 'ms');
                                               });
-                                          } else if (ime_try_show(false)) {
-                                              agentLog('ime: retry ok at ' + delay + 'ms');
+                                              return;
                                           }
+                                          /* r24: keyboard already up - the ladder
+                                             STOPS instead of re-sending showSoftInput
+                                             4x per tap (the "showSoftInput sent ->
+                                             true" console flooding) */
+                                          var up = false;
+                                          try {
+                                              var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
+                                              var immx = Java.cast(
+                                                  IME.act.getSystemService('input_method'),
+                                                  IMMgr);
+                                              up = !!immx.isAcceptingText();
+                                          } catch (eI) {}
+                                          if (up) {
+                                              if (!IME.upLogged) {
+                                                  IME.upLogged = true;
+                                                  agentLog('ime: keyboard already up - ladder stops');
+                                              }
+                                              return;
+                                          }
+                                          if (ime_try_show(false))
+                                              agentLog('ime: retry ok at ' + delay + 'ms');
                                       } catch (e2) {}
                                   });
                               }, delay);
@@ -5028,6 +5168,7 @@ jobs:
           }
 
           function ime_hide() {
+              IME.showSeq++;            /* r24: keyboard closing - ladder stops */
               Java.perform(function () {
                   Java.scheduleOnMainThread(function () {
                       try {
@@ -5130,6 +5271,12 @@ jobs:
                           if (down && gHitTest) {
                               try { gTouchEat = !!gHitTest(rx, ry); } catch (eH) {}
                           }
+                          /* r24: capture BEFORE clearing - the old order cleared
+                             the flag on UP/CANCEL first, so the consume check
+                             below never saw it and the app received an UP for a
+                             gesture whose DOWN the menu had eaten ("eaten
+                             gestures leak UP") */
+                          var eat = gTouchEat;
                           if (act === 1 || act === 3) gTouchEat = false;  /* UP/CANCEL */
                           if (act === 0 || act === 2) {   /* r22/audit: throttled map
                                                              refresh on DOWN + MOVE */
@@ -5139,10 +5286,11 @@ jobs:
                                   report_map(find_gl_view(this));
                               }
                           }
-                          if (gTouchEat) {
+                          if (eat) {
                               /* menu owns the whole gesture: ImGui already got
                                  every event via gNativeTouch above; the app
-                                 never does. MOVE/UP keep flowing to ImGui so
+                                 never does - INCLUDING the UP/CANCEL that ends
+                                 it (r24). MOVE/UP keep flowing to ImGui so
                                  drags and button releases work. */
                               return true;                     /* consume */
                           }
@@ -5150,7 +5298,7 @@ jobs:
                       return this.dispatchTouchEvent(ev);         /* original call */
                   };
                   agentLog('phase: dispatchTouchEvent hook ok');
-                  sendMsg('info', { msg: 'touch hook installed (r23, screen coords + hit-test click-through + IME activity capture + map refresh on DOWN)' });
+                  sendMsg('info', { msg: 'touch hook installed (r24, screen coords + hit-test click-through + UP-leak fix + IME activity capture + map refresh on DOWN)' });
               });
           }
 
@@ -5504,10 +5652,11 @@ jobs:
               return null;
           }
 
-          function dispatch_layers(K, ov, self, args) {
-              var i = K.indexOf('!');
-              var cls = K.substring(0, i), mn = K.substring(i + 1);
-              var L = LAYERS[K];
+          /* r24: L comes in from the hook closure (no registry lookup per
+             call) and cls/mn are parsed from K LAZILY - only recorder rows
+             need them, the hot path does not (the old version substring'd
+             the key on EVERY hooked call of every class) */
+          function dispatch_layers(K, L, ov, self, args) {
               var p = L ? L.parts : {};
               var hk = p.hook;
               var out;
@@ -5538,17 +5687,23 @@ jobs:
               } catch (e2) {
                   /* recorder row for the failing call, then rethrow (r22) */
                   try {
-                      if (p.rec && REC.on && REC.ring.length < 4000)
-                          REC.ring.push({ cls: cls, m: mn, a: jargs(args),
+                      if (p.rec && REC.on && REC.ring.length < 4000) {
+                          var i = K.indexOf('!');   /* r24: lazy - rows only */
+                          REC.ring.push({ cls: K.substring(0, i),
+                                          m: K.substring(i + 1), a: jargs(args),
                                           r: '', x: String(e2).substring(0, 80) });
+                      }
                   } catch (e3) {}
                   throw e2;
               }
               /* observer layers see the FINAL result; each is isolated */
               try {
-                  if (p.rec && REC.on && REC.ring.length < 4000)
-                      REC.ring.push({ cls: cls, m: mn, a: jargs(args),
+                  if (p.rec && REC.on && REC.ring.length < 4000) {
+                      var j = K.indexOf('!');   /* r24: lazy - rows only */
+                      REC.ring.push({ cls: K.substring(0, j),
+                                      m: K.substring(j + 1), a: jargs(args),
                                       r: jstr(out), x: '' });
+                  }
               } catch (e4) {}
               try {
                   if (p.mon && MON.on) p.mon.fn(self, args);
@@ -5575,21 +5730,30 @@ jobs:
           }
 
           /* field-tracker emission - r23: values through field_repr(), never
-             the app's toString() (the audit's Tracker Side Effects item) */
+             the app's toString() (the audit's Tracker Side Effects item).
+             r24 PERF FIX: the old else-branch sent a trackerEvent on EVERY
+             method call of the class even when the value had NOT changed -
+             on a hot class that flooded the bridge and froze the menu
+             (logcat: "Skipped 40 frames!"). Now: the field is read at most
+             every 20 ms, and an event is emitted only when the value
+             ACTUALLY changed and at most once per 100 ms per field. While
+             throttled, st.last is kept, so the next allowed emission shows
+             the full old -> new transition. */
           function field_layer_emit(st, self) {
               var tk = trackers[st.key];
               if (!tk || !tk.on) return;
+              var now = Date.now();
+              if (st.nextRead && now < st.nextRead) return;
+              st.nextRead = now + 20;
               var v = st.stat ? field_repr(st.f.get(null))
                               : (self ? field_repr(st.f.get(self)) : '?');
-              if (v !== st.last) {
-                  sendMsg('trackerEvent', { name: st.key, callers: jstack(3),
-                                            args: st.last + ' -> ' + v,
-                                            ret: '', err: '' });
-                  st.last = v;
-              } else {
-                  sendMsg('trackerEvent', { name: st.key, callers: [],
-                                            args: v, ret: '', err: '' });
-              }
+              if (v === st.last) return;
+              if (st.nextEmit && now < st.nextEmit) return;
+              sendMsg('trackerEvent', { name: st.key, callers: jstack(3),
+                                        args: st.last + ' -> ' + v,
+                                        ret: '', err: '' });
+              st.last = v;
+              st.nextEmit = now + 100;
           }
 
           /* returns the number of overloads carrying this method's layers */
@@ -5606,7 +5770,8 @@ jobs:
                   LAYERS[K] = L;
                   ovs.forEach(function (ov) {
                       ov.implementation = function () {
-                          return dispatch_layers(K, ov, this, arguments);
+                          /* r24: L closed over - no registry lookup per call */
+                          return dispatch_layers(K, L, ov, this, arguments);
                       };
                   });
               }
@@ -5641,18 +5806,41 @@ jobs:
              The bridge exposes no non-initializing path, so the agent only
              Java.use()s classes that are ALREADY LOADED and defers everything
              else: a one-time loadClass watcher installs the queued install the
-             moment the target app loads the class. */
-          var gLoadedSet = null, gLoadedAt = 0;
+             moment the target app loads the class.
+
+             KNOWN LIMITATION (r24, documented instead of papered over): the
+             deferral only avoids classes that are NOT LOADED YET. A class that
+             is loaded but never initialized still gets its <clinit> forced by
+             Java.use() - frida-java-bridge always calls
+             ensureClassInitialized() and offers no non-initializing use().
+             There is no fix on this bridge; apps whose <clinit> misbehaves
+             when probed will still be affected. */
+          var gLoadedSet = null, gLoadedAt = 0, gLoadedRechecked = false;
+          function dt_rebuild_loaded_set() {
+              try {
+                  var all = Java.enumerateLoadedClassesSync();
+                  var set = {};
+                  for (var i = 0; i < all.length; i++) set[all[i]] = 1;
+                  gLoadedSet = set;
+                  gLoadedAt = Date.now();
+              } catch (e0) {}
+          }
           function dt_is_loaded(cls) {
               var now = Date.now();
               if (!gLoadedSet || now - gLoadedAt > 3000) {
-                  try {
-                      var all = Java.enumerateLoadedClassesSync();
-                      var set = {};
-                      for (var i = 0; i < all.length; i++) set[all[i]] = 1;
-                      gLoadedSet = set;
-                      gLoadedAt = now;
-                  } catch (e0) {}
+                  dt_rebuild_loaded_set();
+                  gLoadedRechecked = false;   /* new cache generation */
+              }
+              if (gLoadedSet && gLoadedSet[cls]) return true;
+              /* r24 RACE FIX: the 3 s cache could predate the class actually
+                 loading - and loadClass never fires again for an already-
+                 loaded class - so the queued install waited forever (the
+                 audit's "deferred forever"). On a miss, force ONE rebuild of
+                 the set (once per cache generation, so a burst of misses does
+                 not re-enumerate per class) before declaring it unloaded. */
+              if (!gLoadedRechecked) {
+                  gLoadedRechecked = true;
+                  dt_rebuild_loaded_set();
               }
               return !!(gLoadedSet && gLoadedSet[cls]);
           }
@@ -6520,7 +6708,7 @@ jobs:
                   sendMsg('error', { fn: 'touchhook',
                                      msg: String(eT && eT.message || eT) });
               }
-              sendMsg('ready', { msg: 'Dex-tool agent r23 loaded' });
+              sendMsg('ready', { msg: 'Dex-tool agent r24 loaded' });
               agentLog('phase: ready sent');
           }, 0);
           DXTAGNT
@@ -6946,6 +7134,66 @@ jobs:
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+          ## Fixes in this version (r24)
+
+          Patch #3 of the audits: severe performance bugs (the menu froze on
+          heavier apps - logcat "Skipped 40 frames! The application may be
+          doing too much work on its main thread") plus logic and CI
+          leftovers.
+
+          - **Field-tracker flooding (agent):** `field_layer_emit` sent a
+            `trackerEvent` on EVERY method call of the tracked class, changed
+            value or not - hot classes flooded the bridge and froze the menu.
+            The field is now polled at most every 20 ms, events are emitted
+            only when the value actually changed, and at most once per 100 ms
+            per field.
+          - **`dt_is_loaded` race (agent):** the 3 s loaded-class cache could
+            predate a class actually loading, and `loadClass` never fires
+            again for a class that is already loaded - the queued install
+            waited forever. A cache miss now forces ONE rebuild of the set
+            (once per cache generation) before the class is declared
+            unloaded.
+          - **Dispatcher overhead (agent):** the LAYERS key was substring'd
+            on every hooked call; class/method names are parsed lazily now
+            (only recorder rows need them), and the touch dispatcher keeps
+            doing the minimum on the main thread.
+          - **Eaten gestures no longer leak UP (agent):** `gTouchEat` was
+            cleared on UP/CANCEL before the consume check, so the app got an
+            UP for a gesture whose DOWN the menu had consumed. The flag is
+            captured first, cleared second, consumed last.
+          - **Enter searches now (menu.cpp + agent):** the class filter
+            declares `EnterReturnsTrue`, but the phone IME's Done/Search only
+            hid the keyboard. `onEditorAction` forwards an `imeEnter` message
+            first; the menu injects a real `ImGuiKey_Enter` press (DOWN, then
+            UP next frame) before the field is released.
+          - **Opacity is background-only (menu.cpp):** `style.Alpha` faded
+            everything - text included - on top of the window background
+            alpha. `style.Alpha` is gone; `SetNextWindowBgAlpha(s_opacity)`
+            is the single opacity source.
+          - **agentStatus JSON escaping (frida_bridge.cpp):** the GumJS start
+            failure text (`err->message`) was pasted into the JSON envelope
+            unescaped; quotes inside it produced an envelope the menu could
+            not parse. Escaped now.
+          - **IME ladder stops when the keyboard is up (agent):** every retry
+            re-sent `showSoftInput` and logged "showSoftInput sent -> true"
+            up to 4x per tap. Retries check `isAcceptingText()` (logged
+            once), and each show request carries a session token - a newer
+            request or Done/hide invalidates the pending ladder.
+          - **Console keeps rolling (menu.cpp):** the 400-line guard dropped
+            every new line once full, so the console appeared to stop. It
+            keeps the newest 400 lines now.
+          - **Auto-scroll targets the list (menu.cpp):** the Recorder/Script
+            auto-scroll ran after `EndChild()` and scrolled the PARENT
+            window; it now runs inside the child list.
+          - **CI:** the push trigger is restricted to `dev` (it fired from
+            every branch and pushed to `dev`); the menu title says r24.
+          - **Known limitation, documented:** frida-java-bridge's `Java.use`
+            ALWAYS forces `<clinit>` on a loaded-but-uninitialized class.
+            The loadClass deferral only avoids classes that are not loaded
+            YET - it cannot avoid initialization of loaded classes, because
+            the bridge offers no non-initializing use(). Stated here and in
+            the agent source instead of pretending it is fixed.
+
           ## Fixes in this version (r23)
 
           Patch #2 of the 47-item audit: the 22 open items plus the 7 partial
@@ -6980,8 +7228,10 @@ jobs:
             index - no more stale text across classes.
           - **Class initialization:** hooks/trackers only `Java.use` classes
             that are ALREADY loaded; anything else is deferred and installed by
-            a `loadClass` watcher when the app loads the class (no forced
-            `<clinit>`).
+            a `loadClass` watcher when the app loads the class. Known
+            limitation (see r24 below): `Java.use` still forces `<clinit>` on
+            loaded-but-uninitialized classes - the bridge offers no
+            non-initializing use().
           - **Tracker side effects:** field/tracker values go through
             `field_repr()` - primitives and boxes only, everything else is
             `@class#identityHashCode`; the app's `toString()` is never called
@@ -7550,7 +7800,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r23: audit patch 2 (29 items) - exact JSON message routing (jtype + colon-anchored jhas), dextool_hit_test click-through consumes menu gestures before the app sees them, touch map scored against the real GL surface + clamping dropped, ONE hook-layering registry for Hook/Tracker/Recorder/Monitor (stop really unhooks), retained instance handles + structured instance protocol (| # ; corruption gone), instance editor keyed by class+generation, loadClass-deferred installs (no forced <clinit>), toString-safe field tracking, class search on Enter + stale-page generation guard, IME focus order fixed + app focus restored on keyboard close, opacity applied once + X-button FAB recovery, agent-start failures shown in the menu, main-thread Thread.sleep(500) removed, vertex-attrib state saved/restored, eglTerminate scoped to its own display, parked worlds forget stale GL names (recycled-name deletes impossible), owner migration parks the old world, Dobby pinned to c1da0315, .so/.jar/embed header no longer committed [skip ci]"
+            git commit -m "fix r24: audit patch 3 (perf on heavy apps) - field-tracker emits only on value change with 20 ms poll + 100 ms emit throttles (menu-freeze fix), dt_is_loaded forces one rebuild on cache miss (deferred-forever race), lazy LAYERS key parsing in the dispatcher, eaten gestures no longer leak UP to the app, IME Enter forwarded as a real ImGui key press (class filter searches on Done/Search), background-only opacity (style.Alpha dropped, SetNextWindowBgAlpha single source), agentStatus JSON escapes err->message, IME ladder stops when the keyboard is already up (isAcceptingText + session token), console keeps the newest 400 lines, auto-scroll moved inside the child lists, push trigger restricted to dev, menu title r24, forced <clinit> on loaded classes documented as a known limitation [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
