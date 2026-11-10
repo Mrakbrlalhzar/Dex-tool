@@ -1,7 +1,46 @@
 'use strict';
-/* Dex-tool agent (r21). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r22). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r22 changes (third-party audit, the 18 patch-fixed items ported
+   here and MERGED with the r21 IME code - the audit's raw patch
+   targeted a pre-r19 snapshot and its ime_on_text hunk would have
+   clobbered the r21 fixes):
+   - Script tab runs user code now: the LAST argument of
+     new Function() is the body - the old call made "src" the body
+     and passed the code as a parameter VALUE, so nothing executed.
+   - Java(JS) hooks install: the menu label 'Java(JS)' is
+     normalised to 'Java' (mode strings are compared literally).
+   - orig() in Java hooks keeps the REAL receiver + arguments.
+   - Patch OFF/delete RESTORES the original value (snapshotted
+     before the first write); noop/'char' fallbacks return
+     '\u0000' instead of 'a'.
+   - Recorder pre-filters enumerateLoadedClassesSync() ONCE (the
+     install loop counted skipped classes against its 12-class
+     batch, so a package filter took ~a minute over 30k names).
+   - Tracker callers no longer list the tracked method itself.
+   - Monitor also hooks OkHttp enqueue (async requests).
+   - Script console output is readable via cstr() (no 160-char
+     cut, no '|'->'!' rewrite, objects JSON-stringified).
+   - Smali jar: extracted to a temp file + rename (a killed
+     process cannot leave a truncated jar), setReadOnly() for
+     Android 14+ (writable dex refused), assembled via
+     ClassFactory.get(loader) (loadClass returns a Class wrapper
+     without static main()) trying both Main class names, source
+     written as UTF-8.
+   - smali_load uses the single-ByteBuffer InMemoryDexClassLoader
+     ctor (the ByteBuffer[] one needs API 27; minSdk is 26).
+   - IME deletions are counted in CODE POINTS: an astral char went
+     in as 2 UTF-16 units but ImGui deletes one CHARACTER per
+     backspace, so unit-counting over-deleted the field.
+     Insertions stay per-UTF-16-unit; overlay.cpp (r22) routes the
+     halves through io.AddInputCharacterUTF16() so pairs
+     recombine.
+   - Touch map also refreshed on ACTION_DOWN (throttled), not just
+     on moves.
+   - Dead code removed: DOTS/DMAX, parse_rules, lit_to_java,
+     CONS_Lines/CONS_Dummy batching, gDispSize lookup.
 
    r21 changes (two field reports on the r20 build, both pinned by
    the r20 stage tags):
@@ -250,7 +289,6 @@ function jargs(a) {
         return Array.prototype.map.call(a, jstr).join(',').substring(0, 240);
     } catch (e) { return '?'; }
 }
-var DOTS = 0, DMAX = 4000;
 function describe(a) {           /* deep values for trackers (capped) */
     try {
         var s = '';
@@ -264,7 +302,7 @@ function describe(a) {           /* deep values for trackers (capped) */
             if (d.length > 60) d = d.substring(0, 57) + '...';
             s += (i ? ',' : '') + d;
         }
-        if (DOTS++ < DMAX && s.length > 240) s = s.substring(0, 237) + '...';
+        if (s.length > 240) s = s.substring(0, 237) + '...';
         return s;
     } catch (e) { return '?'; }
 }
@@ -285,33 +323,11 @@ function jstack(limit) {
     } catch (e) { return []; }
 }
 
-/* rewrite rules: parse tiny-language lines from smali code
-   supported:  pN = literal | name  /  R = literal   (literal: number,
-   true/false/null/"str"/'char' or an identifier=literal arg) */
-function parse_rules(code) {
-    var rules = [], lines = code.split('\n');
-    for (var i = 0; i < lines.length; i++) {
-        var ln = lines[i].replace(/#.*$/, '').trim();
-        if (!ln) continue;
-        var m = ln.match(/^(p\d+|R)\s*=\s*(.+)$/);
-        if (m) rules.push({ reg: m[1], lit: m[2].trim(), src: ln });
-    }
-    return rules;
-}
-function lit_to_java(lit) {        /* literal string -> java value object */
-    if (lit === 'true' || lit === 'false') return lit === 'true';
-    if (lit === 'null') return null;
-    var q = lit.match(/^"(.*)"$/); if (q) return q[1];
-    var c = lit.match(/^'(.)'$/);  if (c) return c[1].charCodeAt(0);
-    if (/^-?\d+$/.test(lit)) return parseInt(lit, 10);
-    if (/^-?\d+\.\d*$/.test(lit) || /^-?\d*\.\d+$/.test(lit))
-        return parseFloat(lit);
-    if (/^-?0x[0-9a-fA-F]+$/.test(lit)) return parseInt(lit, 16);
-    return undefined;              /* treat as identifier: copy-through */
-}
+/* r22/audit: parse_rules()/lit_to_java() removed - dead code,
+   nothing called them */
 
 var gAddChar = null, gBackspace = null, gWantMouse = null;
-var gNativeTouch = null, gSetMap = null, gDispSize = null;
+var gNativeTouch = null, gSetMap = null;
 
 function ensure_native_fns() {
     if (gNativeTouch) return true;
@@ -321,14 +337,12 @@ function ensure_native_fns() {
         var w = Module.findExportByName('libtool.so', 'dextool_want_mouse');
         var t = Module.findExportByName('libtool.so', 'dextool_on_touch');
         var s = Module.findExportByName('libtool.so', 'dextool_set_touch_map');
-        var d = Module.findExportByName('libtool.so', 'dextool_display_size');
         if (!m || !b || !t || !s) return false;
         gAddChar   = new NativeFunction(m, 'void', ['int']);
         gBackspace = new NativeFunction(b, 'void', []);
         gNativeTouch = new NativeFunction(t, 'void', ['float', 'float', 'int']);
         gSetMap    = new NativeFunction(s, 'void', ['int', 'int', 'int', 'int']);
         if (w) gWantMouse = new NativeFunction(w, 'bool', []);
-        if (d) gDispSize = new NativeFunction(d, 'int', []);
         return true;
     } catch (e) { return false; }
 }
@@ -546,11 +560,18 @@ function ime_on_text(ed) {
         var e = 0;
         while (e < prev.length - s && e < cur.length - s &&
                prev[prev.length - 1 - e] === cur[cur.length - 1 - e]) e++;
-        var delN = prev.length - s - e;      /* UTF-16 units deleted */
-        /* deletions first, then insertions - one event per UTF-16
-           unit keeps the mapping 1:1 with what we inserted (astral
-           chars went in as a surrogate pair, so they also come out
-           as two backspaces). */
+        /* r22/audit: deletions are counted in CODE POINTS - an
+           astral char entered as 2 UTF-16 units, but ImGui deletes
+           one CHARACTER per backspace, so counting UTF-16 units
+           over-deleted the field. Insertions stay per-UTF-16-unit;
+           overlay.cpp (r22) keeps this order in ONE queue and
+           recombines surrogate halves via
+           io.AddInputCharacterUTF16(). */
+        var gone = prev.substring(s, prev.length - e), delN = 0;
+        for (var gi = 0; gi < gone.length; gi++) {
+            var gc = gone.charCodeAt(gi);
+            if (gc < 0xDC00 || gc > 0xDFFF) delN++;   /* skip low surrogates */
+        }
         for (var d = 0; d < delN; d++) gBackspace();
         var ins = cur.substring(s, cur.length - e);
         for (var i = 0; i < ins.length; i++) gAddChar(ins.charCodeAt(i));
@@ -1127,7 +1148,8 @@ function installTouchHook() {
                    (getLocationOnScreen), so overlay.cpp's transform
                    is exact on BOTH axes */
                 gNativeTouch(ev.getRawX(), ev.getRawY(), act);
-                if (act === 2) {          /* throttle map refresh on moves */
+                if (act === 0 || act === 2) {   /* r22/audit: throttled map
+                                                   refresh on DOWN + MOVE */
                     var now = Date.now();
                     if (now - gMapLastTouch > 2000) {
                         gMapLastTouch = now;
@@ -1144,7 +1166,7 @@ function installTouchHook() {
             return this.dispatchTouchEvent(ev);         /* original call */
         };
         agentLog('phase: dispatchTouchEvent hook ok');
-        sendMsg('info', { msg: 'touch hook installed (r21, screen coords + IME activity capture)' });
+        sendMsg('info', { msg: 'touch hook installed (r22, screen coords + IME activity capture + map refresh on DOWN)' });
     });
 }
 
@@ -1232,7 +1254,6 @@ function rec_install_chunk(list, batch) {
         sendMsg('recorderStopped', { installed: REC.installed });
         return;
     }
-    var done = 0;
     for (var i = 0; i < batch && REC.idx < list.length; i++, REC.idx++) {
         if (REC.installed >= REC.cap) break;
         var cls = list[REC.idx];
@@ -1272,9 +1293,7 @@ function rec_install_chunk(list, batch) {
                         })(ovl[oi], cls, name);
                     } catch (e2) {}
                 }
-                if (made) REC.installed += 0;   /* counted per overload above */
             }
-            done++;
         } catch (e3) {}
     }
     /* r12: throttle progress - the r11 log flooded ~200
@@ -1344,6 +1363,22 @@ function mon_install() {
                             mon_push('http', url, String(req.method()),
                                      mon_origin('okhttp:' + url),
                                      'headers ' + req.headers().size());
+                        }
+                    } catch (e) {}
+                    return ov.apply(this, arguments);
+                };
+            });
+            /* r22/audit: enqueue too - most apps issue async calls,
+               hooking only execute() saw nothing */
+            RealCall.enqueue.overloads.forEach(function (ov) {
+                ov.implementation = function () {
+                    try {
+                        if (MON.on) {
+                            var req = this.request();
+                            var url = String(req.url());
+                            mon_push('http', url, String(req.method()),
+                                     mon_origin('okhttp:' + url),
+                                     'async, headers ' + req.headers().size());
                         }
                     } catch (e) {}
                     return ov.apply(this, arguments);
@@ -1427,6 +1462,44 @@ function call_with_args(ov, argStrings, isCtor) {
 
 var patches = {}, hooks = {}, trackers = {};
 
+/* r22/audit: static-field patch helpers - the ORIGINAL value is
+   captured before the first write so OFF / delete can put it back */
+function patch_store(f, t, value) {
+    if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
+        f.set(null, parseInt(value, 10) || 0);
+    else if (t === 'boolean') f.set(null, value === 'true');
+    else if (t === 'float' || t === 'double')
+        f.set(null, parseFloat(value) || 0.0);
+    else if (t === 'char') f.set(null, (value || 'a').charCodeAt(0));
+    else f.set(null, value);
+}
+function patch_snapshot(f, t) {
+    var v = f.get(null);
+    if (v === null || v === undefined) return { kind: 'null' };
+    if (t === 'int' || t === 'long' || t === 'short' || t === 'byte' ||
+        t === 'boolean' || t === 'float' || t === 'double' || t === 'char' ||
+        t === 'java.lang.String')
+        return { kind: 'val', s: String(v) };
+    return { kind: 'ref', h: Java.retain(v) };
+}
+function patch_restore(cls, field, key) {
+    var p = patches[key];
+    if (!p || !p.snap) return;
+    Java.perform(function () {
+        try {
+            var f = Java.use(cls).class.getDeclaredField(field);
+            f.setAccessible(true);
+            var t = String(f.getType().getName());
+            var sn = p.snap;
+            if (sn.kind === 'null') f.set(null, null);
+            else if (sn.kind === 'ref') f.set(null, sn.h);
+            else patch_store(f, t, sn.s);
+        } catch (e) {
+            sendMsg('error', { fn: 'patchRestore', msg: String(e.message || e) });
+        }
+    });
+}
+
 /* ---------------- rpc exports (called from the menu) ---------------- */
 rpc.exports = {
     /* ---- patches: static-field value replacement ---- */
@@ -1437,17 +1510,15 @@ rpc.exports = {
                 var jc = Java.use(cls);
                 var f = jc.class.getDeclaredField(field);
                 f.setAccessible(true);
-                var t = f.getType().getName();
+                var t = String(f.getType().getName());
                 var st = (f.getModifiers() & 8) !== 0;
                 if (!st) throw new Error('not a static field (instances: Classes tab)');
-                if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
-                    f.set(null, parseInt(value, 10) || 0);
-                else if (t === 'boolean') f.set(null, value === 'true');
-                else if (t === 'float' || t === 'double')
-                    f.set(null, parseFloat(value) || 0.0);
-                else if (t === 'char') f.set(null, (value || 'a').charCodeAt(0));
-                else f.set(null, value);
-                patches[key] = { v: value, on: true };
+                /* r22/audit: snapshot the ORIGINAL value once, before
+                   the first write, so OFF/delete can restore it */
+                var prev = patches[key];
+                var snap = (prev && prev.snap) ? prev.snap : patch_snapshot(f, t);
+                patch_store(f, t, value);
+                patches[key] = { v: value, on: true, snap: snap };
                 sendMsg('patchApplied', { name: key });
             } catch (e) {
                 sendMsg('patchFailed', { name: key, error: String(e.message || e) });
@@ -1456,31 +1527,30 @@ rpc.exports = {
     },
     setPatchEnabled: function (cls, field, en) {
         var key = cls + '.' + field;
-        if (patches[key]) patches[key].on = en;
-        if (!en) {
-            Java.perform(function () {
-                try {
-                    var jc = Java.use(cls);
-                    var f = jc.class.getDeclaredField(field);
-                    f.setAccessible(true);
-                    if ((f.getModifiers() & 8) !== 0)
-                        f.set(null, f.get(null));   /* identity; real restore
-                                                       needs the old value */
-                } catch (e) {}
-            });
-        } else {
-            rpc.exports.addPatch(cls, field, patches[key] ? patches[key].v : '');
-        }
+        var p = patches[key];
+        if (p) p.on = en;
+        /* r22/audit: OFF now RESTORES the snapshotted original
+           (the old identity-set was a no-op) */
+        if (!en) patch_restore(cls, field, key);
+        else rpc.exports.addPatch(cls, field, p ? p.v : '');
         sendMsg('info', { msg: 'patch ' + key + ' -> ' + (en ? 'on' : 'off') });
     },
     removePatch: function (cls, field) {
-        delete patches[cls + '.' + field];
-        sendMsg('info', { msg: 'patch removed ' + cls + '.' + field });
+        var key = cls + '.' + field;
+        patch_restore(cls, field, key);
+        delete patches[key];
+        sendMsg('info', { msg: 'patch removed ' + key });
     },
 
     /* ---- hooks: Java(JS) / Smali / noop ---- */
     addHook: function (cls, method, mode, code) {
         var key = cls + '.' + method;
+        /* r22/audit: the menu labels are 'Java(JS)' / 'Smali' /
+           'noop' - normalise them or Java hooks never install */
+        var ml = String(mode).toLowerCase();
+        if (ml.indexOf('java') === 0) mode = 'Java';
+        else if (ml === 'smali') mode = 'Smali';
+        else if (ml === 'noop') mode = 'noop';
         Java.perform(function () {
             var hit = use_cls_parts(cls, method);
             if (!hit) {
@@ -1496,11 +1566,16 @@ rpc.exports = {
                         ov.implementation = function () {
                             if (!hooks[key] || !hooks[key].on)
                                 return ov.apply(this, arguments);
+                            /* r22/audit: keep the receiver + args for
+                               orig() - `this` inside the closure is
+                               NOT the intercepted call's receiver */
+                            var self = this, orig_args = arguments;
                             try {
                                 return fn(Java, send, CONSOLE(),
-                                          this, Array.prototype.slice.call(arguments),
+                                          self, Array.prototype.slice.call(orig_args),
                                           function () {
-                                              return ov.apply(this, arguments);
+                                              return ov.apply(self,
+                                                  arguments.length ? arguments : orig_args);
                                           });
                             } catch (e1) {
                                 sendMsg('error', { fn: 'hook:' + key,
@@ -1521,7 +1596,7 @@ rpc.exports = {
                                 rt === 'byte') return 0;
                             if (rt === 'float' || rt === 'double') return 0;
                             if (rt === 'boolean') return false;
-                            if (rt === 'char') return 'a';
+                            if (rt === 'char') return '\u0000';
                             return null;
                         };
                     });
@@ -1532,8 +1607,12 @@ rpc.exports = {
                     var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
                                '.super Ljava/lang/Object;\n' +
                                '.method public static hook(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;\n' +
+                               /* r22/audit: default .locals - user code
+                                  without a registers directive died in
+                                  the assembler */
+                               (/^\s*\.(locals|registers)\b/m.test(code) ? '' : '    .locals 4\n') +
                                code + '\n' +
-                               '.end method\n.end class';
+                               '.end method\n';
                     var art = smali_compile(skel);
                     if (art.err) {
                         sendMsg('hookFailed', { name: key, error: art.err });
@@ -1558,7 +1637,7 @@ rpc.exports = {
                                     if (rt === 'int' || rt === 'long' || rt === 'short' ||
                                         rt === 'byte') return 0;
                                     if (rt === 'boolean') return false;
-                                    if (rt === 'char') return 'a';
+                                    if (rt === 'char') return '\u0000';
                                     if (rt === 'float' || rt === 'double') return 0;
                                 }
                                 return r;
@@ -1609,7 +1688,12 @@ rpc.exports = {
                         try { out = ov.apply(this, arguments); }
                         catch (e1) { err = String(e1).substring(0, 100); throw e1; }
                         if (trackers[key] && trackers[key].on) {
-                            var ev = { name: key, callers: jstack(4),
+                            /* r22/audit: exclude the tracked method
+                               from its own callers list */
+                            var ev = { name: key,
+                                       callers: jstack(5).filter(function (c) {
+                                           return c !== key;
+                                       }).slice(0, 4),
                                        args: describe(arguments), ret: jstr(out),
                                        err: err };
                             sendMsg('trackerEvent', ev);
@@ -1696,12 +1780,15 @@ rpc.exports = {
             REC.filter = (filter === undefined || filter === null) ? '' :
                           String(filter);
             if (!REC.filter) REC.filter = pkg;   /* default: own package */
-            if (REC.filter === '.') REC.filter = pkg;  /* menu: explicit all */
             /* '.' sent by the UI means everything; agent: use it directly */
             if (filter === '.') REC.filter = '.';
             REC.cap = (typeof cap === 'number' && cap > 0) ?
                       Math.floor(cap) : 1500;
             var list = Java.enumerateLoadedClassesSync();
+            /* r22/audit: filter ONCE - the install loop counted
+               skipped classes against its 12-class batch, so a
+               package filter took ~a minute over 30k names */
+            list = list.filter(function (n) { return rec_wanted(n, REC.filter); });
             REC.on = true;
             REC.busy = true;
             REC.ring = [];
@@ -1742,10 +1829,13 @@ rpc.exports = {
     /* ---- script console ---- */
     evalScript: function (src) {
         try {
-            var r = (new Function('Java', 'send', 'console', 'require',
-                                  'src'))(Java, send, CONSOLE(),
-                                          require, src);
-            sendMsg('scriptResult', { result: jstr(r) });
+            /* r22/audit: the LAST argument of new Function() is the
+               BODY - the old call made "src" the body (a parameter
+               name) and passed the user's code as a parameter VALUE,
+               so the Script tab ran nothing */
+            var r = (new Function('Java', 'send', 'console', String(src)))(
+                        Java, send, CONSOLE());
+            if (r !== undefined) sendMsg('scriptResult', { result: cstr(r) });
         } catch (e) {
             sendMsg('scriptError', { msg: String(e && e.stack ? e.stack : e) });
         }
@@ -1919,32 +2009,31 @@ rpc.exports = {
     }
 };
 
-/* console for user scripts: lines are batched to the Script tab */
-var CONS_Lines = [];
+/* console for user scripts. r22/audit: cstr() gives readable text
+   (jstr() rewrites '|' and '#' and cuts at 160 chars for the
+   delimiter protocol - wrong for a console line); the dead
+   CONS_Lines/CONS_Dummy batching is gone. */
+function cstr(v) {
+    try {
+        if (v === null) return 'null';
+        if (v === undefined) return 'undefined';
+        if (typeof v === 'string') return v.substring(0, 2000);
+        if (v.$className) return String(v).substring(0, 2000);
+        if (typeof v === 'object') return JSON.stringify(v).substring(0, 2000);
+        return String(v).substring(0, 2000);
+    } catch (e) { return '?'; }
+}
 function CONSOLE() {
-    if (CONS_Lines.flush) return CONS_Dummy;
-    CONS_Lines = [];
+    function line(tag, args) {
+        var a = tag + Array.prototype.map.call(args, cstr).join(' ');
+        sendMsg('console', { line: a });
+    }
     return {
-        log: function () {
-            var a = Array.prototype.map.call(arguments, jstr).join(' ');
-            CONS_Lines.push(a);
-            sendMsg('console', { line: a });
-        },
-        error: function () {
-            var a = 'ERR ' + Array.prototype.map.call(arguments, jstr).join(' ');
-            CONS_Lines.push(a);
-            sendMsg('console', { line: a });
-        },
-        warn: function () {
-            var a = 'WARN ' + Array.prototype.map.call(arguments, jstr).join(' ');
-            CONS_Lines.push(a);
-            sendMsg('console', { line: a });
-        }
+        log:   function () { line('', arguments); },
+        error: function () { line('ERR ', arguments); },
+        warn:  function () { line('WARN ', arguments); }
     };
 }
-var CONS_Dummy = {
-    log: function () {}, error: function () {}, warn: function () {}
-};
 
 /* ---------------- smali assemble + load (runtime dex) ---------------- */
 function smali_compile(src) {
@@ -1961,46 +2050,62 @@ function smali_compile(src) {
             var jar = files + '/smali-fat.jar';
             var File = Java.use('java.io.File');
             if (!File.$new(jar).exists()) {
-                /* first run: extract from assets */
-                var ios = Java.use('java.io.FileOutputStream');
-                var am = ctx.getAssets();
-                var is = am.open('smali-fat.jar');
-                var fos = ios.$new(jar);
+                /* r22/audit: extract to a temp file + rename(2), so
+                   a killed process cannot leave a truncated jar */
+                var FOS0 = Java.use('java.io.FileOutputStream');
+                var tmpJar = jar + '.tmp';
+                var is = ctx.getAssets().open('smali-fat.jar');
+                var fos = FOS0.$new(tmpJar);
                 var buf = Java.array('byte', new Array(8192).fill(0));
                 var n;
                 while ((n = is.read(buf)) > 0) fos.write(buf, 0, n);
                 fos.close(); is.close();
+                File.$new(tmpJar).renameTo(File.$new(jar));
             }
+            /* r22/audit: Android 14+ refuses to load a WRITABLE
+               dex/jar (targetSdk 34) */
+            File.$new(jar).setReadOnly();
             var PC = Java.use('dalvik.system.PathClassLoader');
             var CL = Java.use('java.lang.ClassLoader');
-            var parent = CL.getSystemClassLoader();
-            var loader = PC.$new(jar, parent);
-            var main = loader.loadClass('com.android.tools.smali.Main');
+            var loader = PC.$new(jar, CL.getSystemClassLoader());
+            /* r22/audit: loadClass() returns a java.lang.Class
+               wrapper, which has no static main(): go through a
+               ClassFactory bound to this loader */
+            var F = Java.ClassFactory.get(loader);
             var tmp = files + '/dxt-' + (Date.now() % 1000000);
             var inF  = tmp + '.smali';
             var outF = tmp + '.dex';
             var FOS = Java.use('java.io.FileOutputStream');
             var fos2 = FOS.$new(inF);
-            var jb = Java.array('byte',
-                Array.prototype.map.call(src, function (c) { return c.charCodeAt(0) & 0xff; }));
-            fos2.write(jb);
+            fos2.write(Java.use('java.lang.String').$new(src).getBytes('UTF-8'));
             fos2.close();
-            var arr = Java.array('java.lang.String', [
-                'assemble', '-o', outF, inF ]);
-            main.main(arr);
-            var FIS = Java.use('java.io.FileInputStream');
-            var fis = FIS.$new(outF);
-            var all = [], chunk = Java.array('byte', new Array(8192).fill(0));
-            var k;
-            while ((k = fis.read(chunk)) > 0) {
-                for (var c = 0; c < k; c++) all.push(chunk[c] & 0xff);
+            var done = false, lastErr = '';
+            var mains = ['com.android.tools.smali.smali.Main',
+                         'com.android.tools.smali.Main'];
+            for (var mi = 0; mi < mains.length && !done; mi++) {
+                try {
+                    var Main = F.use(mains[mi]);
+                    Main.main(Java.array('java.lang.String',
+                                         ['assemble', '-o', outF, inF]));
+                    done = true;
+                } catch (eM) { lastErr = String(eM.message || eM); }
             }
-            fis.close();
-            var bytes = Java.array('byte', all);
-            out.dex = bytes;
-            var Del = Java.use('java.io.File');
-            Del.$new(inF).delete();
-            Del.$new(outF).delete();
+            if (!done) { out.err = 'smali Main not usable: ' + lastErr; }
+            else if (!File.$new(outF).exists()) {
+                out.err = 'smali produced no dex (see logcat for assembler errors)';
+            } else {
+                var FIS = Java.use('java.io.FileInputStream');
+                var fis = FIS.$new(outF);
+                var all = [], chunk = Java.array('byte', new Array(8192).fill(0));
+                var k;
+                while ((k = fis.read(chunk)) > 0) {
+                    for (var c = 0; c < k; c++) all.push(chunk[c]);
+                }
+                fis.close();
+                out.dex = Java.array('byte', all);
+            }
+            File.$new(inF).delete();
+            File.$new(outF).delete();
         } catch (e) {
             out.err = String(e.message || e).substring(0, 300);
         }
@@ -2018,8 +2123,9 @@ function smali_load(art) {
             var IMDC = Java.use('dalvik.system.InMemoryDexClassLoader');
             var CL = Java.use('java.lang.ClassLoader');
             var bb = ByteBuffer.wrap(dexBytes);
-            var loader = IMDC.$new(Java.array('java.nio.ByteBuffer', [bb]),
-                                   CL.getSystemClassLoader());
+            /* r22/audit: single-buffer constructor - the ByteBuffer[]
+               one needs API 27+, the sample's minSdk is 26 */
+            var loader = IMDC.$new(bb, CL.getSystemClassLoader());
             var cls = loader.loadClass(art.cls);
             var methods = cls.getDeclaredMethods();
             for (var i = 0; i < methods.length; i++) {
@@ -2108,6 +2214,6 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r21 loaded' });
+    sendMsg('ready', { msg: 'Dex-tool agent r22 loaded' });
     agentLog('phase: ready sent');
 }, 0);

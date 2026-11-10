@@ -16,6 +16,7 @@
 static FILE* g_info_fp  = nullptr;
 static FILE* g_debug_fp = nullptr;
 static int   g_crash_fd = -1;
+static bool  g_stdio_redirected = false;   /* r22/audit: fds 1/2 point at the crash log */
 static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
 
 const char* logger_base_dir() { return g_base_dir; }
@@ -99,12 +100,21 @@ void logger_init(const char* base_dir) {
        copier) can never clobber an offset */
     g_crash_fd = open(p, O_WRONLY|O_CREAT|O_TRUNC|O_APPEND, 0644);
     {
-        stack_t ss;
-        memset(&ss, 0, sizeof(ss));
-        ss.ss_sp    = g_alt_stack;
-        ss.ss_size  = sizeof(g_alt_stack);
-        ss.ss_flags = 0;
-        sigaltstack(&ss, NULL);
+        /* r22/audit: the runtime installs its own alternate stack on
+           the main thread (stack-overflow handling); only add ours
+           when none is usable - replacing it broke the runtime's
+           own stack-overflow path */
+        stack_t old;
+        memset(&old, 0, sizeof(old));
+        if (sigaltstack(NULL, &old) != 0 || (old.ss_flags & SS_DISABLE) ||
+            old.ss_size < 16 * 1024) {
+            stack_t ss;
+            memset(&ss, 0, sizeof(ss));
+            ss.ss_sp    = g_alt_stack;
+            ss.ss_size  = sizeof(g_alt_stack);
+            ss.ss_flags = 0;
+            sigaltstack(&ss, NULL);
+        }
     }
     install_crash_sig(SIGSEGV);
     install_crash_sig(SIGABRT);
@@ -139,7 +149,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r21: IME host fixes - hidden EditText attached via act.addContentView (the DecorView wrapper lacks addView on this bridge), Editable read via Java.cast to CharSequence + poison guard so a failed read can no longer type '[object Object]' or backspace the field, r20 stage tags kept)");
+    log_info("logger_init done (build r22: third-party audit fixes - ONE ordered input queue with UTF-16 surrogate recombination, double-draw guard spans the real eglSwapBuffers, texture binding restored on unit 0, logger FILE* checked under the lock + private crash log rotated on retarget + existing sigaltstack kept + terminate survives no-exception, bridge queues early agent messages + logs uncaught JS errors, r21 IME host fixes kept)");
 }
 
 /* r16: re-point the logs at the app's real private dir.
@@ -166,6 +176,15 @@ void logger_retarget(const char* base_dir) {
     g_info_fp = fopen(p, "a");
     snprintf(p, sizeof(p), "%s/dextool-debug.log", base_dir);
     g_debug_fp = fopen(p, "a");
+    /* r22/audit: the PRIVATE dir's crash log was never rotated here
+       (logger_init rotates the FALLBACK dir's) - without this it
+       grows across runs and dextool-crash.prev.log never exists */
+    {
+        char pprev[640];
+        snprintf(pprev, sizeof(pprev), "%s/dextool-crash.prev.log", base_dir);
+        snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
+        rename(p, pprev);
+    }
     if (g_crash_fd >= 0) {
         /* r16: dup2 replaces the descriptor ATOMICALLY in the fd
            table - a concurrent log_crash_raw() (no mutex: it runs
@@ -175,6 +194,12 @@ void logger_retarget(const char* base_dir) {
         int nfd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
         if (nfd >= 0) {
             dup2(nfd, g_crash_fd);
+            /* r22/audit: stdout/stderr were duplicated from the OLD
+               crash fd; they must follow it to the new file too */
+            if (g_stdio_redirected) {
+                dup2(nfd, STDOUT_FILENO);
+                dup2(nfd, STDERR_FILENO);
+            }
             close(nfd);
         }
     } else {
@@ -190,20 +215,25 @@ void logger_retarget(const char* base_dir) {
 }
 
 void log_info(const char* msg) {
-    if (!g_info_fp) return;
+    /* r22/audit: the FILE* is tested UNDER the lock - retarget()
+       closes/reopens it and a check before the lock raced that */
     pthread_mutex_lock(&g_mtx);
-    char t[32]; ts(t, sizeof(t));
-    fprintf(g_info_fp, "[%s][I] %s\n", t, msg);
-    fflush(g_info_fp);
+    if (g_info_fp) {
+        char t[32]; ts(t, sizeof(t));
+        fprintf(g_info_fp, "[%s][I] %s\n", t, msg);
+        fflush(g_info_fp);
+    }
     pthread_mutex_unlock(&g_mtx);
 }
 
 void log_debug(const char* msg) {
-    if (!g_debug_fp) return;
+    /* r22/audit: same race as log_info - check under the lock */
     pthread_mutex_lock(&g_mtx);
-    char t[32]; ts(t, sizeof(t));
-    fprintf(g_debug_fp, "[%s][D] %s\n", t, msg);
-    fflush(g_debug_fp);
+    if (g_debug_fp) {
+        char t[32]; ts(t, sizeof(t));
+        fprintf(g_debug_fp, "[%s][D] %s\n", t, msg);
+        fflush(g_debug_fp);
+    }
     pthread_mutex_unlock(&g_mtx);
 }
 
@@ -229,13 +259,20 @@ static void glib_log_capture(const gchar* domain, GLogLevelFlags level,
 
 static void dt_terminate() {
     log_crash_raw("std::terminate called\n");
-    try { std::rethrow_exception(std::current_exception()); }
-    catch (const std::exception& e) {
-        char m[512];
-        snprintf(m, sizeof(m), "  uncaught exception: %s\n", e.what());
-        log_crash_raw(m);
-    } catch (...) {
-        log_crash_raw("  uncaught exception: (unknown)\n");
+    /* r22/audit: rethrowing a NULL exception_ptr is undefined -
+       terminate() can run with no active exception */
+    std::exception_ptr ep = std::current_exception();
+    if (ep) {
+        try { std::rethrow_exception(ep); }
+        catch (const std::exception& e) {
+            char m[512];
+            snprintf(m, sizeof(m), "  uncaught exception: %s\n", e.what());
+            log_crash_raw(m);
+        } catch (...) {
+            log_crash_raw("  uncaught exception: (unknown)\n");
+        }
+    } else {
+        log_crash_raw("  (no active exception)\n");
     }
     abort();
 }
@@ -244,6 +281,7 @@ void logger_install_abort_capture() {
     if (g_crash_fd >= 0) {
         dup2(g_crash_fd, STDOUT_FILENO);
         dup2(g_crash_fd, STDERR_FILENO);
+        g_stdio_redirected = true;
     }
     g_log_set_default_handler(glib_log_capture, nullptr);
     std::set_terminate(dt_terminate);

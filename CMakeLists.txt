@@ -34,7 +34,6 @@ add_library(tool SHARED
     src/overlay.cpp
     src/touch.cpp
     src/frida_bridge.cpp
-    src/smali_runtime.cpp
     src/menu.cpp
     ${IMGUI_SRC})
 
@@ -54,4 +53,7 @@ target_compile_options(tool PRIVATE
 target_link_libraries(tool
     frida-gumjs dobby_static
     ${lib_egl} ${lib_gles2} ${lib_gles3} ${lib_log} ${lib_dl} ${lib_android}
-    -lm -Wl,--gc-sections -Wl,--exclude-libs,ALL)
+    -lm -Wl,--gc-sections -Wl,--exclude-libs,ALL
+    # r22/audit: Android 15+ devices may use 16 KB pages - LOAD
+    # segments must be 16 KB aligned
+    -Wl,-z,max-page-size=16384)

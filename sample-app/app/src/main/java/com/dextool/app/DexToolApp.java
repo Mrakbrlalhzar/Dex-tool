@@ -107,14 +107,43 @@ public class DexToolApp extends Application {
         t.start();
     }
 
-    private void copyLogs() throws IOException {
-        String[] names = {"dextool.log", "dextool-debug.log", "dextool-crash.log"};
+    /* r22/audit: where the logs are exported to. /sdcard/Download
+       is best effort only - with targetSdk 30+ raw File writes
+       there are denied on most devices (scoped storage). The
+       app-specific external dir needs no permission:
+       adb pull /sdcard/Android/data/<package>/files/ */
+    private File[] exportDirs() {
+        File ext = getExternalFilesDir(null);
+        return ext != null ? new File[]{ new File(DL), ext }
+                           : new File[]{ new File(DL) };
+    }
+
+    /* r22/audit: synchronized - the copier thread and the
+       uncaught-exception handler both call this and used to write
+       the same <name>.tmp file */
+    private synchronized void copyLogs() throws IOException {
+        /* crash.prev.log is the PREVIOUS run's crash log - the one
+           that matters after a crash; it was missing here */
+        String[] names = {"dextool.log", "dextool-debug.log",
+                          "dextool-crash.log", "dextool-crash.prev.log"};
         File srcDir = new File(getFilesDir(), "dextool-logs");
-        new File(DL).mkdirs();
+        IOException first = null;
+        for (File destDir : exportDirs()) {
+            try {
+                copyInto(srcDir, destDir, names);
+            } catch (IOException e) {      /* one failing dir must not block the other */
+                if (first == null) first = e;
+            }
+        }
+        if (first != null) Log.w(TAG, "copyLogs: " + first.getMessage());
+    }
+
+    private void copyInto(File srcDir, File destDir, String[] names) throws IOException {
+        destDir.mkdirs();
         for (String n : names) {
             File s = new File(srcDir, n);
             if (!s.exists()) continue;
-            File d = new File(DL, n);
+            File d = new File(destDir, n);
             /* unchanged since the last pass -> skip the rewrite */
             if (d.exists() && d.length() == s.length() &&
                     s.lastModified() <= d.lastModified()) continue;
@@ -124,7 +153,7 @@ public class DexToolApp extends Application {
                log held one copy per 5s of uptime. Write a temp file
                and rename(2) it over the target: atomic, no
                duplication, no torn reads. */
-            File t = new File(DL, n + ".tmp");
+            File t = new File(destDir, n + ".tmp");
             try (InputStream  is = new FileInputStream(s);
                  OutputStream os = new FileOutputStream(t, false)) {
                 byte[] buf = new byte[8192]; int len;

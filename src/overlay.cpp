@@ -137,8 +137,13 @@ static long                    g_touch_last_ms = 0;
 static std::atomic<bool>       g_want_mouse {false};
 
 static std::mutex            g_char_mtx;
-static std::vector<unsigned>  g_pending_chars;
-static int                    g_pending_bs     = 0;       /* r15: counter - the r14 bool collapsed N backspaces in one frame into one */
+/* r22/audit: ONE ordered queue. The agent sends deletions first,
+   then insertions (autocorrect "teh" -> "the"); two separate queues
+   replayed every insertion before every backspace and produced the
+   wrong text. Surrogate halves (0xD800-0xDFFF) are routed through
+   io.AddInputCharacterUTF16() below, so astral chars survive. */
+struct InEv { unsigned cp; bool bs; };
+static std::vector<InEv>      g_pending_in;
 
 /* scroll regions published by menu_draw (owner thread) */
 static std::vector<float> g_scroll_regions;
@@ -244,12 +249,12 @@ extern "C" JNIEXPORT int dextool_display_size() {
 
 extern "C" JNIEXPORT void dextool_add_char(int cp) {
     std::lock_guard<std::mutex> lk(g_char_mtx);
-    g_pending_chars.push_back((unsigned)cp);
+    if (g_pending_in.size() < 8192) g_pending_in.push_back(InEv{(unsigned)cp, false});
 }
 
 extern "C" JNIEXPORT void dextool_backspace() {
     std::lock_guard<std::mutex> lk(g_char_mtx);
-    if (g_pending_bs < 4096) g_pending_bs++;   /* r15: count, do not collapse */
+    if (g_pending_in.size() < 8192) g_pending_in.push_back(InEv{0, true});
 }
 
 /* r14: the GumJS agent posts phase markers here (NativeFunction on
@@ -258,10 +263,14 @@ extern "C" JNIEXPORT void dextool_backspace() {
    pins the exact phase that killed the process. */
 extern "C" JNIEXPORT void dextool_agent_log(const char* msg) {
     if (!msg) return;
-    char m[560];
-    snprintf(m, sizeof(m), "[agent] %.500s\n", msg);
+    /* r22/audit: log_debug() adds its own newline - feeding it the
+       \n-terminated string wrote a blank line after every marker */
+    char d[560];
+    snprintf(d, sizeof(d), "[agent] %.500s", msg);
+    log_debug(d);
+    char m[570];
+    snprintf(m, sizeof(m), "%s\n", d);
     log_crash_raw(m);
-    log_debug(m);
 }
 
 bool overlay_ready() { return g_ready.load(); }
@@ -337,6 +346,10 @@ static bool ensure_ownership(Slot* s, EGLContext ctx, float sw,
     if (s->dead) return false;
     s->swaps++;
     long now = now_ms();
+    /* r22/audit: remember the PREVIOUS swap time - the stale-owner
+       test below needs the value this swap replaced (comparing
+       against the just-written one made the test always true) */
+    long prev_swap = s->last_swap_ms;
     s->last_swap_ms = now;
     Slot* ow = nullptr;
     if (g_owner) {
@@ -376,7 +389,7 @@ static bool ensure_ownership(Slot* s, EGLContext ctx, float sw,
     }
     if (ow) {
         bool stale = (now - ow->last_swap_ms) > DT_OWNER_STALE_MS &&
-                     (now - s->last_swap_ms)  < 600;
+                     (now - prev_swap)        < 600;
         if (!stale) return false;     /* healthy owner elsewhere */
         g_owner = nullptr;
         LOGI("[overlay] owner migrated (previous went quiet)");
@@ -413,8 +426,8 @@ static void build_fonts(ImGuiIO& io) {
     io.Fonts->Clear();
     bool ok = false;
     if (g_font_path[0]) {
-        ImFontConfig cfg;
-        cfg.SizePixels = g_font_size;
+        /* r22/audit: dead ImFontConfig removed (built but never
+           passed to AddFontFromFileTTF) */
         ok = io.Fonts->AddFontFromFileTTF(g_font_path, g_font_size,
                                          nullptr, nullptr) != nullptr;
     }
@@ -444,9 +457,14 @@ static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
         g_orphan_imgui = nullptr;
         g_orphan_dw = 0.f; g_orphan_dh = 0.f;
         ImGui::SetCurrentContext(s->imgui);
-        ImGui_ImplOpenGL3_Shutdown();   /* GL deletes: no-ops here, the
-                                           names never existed in this
-                                           context; zeroes the handles */
+        /* r22/audit: a world parked by slot_destroy() was ALREADY
+           shut down (backend data freed) - a second Shutdown
+           dereferences null. NOTE: worlds parked by my_terminate
+           keep the old context's GL names - deleting them here can
+           hit the app's own objects; zeroing them without GL calls
+           needs a backend patch. */
+        if (ImGui::GetIO().BackendRendererUserData)
+            ImGui_ImplOpenGL3_Shutdown();
         LOGI("[overlay] ImGui world adopted after context switch");
     } else {
         s->imgui = ImGui::CreateContext();
@@ -562,8 +580,11 @@ static void gl_state_restore(Slot* s) {
     glBindBuffer(GL_ARRAY_BUFFER,         g.ab);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.eb);
     glBindFramebuffer(GL_FRAMEBUFFER,     g.fb);
-    glActiveTexture(g.active_tex);
+    /* r22/audit: tex2d was captured with unit 0 active - restore it
+       on unit 0, then put the app's active unit back */
+    glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g.tex2d);
+    glActiveTexture(g.active_tex);
     glBlendEquationSeparate(g.blend_eq_rgb, g.blend_eq_a);
     glBlendFuncSeparate(g.blend_src_rgb, g.blend_dst_rgb,
                         g.blend_src_a, g.blend_dst_a);
@@ -722,13 +743,18 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
 
     {
         std::lock_guard<std::mutex> lk2(g_char_mtx);
-        for (unsigned cp : g_pending_chars) io.AddInputCharacter(cp);
-        g_pending_chars.clear();
-        for (int i = 0; i < g_pending_bs && i < 4096; i++) {
-            io.AddKeyEvent(ImGuiKey_Backspace, true);
-            io.AddKeyEvent(ImGuiKey_Backspace, false);
+        for (const InEv& ev : g_pending_in) {
+            if (ev.bs) {
+                io.AddKeyEvent(ImGuiKey_Backspace, true);
+                io.AddKeyEvent(ImGuiKey_Backspace, false);
+            } else if (ev.cp >= 0xD800 && ev.cp <= 0xDFFF) {
+                /* UTF-16 surrogate half: let ImGui recombine the pair */
+                io.AddInputCharacterUTF16((ImWchar16)ev.cp);
+            } else {
+                io.AddInputCharacter(ev.cp);
+            }
         }
-        g_pending_bs = 0;
+        g_pending_in.clear();
     }
 
     menu_init_once();
@@ -809,16 +835,33 @@ static EGLBoolean my_terminate(EGLDisplay dpy) {
     return g_orig_terminate ? g_orig_terminate(dpy) : EGL_TRUE;
 }
 
+/* r22/audit: ONE flag for BOTH hooks, held across the call into the
+   real function. libEGL's eglSwapBuffers forwards to
+   eglSwapBuffersWithDamageKHR (also hooked); the in_tick guard
+   inside overlay_tick was already released by then, so the overlay
+   was drawn TWICE per frame. */
+static thread_local bool t_in_swap = false;
+
 static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
+    if (t_in_swap) return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
+    t_in_swap = true;
     overlay_tick(dpy, surf);
-    return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
+    EGLBoolean r = g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
+    t_in_swap = false;
+    return r;
 }
 
 static EGLBoolean my_swap_dmg(EGLDisplay dpy, EGLSurface surf,
                               EGLint* rects, EGLint n) {
+    if (t_in_swap)
+        return g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
+                               : EGL_FALSE;
+    t_in_swap = true;
     overlay_tick(dpy, surf);
-    return g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
-                           : EGL_FALSE;
+    EGLBoolean r = g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
+                                   : EGL_FALSE;
+    t_in_swap = false;
+    return r;
 }
 
 bool install_swap_hook() {

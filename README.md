@@ -3,6 +3,63 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r22)
+
+Third-party audit (47 items): the 18 patch-fixed items are ported
+INTO the generated sources and merged with the r19-r21 IME fixes
+(the audit's raw patch targeted a pre-r19 snapshot - its
+ime_on_text hunk would not apply over the r21 code). The audit's
+"build committed sources only" workflow was NOT adopted: this
+workflow stays self-contained and regenerates the sources, so the
+fixes cannot be reverted by a push.
+
+1. Overlay input: ONE ordered queue - deletions keep their order
+   before insertions (autocorrect no longer scrambles text), and
+   UTF-16 surrogate halves are recombined via
+   AddInputCharacterUTF16, so astral characters survive. The agent
+   now counts IME deletions in code points (ImGui deletes one
+   character per backspace - unit counting over-deleted fields).
+
+2. Overlay GL: the double-draw guard spans the real eglSwapBuffers
+   call (libEGL forwards to eglSwapBuffersWithDamageKHR, also
+   hooked - the menu was drawn twice per frame); texture binding
+   restored on unit 0; owner-migration stale test fixed; no second
+   renderer Shutdown when adopting a parked world; dead
+   ImFontConfig removed.
+
+3. Logger: FILE* checked under the lock (retarget race), private
+   crash log rotated on retarget (dextool-crash.prev.log is real
+   now), stdout/stderr follow the new crash fd, the runtime's
+   existing sigaltstack is preserved, terminate handler survives
+   "no active exception".
+
+4. frida_bridge: early agent messages (the one-shot "ready") are
+   queued and replayed when the menu registers; uncaught GumJS
+   errors are logged to the crash log and forwarded to the Script
+   console; dropped frida_post calls are logged.
+
+5. Agent: Script tab code actually runs (new Function body);
+   Java(JS) hooks install (mode strings normalised); orig() keeps
+   receiver + args; Patch OFF/delete restores the snapshotted
+   original; recorder pre-filters loaded classes; tracker callers
+   exclude the tracked method; OkHttp enqueue also monitored;
+   readable script console (cstr); smali jar extracted atomically
+   + read-only (Android 14) + assembled via ClassFactory with both
+   Main class names; single-ByteBuffer InMemoryDexClassLoader
+   (minSdk 26); dead code removed (DOTS/DMAX, parse_rules,
+   lit_to_java, CONS_Dummy, gDispSize).
+
+6. DexToolApp: crash.prev.log exported, copyLogs synchronized,
+   logs also exported to the app-specific external dir (no
+   permission needed on Android 11+).
+
+7. CI: the smali fat jar is DEXED with d8 (+ antlr-runtime) - ART
+   loads classes.dex, never .class files, and the ANTLR runtime
+   was missing, so the Smali mode could not work on-device; 16 KB
+   page alignment (-Wl,-z,max-page-size=16384) for Android 15+;
+   debug keystore cached so APK updates keep one signature; dead
+   smali_runtime.cpp removed from the build.
+
 ## Fixes in this version (r21)
 
 1. Field evidence (r20 build, device logs, both failures pinned by
