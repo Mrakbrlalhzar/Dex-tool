@@ -78,16 +78,27 @@ jobs:
       - name: Install meson
         run: pip3 install meson
 
+      - name: Cache debug keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+
       - name: Ensure debug keystore exists
         run: |
           mkdir -p ~/.android
-          keytool -genkey -v \
-            -keystore ~/.android/debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -dname "CN=Android Debug,O=Android,C=US" \
-            -keyalg RSA -keysize 2048 -validity 10000 2>/dev/null || true
+          # r22/audit: the keystore used to be REGENERATED on every run, so
+          # every APK carried a different signature and an update failed to
+          # install over the previous build. Cached above -> one stable key.
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkey -v \
+              -keystore ~/.android/debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -keyalg RSA -keysize 2048 -validity 10000 2>/dev/null || true
+          fi
 
       - name: Cache frida-gum arm64-v8a
         id: cache-frida-arm64
@@ -179,21 +190,35 @@ jobs:
             https://github.com/ocornut/imgui.git imgui
           ls imgui/backends/imgui_impl_opengl3.cpp
 
-      - name: Download smali 3.0.7 fat jar
+      - name: Build smali 3.0.7 dex jar
         run: |
-          mkdir -p deps/smali
+          mkdir -p deps/smali/jars
           BASE="https://dl.google.com/dl/android/maven2/com/android/tools/smali"
           SMVER="3.0.7"
           for art in smali smali-dexlib2 smali-util; do
-            wget -q "$BASE/$art/$SMVER/$art-$SMVER.jar" -O "deps/smali/$art.jar"
+            wget -q "$BASE/$art/$SMVER/$art-$SMVER.jar" -O "deps/smali/jars/$art.jar"
           done
           wget -q "https://repo1.maven.org/maven2/com/beust/jcommander/1.72/jcommander-1.72.jar" \
-            -O deps/smali/jcommander.jar
+            -O deps/smali/jars/jcommander.jar
           wget -q "https://repo1.maven.org/maven2/com/google/guava/guava/30.1.1-android/guava-30.1.1-android.jar" \
-            -O deps/smali/guava.jar
-          MERGE="$(mktemp -d)"
-          for j in deps/smali/*.jar; do unzip -nqo "$j" -d "$MERGE" 2>/dev/null || true; done
-          jar cf deps/smali/smali-fat.jar -C "$MERGE" .
+            -O deps/smali/jars/guava.jar
+          # r22/audit: smali's lexer/parser are ANTLR 3 generated - the
+          # runtime was missing, so the assembler died on-device
+          wget -q "https://repo1.maven.org/maven2/org/antlr/antlr-runtime/3.5.2/antlr-runtime-3.5.2.jar" \
+            -O deps/smali/jars/antlr-runtime.jar
+          # r22/audit: ART loads classes.dex, never .class files - the plain
+          # JVM jar made the on-device Smali mode impossible; convert with d8
+          D8="$ANDROID_HOME/build-tools/35.0.1/d8"
+          if "$D8" --release --min-api 26 \
+               --lib "$ANDROID_HOME/platforms/android-34/android.jar" \
+               --output deps/smali/smali-fat.jar deps/smali/jars/*.jar; then
+            unzip -l deps/smali/smali-fat.jar | grep -E "classes[0-9]*\.dex" || true
+          else
+            echo "::warning::d8 failed - falling back to the plain JVM jar; Smali hooks cannot load it on-device"
+            MERGE="$(mktemp -d)"
+            for j in deps/smali/jars/*.jar; do unzip -qn "$j" -d "$MERGE" 2>/dev/null || true; done
+            jar cf deps/smali/smali-fat.jar -C "$MERGE" .
+          fi
           ls -lh deps/smali/smali-fat.jar
 
       - name: Create project directories
@@ -246,7 +271,6 @@ jobs:
               src/overlay.cpp
               src/touch.cpp
               src/frida_bridge.cpp
-              src/smali_runtime.cpp
               src/menu.cpp
               ${IMGUI_SRC})
 
@@ -266,7 +290,10 @@ jobs:
           target_link_libraries(tool
               frida-gumjs dobby_static
               ${lib_egl} ${lib_gles2} ${lib_gles3} ${lib_log} ${lib_dl} ${lib_android}
-              -lm -Wl,--gc-sections -Wl,--exclude-libs,ALL)
+              -lm -Wl,--gc-sections -Wl,--exclude-libs,ALL
+              # r22/audit: Android 15+ devices may use 16 KB pages - LOAD
+              # segments must be 16 KB aligned
+              -Wl,-z,max-page-size=16384)
           DXTCMK
 
       - name: Generate logger.h
@@ -312,6 +339,7 @@ jobs:
           static FILE* g_info_fp  = nullptr;
           static FILE* g_debug_fp = nullptr;
           static int   g_crash_fd = -1;
+          static bool  g_stdio_redirected = false;   /* r22/audit: fds 1/2 point at the crash log */
           static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
 
           const char* logger_base_dir() { return g_base_dir; }
@@ -395,12 +423,21 @@ jobs:
                  copier) can never clobber an offset */
               g_crash_fd = open(p, O_WRONLY|O_CREAT|O_TRUNC|O_APPEND, 0644);
               {
-                  stack_t ss;
-                  memset(&ss, 0, sizeof(ss));
-                  ss.ss_sp    = g_alt_stack;
-                  ss.ss_size  = sizeof(g_alt_stack);
-                  ss.ss_flags = 0;
-                  sigaltstack(&ss, NULL);
+                  /* r22/audit: the runtime installs its own alternate stack on
+                     the main thread (stack-overflow handling); only add ours
+                     when none is usable - replacing it broke the runtime's
+                     own stack-overflow path */
+                  stack_t old;
+                  memset(&old, 0, sizeof(old));
+                  if (sigaltstack(NULL, &old) != 0 || (old.ss_flags & SS_DISABLE) ||
+                      old.ss_size < 16 * 1024) {
+                      stack_t ss;
+                      memset(&ss, 0, sizeof(ss));
+                      ss.ss_sp    = g_alt_stack;
+                      ss.ss_size  = sizeof(g_alt_stack);
+                      ss.ss_flags = 0;
+                      sigaltstack(&ss, NULL);
+                  }
               }
               install_crash_sig(SIGSEGV);
               install_crash_sig(SIGABRT);
@@ -435,7 +472,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r21: IME host fixes - hidden EditText attached via act.addContentView (the DecorView wrapper lacks addView on this bridge), Editable read via Java.cast to CharSequence + poison guard so a failed read can no longer type '[object Object]' or backspace the field, r20 stage tags kept)");
+              log_info("logger_init done (build r22: third-party audit fixes - ONE ordered input queue with UTF-16 surrogate recombination, double-draw guard spans the real eglSwapBuffers, texture binding restored on unit 0, logger FILE* checked under the lock + private crash log rotated on retarget + existing sigaltstack kept + terminate survives no-exception, bridge queues early agent messages + logs uncaught JS errors, r21 IME host fixes kept)");
           }
 
           /* r16: re-point the logs at the app's real private dir.
@@ -462,6 +499,15 @@ jobs:
               g_info_fp = fopen(p, "a");
               snprintf(p, sizeof(p), "%s/dextool-debug.log", base_dir);
               g_debug_fp = fopen(p, "a");
+              /* r22/audit: the PRIVATE dir's crash log was never rotated here
+                 (logger_init rotates the FALLBACK dir's) - without this it
+                 grows across runs and dextool-crash.prev.log never exists */
+              {
+                  char pprev[640];
+                  snprintf(pprev, sizeof(pprev), "%s/dextool-crash.prev.log", base_dir);
+                  snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
+                  rename(p, pprev);
+              }
               if (g_crash_fd >= 0) {
                   /* r16: dup2 replaces the descriptor ATOMICALLY in the fd
                      table - a concurrent log_crash_raw() (no mutex: it runs
@@ -471,6 +517,12 @@ jobs:
                   int nfd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
                   if (nfd >= 0) {
                       dup2(nfd, g_crash_fd);
+                      /* r22/audit: stdout/stderr were duplicated from the OLD
+                         crash fd; they must follow it to the new file too */
+                      if (g_stdio_redirected) {
+                          dup2(nfd, STDOUT_FILENO);
+                          dup2(nfd, STDERR_FILENO);
+                      }
                       close(nfd);
                   }
               } else {
@@ -486,20 +538,25 @@ jobs:
           }
 
           void log_info(const char* msg) {
-              if (!g_info_fp) return;
+              /* r22/audit: the FILE* is tested UNDER the lock - retarget()
+                 closes/reopens it and a check before the lock raced that */
               pthread_mutex_lock(&g_mtx);
-              char t[32]; ts(t, sizeof(t));
-              fprintf(g_info_fp, "[%s][I] %s\n", t, msg);
-              fflush(g_info_fp);
+              if (g_info_fp) {
+                  char t[32]; ts(t, sizeof(t));
+                  fprintf(g_info_fp, "[%s][I] %s\n", t, msg);
+                  fflush(g_info_fp);
+              }
               pthread_mutex_unlock(&g_mtx);
           }
 
           void log_debug(const char* msg) {
-              if (!g_debug_fp) return;
+              /* r22/audit: same race as log_info - check under the lock */
               pthread_mutex_lock(&g_mtx);
-              char t[32]; ts(t, sizeof(t));
-              fprintf(g_debug_fp, "[%s][D] %s\n", t, msg);
-              fflush(g_debug_fp);
+              if (g_debug_fp) {
+                  char t[32]; ts(t, sizeof(t));
+                  fprintf(g_debug_fp, "[%s][D] %s\n", t, msg);
+                  fflush(g_debug_fp);
+              }
               pthread_mutex_unlock(&g_mtx);
           }
 
@@ -525,13 +582,20 @@ jobs:
 
           static void dt_terminate() {
               log_crash_raw("std::terminate called\n");
-              try { std::rethrow_exception(std::current_exception()); }
-              catch (const std::exception& e) {
-                  char m[512];
-                  snprintf(m, sizeof(m), "  uncaught exception: %s\n", e.what());
-                  log_crash_raw(m);
-              } catch (...) {
-                  log_crash_raw("  uncaught exception: (unknown)\n");
+              /* r22/audit: rethrowing a NULL exception_ptr is undefined -
+                 terminate() can run with no active exception */
+              std::exception_ptr ep = std::current_exception();
+              if (ep) {
+                  try { std::rethrow_exception(ep); }
+                  catch (const std::exception& e) {
+                      char m[512];
+                      snprintf(m, sizeof(m), "  uncaught exception: %s\n", e.what());
+                      log_crash_raw(m);
+                  } catch (...) {
+                      log_crash_raw("  uncaught exception: (unknown)\n");
+                  }
+              } else {
+                  log_crash_raw("  (no active exception)\n");
               }
               abort();
           }
@@ -540,6 +604,7 @@ jobs:
               if (g_crash_fd >= 0) {
                   dup2(g_crash_fd, STDOUT_FILENO);
                   dup2(g_crash_fd, STDERR_FILENO);
+                  g_stdio_redirected = true;
               }
               g_log_set_default_handler(glib_log_capture, nullptr);
               std::set_terminate(dt_terminate);
@@ -741,8 +806,13 @@ jobs:
           static std::atomic<bool>       g_want_mouse {false};
 
           static std::mutex            g_char_mtx;
-          static std::vector<unsigned>  g_pending_chars;
-          static int                    g_pending_bs     = 0;       /* r15: counter - the r14 bool collapsed N backspaces in one frame into one */
+          /* r22/audit: ONE ordered queue. The agent sends deletions first,
+             then insertions (autocorrect "teh" -> "the"); two separate queues
+             replayed every insertion before every backspace and produced the
+             wrong text. Surrogate halves (0xD800-0xDFFF) are routed through
+             io.AddInputCharacterUTF16() below, so astral chars survive. */
+          struct InEv { unsigned cp; bool bs; };
+          static std::vector<InEv>      g_pending_in;
 
           /* scroll regions published by menu_draw (owner thread) */
           static std::vector<float> g_scroll_regions;
@@ -848,12 +918,12 @@ jobs:
 
           extern "C" JNIEXPORT void dextool_add_char(int cp) {
               std::lock_guard<std::mutex> lk(g_char_mtx);
-              g_pending_chars.push_back((unsigned)cp);
+              if (g_pending_in.size() < 8192) g_pending_in.push_back(InEv{(unsigned)cp, false});
           }
 
           extern "C" JNIEXPORT void dextool_backspace() {
               std::lock_guard<std::mutex> lk(g_char_mtx);
-              if (g_pending_bs < 4096) g_pending_bs++;   /* r15: count, do not collapse */
+              if (g_pending_in.size() < 8192) g_pending_in.push_back(InEv{0, true});
           }
 
           /* r14: the GumJS agent posts phase markers here (NativeFunction on
@@ -862,10 +932,14 @@ jobs:
              pins the exact phase that killed the process. */
           extern "C" JNIEXPORT void dextool_agent_log(const char* msg) {
               if (!msg) return;
-              char m[560];
-              snprintf(m, sizeof(m), "[agent] %.500s\n", msg);
+              /* r22/audit: log_debug() adds its own newline - feeding it the
+                 \n-terminated string wrote a blank line after every marker */
+              char d[560];
+              snprintf(d, sizeof(d), "[agent] %.500s", msg);
+              log_debug(d);
+              char m[570];
+              snprintf(m, sizeof(m), "%s\n", d);
               log_crash_raw(m);
-              log_debug(m);
           }
 
           bool overlay_ready() { return g_ready.load(); }
@@ -941,6 +1015,10 @@ jobs:
               if (s->dead) return false;
               s->swaps++;
               long now = now_ms();
+              /* r22/audit: remember the PREVIOUS swap time - the stale-owner
+                 test below needs the value this swap replaced (comparing
+                 against the just-written one made the test always true) */
+              long prev_swap = s->last_swap_ms;
               s->last_swap_ms = now;
               Slot* ow = nullptr;
               if (g_owner) {
@@ -980,7 +1058,7 @@ jobs:
               }
               if (ow) {
                   bool stale = (now - ow->last_swap_ms) > DT_OWNER_STALE_MS &&
-                               (now - s->last_swap_ms)  < 600;
+                               (now - prev_swap)        < 600;
                   if (!stale) return false;     /* healthy owner elsewhere */
                   g_owner = nullptr;
                   LOGI("[overlay] owner migrated (previous went quiet)");
@@ -1017,8 +1095,8 @@ jobs:
               io.Fonts->Clear();
               bool ok = false;
               if (g_font_path[0]) {
-                  ImFontConfig cfg;
-                  cfg.SizePixels = g_font_size;
+                  /* r22/audit: dead ImFontConfig removed (built but never
+                     passed to AddFontFromFileTTF) */
                   ok = io.Fonts->AddFontFromFileTTF(g_font_path, g_font_size,
                                                    nullptr, nullptr) != nullptr;
               }
@@ -1048,9 +1126,14 @@ jobs:
                   g_orphan_imgui = nullptr;
                   g_orphan_dw = 0.f; g_orphan_dh = 0.f;
                   ImGui::SetCurrentContext(s->imgui);
-                  ImGui_ImplOpenGL3_Shutdown();   /* GL deletes: no-ops here, the
-                                                     names never existed in this
-                                                     context; zeroes the handles */
+                  /* r22/audit: a world parked by slot_destroy() was ALREADY
+                     shut down (backend data freed) - a second Shutdown
+                     dereferences null. NOTE: worlds parked by my_terminate
+                     keep the old context's GL names - deleting them here can
+                     hit the app's own objects; zeroing them without GL calls
+                     needs a backend patch. */
+                  if (ImGui::GetIO().BackendRendererUserData)
+                      ImGui_ImplOpenGL3_Shutdown();
                   LOGI("[overlay] ImGui world adopted after context switch");
               } else {
                   s->imgui = ImGui::CreateContext();
@@ -1166,8 +1249,11 @@ jobs:
               glBindBuffer(GL_ARRAY_BUFFER,         g.ab);
               glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.eb);
               glBindFramebuffer(GL_FRAMEBUFFER,     g.fb);
-              glActiveTexture(g.active_tex);
+              /* r22/audit: tex2d was captured with unit 0 active - restore it
+                 on unit 0, then put the app's active unit back */
+              glActiveTexture(GL_TEXTURE0);
               glBindTexture(GL_TEXTURE_2D, g.tex2d);
+              glActiveTexture(g.active_tex);
               glBlendEquationSeparate(g.blend_eq_rgb, g.blend_eq_a);
               glBlendFuncSeparate(g.blend_src_rgb, g.blend_dst_rgb,
                                   g.blend_src_a, g.blend_dst_a);
@@ -1326,13 +1412,18 @@ jobs:
 
               {
                   std::lock_guard<std::mutex> lk2(g_char_mtx);
-                  for (unsigned cp : g_pending_chars) io.AddInputCharacter(cp);
-                  g_pending_chars.clear();
-                  for (int i = 0; i < g_pending_bs && i < 4096; i++) {
-                      io.AddKeyEvent(ImGuiKey_Backspace, true);
-                      io.AddKeyEvent(ImGuiKey_Backspace, false);
+                  for (const InEv& ev : g_pending_in) {
+                      if (ev.bs) {
+                          io.AddKeyEvent(ImGuiKey_Backspace, true);
+                          io.AddKeyEvent(ImGuiKey_Backspace, false);
+                      } else if (ev.cp >= 0xD800 && ev.cp <= 0xDFFF) {
+                          /* UTF-16 surrogate half: let ImGui recombine the pair */
+                          io.AddInputCharacterUTF16((ImWchar16)ev.cp);
+                      } else {
+                          io.AddInputCharacter(ev.cp);
+                      }
                   }
-                  g_pending_bs = 0;
+                  g_pending_in.clear();
               }
 
               menu_init_once();
@@ -1413,16 +1504,33 @@ jobs:
               return g_orig_terminate ? g_orig_terminate(dpy) : EGL_TRUE;
           }
 
+          /* r22/audit: ONE flag for BOTH hooks, held across the call into the
+             real function. libEGL's eglSwapBuffers forwards to
+             eglSwapBuffersWithDamageKHR (also hooked); the in_tick guard
+             inside overlay_tick was already released by then, so the overlay
+             was drawn TWICE per frame. */
+          static thread_local bool t_in_swap = false;
+
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
+              if (t_in_swap) return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
+              t_in_swap = true;
               overlay_tick(dpy, surf);
-              return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
+              EGLBoolean r = g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
+              t_in_swap = false;
+              return r;
           }
 
           static EGLBoolean my_swap_dmg(EGLDisplay dpy, EGLSurface surf,
                                         EGLint* rects, EGLint n) {
+              if (t_in_swap)
+                  return g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
+                                         : EGL_FALSE;
+              t_in_swap = true;
               overlay_tick(dpy, surf);
-              return g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
-                                     : EGL_FALSE;
+              EGLBoolean r = g_orig_swap_dmg ? g_orig_swap_dmg(dpy, surf, rects, n)
+                                             : EGL_FALSE;
+              t_in_swap = false;
+              return r;
           }
 
           bool install_swap_hook() {
@@ -1557,6 +1665,7 @@ jobs:
           #include "logger.h"
           #include "frida-gumjs.h"
           #include "agent_bundle_embed.h"
+          #include <deque>
           #include <mutex>
           #include <string>
           #include <cstdio>
@@ -1568,6 +1677,10 @@ jobs:
           static GMainContext*     g_ctx     = nullptr;
           static std::mutex        g_pmtx;
           static MsgCallback       g_cb;
+          /* r22/audit: agent messages that arrive before menu_init()
+             registers the callback (the one-shot "ready" usually does) are
+             kept and replayed when it does */
+          static std::deque<std::string> g_backlog;
 
           /* GumJS `msg` for send(x) is: {"type":"send","payload":<x>}.
              menu.cpp wants <x> (the agent's own JSON object), not the whole
@@ -1587,9 +1700,38 @@ jobs:
               return m.substr(p, e - p);
           }
 
+          /* raw (still JSON-escaped) value of a string key, or "" */
+          static std::string raw_json_string(const std::string& j, const char* key) {
+              std::string k = std::string("\"") + key + "\":\"";
+              size_t p = j.find(k);
+              if (p == std::string::npos) return "";
+              p += k.size();
+              size_t i = p;
+              while (i < j.size() && j[i] != '"') {
+                  if (j[i] == '\\' && i + 1 < j.size()) i++;
+                  i++;
+              }
+              return j.substr(p, i - p);
+          }
+
+          static const char kErrEnvelope[] = "{\"type\":\"error\"";
+
           static void on_message(const gchar* msg, GBytes*, gpointer) {
               if (!msg) return;
               std::string pl = extract_payload(msg);
+              if (pl.empty() && strncmp(msg, kErrEnvelope, sizeof(kErrEnvelope) - 1) == 0) {
+                  /* r22/audit: an uncaught JS exception raised by GumJS itself
+                     arrives as {"type":"error",...} with NO "payload" key, so
+                     it used to be dropped silently. Log it and forward the
+                     description to the menu in the agent's own shape. */
+                  std::string d  = raw_json_string(msg, "description");
+                  std::string st = raw_json_string(msg, "stack");
+                  char em[1200];
+                  snprintf(em, sizeof(em), "[js error] %.500s | %.600s\n",
+                           d.c_str(), st.c_str());
+                  log_crash_raw(em);
+                  pl = "{\"type\":\"error\",\"payload\":{\"fn\":\"js\",\"msg\":\"" + d + "\"}}";
+              }
               if (!pl.empty()) {
                   const char* t = strstr(pl.c_str(), "\"type\":\"");
                   if (t) {
@@ -1609,6 +1751,10 @@ jobs:
               {
                   std::lock_guard<std::mutex> lk(g_pmtx);
                   local = g_cb;
+                  if (!local && !pl.empty()) {       /* menu not up yet: keep for it */
+                      if (g_backlog.size() < 256) g_backlog.push_back(pl);
+                      return;
+                  }
               }
               if (local && !pl.empty()) local(pl);
           }
@@ -1644,134 +1790,26 @@ jobs:
           }
 
           void frida_post(const std::string& json) {
-              if (!g_script) return;
+              if (!g_script) {
+                  /* r22/audit: say so instead of vanishing - the menu's first
+                     messages used to disappear without a trace */
+                  log_debug("[frida_post] dropped: agent not loaded yet");
+                  return;
+              }
               std::lock_guard<std::mutex> lk(g_pmtx);
               gum_script_post(g_script, json.c_str(), nullptr);
           }
 
           void frida_set_message_callback(MsgCallback cb) {
-              std::lock_guard<std::mutex> lk(g_pmtx);
-              g_cb = cb;
+              std::deque<std::string> pending;
+              {
+                  std::lock_guard<std::mutex> lk(g_pmtx);
+                  g_cb = cb;
+                  if (cb) pending.swap(g_backlog);
+              }
+              if (cb) for (const std::string& m : pending) cb(m);   /* replay early ones */
           }
           DXTFBC
-
-      - name: Generate smali_runtime.h and smali_runtime.cpp
-        run: |
-          cat > src/smali_runtime.h << 'DXTSRH'
-          #pragma once
-          #include <cstdint>
-          #include <string>
-          #include <vector>
-          std::string smali_compile(const std::string& src,
-                                    const std::string& class_name,
-                                    std::vector<uint8_t>& dex_out);
-          DXTSRH
-          cat > src/smali_runtime.cpp << 'DXTSRC'
-          #include "smali_runtime.h"
-          #include "logger.h"
-          #include <jni.h>
-          #include <android/asset_manager.h>
-          #include <android/asset_manager_jni.h>
-          #include <vector>
-          #include <cstdio>
-          #include <cstdint>
-          #include <unistd.h>
-          #include <sys/stat.h>
-
-          extern JavaVM* g_jvm_global;
-          static bool   s_ready    = false;
-          static jclass s_main_cls = nullptr;
-
-          static std::string extract_jar(JNIEnv* env) {
-              jclass   act = env->FindClass("android/app/ActivityThread");
-              jobject  app = env->CallStaticObjectMethod(act,
-                  env->GetStaticMethodID(act,"currentApplication","()Landroid/app/Application;"));
-              jobject  am  = env->CallObjectMethod(app,
-                  env->GetMethodID(env->FindClass("android/content/Context"),
-                                   "getAssets","()Landroid/content/res/AssetManager;"));
-              /* r15 FIX: getFilesDir returns java.io.File, NOT a string.
-                 The r14 code cast that File object straight to jstring and
-                 fed it to GetStringUTFChars - a JNI type mismatch that would
-                 crash the process the moment the native Smali path ran.
-                 Call getAbsolutePath() first; THAT result is the real
-                 jstring. */
-              jobject  fdir = env->CallObjectMethod(app,
-                  env->GetMethodID(env->FindClass("android/content/Context"),
-                                   "getFilesDir","()Ljava/io/File;"));
-              if (!fdir || env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
-              jstring  fds = (jstring)env->CallObjectMethod(fdir,
-                  env->GetMethodID(env->FindClass("java/io/File"),
-                                   "getAbsolutePath","()Ljava/lang/String;"));
-              if (!fds || env->ExceptionCheck()) { env->ExceptionClear(); return ""; }
-              const char* fdp = env->GetStringUTFChars(fds, nullptr);
-              if (!fdp) return "";
-              char jar[512];
-              snprintf(jar, sizeof(jar), "%s/smali-fat.jar", fdp);
-              env->ReleaseStringUTFChars(fds, fdp);
-              if (access(jar, F_OK) == 0) return jar;
-              AAssetManager* amgr = AAssetManager_fromJava(env, am);
-              AAsset* a = AAssetManager_open(amgr, "smali-fat.jar", AASSET_MODE_BUFFER);
-              if (!a) return "";
-              FILE* f = fopen(jar, "wb");
-              if (!f) { AAsset_close(a); return ""; }
-              fwrite(AAsset_getBuffer(a), 1, (size_t)AAsset_getLength(a), f);
-              fclose(f); AAsset_close(a);
-              return std::string(jar);
-          }
-
-          static bool ensure_ready(JNIEnv* env) {
-              if (s_ready) return true;
-              std::string jar = extract_jar(env);
-              if (jar.empty()) return false;
-              jclass cl = env->FindClass("java/lang/ClassLoader");
-              jobject sc = env->CallStaticObjectMethod(cl,
-                  env->GetStaticMethodID(cl,"getSystemClassLoader","()Ljava/lang/ClassLoader;"));
-              jclass dcl = env->FindClass("dalvik/system/PathClassLoader");
-              jstring js = env->NewStringUTF(jar.c_str());
-              jobject lo = env->NewObject(dcl,
-                  env->GetMethodID(dcl,"<init>",
-                      "(Ljava/lang/String;Ljava/lang/ClassLoader;)V"),js,sc);
-              if (!lo) return false;
-              jstring cn = env->NewStringUTF("com.android.tools.smali.smali.Main");
-              s_main_cls = (jclass)env->CallObjectMethod(lo,
-                  env->GetMethodID(cl,"loadClass","(Ljava/lang/String;)Ljava/lang/Class;"),cn);
-              if (!s_main_cls||env->ExceptionCheck()){env->ExceptionClear();return false;}
-              s_main_cls = (jclass)env->NewGlobalRef(s_main_cls);
-              s_ready = true;
-              return true;
-          }
-
-          std::string smali_compile(const std::string& src, const std::string& cname,
-                                    std::vector<uint8_t>& out) {
-              JNIEnv* env = nullptr;
-              if (!g_jvm_global) return "no JVM";
-              g_jvm_global->AttachCurrentThread(&env, nullptr);
-              if (!ensure_ready(env)) return "smali not ready";
-              char tmp[] = "/data/local/tmp/dxt-XXXXXX";
-              if (!mkdtemp(tmp)) return "mkdtemp failed";
-              std::string sf = std::string(tmp)+"/"+cname+".smali";
-              std::string df = std::string(tmp)+"/out.dex";
-              FILE* f = fopen(sf.c_str(),"w");
-              if (!f) return "fopen failed";
-              fwrite(src.c_str(),1,src.size(),f); fclose(f);
-              jclass sc = env->FindClass("java/lang/String");
-              jmethodID m = env->GetStaticMethodID(s_main_cls,"main","([Ljava/lang/String;)V");
-              if (!m) return "no main method";
-              jobjectArray a = env->NewObjectArray(4,sc,nullptr);
-              env->SetObjectArrayElement(a,0,env->NewStringUTF("assemble"));
-              env->SetObjectArrayElement(a,1,env->NewStringUTF("-o"));
-              env->SetObjectArrayElement(a,2,env->NewStringUTF(df.c_str()));
-              env->SetObjectArrayElement(a,3,env->NewStringUTF(sf.c_str()));
-              env->CallStaticVoidMethod(s_main_cls,m,a);
-              if (env->ExceptionCheck()){env->ExceptionClear();return "smali threw";}
-              FILE* df2 = fopen(df.c_str(),"rb");
-              if (!df2) return "no dex output";
-              fseek(df2,0,SEEK_END); long sz=ftell(df2); rewind(df2);
-              out.resize((size_t)sz);
-              fread(out.data(),1,(size_t)sz,df2); fclose(df2);
-              return "";
-          }
-          DXTSRC
 
       - name: Generate menu.h
         run: |
@@ -3411,9 +3449,48 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r21). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r22). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
+
+             r22 changes (third-party audit, the 18 patch-fixed items ported
+             here and MERGED with the r21 IME code - the audit's raw patch
+             targeted a pre-r19 snapshot and its ime_on_text hunk would have
+             clobbered the r21 fixes):
+             - Script tab runs user code now: the LAST argument of
+               new Function() is the body - the old call made "src" the body
+               and passed the code as a parameter VALUE, so nothing executed.
+             - Java(JS) hooks install: the menu label 'Java(JS)' is
+               normalised to 'Java' (mode strings are compared literally).
+             - orig() in Java hooks keeps the REAL receiver + arguments.
+             - Patch OFF/delete RESTORES the original value (snapshotted
+               before the first write); noop/'char' fallbacks return
+               '\u0000' instead of 'a'.
+             - Recorder pre-filters enumerateLoadedClassesSync() ONCE (the
+               install loop counted skipped classes against its 12-class
+               batch, so a package filter took ~a minute over 30k names).
+             - Tracker callers no longer list the tracked method itself.
+             - Monitor also hooks OkHttp enqueue (async requests).
+             - Script console output is readable via cstr() (no 160-char
+               cut, no '|'->'!' rewrite, objects JSON-stringified).
+             - Smali jar: extracted to a temp file + rename (a killed
+               process cannot leave a truncated jar), setReadOnly() for
+               Android 14+ (writable dex refused), assembled via
+               ClassFactory.get(loader) (loadClass returns a Class wrapper
+               without static main()) trying both Main class names, source
+               written as UTF-8.
+             - smali_load uses the single-ByteBuffer InMemoryDexClassLoader
+               ctor (the ByteBuffer[] one needs API 27; minSdk is 26).
+             - IME deletions are counted in CODE POINTS: an astral char went
+               in as 2 UTF-16 units but ImGui deletes one CHARACTER per
+               backspace, so unit-counting over-deleted the field.
+               Insertions stay per-UTF-16-unit; overlay.cpp (r22) routes the
+               halves through io.AddInputCharacterUTF16() so pairs
+               recombine.
+             - Touch map also refreshed on ACTION_DOWN (throttled), not just
+               on moves.
+             - Dead code removed: DOTS/DMAX, parse_rules, lit_to_java,
+               CONS_Lines/CONS_Dummy batching, gDispSize lookup.
 
              r21 changes (two field reports on the r20 build, both pinned by
              the r20 stage tags):
@@ -3662,7 +3739,6 @@ jobs:
                   return Array.prototype.map.call(a, jstr).join(',').substring(0, 240);
               } catch (e) { return '?'; }
           }
-          var DOTS = 0, DMAX = 4000;
           function describe(a) {           /* deep values for trackers (capped) */
               try {
                   var s = '';
@@ -3676,7 +3752,7 @@ jobs:
                       if (d.length > 60) d = d.substring(0, 57) + '...';
                       s += (i ? ',' : '') + d;
                   }
-                  if (DOTS++ < DMAX && s.length > 240) s = s.substring(0, 237) + '...';
+                  if (s.length > 240) s = s.substring(0, 237) + '...';
                   return s;
               } catch (e) { return '?'; }
           }
@@ -3697,33 +3773,11 @@ jobs:
               } catch (e) { return []; }
           }
 
-          /* rewrite rules: parse tiny-language lines from smali code
-             supported:  pN = literal | name  /  R = literal   (literal: number,
-             true/false/null/"str"/'char' or an identifier=literal arg) */
-          function parse_rules(code) {
-              var rules = [], lines = code.split('\n');
-              for (var i = 0; i < lines.length; i++) {
-                  var ln = lines[i].replace(/#.*$/, '').trim();
-                  if (!ln) continue;
-                  var m = ln.match(/^(p\d+|R)\s*=\s*(.+)$/);
-                  if (m) rules.push({ reg: m[1], lit: m[2].trim(), src: ln });
-              }
-              return rules;
-          }
-          function lit_to_java(lit) {        /* literal string -> java value object */
-              if (lit === 'true' || lit === 'false') return lit === 'true';
-              if (lit === 'null') return null;
-              var q = lit.match(/^"(.*)"$/); if (q) return q[1];
-              var c = lit.match(/^'(.)'$/);  if (c) return c[1].charCodeAt(0);
-              if (/^-?\d+$/.test(lit)) return parseInt(lit, 10);
-              if (/^-?\d+\.\d*$/.test(lit) || /^-?\d*\.\d+$/.test(lit))
-                  return parseFloat(lit);
-              if (/^-?0x[0-9a-fA-F]+$/.test(lit)) return parseInt(lit, 16);
-              return undefined;              /* treat as identifier: copy-through */
-          }
+          /* r22/audit: parse_rules()/lit_to_java() removed - dead code,
+             nothing called them */
 
           var gAddChar = null, gBackspace = null, gWantMouse = null;
-          var gNativeTouch = null, gSetMap = null, gDispSize = null;
+          var gNativeTouch = null, gSetMap = null;
 
           function ensure_native_fns() {
               if (gNativeTouch) return true;
@@ -3733,14 +3787,12 @@ jobs:
                   var w = Module.findExportByName('libtool.so', 'dextool_want_mouse');
                   var t = Module.findExportByName('libtool.so', 'dextool_on_touch');
                   var s = Module.findExportByName('libtool.so', 'dextool_set_touch_map');
-                  var d = Module.findExportByName('libtool.so', 'dextool_display_size');
                   if (!m || !b || !t || !s) return false;
                   gAddChar   = new NativeFunction(m, 'void', ['int']);
                   gBackspace = new NativeFunction(b, 'void', []);
                   gNativeTouch = new NativeFunction(t, 'void', ['float', 'float', 'int']);
                   gSetMap    = new NativeFunction(s, 'void', ['int', 'int', 'int', 'int']);
                   if (w) gWantMouse = new NativeFunction(w, 'bool', []);
-                  if (d) gDispSize = new NativeFunction(d, 'int', []);
                   return true;
               } catch (e) { return false; }
           }
@@ -3958,11 +4010,18 @@ jobs:
                   var e = 0;
                   while (e < prev.length - s && e < cur.length - s &&
                          prev[prev.length - 1 - e] === cur[cur.length - 1 - e]) e++;
-                  var delN = prev.length - s - e;      /* UTF-16 units deleted */
-                  /* deletions first, then insertions - one event per UTF-16
-                     unit keeps the mapping 1:1 with what we inserted (astral
-                     chars went in as a surrogate pair, so they also come out
-                     as two backspaces). */
+                  /* r22/audit: deletions are counted in CODE POINTS - an
+                     astral char entered as 2 UTF-16 units, but ImGui deletes
+                     one CHARACTER per backspace, so counting UTF-16 units
+                     over-deleted the field. Insertions stay per-UTF-16-unit;
+                     overlay.cpp (r22) keeps this order in ONE queue and
+                     recombines surrogate halves via
+                     io.AddInputCharacterUTF16(). */
+                  var gone = prev.substring(s, prev.length - e), delN = 0;
+                  for (var gi = 0; gi < gone.length; gi++) {
+                      var gc = gone.charCodeAt(gi);
+                      if (gc < 0xDC00 || gc > 0xDFFF) delN++;   /* skip low surrogates */
+                  }
                   for (var d = 0; d < delN; d++) gBackspace();
                   var ins = cur.substring(s, cur.length - e);
                   for (var i = 0; i < ins.length; i++) gAddChar(ins.charCodeAt(i));
@@ -4539,7 +4598,8 @@ jobs:
                              (getLocationOnScreen), so overlay.cpp's transform
                              is exact on BOTH axes */
                           gNativeTouch(ev.getRawX(), ev.getRawY(), act);
-                          if (act === 2) {          /* throttle map refresh on moves */
+                          if (act === 0 || act === 2) {   /* r22/audit: throttled map
+                                                             refresh on DOWN + MOVE */
                               var now = Date.now();
                               if (now - gMapLastTouch > 2000) {
                                   gMapLastTouch = now;
@@ -4556,7 +4616,7 @@ jobs:
                       return this.dispatchTouchEvent(ev);         /* original call */
                   };
                   agentLog('phase: dispatchTouchEvent hook ok');
-                  sendMsg('info', { msg: 'touch hook installed (r21, screen coords + IME activity capture)' });
+                  sendMsg('info', { msg: 'touch hook installed (r22, screen coords + IME activity capture + map refresh on DOWN)' });
               });
           }
 
@@ -4644,7 +4704,6 @@ jobs:
                   sendMsg('recorderStopped', { installed: REC.installed });
                   return;
               }
-              var done = 0;
               for (var i = 0; i < batch && REC.idx < list.length; i++, REC.idx++) {
                   if (REC.installed >= REC.cap) break;
                   var cls = list[REC.idx];
@@ -4684,9 +4743,7 @@ jobs:
                                   })(ovl[oi], cls, name);
                               } catch (e2) {}
                           }
-                          if (made) REC.installed += 0;   /* counted per overload above */
                       }
-                      done++;
                   } catch (e3) {}
               }
               /* r12: throttle progress - the r11 log flooded ~200
@@ -4756,6 +4813,22 @@ jobs:
                                       mon_push('http', url, String(req.method()),
                                                mon_origin('okhttp:' + url),
                                                'headers ' + req.headers().size());
+                                  }
+                              } catch (e) {}
+                              return ov.apply(this, arguments);
+                          };
+                      });
+                      /* r22/audit: enqueue too - most apps issue async calls,
+                         hooking only execute() saw nothing */
+                      RealCall.enqueue.overloads.forEach(function (ov) {
+                          ov.implementation = function () {
+                              try {
+                                  if (MON.on) {
+                                      var req = this.request();
+                                      var url = String(req.url());
+                                      mon_push('http', url, String(req.method()),
+                                               mon_origin('okhttp:' + url),
+                                               'async, headers ' + req.headers().size());
                                   }
                               } catch (e) {}
                               return ov.apply(this, arguments);
@@ -4839,6 +4912,44 @@ jobs:
 
           var patches = {}, hooks = {}, trackers = {};
 
+          /* r22/audit: static-field patch helpers - the ORIGINAL value is
+             captured before the first write so OFF / delete can put it back */
+          function patch_store(f, t, value) {
+              if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
+                  f.set(null, parseInt(value, 10) || 0);
+              else if (t === 'boolean') f.set(null, value === 'true');
+              else if (t === 'float' || t === 'double')
+                  f.set(null, parseFloat(value) || 0.0);
+              else if (t === 'char') f.set(null, (value || 'a').charCodeAt(0));
+              else f.set(null, value);
+          }
+          function patch_snapshot(f, t) {
+              var v = f.get(null);
+              if (v === null || v === undefined) return { kind: 'null' };
+              if (t === 'int' || t === 'long' || t === 'short' || t === 'byte' ||
+                  t === 'boolean' || t === 'float' || t === 'double' || t === 'char' ||
+                  t === 'java.lang.String')
+                  return { kind: 'val', s: String(v) };
+              return { kind: 'ref', h: Java.retain(v) };
+          }
+          function patch_restore(cls, field, key) {
+              var p = patches[key];
+              if (!p || !p.snap) return;
+              Java.perform(function () {
+                  try {
+                      var f = Java.use(cls).class.getDeclaredField(field);
+                      f.setAccessible(true);
+                      var t = String(f.getType().getName());
+                      var sn = p.snap;
+                      if (sn.kind === 'null') f.set(null, null);
+                      else if (sn.kind === 'ref') f.set(null, sn.h);
+                      else patch_store(f, t, sn.s);
+                  } catch (e) {
+                      sendMsg('error', { fn: 'patchRestore', msg: String(e.message || e) });
+                  }
+              });
+          }
+
           /* ---------------- rpc exports (called from the menu) ---------------- */
           rpc.exports = {
               /* ---- patches: static-field value replacement ---- */
@@ -4849,17 +4960,15 @@ jobs:
                           var jc = Java.use(cls);
                           var f = jc.class.getDeclaredField(field);
                           f.setAccessible(true);
-                          var t = f.getType().getName();
+                          var t = String(f.getType().getName());
                           var st = (f.getModifiers() & 8) !== 0;
                           if (!st) throw new Error('not a static field (instances: Classes tab)');
-                          if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
-                              f.set(null, parseInt(value, 10) || 0);
-                          else if (t === 'boolean') f.set(null, value === 'true');
-                          else if (t === 'float' || t === 'double')
-                              f.set(null, parseFloat(value) || 0.0);
-                          else if (t === 'char') f.set(null, (value || 'a').charCodeAt(0));
-                          else f.set(null, value);
-                          patches[key] = { v: value, on: true };
+                          /* r22/audit: snapshot the ORIGINAL value once, before
+                             the first write, so OFF/delete can restore it */
+                          var prev = patches[key];
+                          var snap = (prev && prev.snap) ? prev.snap : patch_snapshot(f, t);
+                          patch_store(f, t, value);
+                          patches[key] = { v: value, on: true, snap: snap };
                           sendMsg('patchApplied', { name: key });
                       } catch (e) {
                           sendMsg('patchFailed', { name: key, error: String(e.message || e) });
@@ -4868,31 +4977,30 @@ jobs:
               },
               setPatchEnabled: function (cls, field, en) {
                   var key = cls + '.' + field;
-                  if (patches[key]) patches[key].on = en;
-                  if (!en) {
-                      Java.perform(function () {
-                          try {
-                              var jc = Java.use(cls);
-                              var f = jc.class.getDeclaredField(field);
-                              f.setAccessible(true);
-                              if ((f.getModifiers() & 8) !== 0)
-                                  f.set(null, f.get(null));   /* identity; real restore
-                                                                 needs the old value */
-                          } catch (e) {}
-                      });
-                  } else {
-                      rpc.exports.addPatch(cls, field, patches[key] ? patches[key].v : '');
-                  }
+                  var p = patches[key];
+                  if (p) p.on = en;
+                  /* r22/audit: OFF now RESTORES the snapshotted original
+                     (the old identity-set was a no-op) */
+                  if (!en) patch_restore(cls, field, key);
+                  else rpc.exports.addPatch(cls, field, p ? p.v : '');
                   sendMsg('info', { msg: 'patch ' + key + ' -> ' + (en ? 'on' : 'off') });
               },
               removePatch: function (cls, field) {
-                  delete patches[cls + '.' + field];
-                  sendMsg('info', { msg: 'patch removed ' + cls + '.' + field });
+                  var key = cls + '.' + field;
+                  patch_restore(cls, field, key);
+                  delete patches[key];
+                  sendMsg('info', { msg: 'patch removed ' + key });
               },
 
               /* ---- hooks: Java(JS) / Smali / noop ---- */
               addHook: function (cls, method, mode, code) {
                   var key = cls + '.' + method;
+                  /* r22/audit: the menu labels are 'Java(JS)' / 'Smali' /
+                     'noop' - normalise them or Java hooks never install */
+                  var ml = String(mode).toLowerCase();
+                  if (ml.indexOf('java') === 0) mode = 'Java';
+                  else if (ml === 'smali') mode = 'Smali';
+                  else if (ml === 'noop') mode = 'noop';
                   Java.perform(function () {
                       var hit = use_cls_parts(cls, method);
                       if (!hit) {
@@ -4908,11 +5016,16 @@ jobs:
                                   ov.implementation = function () {
                                       if (!hooks[key] || !hooks[key].on)
                                           return ov.apply(this, arguments);
+                                      /* r22/audit: keep the receiver + args for
+                                         orig() - `this` inside the closure is
+                                         NOT the intercepted call's receiver */
+                                      var self = this, orig_args = arguments;
                                       try {
                                           return fn(Java, send, CONSOLE(),
-                                                    this, Array.prototype.slice.call(arguments),
+                                                    self, Array.prototype.slice.call(orig_args),
                                                     function () {
-                                                        return ov.apply(this, arguments);
+                                                        return ov.apply(self,
+                                                            arguments.length ? arguments : orig_args);
                                                     });
                                       } catch (e1) {
                                           sendMsg('error', { fn: 'hook:' + key,
@@ -4933,7 +5046,7 @@ jobs:
                                           rt === 'byte') return 0;
                                       if (rt === 'float' || rt === 'double') return 0;
                                       if (rt === 'boolean') return false;
-                                      if (rt === 'char') return 'a';
+                                      if (rt === 'char') return '\u0000';
                                       return null;
                                   };
                               });
@@ -4944,8 +5057,12 @@ jobs:
                               var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
                                          '.super Ljava/lang/Object;\n' +
                                          '.method public static hook(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;\n' +
+                                         /* r22/audit: default .locals - user code
+                                            without a registers directive died in
+                                            the assembler */
+                                         (/^\s*\.(locals|registers)\b/m.test(code) ? '' : '    .locals 4\n') +
                                          code + '\n' +
-                                         '.end method\n.end class';
+                                         '.end method\n';
                               var art = smali_compile(skel);
                               if (art.err) {
                                   sendMsg('hookFailed', { name: key, error: art.err });
@@ -4970,7 +5087,7 @@ jobs:
                                               if (rt === 'int' || rt === 'long' || rt === 'short' ||
                                                   rt === 'byte') return 0;
                                               if (rt === 'boolean') return false;
-                                              if (rt === 'char') return 'a';
+                                              if (rt === 'char') return '\u0000';
                                               if (rt === 'float' || rt === 'double') return 0;
                                           }
                                           return r;
@@ -5021,7 +5138,12 @@ jobs:
                                   try { out = ov.apply(this, arguments); }
                                   catch (e1) { err = String(e1).substring(0, 100); throw e1; }
                                   if (trackers[key] && trackers[key].on) {
-                                      var ev = { name: key, callers: jstack(4),
+                                      /* r22/audit: exclude the tracked method
+                                         from its own callers list */
+                                      var ev = { name: key,
+                                                 callers: jstack(5).filter(function (c) {
+                                                     return c !== key;
+                                                 }).slice(0, 4),
                                                  args: describe(arguments), ret: jstr(out),
                                                  err: err };
                                       sendMsg('trackerEvent', ev);
@@ -5108,12 +5230,15 @@ jobs:
                       REC.filter = (filter === undefined || filter === null) ? '' :
                                     String(filter);
                       if (!REC.filter) REC.filter = pkg;   /* default: own package */
-                      if (REC.filter === '.') REC.filter = pkg;  /* menu: explicit all */
                       /* '.' sent by the UI means everything; agent: use it directly */
                       if (filter === '.') REC.filter = '.';
                       REC.cap = (typeof cap === 'number' && cap > 0) ?
                                 Math.floor(cap) : 1500;
                       var list = Java.enumerateLoadedClassesSync();
+                      /* r22/audit: filter ONCE - the install loop counted
+                         skipped classes against its 12-class batch, so a
+                         package filter took ~a minute over 30k names */
+                      list = list.filter(function (n) { return rec_wanted(n, REC.filter); });
                       REC.on = true;
                       REC.busy = true;
                       REC.ring = [];
@@ -5154,10 +5279,13 @@ jobs:
               /* ---- script console ---- */
               evalScript: function (src) {
                   try {
-                      var r = (new Function('Java', 'send', 'console', 'require',
-                                            'src'))(Java, send, CONSOLE(),
-                                                    require, src);
-                      sendMsg('scriptResult', { result: jstr(r) });
+                      /* r22/audit: the LAST argument of new Function() is the
+                         BODY - the old call made "src" the body (a parameter
+                         name) and passed the user's code as a parameter VALUE,
+                         so the Script tab ran nothing */
+                      var r = (new Function('Java', 'send', 'console', String(src)))(
+                                  Java, send, CONSOLE());
+                      if (r !== undefined) sendMsg('scriptResult', { result: cstr(r) });
                   } catch (e) {
                       sendMsg('scriptError', { msg: String(e && e.stack ? e.stack : e) });
                   }
@@ -5331,32 +5459,31 @@ jobs:
               }
           };
 
-          /* console for user scripts: lines are batched to the Script tab */
-          var CONS_Lines = [];
+          /* console for user scripts. r22/audit: cstr() gives readable text
+             (jstr() rewrites '|' and '#' and cuts at 160 chars for the
+             delimiter protocol - wrong for a console line); the dead
+             CONS_Lines/CONS_Dummy batching is gone. */
+          function cstr(v) {
+              try {
+                  if (v === null) return 'null';
+                  if (v === undefined) return 'undefined';
+                  if (typeof v === 'string') return v.substring(0, 2000);
+                  if (v.$className) return String(v).substring(0, 2000);
+                  if (typeof v === 'object') return JSON.stringify(v).substring(0, 2000);
+                  return String(v).substring(0, 2000);
+              } catch (e) { return '?'; }
+          }
           function CONSOLE() {
-              if (CONS_Lines.flush) return CONS_Dummy;
-              CONS_Lines = [];
+              function line(tag, args) {
+                  var a = tag + Array.prototype.map.call(args, cstr).join(' ');
+                  sendMsg('console', { line: a });
+              }
               return {
-                  log: function () {
-                      var a = Array.prototype.map.call(arguments, jstr).join(' ');
-                      CONS_Lines.push(a);
-                      sendMsg('console', { line: a });
-                  },
-                  error: function () {
-                      var a = 'ERR ' + Array.prototype.map.call(arguments, jstr).join(' ');
-                      CONS_Lines.push(a);
-                      sendMsg('console', { line: a });
-                  },
-                  warn: function () {
-                      var a = 'WARN ' + Array.prototype.map.call(arguments, jstr).join(' ');
-                      CONS_Lines.push(a);
-                      sendMsg('console', { line: a });
-                  }
+                  log:   function () { line('', arguments); },
+                  error: function () { line('ERR ', arguments); },
+                  warn:  function () { line('WARN ', arguments); }
               };
           }
-          var CONS_Dummy = {
-              log: function () {}, error: function () {}, warn: function () {}
-          };
 
           /* ---------------- smali assemble + load (runtime dex) ---------------- */
           function smali_compile(src) {
@@ -5373,46 +5500,62 @@ jobs:
                       var jar = files + '/smali-fat.jar';
                       var File = Java.use('java.io.File');
                       if (!File.$new(jar).exists()) {
-                          /* first run: extract from assets */
-                          var ios = Java.use('java.io.FileOutputStream');
-                          var am = ctx.getAssets();
-                          var is = am.open('smali-fat.jar');
-                          var fos = ios.$new(jar);
+                          /* r22/audit: extract to a temp file + rename(2), so
+                             a killed process cannot leave a truncated jar */
+                          var FOS0 = Java.use('java.io.FileOutputStream');
+                          var tmpJar = jar + '.tmp';
+                          var is = ctx.getAssets().open('smali-fat.jar');
+                          var fos = FOS0.$new(tmpJar);
                           var buf = Java.array('byte', new Array(8192).fill(0));
                           var n;
                           while ((n = is.read(buf)) > 0) fos.write(buf, 0, n);
                           fos.close(); is.close();
+                          File.$new(tmpJar).renameTo(File.$new(jar));
                       }
+                      /* r22/audit: Android 14+ refuses to load a WRITABLE
+                         dex/jar (targetSdk 34) */
+                      File.$new(jar).setReadOnly();
                       var PC = Java.use('dalvik.system.PathClassLoader');
                       var CL = Java.use('java.lang.ClassLoader');
-                      var parent = CL.getSystemClassLoader();
-                      var loader = PC.$new(jar, parent);
-                      var main = loader.loadClass('com.android.tools.smali.Main');
+                      var loader = PC.$new(jar, CL.getSystemClassLoader());
+                      /* r22/audit: loadClass() returns a java.lang.Class
+                         wrapper, which has no static main(): go through a
+                         ClassFactory bound to this loader */
+                      var F = Java.ClassFactory.get(loader);
                       var tmp = files + '/dxt-' + (Date.now() % 1000000);
                       var inF  = tmp + '.smali';
                       var outF = tmp + '.dex';
                       var FOS = Java.use('java.io.FileOutputStream');
                       var fos2 = FOS.$new(inF);
-                      var jb = Java.array('byte',
-                          Array.prototype.map.call(src, function (c) { return c.charCodeAt(0) & 0xff; }));
-                      fos2.write(jb);
+                      fos2.write(Java.use('java.lang.String').$new(src).getBytes('UTF-8'));
                       fos2.close();
-                      var arr = Java.array('java.lang.String', [
-                          'assemble', '-o', outF, inF ]);
-                      main.main(arr);
-                      var FIS = Java.use('java.io.FileInputStream');
-                      var fis = FIS.$new(outF);
-                      var all = [], chunk = Java.array('byte', new Array(8192).fill(0));
-                      var k;
-                      while ((k = fis.read(chunk)) > 0) {
-                          for (var c = 0; c < k; c++) all.push(chunk[c] & 0xff);
+                      var done = false, lastErr = '';
+                      var mains = ['com.android.tools.smali.smali.Main',
+                                   'com.android.tools.smali.Main'];
+                      for (var mi = 0; mi < mains.length && !done; mi++) {
+                          try {
+                              var Main = F.use(mains[mi]);
+                              Main.main(Java.array('java.lang.String',
+                                                   ['assemble', '-o', outF, inF]));
+                              done = true;
+                          } catch (eM) { lastErr = String(eM.message || eM); }
                       }
-                      fis.close();
-                      var bytes = Java.array('byte', all);
-                      out.dex = bytes;
-                      var Del = Java.use('java.io.File');
-                      Del.$new(inF).delete();
-                      Del.$new(outF).delete();
+                      if (!done) { out.err = 'smali Main not usable: ' + lastErr; }
+                      else if (!File.$new(outF).exists()) {
+                          out.err = 'smali produced no dex (see logcat for assembler errors)';
+                      } else {
+                          var FIS = Java.use('java.io.FileInputStream');
+                          var fis = FIS.$new(outF);
+                          var all = [], chunk = Java.array('byte', new Array(8192).fill(0));
+                          var k;
+                          while ((k = fis.read(chunk)) > 0) {
+                              for (var c = 0; c < k; c++) all.push(chunk[c]);
+                          }
+                          fis.close();
+                          out.dex = Java.array('byte', all);
+                      }
+                      File.$new(inF).delete();
+                      File.$new(outF).delete();
                   } catch (e) {
                       out.err = String(e.message || e).substring(0, 300);
                   }
@@ -5430,8 +5573,9 @@ jobs:
                       var IMDC = Java.use('dalvik.system.InMemoryDexClassLoader');
                       var CL = Java.use('java.lang.ClassLoader');
                       var bb = ByteBuffer.wrap(dexBytes);
-                      var loader = IMDC.$new(Java.array('java.nio.ByteBuffer', [bb]),
-                                             CL.getSystemClassLoader());
+                      /* r22/audit: single-buffer constructor - the ByteBuffer[]
+                         one needs API 27+, the sample's minSdk is 26 */
+                      var loader = IMDC.$new(bb, CL.getSystemClassLoader());
                       var cls = loader.loadClass(art.cls);
                       var methods = cls.getDeclaredMethods();
                       for (var i = 0; i < methods.length; i++) {
@@ -5520,7 +5664,7 @@ jobs:
                   sendMsg('error', { fn: 'touchhook',
                                      msg: String(eT && eT.message || eT) });
               }
-              sendMsg('ready', { msg: 'Dex-tool agent r21 loaded' });
+              sendMsg('ready', { msg: 'Dex-tool agent r22 loaded' });
               agentLog('phase: ready sent');
           }, 0);
           DXTAGNT
@@ -5683,14 +5827,43 @@ jobs:
                   t.start();
               }
 
-              private void copyLogs() throws IOException {
-                  String[] names = {"dextool.log", "dextool-debug.log", "dextool-crash.log"};
+              /* r22/audit: where the logs are exported to. /sdcard/Download
+                 is best effort only - with targetSdk 30+ raw File writes
+                 there are denied on most devices (scoped storage). The
+                 app-specific external dir needs no permission:
+                 adb pull /sdcard/Android/data/<package>/files/ */
+              private File[] exportDirs() {
+                  File ext = getExternalFilesDir(null);
+                  return ext != null ? new File[]{ new File(DL), ext }
+                                     : new File[]{ new File(DL) };
+              }
+
+              /* r22/audit: synchronized - the copier thread and the
+                 uncaught-exception handler both call this and used to write
+                 the same <name>.tmp file */
+              private synchronized void copyLogs() throws IOException {
+                  /* crash.prev.log is the PREVIOUS run's crash log - the one
+                     that matters after a crash; it was missing here */
+                  String[] names = {"dextool.log", "dextool-debug.log",
+                                    "dextool-crash.log", "dextool-crash.prev.log"};
                   File srcDir = new File(getFilesDir(), "dextool-logs");
-                  new File(DL).mkdirs();
+                  IOException first = null;
+                  for (File destDir : exportDirs()) {
+                      try {
+                          copyInto(srcDir, destDir, names);
+                      } catch (IOException e) {      /* one failing dir must not block the other */
+                          if (first == null) first = e;
+                      }
+                  }
+                  if (first != null) Log.w(TAG, "copyLogs: " + first.getMessage());
+              }
+
+              private void copyInto(File srcDir, File destDir, String[] names) throws IOException {
+                  destDir.mkdirs();
                   for (String n : names) {
                       File s = new File(srcDir, n);
                       if (!s.exists()) continue;
-                      File d = new File(DL, n);
+                      File d = new File(destDir, n);
                       /* unchanged since the last pass -> skip the rewrite */
                       if (d.exists() && d.length() == s.length() &&
                               s.lastModified() <= d.lastModified()) continue;
@@ -5700,7 +5873,7 @@ jobs:
                          log held one copy per 5s of uptime. Write a temp file
                          and rename(2) it over the target: atomic, no
                          duplication, no torn reads. */
-                      File t = new File(DL, n + ".tmp");
+                      File t = new File(destDir, n + ".tmp");
                       try (InputStream  is = new FileInputStream(s);
                            OutputStream os = new FileOutputStream(t, false)) {
                           byte[] buf = new byte[8192]; int len;
@@ -5911,6 +6084,63 @@ jobs:
 
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+          ## Fixes in this version (r22)
+
+          Third-party audit (47 items): the 18 patch-fixed items are ported
+          INTO the generated sources and merged with the r19-r21 IME fixes
+          (the audit's raw patch targeted a pre-r19 snapshot - its
+          ime_on_text hunk would not apply over the r21 code). The audit's
+          "build committed sources only" workflow was NOT adopted: this
+          workflow stays self-contained and regenerates the sources, so the
+          fixes cannot be reverted by a push.
+
+          1. Overlay input: ONE ordered queue - deletions keep their order
+             before insertions (autocorrect no longer scrambles text), and
+             UTF-16 surrogate halves are recombined via
+             AddInputCharacterUTF16, so astral characters survive. The agent
+             now counts IME deletions in code points (ImGui deletes one
+             character per backspace - unit counting over-deleted fields).
+
+          2. Overlay GL: the double-draw guard spans the real eglSwapBuffers
+             call (libEGL forwards to eglSwapBuffersWithDamageKHR, also
+             hooked - the menu was drawn twice per frame); texture binding
+             restored on unit 0; owner-migration stale test fixed; no second
+             renderer Shutdown when adopting a parked world; dead
+             ImFontConfig removed.
+
+          3. Logger: FILE* checked under the lock (retarget race), private
+             crash log rotated on retarget (dextool-crash.prev.log is real
+             now), stdout/stderr follow the new crash fd, the runtime's
+             existing sigaltstack is preserved, terminate handler survives
+             "no active exception".
+
+          4. frida_bridge: early agent messages (the one-shot "ready") are
+             queued and replayed when the menu registers; uncaught GumJS
+             errors are logged to the crash log and forwarded to the Script
+             console; dropped frida_post calls are logged.
+
+          5. Agent: Script tab code actually runs (new Function body);
+             Java(JS) hooks install (mode strings normalised); orig() keeps
+             receiver + args; Patch OFF/delete restores the snapshotted
+             original; recorder pre-filters loaded classes; tracker callers
+             exclude the tracked method; OkHttp enqueue also monitored;
+             readable script console (cstr); smali jar extracted atomically
+             + read-only (Android 14) + assembled via ClassFactory with both
+             Main class names; single-ByteBuffer InMemoryDexClassLoader
+             (minSdk 26); dead code removed (DOTS/DMAX, parse_rules,
+             lit_to_java, CONS_Dummy, gDispSize).
+
+          6. DexToolApp: crash.prev.log exported, copyLogs synchronized,
+             logs also exported to the app-specific external dir (no
+             permission needed on Android 11+).
+
+          7. CI: the smali fat jar is DEXED with d8 (+ antlr-runtime) - ART
+             loads classes.dex, never .class files, and the ANTLR runtime
+             was missing, so the Smali mode could not work on-device; 16 KB
+             page alignment (-Wl,-z,max-page-size=16384) for Android 15+;
+             debug keystore cached so APK updates keep one signature; dead
+             smali_runtime.cpp removed from the build.
 
           ## Fixes in this version (r21)
 
@@ -6376,7 +6606,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r21: field logs pin two IME failures on this bridge - win.getDecorView() wrapper lacks ViewGroup methods (stage decor.addView: typeof undefined) so the hidden EditText now attaches via act.addContentView(edit, lp); the afterTextChanged Editable has no bridged toString so ed.toString() silently returned QuickJS '[object Object]' - read text via Java.cast to CharSequence with Object-cast/call fallbacks, reject the poison literal, skip the delta on failed reads instead of backspacing the field [skip ci]"
+            git commit -m "fix r22: port third-party audit fixes (18 items) into the generated sources - overlay ONE ordered input queue + UTF-16 surrogate recombination (IME deletions now counted in code points), double-draw guard spans the real eglSwapBuffers, texture binding restored on unit 0, logger FILE* under lock + private crash log rotated on retarget + sigaltstack preserved + terminate survives no-exception, bridge queues early agent messages + logs uncaught JS errors, agent Script tab runs code + Java(JS) hooks install + orig() keeps receiver/args + patch OFF/delete restores + recorder pre-filter + OkHttp enqueue + readable console + smali loader hardening (atomic extract, read-only, ClassFactory, single ByteBuffer), d8-dexed smali jar with antlr-runtime, 16KB page alignment, cached debug keystore, dead smali_runtime.cpp removed [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
