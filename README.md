@@ -3,6 +3,71 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r23)
+
+Patch #2 of the 47-item audit: the 22 open items plus the 7 partial
+ones finished.
+
+- **Message routing (menu.cpp):** every agent message is dispatched on
+  the EXACT `"type"` value (`jtype()`); `jhas()` is colon-anchored, so
+  a payload that merely contains a word can no longer hijack another
+  branch.
+- **Click-through (overlay.cpp + agent):** menu.cpp/overlay publish the
+  rects of every live ImGui window each frame; the Java touch hook asks
+  `dextool_hit_test(rawX, rawY)` BEFORE the app sees the gesture and
+  consumes the whole gesture when it starts on the menu - taps no
+  longer leak to the host app.
+- **Touch map:** the view probe scores SurfaceView/TextureView
+  candidates against the overlay's REAL GL surface size
+  (`dextool_display_size`); overlay.cpp dropped its clamping, so taps
+  outside the view no longer snap onto edge widgets.
+- **Hook layering (agent):** one registry (`LAYERS`) per
+  class+method - Hook, Tracker, field-Tracker, Recorder and Monitor
+  stack on the same method through a single dispatcher instead of
+  overwriting each other's `ov.implementation`.
+- **Recorder/Monitor Stop really unhooks:** stopping removes the
+  layer and restores the original implementation.
+- **Instance-method Call:** `listInstances` retains every instance
+  (`Java.retain`) and returns `{str, handle, fields:[{n,t,v}]}`;
+  `callMethod`/`setInstanceField` address instances by handle - real
+  receivers. Static-only calls without a handle are refused with a
+  hint. The old `"##"/";"` value protocol (which corrupted values
+  containing `|`, `#`, `;`) is gone.
+- **Instance editor:** buffers are keyed by class + list generation +
+  index - no more stale text across classes.
+- **Class initialization:** hooks/trackers only `Java.use` classes
+  that are ALREADY loaded; anything else is deferred and installed by
+  a `loadClass` watcher when the app loads the class (no forced
+  `<clinit>`).
+- **Tracker side effects:** field/tracker values go through
+  `field_repr()` - primitives and boxes only, everything else is
+  `@class#identityHashCode`; the app's `toString()` is never called
+  inside hooks (no more recursion/crash).
+- **Search:** class filter searches on Enter/button only (no more
+  per-keystroke `enumerateLoadedClasses`); stale pages of an older
+  query are dropped via the qid generation counter.
+- **IME focus order:** the OLD field's deferred deactivation no longer
+  closes the keyboard of the NEW field (owner-ID check).
+- **IME focus restore:** the app's previously focused view is
+  remembered and gets focus back when the keyboard closes (Done/back/
+  hide) - the hidden EditText no longer keeps focus forever.
+- **UI polish:** window opacity applied once (was squared); the X
+  button force-returns the toggle FAB when it was disabled.
+- **Agent status:** failed GumJS starts are delivered to the menu
+  (`agentStatus`) and shown in Settings instead of "waiting" forever.
+- **Main thread:** the 500 ms `Thread.sleep` in DexToolApp.onCreate is
+  gone.
+- **GL state:** vertex-attrib enable flags (0..7) are saved and
+  restored around the overlay draw alongside the VAO binding.
+- **`my_terminate`:** retires only the slots belonging to the
+  terminated display (slots record their `dpy`).
+- **Stale GL names:** parked worlds "forget" their backend GL handles
+  (`ImGui_ImplOpenGL3_ForgetDeviceObjects`, appended to the backend by
+  CI) so adoption can never delete a name the new context recycled;
+  owner migration now PARKS the old world instead of leaking it.
+- **Build:** Dobby is pinned to a specific commit; `.so`/`.jar`
+  binaries and the generated embed header are no longer committed.
+
 ## Fixes in this version (r22)
 
 Third-party audit (47 items): the 18 patch-fixed items are ported

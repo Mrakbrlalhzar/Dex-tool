@@ -19,7 +19,14 @@ static fn_getEvent g_orig_get = nullptr;
    coords through the rect the agent measured (dextool_set_touch_map)
    before they reach ImGui; this hook therefore forwards untouched
    coords and lets overlay.cpp do the mapping. (AInputQueue coords
-   are window-local - this fallback may need the Settings Y bias.) */
+   are window-local - this fallback may need the Settings Y bias.)
+
+   r23 click-through: the JAVA path consumes menu taps before the host
+   app sees them (dextool_hit_test in the dispatchTouchEvent hook).
+   THIS path only READS events - the app's AInputQueue poll loop owns
+   dispatch, so consuming here is not possible without rewriting the
+   app's input loop; NativeActivity hosts still receive taps that land
+   on the menu (documented limitation, unchanged from r22). */
 static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
     int32_t rc = g_orig_get(q, ev);
     if (rc >= 0 && ev && *ev) {

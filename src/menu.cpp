@@ -74,7 +74,11 @@ static void mark_scroll_item(float speed) {
 /* ---------------- data model ---------------- */
 struct MethodSig { std::string name, params, ret; };
 struct FieldInfo { std::string name, type, value; };
-struct InstInfo  { std::string str; std::vector<FieldInfo> fields; };
+/* r23: instances arrive as structured JSON objects (see jobjarr);
+   handle is the agent's retained-instance id for setInstanceField /
+   callMethod - the old index-only addressing had no receiver at all */
+struct InstInfo  { std::string str; long handle = -1;
+                   std::vector<FieldInfo> fields; };
 struct ClassTab {
     std::string cname;
     bool got_info = false, waiting = false;
@@ -82,6 +86,7 @@ struct ClassTab {
     std::vector<FieldInfo> fields;
     std::vector<InstInfo>  instances;
     int  sel_inst = -1;
+    int  gen = -1;                      /* r23: instance-list generation; part of the editor buffer key */
     int  sub = 0;                       /* 0 Instances 1 Methods 2 Fields */
     /* inline method-call editor */
     bool call_open = false;
@@ -128,6 +133,10 @@ static bool s_cls_auto_done=false;   /* full class list requested once
 static int  s_search_total=0, s_search_shown=0;
 static bool s_search_wait=false;
 static int  s_search_seq=0, s_search_qid=-1;
+static bool s_search_page0=false;    /* r23: set when a NEW qid is sent;
+                                        the first page OF THAT QID clears
+                                        the list - stale pages of an older
+                                        qid are dropped, not mixed in */
 static std::string s_focus_cls;          /* class tab to select */
 static std::string s_next_tab;           /* top tab to select */
 
@@ -258,7 +267,67 @@ static long jnum(const std::string& j, const char* key, long dflt=0) {
 }
 
 static bool jhas(const std::string& j, const char* key) {
-    return j.find(std::string("\"")+key+"\"") != std::string::npos;
+    /* r23: colon-anchored - the old substring test matched "key"
+       INSIDE string values (a class named ...ok... satisfied
+       jhas(j,"ok")); the key must now be followed by ':' to count */
+    return j.find(std::string("\"") + key + "\":") != std::string::npos;
+}
+
+/* r23: EXACT value of the top-level "type" field. The whole message
+   dispatch used to be a chain of jhas() substring tests, so a payload
+   that merely CONTAINED the word ("...ready...", a URL holding
+   "info", a class name ending in "error") hijacked the branch meant
+   for another message. Every branch now compares this exact string. */
+static std::string jtype(const std::string& j) {
+    const std::string k = "\"type\":\"";
+    auto p = j.find(k);
+    if (p == std::string::npos) return "";
+    p += k.size();
+    size_t i = p;
+    while (i < j.size() && j[i] != '"') {
+        if (j[i] == '\\' && i + 1 < j.size()) i++;
+        i++;
+    }
+    return j.substr(p, i - p);
+}
+
+/* r23: array of JSON OBJECTS; each element is returned as its
+   balanced {...} substring (nesting + quoted braces handled).
+   The instance list used a "toString##name=value;name=value" string
+   protocol whose | # ; delimiters corrupted every value that
+   contained those characters - the audit's "value corruption on
+   edit". Fields now travel as structured JSON. */
+static std::vector<std::string> jobjarr(const std::string& j,
+                                        const char* key) {
+    std::vector<std::string> r;
+    std::string k = std::string("\"") + key + "\":[";
+    auto p = j.find(k);
+    if (p == std::string::npos) return r;
+    p += k.size();
+    while (p < j.size()) {
+        while (p < j.size() && (j[p] == ' ' || j[p] == ',')) p++;
+        if (p >= j.size() || j[p] != '{') break;
+        size_t s = p;
+        int depth = 0;
+        bool instr = false;
+        while (p < j.size()) {
+            char c = j[p];
+            if (instr) {
+                if (c == '\\') p++;
+                else if (c == '"') instr = false;
+            } else {
+                if (c == '"') instr = true;
+                else if (c == '{') depth++;
+                else if (c == '}') {
+                    depth--;
+                    if (depth == 0) { p++; break; }
+                }
+            }
+            p++;
+        }
+        r.push_back(j.substr(s, p - s));
+    }
+    return r;
 }
 
 static void post_rpc(const char* fn, const std::string& args) {
@@ -367,23 +436,8 @@ static MonRow parse_mon(const std::string& s) {
     m.note = s.substr(p4+1);
     return m;
 }
-/* instance string "toString##name=value;name=value" */
-static InstInfo parse_inst(const std::string& s) {
-    InstInfo i;
-    auto h = s.find("##");
-    if (h == std::string::npos) { i.str = s; return i; }
-    i.str = s.substr(0, h);
-    std::string rest = s.substr(h + 2), cur;
-    size_t st = 0;
-    while (st < rest.size()) {
-        auto e = rest.find(';', st);
-        cur = rest.substr(st, (e == std::string::npos ? rest.size() : e) - st);
-        if (!cur.empty()) i.fields.push_back(parse_field(cur));
-        if (e == std::string::npos) break;
-        st = e + 1;
-    }
-    return i;
-}
+/* (r23: parse_inst() removed with the "a##n=v;n=v" instance protocol -
+   instances are structured JSON now, see the instanceList branch) */
 
 /* strip the trailing ".method" from a caller string "pkg.Cls.method" */
 static std::string cls_of_member(const std::string& s) {
@@ -466,6 +520,7 @@ static void apply_theme() {
    ImGui field - so the next tap on it re-opens the keyboard. */
 static bool s_ime_active = false;   /* a text field owns ImGui focus */
 static bool s_ime_clear  = false;   /* drop active id next frame      */
+static ImGuiID s_ime_owner = 0;     /* r23: WHICH field owns the IME */
 
 static void ime_show() { post_rpc("showIme", "{}"); }
 static void ime_hide() { post_rpc("hideIme", "{}"); }
@@ -486,17 +541,30 @@ static void ime_frame_prelude() {
     if (clear) ImGui::ClearActiveID();
 }
 
-/* plain InputText wired to the system keyboard */
-static bool ime_textfield(const char* label, char* buf, size_t cap) {
+/* plain InputText wired to the system keyboard. r23: `extra` lets a
+   caller add flags (the class filter uses EnterReturnsTrue so a
+   keystroke no longer re-queries enumerateLoadedClasses). */
+static bool ime_textfield(const char* label, char* buf, size_t cap,
+                          ImGuiInputTextFlags extra = 0) {
     bool used = ImGui::InputText(label, buf, cap,
-                                 ImGuiInputTextFlags_AutoSelectAll);
+                                 ImGuiInputTextFlags_AutoSelectAll | extra);
     if (ImGui::IsItemActivated()) {
         s_ime_active = true;
+        s_ime_owner  = ImGui::GetItemID();
         ime_show();
     } else if (ImGui::IsItemDeactivated()) {
-        ime_close_if_active();
-    } else if (s_ime_active && ImGui::IsItemActive() &&
-               ImGui::IsMouseClicked(0)) {
+        /* r23 IME focus order: ImGui fires the OLD field's deactivation
+           one frame AFTER the NEW field activated - the old code called
+           ime_close_if_active() then, which hid the keyboard the new
+           field had just opened ("tapping a field while another is
+           active closes the keyboard"). Only the OWNING field
+           deactivating releases the IME. */
+        if (s_ime_active && ImGui::GetItemID() == s_ime_owner) {
+            s_ime_active = false;
+            ime_hide();
+        }
+    } else if (s_ime_active && ImGui::GetItemID() == s_ime_owner &&
+               ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
         ime_show();     /* re-tap while active: keyboard was closed */
     }
     return used;
@@ -508,11 +576,15 @@ static bool ime_multiline(const char* label, char* buf, size_t cap,
     bool used = ImGui::InputTextMultiline(label, buf, cap, size);
     if (ImGui::IsItemActivated()) {
         s_ime_active = true;
+        s_ime_owner  = ImGui::GetItemID();
         ime_show();
     } else if (ImGui::IsItemDeactivated()) {
-        ime_close_if_active();
-    } else if (s_ime_active && ImGui::IsItemActive() &&
-               ImGui::IsMouseClicked(0)) {
+        if (s_ime_active && ImGui::GetItemID() == s_ime_owner) {
+            s_ime_active = false;
+            ime_hide();
+        }
+    } else if (s_ime_active && ImGui::GetItemID() == s_ime_owner &&
+               ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
         ime_show();
     }
     return used;
@@ -527,16 +599,19 @@ void menu_init() {
     overlay_request_font_rebuild(s_font_size);
     frida_set_message_callback([](const std::string& j) {
         MLK();
-        if (jhas(j, "ready")) {
+        /* r23: dispatch on the EXACT "type" value (jtype) instead of
+           jhas() substring tests - see jtype() above. */
+        std::string ty = jtype(j);
+        if (ty == "ready") {
             s_agent_ready = true;
             s_cls_auto_done = false;  /* new agent: re-list classes */
             snprintf(s_agent_note, sizeof(s_agent_note), "%s",
                      jstr(j, "msg").c_str());
-        } else if (jhas(j, "imeHidden")) {
+        } else if (ty == "imeHidden") {
             /* user closed the phone keyboard (Done / back):
                drop ImGui focus so the next tap re-opens it */
             if (s_ime_active) { s_ime_active = false; s_ime_clear = true; }
-        } else if (jhas(j, "staticValues")) {
+        } else if (ty == "staticValues") {
             /* r12: static values are read on demand only - reading
                them during openClass() ran <clinit> of arbitrary
                classes and could block the agent forever */
@@ -548,7 +623,7 @@ void menu_init() {
                         if (old.name == nf.name) { old.value = nf.value; break; }
                 }
             }
-        } else if (jhas(j, "classInfo")) {
+        } else if (ty == "classInfo") {
             ClassTab* c = find_tab(jstr(j, "class"));
             if (c) {
                 c->got_info = true; c->waiting = false;
@@ -559,36 +634,61 @@ void menu_init() {
                 for (auto& f : jarr(j, "fields"))
                     c->fields.push_back(parse_field(f));
             }
-        } else if (jhas(j, "classList")) {
+        } else if (ty == "classList") {
             /* r11: the agent streams the full result in pages of 400;
                the r10 single message was capped at 800 names, which is
                why "Classes" never displayed all classes */
             long qid  = jnum(j, "qid");
             long page = jnum(j, "page");
-            if (qid != s_search_qid || page == 0) {
-                s_search_res.clear();
-                s_search_qid = (int)qid;
+            /* r23: generation counter - pages of an OUTDATED qid are
+               DROPPED, never mixed in. The old `page == 0` force-adopt
+               let a slow first page of an older query clobber the
+               fresh list (stale search pages). The first page of the
+               CURRENT qid clears the buffer once. */
+            if (qid == (long)s_search_qid) {
+                if (!s_search_page0) {
+                    s_search_res.clear();
+                    s_search_page0 = true;
+                }
+                for (auto& c : jarr(j, "classes")) s_search_res.push_back(c);
+                s_search_total = (int)jnum(j, "total");
+                s_search_shown = (int)jnum(j, "shown");
+                if (page + 1 >= jnum(j, "pages")) s_search_wait = false;
             }
-            for (auto& c : jarr(j, "classes")) s_search_res.push_back(c);
-            s_search_total = (int)jnum(j, "total");
-            s_search_shown = (int)jnum(j, "shown");
-            if (page + 1 >= jnum(j, "pages")) s_search_wait = false;
-        } else if (jhas(j, "instanceList")) {
+        } else if (ty == "instanceList") {
+            /* r23: structured instances - {str, handle, fields:[{n,t,v}]}.
+               The old "##"/";" string protocol corrupted every value
+               containing | # or ;, and index-only addressing gave
+               setInstanceField/callMethod NO receiver at all. gen keys
+               the editor buffers; handle addresses the retained
+               instance on the agent side. */
             ClassTab* c = find_tab(jstr(j, "class"));
             if (c) {
                 c->instances.clear();
-                for (auto& i : jarr(j, "instances"))
-                    c->instances.push_back(parse_inst(i));
+                c->gen = (int)jnum(j, "gen");
+                for (auto& o : jobjarr(j, "instances")) {
+                    InstInfo in;
+                    in.str    = jstr(o, "str");
+                    in.handle = jnum(o, "handle", -1);
+                    for (auto& fo : jobjarr(o, "fields")) {
+                        FieldInfo fi;
+                        fi.name  = jstr(fo, "n");
+                        fi.type  = jstr(fo, "t");
+                        fi.value = jstr(fo, "v");
+                        in.fields.push_back(std::move(fi));
+                    }
+                    c->instances.push_back(std::move(in));
+                }
                 c->sel_inst = -1;
             }
-        } else if (jhas(j, "callResult")) {
+        } else if (ty == "callResult") {
             ClassTab* c = find_tab(jstr(j, "class"));
             if (c) {
                 c->call_result = jhas(j, "ok") && jnum(j, "ok") ?
                     jstr(j, "result") :
                     ("ERR: " + jstr(j, "error"));
             }
-        } else if (jhas(j, "trackerEvent")) {
+        } else if (ty == "trackerEvent") {
             std::string n = jstr(j, "name");
             int ti = find_tracker(n);
             if (ti >= 0) {
@@ -601,58 +701,58 @@ void menu_init() {
                 t.log.push_back(std::move(r));
                 if (t.log.size() > 200) t.log.erase(t.log.begin());
             }
-        } else if (jhas(j, "recBatch")) {
+        } else if (ty == "recBatch") {
             for (auto& it : jarr(j, "items")) {
                 if (s_rec.size() >= 600) s_rec.erase(s_rec.begin(),
                                                      s_rec.begin() + 100);
                 s_rec.push_back(parse_rec(it));
             }
-        } else if (jhas(j, "recorderProgress")) {
+        } else if (ty == "recorderProgress") {
             s_rec_installed = (int)jnum(j, "installed");
             s_rec_total     = (int)jnum(j, "total");
             snprintf(s_rec_stat, sizeof(s_rec_stat), "installing %ld/%ld",
                      (long)s_rec_installed, (long)s_rec_total);
-        } else if (jhas(j, "recorderStarted")) {
+        } else if (ty == "recorderStarted") {
             snprintf(s_rec_stat, sizeof(s_rec_stat), "live (%ld hooks)",
                      (long)jnum(j, "installed"));
-        } else if (jhas(j, "recorderStopped")) {
+        } else if (ty == "recorderStopped") {
             snprintf(s_rec_stat, sizeof(s_rec_stat), "stopped");
-        } else if (jhas(j, "monitorEvent")) {
+        } else if (ty == "monitorEvent") {
             for (auto& it : jarr(j, "items")) {
                 if (s_mon.size() >= 400) s_mon.erase(s_mon.begin(),
                                                      s_mon.begin() + 100);
                 s_mon.push_back(parse_mon(it));
             }
-        } else if (jhas(j, "monitorInfo") || jhas(j, "sslInit")) {
+        } else if (ty == "monitorInfo" || ty == "sslInit") {
             snprintf(s_mon_stat, sizeof(s_mon_stat), "%s",
                      jstr(j, "note").c_str());
-        } else if (jhas(j, "monitorStarted")) {
+        } else if (ty == "monitorStarted") {
             snprintf(s_mon_stat, sizeof(s_mon_stat), "on");
-        } else if (jhas(j, "monitorStopped")) {
+        } else if (ty == "monitorStopped") {
             snprintf(s_mon_stat, sizeof(s_mon_stat), "off");
-        } else if (jhas(j, "console")) {
+        } else if (ty == "console") {
             push_console("[js]", jstr(j, "line"));
-        } else if (jhas(j, "scriptResult")) {
+        } else if (ty == "scriptResult") {
             push_console("=>", jstr(j, "result"));
-        } else if (jhas(j, "scriptError")) {
+        } else if (ty == "scriptError") {
             push_console("ERR", jstr(j, "msg"));
-        } else if (jhas(j, "patchApplied")) {
+        } else if (ty == "patchApplied") {
             std::string n = jstr(j, "name");
             for (auto& p : s_patches)
                 if (p.cls + "." + p.field == n) p.note = "";
-        } else if (jhas(j, "patchFailed")) {
+        } else if (ty == "patchFailed") {
             std::string n = jstr(j, "name");
             for (auto& p : s_patches)
                 if (p.cls + "." + p.field == n) p.note = jstr(j, "error");
-        } else if (jhas(j, "hookAdded")) {
+        } else if (ty == "hookAdded") {
             std::string n = jstr(j, "name");
             for (auto& h : s_hooks)
                 if (h.cls + "." + h.method == n) h.note = "";
-        } else if (jhas(j, "hookFailed")) {
+        } else if (ty == "hookFailed") {
             std::string n = jstr(j, "name");
             for (auto& h : s_hooks)
                 if (h.cls + "." + h.method == n) h.note = jstr(j, "error");
-        } else if (jhas(j, "smaliReady")) {
+        } else if (ty == "smaliReady") {
             char b[200];
             snprintf(b, sizeof(b), "smali %s: %s",
                      jnum(j, "ok") ? "OK" : "FAILED",
@@ -663,11 +763,22 @@ void menu_init() {
                 for (auto& h : s_hooks)
                     if (h.cls + "." + h.method == n) h.note = jstr(j, "error");
             }
-        } else if (jhas(j, "warn")) {
+        } else if (ty == "agentStatus") {
+            /* r23: the native bridge posts this when the GumJS script
+               itself failed to start - it used to only land in the
+               crash log while the menu kept saying "waiting" forever. */
+            if (!jnum(j, "ok")) {
+                s_agent_ready = false;
+                snprintf(s_agent_note, sizeof(s_agent_note), "FAILED: %.120s",
+                         jstr(j, "msg").c_str());
+                push_console("[agent]", std::string("start failed: ") +
+                             jstr(j, "msg").c_str());
+            }
+        } else if (ty == "warn") {
             push_console("[warn]", jstr(j, "msg"));
-        } else if (jhas(j, "error")) {
+        } else if (ty == "error") {
             push_console("[agent-err]", jstr(j, "msg"));
-        } else if (jhas(j, "info")) {
+        } else if (ty == "info") {
             push_console("[info]", jstr(j, "msg"));
         }
         MULK();
@@ -722,9 +833,16 @@ static void tab_settings() {
     ImGui::Text("Overlay: %s (%.0fx%.0f)",
                 s_ovl_ready ? "up" : "waiting",
                 dw, dh);
-    ImGui::Text("Agent:   %s %s",
-                s_agent_ready ? "ready" : "waiting",
-                s_agent_note);
+    /* r23: failed agent starts are visible now (frida_bridge posts
+       agentStatus) - it used to stay "waiting" forever */
+    if (!s_agent_ready && s_agent_note[0] &&
+        strncmp(s_agent_note, "FAILED", 6) == 0)
+        ImGui::TextColored(ImVec4(1, .4f, .4f, 1),
+                           "Agent:   %s", s_agent_note);
+    else
+        ImGui::Text("Agent:   %s %s",
+                    s_agent_ready ? "ready" : "waiting",
+                    s_agent_note);
     char mb[128];
     overlay_touch_map_desc(mb, sizeof(mb));
     ImGui::Text("Input:   %s", mb);
@@ -1097,16 +1215,25 @@ static void class_tab_content(ClassTab& c) {
             ImGui::Text("fields of #%d:", c.sel_inst);
             /* edit buffers are (re)filled only when a different instance
                is picked, not every frame - otherwise the user's typing
-               would be overwritten before it ever reaches the agent */
-            static char nv[32][128];
-            static int  nv_for = -1;
-            if (nv_for != c.sel_inst) {
-                nv_for = c.sel_inst;
-                for (int f = 0; f < 32; f++) {
-                    nv[f][0] = 0;
-                    if (f < (int)in.fields.size())
-                        snprintf(nv[f], sizeof(nv[f]), "%s",
-                                 in.fields[f].value.c_str());
+               would be overwritten before it ever reaches the agent.
+               r23: the key used to be the BARE index - picking instance
+               0 of another class kept the stale text of the previous
+               class (nv_for still matched). The key is class + list
+               generation + index now. */
+            static char        nv[32][128];
+            static std::string nv_key;
+            static int         nv_idx = -1;
+            {
+                std::string key = c.cname + "#" + std::to_string(c.gen);
+                if (key != nv_key || nv_idx != c.sel_inst) {
+                    nv_key = key;
+                    nv_idx = c.sel_inst;
+                    for (int f = 0; f < 32; f++) {
+                        nv[f][0] = 0;
+                        if (f < (int)in.fields.size())
+                            snprintf(nv[f], sizeof(nv[f]), "%s",
+                                     in.fields[f].value.c_str());
+                    }
                 }
             }
             for (int f = 0; f < (int)in.fields.size() && f < 32; f++) {
@@ -1129,8 +1256,14 @@ static void class_tab_content(ClassTab& c) {
                 ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper - raw InputText never opened the keyboard */
                 ImGui::SameLine();
                 if (ImGui::Button("Set##fs")) {
+                    /* r23: address the instance by the agent's retained
+                       handle when one exists - the index-only request
+                       had NO receiver, so f.set() failed on every
+                       instance field (same fix as callMethod below) */
+                    long h = in.handle;
                     std::string a = "{\"class\":\"" + jesc(c.cname)
-                                  + "\",\"index\":" + std::to_string(c.sel_inst)
+                                  + "\",\"handle\":" + std::to_string(h)
+                                  + ",\"index\":" + std::to_string(c.sel_inst)
                                   + ",\"field\":\"" + jesc(fi.name)
                                   + "\",\"value\":\"" + jesc(nv[f]) + "\"}";
                     post_rpc("setInstanceField", a);
@@ -1161,9 +1294,18 @@ static void class_tab_content(ClassTab& c) {
                 }
             }
             if (ImGui::Button("Invoke")) {
+                /* r23: instance methods need a RECEIVER - when an
+                   instance is selected its retained handle rides along
+                   (Java.retain-ed on the agent side), otherwise the
+                   agent refuses a non-static call with a hint instead
+                   of the old silent ov.apply(null) failure */
+                long h = (c.sel_inst >= 0 &&
+                          c.sel_inst < (int)c.instances.size())
+                             ? c.instances[c.sel_inst].handle : -1;
                 std::string a = "{\"class\":\"" + jesc(c.cname)
                               + "\",\"method\":\"" + jesc(c.call_sig.name)
-                              + "\",\"args\":[";
+                              + "\",\"handle\":" + std::to_string(h)
+                              + ",\"args\":[";
                 for (int k = 0; k < na; k++) {
                     if (k) a += ",";
                     a += "\"" + jesc(c.call_args[k]) + "\"";
@@ -1265,6 +1407,8 @@ static void tab_classes() {
         s_cls_auto_done = true;
         s_search_wait   = true;
         qid = ++s_search_seq;
+        s_search_qid   = qid;      /* r23: generation armed at SEND time */
+        s_search_page0 = false;
     }
     MULK();
     if (qid)
@@ -1274,7 +1418,11 @@ static void tab_classes() {
     bool do_search = false;
     MLK();
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 150.f);
-    do_search |= ime_textfield("Filter##sf", s_search, sizeof(s_search));
+    /* r23: search on Enter / button ONLY - every keystroke used to
+       re-run enumerateLoadedClasses on the agent (30k+ names per
+       letter, flooding the bridge while typing). */
+    do_search |= ime_textfield("Filter##sf", s_search, sizeof(s_search),
+                               ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::PopItemWidth();
     ImGui::SameLine();
     if (ImGui::Button("Search##cls")) do_search = true;
@@ -1300,6 +1448,8 @@ static void tab_classes() {
         MLK();
         s_search_wait = true;
         int sqid = ++s_search_seq;
+        s_search_qid   = sqid;     /* r23: generation armed at SEND time */
+        s_search_page0 = false;
         MULK();
         std::string a = "{\"filter\":\"" + jesc(s_search)
                        + "\",\"qid\":" + std::to_string(sqid) + "}";
@@ -1441,11 +1591,23 @@ void menu_draw() {
     ImGui::SetNextWindowSizeConstraints(
         ImVec2(420, 300), ImVec2(ds.x * .95f, ds.y * .95f));
     ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
-    ImGui::SetNextWindowBgAlpha(s_opacity);
+    /* r23 UI polish: opacity was applied TWICE - apply_theme() already
+       sets style.Alpha, and the SetNextWindowBgAlpha(s_opacity) here
+       multiplied the window background by the same value again
+       (0.92 rendered as ~0.85). style.Alpha is the single source. */
     bool open = vis;
     ImGui::Begin("Dex-tool v1.2 (r14)", &open,
                  ImGuiWindowFlags_NoCollapse);
-    if (!open) { MLK(); s_visible = false; s_conf_dirty = true; MULK(); }
+    if (!open) {
+        MLK();
+        s_visible = false;
+        s_conf_dirty = true;
+        /* r23 UI polish: pressing the window X with the toggle button
+           disabled stranded the menu (nothing could bring it back) -
+           the FAB force-returns, same policy as the Settings rescue */
+        if (!s_show_fab) s_show_fab = true;
+        MULK();
+    }
 
     if (ImGui::BeginTabBar("tb")) {
         struct TabDef { const char* name; void (*fn)(); };

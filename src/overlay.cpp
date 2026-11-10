@@ -4,6 +4,7 @@
 #include "frida_bridge.h"
 #include "touch.h"
 #include "imgui.h"
+#include "imgui_internal.h"   /* r23: live window list for the hit test */
 #include "imgui_impl_opengl3.h"
 #include "dobby.h"
 #include "frida-gumjs.h"
@@ -30,6 +31,14 @@ static fn_swap        g_orig_swap        = nullptr;
 static fn_swap_dmg    g_orig_swap_dmg    = nullptr;
 static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
 static fn_terminate   g_orig_terminate   = nullptr;
+
+/* r23: appended to the cloned backend by the CI build (see the ImGui
+   step in build.yml). Zeroes the stored GL object names WITHOUT any
+   GL calls - the guarded deletes in DestroyDeviceObjects become
+   no-ops, so a parked world can never delete stale names that a
+   recycled name in the NEW context now owns (the r22 residual of
+   the 0x501 abort class). */
+IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects();
 
 static std::atomic<bool> g_gum_inited {false};
 static JavaVM*           g_jvm        = nullptr;
@@ -70,6 +79,11 @@ struct GlState {
     GLint vao = 0, ab = 0, eb = 0;
     GLint fb = 0;                     /* r9: app FBO restored too */
     GLint active_tex = GL_TEXTURE0, tex2d = 0;
+    /* r23: vertex-attrib-array ENABLE flags are global context state
+       on ES2 (VAO state on ES3, but we run the ES2 backend path) -
+       the ImGui draw leaves attribs 0/1 enabled; apps that never
+       re-enable their own attribs drew garbage after our frame. */
+    GLboolean attrib_en[8] = {GL_FALSE};
     GLint viewport[4]    = {0, 0, 0, 0};
     GLint scissor_box[4] = {0, 0, 0, 0};
     GLboolean scissor = GL_FALSE, depth = GL_FALSE,
@@ -87,6 +101,7 @@ struct Slot {
     long  swaps = 0;            /* under g_slots_mtx */
     long  last_swap_ms = 0;     /* under g_slots_mtx */
     long  last_frame_ms = 0;    /* owner thread only */
+    EGLDisplay dpy = nullptr;   /* r23: which display this context belongs to - eglTerminate(dpy) may only retire THESE slots */
     GlState gl;
 };
 static std::mutex g_slots_mtx;
@@ -147,6 +162,24 @@ static std::vector<InEv>      g_pending_in;
 
 /* scroll regions published by menu_draw (owner thread) */
 static std::vector<float> g_scroll_regions;
+
+/* r23: rects of every LIVE ImGui window of the last frame (owner
+   thread collects them right after menu_draw; the Java touch hook
+   reads them from dextool_hit_test() on a binder/UI thread - the
+   only cross-thread contact, guarded here). */
+static std::mutex           g_win_mtx;
+static std::vector<float>   g_window_rects;   /* x,y,w,h quads */
+
+/* r23: the rects must not outlive the world that drew them -
+   after a park (owner death / display terminate / migration)
+   NOTHING is drawn until a new context adopts, so a frozen
+   rect would make dextool_hit_test() eat taps aimed at
+   whatever is on screen now. The next owner frame rebuilds
+   the snapshot. */
+static void clear_window_rects() {
+    std::lock_guard<std::mutex> lk(g_win_mtx);
+    g_window_rects.clear();
+}
 
 /* font atlas: rebuilt on demand from a system font, so the Font Size
    slider actually changes the glyphs instead of just scaling them */
@@ -340,10 +373,11 @@ static Slot* slot_for(EGLContext ctx) {
        RenderThread). If an ImGui world is parked from a dead context,
        DT_ADOPT_MIN_SWAPS is enough - coming back from the background
        the new context adopts it almost immediately. */
-static bool ensure_ownership(Slot* s, EGLContext ctx, float sw,
-                             float sh) {
+static bool ensure_ownership(Slot* s, EGLContext ctx, EGLDisplay dpy,
+                             float sw, float sh) {
     std::lock_guard<std::mutex> lk(g_slots_mtx);
     if (s->dead) return false;
+    s->dpy = dpy;              /* r23: recorded for my_terminate */
     s->swaps++;
     long now = now_ms();
     /* r22/audit: remember the PREVIOUS swap time - the stale-owner
@@ -391,6 +425,28 @@ static bool ensure_ownership(Slot* s, EGLContext ctx, float sw,
         bool stale = (now - ow->last_swap_ms) > DT_OWNER_STALE_MS &&
                      (now - prev_swap)        < 600;
         if (!stale) return false;     /* healthy owner elsewhere */
+        /* r23: the migration PARKED nothing before - the old owner's
+           slot kept its whole ImGui world (layouts, lists, fonts)
+           alive even though that context is gone: the leak the audit
+           flagged. Park it as the orphan (the next context adopts
+           it), and Forget its backend GL names - the old context is
+           not current here (we are on the NEW owner's thread), so
+           Shutdown/delete would hit whatever owns those names now. */
+        if (ow->imgui && !g_orphan_imgui) {
+            g_orphan_imgui = ow->imgui;
+            ow->imgui = nullptr;
+            {
+                std::lock_guard<std::mutex> lk3(g_disp_mtx);
+                g_orphan_dw = g_disp_w;
+                g_orphan_dh = g_disp_h;
+            }
+            ImGui::SetCurrentContext(g_orphan_imgui);
+            ImGui_ImplOpenGL3_ForgetDeviceObjects();
+            clear_window_rects();   /* nothing draws for this world
+                                       until a context adopts it */
+            LOGI("[overlay] owner migrated - old ImGui world parked "
+                 "(not leaked)");
+        }
         g_owner = nullptr;
         LOGI("[overlay] owner migrated (previous went quiet)");
     }
@@ -457,12 +513,13 @@ static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
         g_orphan_imgui = nullptr;
         g_orphan_dw = 0.f; g_orphan_dh = 0.f;
         ImGui::SetCurrentContext(s->imgui);
-        /* r22/audit: a world parked by slot_destroy() was ALREADY
-           shut down (backend data freed) - a second Shutdown
-           dereferences null. NOTE: worlds parked by my_terminate
-           keep the old context's GL names - deleting them here can
-           hit the app's own objects; zeroing them without GL calls
-           needs a backend patch. */
+        /* r23: every park path either already ran a real Shutdown
+           (dying context was current) or called ForgetDeviceObjects
+           (backend patch appended by CI) first - the stored GL
+           names are zeroed, so this Shutdown's glDelete* calls are
+           no-ops and can never hit a name the new context recycled
+           for one of the app's own objects. Shutdown still frees
+           the backend data struct, which the raw Forget cannot. */
         if (ImGui::GetIO().BackendRendererUserData)
             ImGui_ImplOpenGL3_Shutdown();
         LOGI("[overlay] ImGui world adopted after context switch");
@@ -523,7 +580,17 @@ static void slot_destroy(EGLContext ctx) {
                    otherwise the driver frees everything with the ctx */
                 ImGui::SetCurrentContext(g_orphan_imgui);
                 ImGui_ImplOpenGL3_Shutdown();
+            } else {
+                /* r23: the names belong to the dying context, but the
+                   stored slots must not survive into a NEW context:
+                   zero them with no GL calls (Shutdown here would
+                   delete in whatever context is current - the r22
+                   residual 0x501 class). */
+                ImGui::SetCurrentContext(g_orphan_imgui);
+                ImGui_ImplOpenGL3_ForgetDeviceObjects();
             }
+            clear_window_rects();   /* r23: this world draws nothing
+                                       until a new context adopts it */
             LOGI("[overlay] owner context destroyed - ImGui parked, "
                  "waiting for the next GL context");
         }
@@ -547,6 +614,13 @@ static void gl_state_save(Slot* s) {
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &g.tex2d);
     glGetIntegerv(GL_VIEWPORT,    g.viewport);
     glGetIntegerv(GL_SCISSOR_BOX, g.scissor_box);
+    /* r23: vertex-attrib enable flags (ES2 global state; 8 is the
+       ES2 guaranteed minimum) */
+    for (int i = 0; i < 8; i++) {
+        GLint en = 0;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en);
+        g.attrib_en[i] = en ? GL_TRUE : GL_FALSE;
+    }
     g.scissor = glIsEnabled(GL_SCISSOR_TEST);
     g.depth   = glIsEnabled(GL_DEPTH_TEST);
     g.stencil = glIsEnabled(GL_STENCIL_TEST);
@@ -579,6 +653,12 @@ static void gl_state_restore(Slot* s) {
     if (s->es3) glBindVertexArray(g.vao);
     glBindBuffer(GL_ARRAY_BUFFER,         g.ab);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.eb);
+    /* r23: put the app's vertex-attrib enable flags back - right
+       after the buffer bindings, before anything else may bind */
+    for (int i = 0; i < 8; i++) {
+        if (g.attrib_en[i]) glEnableVertexAttribArray(i);
+        else                glDisableVertexAttribArray(i);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER,     g.fb);
     /* r22/audit: tex2d was captured with unit 0 active - restore it
        on unit 0, then put the app's active unit back */
@@ -644,11 +724,63 @@ static ImVec2 map_touch(float x, float y, const ImVec2& ds) {
         }
         my += g_bias_y;
     }
-    if (mx < 0.f)   mx = 0.f;
-    if (my < 0.f)   my = 0.f;
-    if (mx > ds.x)  mx = ds.x;
-    if (my > ds.y)  my = ds.y;
+    /* r23: NO clamping. Clamping to the display rect pushed taps that
+       landed OUTSIDE the measured view (letterboxed games, split
+       screen, free-form windows) onto the edge widgets - a tap below
+       the view hit the bottom row of the menu. Off-view taps now map
+       off-canvas and simply hit nothing. */
     return ImVec2(mx, my);
+}
+
+/* r23: owner thread, right after menu_draw()/Render() - snapshot the
+   rects of every live ImGui window for dextool_hit_test(). */
+static void collect_window_rects() {
+    ImGuiContext* g = ImGui::GetCurrentContext();
+    std::vector<float> wr;
+    if (g) {
+        for (int i = 0; i < g->Windows.Size; i++) {
+            ImGuiWindow* w = g->Windows[i];
+            if (!w || !w->Active || w->Hidden) continue;
+            if (w->Flags & ImGuiWindowFlags_NoInputs) continue;
+            ImRect r = w->Rect();
+            wr.push_back(r.Min.x);
+            wr.push_back(r.Min.y);
+            wr.push_back(r.Max.x - r.Min.x);
+            wr.push_back(r.Max.y - r.Min.y);
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_win_mtx);
+    g_window_rects.swap(wr);
+}
+
+/* r23: click-through filter, called by the Java touch hook BEFORE the
+   gesture reaches the host app: true = the tap maps onto a live ImGui
+   window and must be consumed. The window-rect snapshot IS the source
+   of truth: io.WantCaptureMouse (g_want_mouse) was tried as a gate
+   here, but it is computed from the PREVIOUS event's position - the
+   FIRST tap on the menu after any passthrough tap (e.g. the FAB tap
+   that opens the menu) still leaked to the app below it. Rects are
+   refreshed every frame by collect_window_rects() and cleared on
+   every park, so a hit here always means "a window was really drawn
+   at this point last frame". Runs on the app's UI thread: only
+   touches mutex-guarded snapshots. */
+extern "C" JNIEXPORT bool dextool_hit_test(float x, float y) {
+    float dw = 0.f, dh = 0.f;
+    {
+        std::lock_guard<std::mutex> lk(g_disp_mtx);
+        dw = g_disp_w;
+        dh = g_disp_h;
+    }
+    if (dw <= 0.f || dh <= 0.f) return false;
+    ImVec2 p = map_touch(x, y, ImVec2(dw, dh));
+    std::lock_guard<std::mutex> lk(g_win_mtx);
+    const std::vector<float>& r = g_window_rects;
+    for (size_t i = 0; i + 3 < r.size(); i += 4) {
+        if (p.x >= r[i] && p.x <= r[i] + r[i + 2] &&
+            p.y >= r[i + 1] && p.y <= r[i + 1] + r[i + 3])
+            return true;
+    }
+    return false;
 }
 
 static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
@@ -681,7 +813,7 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     std::lock_guard<std::mutex> lk(g_tick_mtx);
 
     Slot* s = slot_for(ctx);
-    if (!ensure_ownership(s, ctx, (float)sw, (float)sh)) return;
+    if (!ensure_ownership(s, ctx, dpy, (float)sw, (float)sh)) return;
     if (s->dead || s->failed) return;
 
     if (!s->imgui) slot_init(dpy, surf, s);
@@ -775,6 +907,7 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
     menu_draw();
+    collect_window_rects();   /* r23: snapshot for the hit test */
     g_want_mouse.store(io.WantCaptureMouse);
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -789,18 +922,25 @@ static EGLBoolean my_destroy_ctx(EGLDisplay dpy, EGLContext ctx) {
 
 static EGLBoolean my_terminate(EGLDisplay dpy) {
     /* r11: terminating a display invalidates every context of that
-       display. Retire all slots now; otherwise the next eglCreateContext
-       can land at a recycled address whose stale slot would draw with
-       GL handles that are invalid in the new context (the
-       glUseProgram GL_INVALID_VALUE 0x501 abort class). */
+       display. r23: retire ONLY the slots that belong to THIS display
+       (recorded at swap time in Slot.dpy) - a second display's
+       contexts stay valid, and slots never drawn on have no recorded
+       display and are retired conservatively; otherwise the next
+       eglCreateContext can land at a recycled address whose stale
+       slot would draw with GL handles that are invalid in the new
+       context (the glUseProgram GL_INVALID_VALUE 0x501 abort class). */
     {
         std::lock_guard<std::mutex> lk(g_tick_mtx);
         std::lock_guard<std::mutex> lk2(g_slots_mtx);
         ImGuiContext* park = nullptr;
         bool had_owner = false;
+        bool retired_any = false;
         for (auto& kv : g_slots) {
             Slot* s = kv.second;
+            if (s->dpy != nullptr && s->dpy != dpy)
+                continue;               /* another display - still live */
             s->dead = true;
+            retired_any = true;
             g_graveyard.push_back(s);
             if (g_owner == kv.first) {
                 had_owner = true;
@@ -814,7 +954,12 @@ static EGLBoolean my_terminate(EGLDisplay dpy) {
                 s->imgui = nullptr;
             }
         }
-        g_slots.clear();
+        if (retired_any) {
+            for (auto it = g_slots.begin(); it != g_slots.end(); ) {
+                if (it->second->dead) it = g_slots.erase(it);
+                else ++it;
+            }
+        }
         if (had_owner) {
             g_owner = nullptr;
             g_ready.store(false);
@@ -827,6 +972,14 @@ static EGLBoolean my_terminate(EGLDisplay dpy) {
                     g_orphan_dw = g_disp_w;
                     g_orphan_dh = g_disp_h;
                 }
+                /* r23: the terminated display's contexts are gone -
+                   the parked backend names are stale; zero them with
+                   NO GL calls so adoption can never delete a recycled
+                   name in the new context (audit item: stale GL
+                   names deleted in the new context) */
+                ImGui::SetCurrentContext(g_orphan_imgui);
+                ImGui_ImplOpenGL3_ForgetDeviceObjects();
+                clear_window_rects();
                 LOGI("[overlay] display terminated - ImGui parked, "
                      "waiting for the next GL context");
             }

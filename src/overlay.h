@@ -40,6 +40,10 @@ JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h);   /* overlay v
 JNIEXPORT void dextool_add_char(int codepoint);
 JNIEXPORT void dextool_backspace();
 JNIEXPORT bool dextool_want_mouse();
+/* r23: click-through filter. Called by the Java touch hook BEFORE the
+   gesture reaches the host app; true = the tap mapped onto one of the
+   live ImGui windows of the last frame and must be consumed. */
+JNIEXPORT bool dextool_hit_test(float x, float y);
 JNIEXPORT int  dextool_display_size();  /* (w<<16)|h, 0 until the overlay is up */
 JNIEXPORT void dextool_agent_log(const char* msg); /* r14: agent phase markers -> logs */
 #ifdef __cplusplus

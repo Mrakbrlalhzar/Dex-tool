@@ -53,6 +53,23 @@ static std::string raw_json_string(const std::string& j, const char* key) {
 
 static const char kErrEnvelope[] = "{\"type\":\"error\"";
 
+/* r23: shared delivery to the menu (callback if registered, backlog
+   otherwise) - also used by the START-FAILURE paths below, so a
+   GumJS backend/script failure reaches the UI as an agentStatus
+   message instead of dying silently in the crash log. */
+static void deliver(const std::string& pl) {
+    MsgCallback local;
+    {
+        std::lock_guard<std::mutex> lk(g_pmtx);
+        local = g_cb;
+        if (!local && !pl.empty()) {       /* menu not up yet: keep for it */
+            if (g_backlog.size() < 256) g_backlog.push_back(pl);
+            return;
+        }
+    }
+    if (local && !pl.empty()) local(pl);
+}
+
 static void on_message(const gchar* msg, GBytes*, gpointer) {
     if (!msg) return;
     std::string pl = extract_payload(msg);
@@ -84,16 +101,7 @@ static void on_message(const gchar* msg, GBytes*, gpointer) {
             }
         }
     }
-    MsgCallback local;
-    {
-        std::lock_guard<std::mutex> lk(g_pmtx);
-        local = g_cb;
-        if (!local && !pl.empty()) {       /* menu not up yet: keep for it */
-            if (g_backlog.size() < 256) g_backlog.push_back(pl);
-            return;
-        }
-    }
-    if (local && !pl.empty()) local(pl);
+    deliver(pl);
 }
 void frida_bridge_start(JavaVM*) {
     log_info("[frida_bridge] starting GumJS");
@@ -103,6 +111,9 @@ void frida_bridge_start(JavaVM*) {
     g_backend = gum_script_backend_obtain_qjs();
     if (!g_backend) {
         log_crash_raw("[frida_bridge] FATAL: no QJS backend\n");
+        /* r23: tell the menu instead of leaving it on "waiting" forever */
+        deliver("{\"type\":\"agentStatus\",\"payload\":{\"ok\":0,"
+                "\"msg\":\"no GumJS QuickJS backend (gum_init failed?)\"}}");
         return;
     }
     log_info("[frida_bridge] QJS backend obtained");
@@ -115,6 +126,13 @@ void frida_bridge_start(JavaVM*) {
         snprintf(m, sizeof(m), "[frida_bridge] create: %s\n",
                  err ? err->message : "(null)");
         log_crash_raw(m);
+        /* r23: the Settings tab now shows WHY the agent is not coming up */
+        char jm[640];
+        snprintf(jm, sizeof(jm),
+                 "{\"type\":\"agentStatus\",\"payload\":{\"ok\":0,"
+                 "\"msg\":\"script create failed: %s\"}}",
+                 err ? err->message : "(null)");
+        deliver(jm);
         if (err) g_error_free(err);
         return;
     }

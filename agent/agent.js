@@ -1,7 +1,57 @@
 'use strict';
-/* Dex-tool agent (r22). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r23). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
+
+   r23 changes (patch #2 of the 47-item audit - 22 open + 7 partial
+   items finished):
+   - ONE layering registry (LAYERS) per class+method: Hook, Tracker,
+     field-Tracker, Recorder and Monitor now STACK on the same method
+     instead of overwriting each other's ov.implementation. A single
+     dispatcher runs recorder -> monitor -> tracker -> field-diff ->
+     user hook; removing the last layer of a method restores the
+     original implementation.
+   - Recorder Stop and Monitor Stop really UNHOOK: their layer is
+     removed and the method's original implementation returns (the
+     r22 stop only flipped a flag and left every hook installed).
+   - listInstances retains every instance (Java.retain) and returns a
+     structured protocol {str, handle, fields:[{n,t,v}]} - the old
+     "toString##name=value;name=value" string corrupted every value
+     containing | # or ;. setInstanceField/callMethod address the
+     instance by HANDLE, so instance methods finally have a receiver
+     (callMethod without a handle now refuses non-static calls with a
+     hint instead of failing on ov.apply(null)).
+   - Class access avoids premature <clinit> where possible: hook and
+     tracker installs only Java.use classes that are ALREADY loaded;
+     anything else is DEFERRED and installed by a loadClass watcher
+     when the target loads the class (frida-java-bridge always runs
+     ensureClassInitialized in use(), so "not loaded yet" is the one
+     case we can avoid triggering).
+   - trackField/tracker values no longer call toString() inside
+     hooks: field_repr() stringifies primitives and boxes only, and
+     reports '@class#identityHashCode' for anything else - no more
+     recursion/crash through an app's own toString (which this agent
+     may itself be recording).
+   - Click-through: the dispatchTouchEvent hook asks
+     dextool_hit_test(rawX, rawY) BEFORE the app sees the gesture and
+     consumes the whole gesture when it starts on a live menu window
+     (menu.cpp publishes every ImGui window rect each frame; the old
+     gWantMouse path still called the app's dispatch and leaked taps).
+   - Touch map view choice: the probe now scores SurfaceView/
+     TextureView candidates against the overlay's ACTUAL GL surface
+     size (dextool_display_size) instead of blindly taking the
+     largest, and overlay.cpp dropped its coordinate clamping - taps
+     outside the view no longer snap onto edge widgets (both axes
+     were already proportional since r15).
+   - IME focus: before the hidden EditText takes focus the app's
+     currently-focused view is retained; ime_hide / Done / imeHidden
+     restore focus to it and clear the EditText - the app gets its
+     focus state back instead of the 1x1 view keeping it forever.
+   - Everything from r22 (script new Function fix, mode
+     normalisation, orig() receiver/args, patch snapshot/restore,
+     ordered input queue + UTF-16, code-point deletions, OkHttp
+     enqueue, readable console, smali loader hardening) and r21
+     (addContentView host attach, ime_read_text cast chain) is kept.
 
    r22 changes (third-party audit, the 18 patch-fixed items ported
    here and MERGED with the r21 IME code - the audit's raw patch
@@ -289,23 +339,8 @@ function jargs(a) {
         return Array.prototype.map.call(a, jstr).join(',').substring(0, 240);
     } catch (e) { return '?'; }
 }
-function describe(a) {           /* deep values for trackers (capped) */
-    try {
-        var s = '';
-        for (var i = 0; i < a.length && i < 8; i++) {
-            var v = a[i], d;
-            try {
-                if (v === null || v === undefined) d = 'null';
-                else if (v.$className) d = String(v) + '@' + v.$className;
-                else d = String(v);
-            } catch (e) { d = '?'; }
-            if (d.length > 60) d = d.substring(0, 57) + '...';
-            s += (i ? ',' : '') + d;
-        }
-        if (s.length > 240) s = s.substring(0, 237) + '...';
-        return s;
-    } catch (e) { return '?'; }
-}
+/* (r23: describe() removed - describe_safe()/field_repr() render
+   tracker values without calling the app's toString()) */
 
 /* Java stack of the calling thread, app frames only, capped */
 function jstack(limit) {
@@ -323,11 +358,46 @@ function jstack(limit) {
     } catch (e) { return []; }
 }
 
+/* r23: recursion-safe value renderer for tracker/field reads.
+   jstr()/String(v) call the app's toString() INSIDE our hooks - when
+   the recorded/tracked class's own toString (or something it calls)
+   comes back through a hook, that recurses, floods the ring and can
+   crash (the audit's "Tracker Side Effects" item). Only primitives
+   and their boxes get real text here; every other object is reported
+   as '@class#identityHashCode'. */
+var gSysCls = null;
+function field_repr(v) {
+    try {
+        if (v === null || v === undefined) return 'null';
+        if (typeof v === 'string') return v.substring(0, 160);
+        if (typeof v === 'number' || typeof v === 'boolean')
+            return String(v);
+        var cn = '';
+        try { cn = String(v.$className || ''); } catch (e0) {}
+        if (cn === 'java.lang.String' || cn === 'java.lang.Integer' ||
+            cn === 'java.lang.Long'    || cn === 'java.lang.Boolean' ||
+            cn === 'java.lang.Short'   || cn === 'java.lang.Byte' ||
+            cn === 'java.lang.Float'   || cn === 'java.lang.Double' ||
+            cn === 'java.lang.Character')
+            return String(v).substring(0, 160);   /* boxes: toString is safe */
+        if (cn) {
+            var id = '?';
+            try {
+                if (!gSysCls) gSysCls = Java.use('java.lang.System');
+                id = String(gSysCls.identityHashCode(v));
+            } catch (e1) {}
+            return '@' + cn + '#' + id;
+        }
+        return String(v).substring(0, 160);   /* plain JS values */
+    } catch (e) { return '?'; }
+}
+
 /* r22/audit: parse_rules()/lit_to_java() removed - dead code,
    nothing called them */
 
 var gAddChar = null, gBackspace = null, gWantMouse = null;
 var gNativeTouch = null, gSetMap = null;
+var gHitTest = null, gDisplaySize = null;   /* r23 */
 
 function ensure_native_fns() {
     if (gNativeTouch) return true;
@@ -343,6 +413,13 @@ function ensure_native_fns() {
         gNativeTouch = new NativeFunction(t, 'void', ['float', 'float', 'int']);
         gSetMap    = new NativeFunction(s, 'void', ['int', 'int', 'int', 'int']);
         if (w) gWantMouse = new NativeFunction(w, 'bool', []);
+        /* r23: click-through filter + the owner surface's real size
+           (both exports exist since r23; older libtool builds simply
+           leave them null and the hooks fall back to r22 behaviour) */
+        var h = Module.findExportByName('libtool.so', 'dextool_hit_test');
+        if (h) gHitTest = new NativeFunction(h, 'bool', ['float', 'float']);
+        var d = Module.findExportByName('libtool.so', 'dextool_display_size');
+        if (d) gDisplaySize = new NativeFunction(d, 'int', []);
         return true;
     } catch (e) { return false; }
 }
@@ -361,6 +438,7 @@ function ensure_native_fns() {
    updates the map. */
 var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
 var gMapLastTouch = 0;
+var gTouchEat = false;   /* r23: the current gesture started on the menu */
 function report_map(view) {
     try {
         if (!view) return;
@@ -382,15 +460,27 @@ function content_view(activity) {
                         .findViewById(0x01020002);
     } catch (e) { return null; }
 }
-/* the view the overlay actually renders onto: the largest
-   SurfaceView / GLSurfaceView / TextureView in the window;
-   falls back to android.R.id.content */
+/* the view the overlay actually renders onto. r23: candidates are
+   SCORED against the overlay's real GL surface size
+   (dextool_display_size) instead of blindly taking the largest - an
+   ad/video SurfaceView bigger than the game surface used to win and
+   the map then belonged to the wrong view. Falls back to the largest
+   candidate, then to android.R.id.content. */
+function gl_surface_hint() {
+    try {
+        if (!gDisplaySize && !ensure_native_fns()) return null;
+        if (!gDisplaySize) return null;
+        var v = gDisplaySize();
+        if (!v || v <= 0) return null;
+        return { w: (v >>> 16) & 0xffff, h: v & 0xffff };
+    } catch (e) { return null; }
+}
 function find_gl_view(activity) {
     try {
         var decor = activity.getWindow().getDecorView();
         if (!decor) return content_view(activity);
         var VG = Java.use('android.view.ViewGroup');
-        var best = null, bestArea = 0;
+        var cands = [];
         var stack = [decor];
         while (stack.length) {
             var v = stack.pop();
@@ -402,9 +492,8 @@ function find_gl_view(activity) {
                 cn.indexOf('TextureView') >= 0) {
                 var w = 0, h = 0;
                 try { w = v.getWidth(); h = v.getHeight(); } catch (e1) {}
-                if (w > 0 && h > 0 && w * h > bestArea) {
-                    best = v; bestArea = w * h;
-                }
+                if (w > 0 && h > 0)
+                    cands.push({ v: v, w: w, h: h });
             }
             var grp = null;
             try { grp = Java.cast(v, VG); } catch (e2) {}
@@ -413,7 +502,23 @@ function find_gl_view(activity) {
                 for (var i = 0; i < n; i++) stack.push(grp.getChildAt(i));
             }
         }
-        if (best) return best;
+        if (!cands.length) return content_view(activity);
+        var hint = gl_surface_hint();
+        var best = null, bestScore = -1e30;
+        for (var k = 0; k < cands.length; k++) {
+            var c = cands[k];
+            var score = -Math.abs(c.w * c.h);
+            if (hint && hint.w > 0 && hint.h > 0) {
+                /* closest total area wins, aspect-compatible preferred */
+                score = -Math.abs(Math.log((c.w * c.h + 1) /
+                                           (hint.w * hint.h + 1))) * 100;
+                var ar1 = c.w / c.h, ar2 = hint.w / hint.h;
+                if (Math.abs(ar1 - ar2) / ar2 < 0.25) score += 50;
+            }
+            if (score > bestScore) { bestScore = score; best = c; }
+        }
+        if (best) return best.v;
+        return content_view(activity);
     } catch (e3) {}
     return content_view(activity);
 }
@@ -434,7 +539,8 @@ function find_gl_view(activity) {
    previous one when the tracked activity changes. */
 var IME = { act: null, edit: null, actHash: 0, prev: '',
             silent: false, cnt: 0, everLogged: false,
-            mapProbed: false };   /* r20: one-shot view-map probe */
+            mapProbed: false,                   /* r20: one-shot view-map probe */
+            restore: null };                    /* r23: app view whose focus we borrowed */
 
 /* r18: release the previous retained activity. The bridge does not
    export Java.release(), so the documented cleanup is the
@@ -449,6 +555,30 @@ function ime_release_act(obj) {
         if (typeof obj.$dispose === 'function') obj.$dispose();
     } catch (e) {}
 }
+/* r23: the hidden EditText STEALS focus from the app while the
+   keyboard is open (unavoidable - the IME needs a focused view) -
+   the fix is to give it BACK: remember the app's focused view before
+   ours takes it, and restore + clearFocus when the keyboard closes
+   (ime_hide, the IME's Done button, or the menu closing). Retained
+   like IME.act: the wrapper is callback-scoped otherwise. */
+function ime_set_restore(v) {
+    try {
+        if (IME.restore && v) {
+            try { if (IME.restore.equals(v)) return; } catch (eQ) {}
+        }
+        if (IME.restore) ime_release_act(IME.restore);
+        IME.restore = v ? Java.retain(v) : null;
+    } catch (e) { IME.restore = null; }
+}
+function ime_restore_focus() {
+    try {
+        if (IME.edit) IME.edit.clearFocus();
+    } catch (e0) {}
+    try {
+        if (IME.restore) IME.restore.requestFocus();
+    } catch (e1) {}
+}
+
 /* r18: the ONLY writer of IME.act. Stores a Java.retain()-ed
    wrapper (global reference, valid after the producing callback
    returned and from any thread), releases the previous retained
@@ -462,6 +592,8 @@ function ime_set_act(obj, how) {
             try { same = IME.act.equals(obj); } catch (eQ) { same = false; }
             if (same) return false;   /* already tracked - reuse */
             ime_release_act(IME.act);
+            /* r23: the saved focus view belonged to the OLD activity */
+            if (IME.restore) { ime_release_act(IME.restore); IME.restore = null; }
         }
         /* r19: retain, then VERIFY the retained wrapper actually
            exposes Activity methods before trusting it. Every
@@ -712,6 +844,8 @@ function ime_create_edit(act) {
                            the next tap on it re-opens the keyboard */
                         sendMsg('imeHidden', {});
                         ime_reset_text();
+                        /* r23: give the app its focused view back */
+                        ime_restore_focus();
                         return false;
                     }
                 }
@@ -777,8 +911,19 @@ function ime_try_show(reset) {
         var edit = makeEdit(IME.act);
         if (!edit) return false;
         if (reset !== false) ime_reset_text();
+        /* r23: remember which app view currently holds focus BEFORE our
+           hidden EditText steals it, so it can be handed back later */
+        try {
+            var cur = IME.act.getWindow().getCurrentFocus();
+            if (cur) {
+                var isOurs = false;
+                try { if (IME.edit && cur.equals(IME.edit)) isOurs = true; }
+                catch (eC) {}
+                if (!isOurs) ime_set_restore(cur);
+            }
+        } catch (eF) {}
         /* r20: same stage tagging as the factory - if the factory
-           ever passes and the next failure lands here, the payload
+           passes and the next failure lands here, the payload
            names the exact call instead of a bare TypeError. */
         ime_stage('edit.requestFocus', function () {
             edit.requestFocus();
@@ -1070,6 +1215,9 @@ function ime_hide() {
                 var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
                 imm.hideSoftInputFromWindow(IME.edit.getWindowToken(), 0);
                 ime_reset_text();
+                /* r23: the hidden 1x1 EditText used to KEEP the app's
+                   focus forever - hand the previously focused view back */
+                ime_restore_focus();
             } catch (e) {}
         });
     });
@@ -1147,7 +1295,21 @@ function installTouchHook() {
                    same space the map is measured in
                    (getLocationOnScreen), so overlay.cpp's transform
                    is exact on BOTH axes */
-                gNativeTouch(ev.getRawX(), ev.getRawY(), act);
+                var rx = ev.getRawX(), ry = ev.getRawY();
+                gNativeTouch(rx, ry, act);
+                /* r23 click-through: ask the overlay whether this
+                   gesture STARTS on a live menu window BEFORE the app
+                   sees anything. The r22 attempt returned true when
+                   WantCaptureMouse was set but still CALLED
+                   this.dispatchTouchEvent(ev) for down/up first - the
+                   tap reached the app anyway (the audit's
+                   "taps on the menu still leak to the host app").
+                   The hit test reads the window rects menu.cpp/overlay
+                   publish each frame, mapped through the touch map. */
+                if (down && gHitTest) {
+                    try { gTouchEat = !!gHitTest(rx, ry); } catch (eH) {}
+                }
+                if (act === 1 || act === 3) gTouchEat = false;  /* UP/CANCEL */
                 if (act === 0 || act === 2) {   /* r22/audit: throttled map
                                                    refresh on DOWN + MOVE */
                     var now = Date.now();
@@ -1156,40 +1318,24 @@ function installTouchHook() {
                         report_map(find_gl_view(this));
                     }
                 }
-                /* let the overlay decide (menu/keyboard own the tap) */
-                if (gWantMouse && gWantMouse()) {
-                    if (down || act === 1 || act === 3)
-                        this.dispatchTouchEvent(ev);   /* original call */
-                    return true;                        /* consume */
+                if (gTouchEat) {
+                    /* menu owns the whole gesture: ImGui already got
+                       every event via gNativeTouch above; the app
+                       never does. MOVE/UP keep flowing to ImGui so
+                       drags and button releases work. */
+                    return true;                     /* consume */
                 }
             } catch (e) {}
             return this.dispatchTouchEvent(ev);         /* original call */
         };
         agentLog('phase: dispatchTouchEvent hook ok');
-        sendMsg('info', { msg: 'touch hook installed (r22, screen coords + IME activity capture + map refresh on DOWN)' });
+        sendMsg('info', { msg: 'touch hook installed (r23, screen coords + hit-test click-through + IME activity capture + map refresh on DOWN)' });
     });
 }
 
 /* ---------------- class info ---------------- */
-function field_lines(jc, inst) {
-    var out = [];
-    var fs = jc.class.getDeclaredFields();
-    for (var i = 0; i < fs.length; i++) {
-        var f = fs[i];
-        try {
-            f.setAccessible(true);
-            var t = f.getType().getName();
-            var val = '?';
-            if (inst) val = jstr(f.get(inst));
-            else {
-                var st = (f.getModifiers() & 8) !== 0;   /* STATIC */
-                val = st ? jstr(f.get(null)) : '(instance)';
-            }
-            out.push(f.getName() + ':' + t + '=' + val);
-        } catch (e) { out.push(f.getName() + ':?'); }
-    }
-    return out;
-}
+/* (r23: field_lines() removed with the "n:t=v;n=v" instance protocol;
+   instances now use the structured field_rows() below) */
 function method_lines(jc) {
     var out = [];
     var ms = jc.class.getDeclaredMethods();
@@ -1221,6 +1367,28 @@ function field_lines_light(jc) {
     return out;
 }
 
+/* r23: structured instance fields - values through field_repr()
+   (toString-safe); replaces the mangled "n:t=v;n:t=v" protocol whose
+   delimiters corrupted values containing | # or ; */
+function field_rows(jc, inst) {
+    var out = [];
+    try {
+        var fs = jc.class.getDeclaredFields();
+        for (var i = 0; i < fs.length; i++) {
+            var f = fs[i];
+            var nm = '?';
+            try { nm = String(f.getName()); } catch (e0) {}
+            try {
+                f.setAccessible(true);
+                out.push({ n: nm,
+                           t: String(f.getType().getName()),
+                           v: field_repr(f.get(inst)) });
+            } catch (e1) { out.push({ n: nm, t: '?', v: '?' }); }
+        }
+    } catch (e2) {}
+    return out;
+}
+
 /* ---------------- recorder ----------------
    r11: scoped. Only classes matching the package filter are hooked and
    installation stops at cap methods; the r10 version hooked every
@@ -1248,7 +1416,9 @@ setInterval(rec_flush, 500);
 function rec_install_chunk(list, batch) {
     /* r12: Stop must also abort a still-running installation (the
        r11 Stop left the loop hooking classes, so the Recorder tab
-       looked stuck on "installing ...") */
+       looked stuck on "installing ...").
+       r23: every method goes through the layering registry, so
+       stopRecorder can remove all recorder layers again. */
     if (!REC.on) {
         REC.busy = false;
         sendMsg('recorderStopped', { installed: REC.installed });
@@ -1257,42 +1427,19 @@ function rec_install_chunk(list, batch) {
     for (var i = 0; i < batch && REC.idx < list.length; i++, REC.idx++) {
         if (REC.installed >= REC.cap) break;
         var cls = list[REC.idx];
-        if (!rec_wanted(cls, REC.filter)) continue;
         try {
             var jc = Java.use(cls);
             var ms = jc.class.getDeclaredMethods();
+            var seen = {};
             for (var k = 0; k < ms.length; k++) {
                 if (REC.installed >= REC.cap) break;
-                var name = ms[k].getName();
-                var ovl;
-                try { ovl = jc[name].overloads; } catch (e0) { continue; }
-                if (!ovl) continue;
-                var made = 0;
-                for (var oi = 0; oi < ovl.length; oi++) {
-                    if (REC.installed >= REC.cap) break;
-                    try {
-                        (function (ov, cn, mn) {
-                            ov.implementation = function () {
-                                if (!REC.on) {
-                                    /* pass-through, no cost when stopped */
-                                    return ov.apply(this, arguments);
-                                }
-                                if (REC.ring.length < 4000) {
-                                    var ret, err = '';
-                                    try { ret = ov.apply(this, arguments); }
-                                    catch (e1) { err = String(e1).substring(0, 80); throw e1; }
-                                    REC.ring.push({ cls: cn, m: mn,
-                                        a: jargs(arguments),
-                                        r: jstr(ret), x: err });
-                                    return ret;
-                                }
-                                return ov.apply(this, arguments);
-                            };
-                            made++;
-                            REC.installed++;
-                        })(ovl[oi], cls, name);
-                    } catch (e2) {}
-                }
+                var name;
+                try { name = String(ms[k].getName()); } catch (eN) { continue; }
+                if (seen[name]) continue;
+                seen[name] = 1;
+                try {
+                    REC.installed += install_layer(cls, name, 'rec', {});
+                } catch (e0) {}
             }
         } catch (e3) {}
     }
@@ -1351,92 +1498,74 @@ setInterval(function () { if (MON.on) mon_flush(); }, 600);
 
 function mon_install() {
     Java.perform(function () {
-        /* OkHttp: request line at RealCall.execute/enqueue */
+        /* r23: monitor hooks go through the layering registry, so
+           stopMonitor removes them again (r22 left them installed
+           forever - the audit's "stopMonitor doesn't unhook") */
+        var okhttpOk = false;
         try {
-            var RealCall = Java.use('okhttp3.RealCall');
-            RealCall.execute.overloads.forEach(function (ov) {
-                ov.implementation = function () {
-                    try {
-                        if (MON.on) {
-                            var req = this.request();
+            if (dt_is_loaded('okhttp3.RealCall')) {
+                install_layer('okhttp3.RealCall', 'execute', 'mon', {
+                    fn: function (self) {
+                        try {
+                            var req = self.request();
                             var url = String(req.url());
                             mon_push('http', url, String(req.method()),
                                      mon_origin('okhttp:' + url),
                                      'headers ' + req.headers().size());
-                        }
-                    } catch (e) {}
-                    return ov.apply(this, arguments);
-                };
-            });
-            /* r22/audit: enqueue too - most apps issue async calls,
-               hooking only execute() saw nothing */
-            RealCall.enqueue.overloads.forEach(function (ov) {
-                ov.implementation = function () {
-                    try {
-                        if (MON.on) {
-                            var req = this.request();
+                        } catch (e) {}
+                    }
+                });
+                install_layer('okhttp3.RealCall', 'enqueue', 'mon', {
+                    fn: function (self) {
+                        try {
+                            var req = self.request();
                             var url = String(req.url());
                             mon_push('http', url, String(req.method()),
                                      mon_origin('okhttp:' + url),
                                      'async, headers ' + req.headers().size());
-                        }
-                    } catch (e) {}
-                    return ov.apply(this, arguments);
-                };
-            });
-            MON.okhttp = true;
-        } catch (e) { MON.okhttp = false; }
+                        } catch (e) {}
+                    }
+                });
+                okhttpOk = true;
+            }
+        } catch (e) { okhttpOk = false; }
 
         /* HttpURLConnection: URL at connect time */
         try {
-            var URL = Java.use('java.net.URL');
-            URL.openConnection.overloads.forEach(function (ov) {
-                ov.implementation = function () {
+            install_layer('java.net.URL', 'openConnection', 'mon', {
+                fn: function (self) {
                     try {
-                        if (MON.on)
-                            mon_push('urlconn', String(this.toString()), 'open',
-                                     mon_origin('url:' + this.toString()), '');
+                        mon_push('urlconn', String(self.toString()), 'open',
+                                 mon_origin('url:' + self.toString()), '');
                     } catch (e) {}
-                    return ov.apply(this, arguments);
-                };
+                }
             });
         } catch (e) {}
 
         /* SSL: best-effort note only; full plaintext would need
            SSL_read/SSL_write native hooks */
         try {
-            var SSLSocket = Java.use('javax.net.ssl.SSLSocket');
+            Java.use('javax.net.ssl.SSLSocket');
             mon_push('ssl', 'engine', 'note',
                      '', 'SSLSocket reachable');
         } catch (e) {}
 
         sendMsg('monitorInfo', {
-            note: 'okhttp ' + (MON.okhttp ? 'hooked' : 'absent') +
+            note: 'okhttp ' + (okhttpOk ? 'hooked' : 'absent') +
                    ', urlconn hooked'
         });
     });
 }
 
 /* ---------------- helpers for exports ---------------- */
-function use_cls_parts(cls, member) {
-    var jc;
-    try { jc = Java.use(cls); } catch (e) { return null; }
-    var found = null;
-    try {
-        if (jc[member]) found = jc[member];
-    } catch (e) {}
-    if (!found) {
-        try {
-            var ms = jc.class.getDeclaredMethods();
-            for (var i = 0; i < ms.length; i++)
-                if (ms[i].getName() === member) { found = jc[member]; break; }
-        } catch (e2) {}
-    }
-    return found ? { jc: jc, m: found } : null;
-}
+/* (r23: use_cls_parts() removed - layer installs resolve the member
+   themselves) */
 
-function call_with_args(ov, argStrings, isCtor) {
-    /* map the text args onto the overload's parameter types */
+function call_with_args(ov, argStrings, isCtor, recv) {
+    /* map the text args onto the overload's parameter types.
+       r23: `recv` is the retained-instance receiver for instance
+       methods (the old call was ov.apply(null, ...) - no receiver,
+       so instance methods could never be invoked). */
     var params = ov.argumentTypes;
     var real = [];
     for (var i = 0; i < params.length; i++) {
@@ -1445,7 +1574,7 @@ function call_with_args(ov, argStrings, isCtor) {
             if (t === 'int' || t === 'short' || t === 'byte' ||
                 t === 'long' || t === 'float' || t === 'double') { real.push(0); continue; }
             if (t === 'boolean') { real.push(false); continue; }
-            if (t === 'char') { real.push('a'); continue; }
+            if (t === 'char') { real.push('\u0000'); continue; }
             real.push(null); continue;
         }
         if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
@@ -1453,14 +1582,425 @@ function call_with_args(ov, argStrings, isCtor) {
         else if (t === 'float' || t === 'double')
             real.push(parseFloat(s) || 0.0);
         else if (t === 'boolean') real.push(s === 'true');
-        else if (t === 'char') real.push(s.length ? s.charCodeAt(0) : 'a');
+        else if (t === 'char') real.push(s.length ? s.charCodeAt(0) : '\u0000');
         else if (t.lastIndexOf('[') === 0) real.push(null);
         else real.push(s);
     }
-    return ov.apply(null, real);
+    return ov.apply(recv || null, real);
+}
+
+var gModCls = null;
+function is_static_method(jc, method) {
+    try {
+        var ms = jc.class.getDeclaredMethods();
+        for (var i = 0; i < ms.length; i++) {
+            if (String(ms[i].getName()) !== method) continue;
+            try {
+                if (!gModCls) gModCls = Java.use('java.lang.reflect.Modifier');
+                if (gModCls.isStatic(ms[i].getModifiers())) return true;
+            } catch (e0) {}
+        }
+    } catch (e1) {}
+    return false;
+}
+
+/* r23: recursion-safe args renderer for tracker events (field_repr
+   per value instead of String(v) - see the note above field_repr) */
+function describe_safe(a) {
+    try {
+        var s = '';
+        for (var i = 0; i < a.length && i < 8; i++) {
+            var d = field_repr(a[i]);
+            if (d.length > 60) d = d.substring(0, 57) + '...';
+            s += (i ? ',' : '') + d;
+        }
+        if (s.length > 240) s = s.substring(0, 237) + '...';
+        return s;
+    } catch (e) { return '?'; }
+}
+
+/* r23: retained-instance registry (the audit's "Instance-method
+   Call": callMethod/setInstanceField had NO receiver - instances
+   were addressed by a bare scan index that died when the scan
+   returned). Handles are Java.retain()ed global references; the
+   table is capped and evicts oldest-first. */
+var gInstHandles = {};     /* id -> retained wrapper */
+var INST_ID = 0, INST_GEN = 0;
+var INST_LIMIT = 200;
+function inst_put(inst) {
+    var id = ++INST_ID;
+    try {
+        gInstHandles[id] = Java.retain(inst);
+        var keys = Object.keys(gInstHandles);
+        if (keys.length > INST_LIMIT) {
+            keys.sort(function (a, b) { return (a | 0) - (b | 0); });
+            while (keys.length > INST_LIMIT) {
+                var old = keys.shift();
+                try { if (gInstHandles[old]) ime_release_act(gInstHandles[old]); }
+                catch (e0) {}
+                delete gInstHandles[old];
+            }
+        }
+        return id;
+    } catch (e) { return -1; }
+}
+function inst_get(handle) {
+    if (typeof handle !== 'number' || handle <= 0) return null;
+    return gInstHandles[handle] || null;
+}
+
+function set_field_value(f, recv, value) {
+    var t = String(f.getType().getName());
+    if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
+        f.set(recv, parseInt(value, 10) || 0);
+    else if (t === 'boolean') f.set(recv, value === 'true');
+    else if (t === 'float' || t === 'double')
+        f.set(recv, parseFloat(value) || 0.0);
+    else if (t === 'char')
+        f.set(recv, (value || 'a').charCodeAt(0));
+    else f.set(recv, value);
+}
+
+/* ---------------- unified hook layering registry (r23) ----------------
+   Hook, Tracker, field-Tracker, Recorder and Monitor used to assign
+   ov.implementation INDEPENDENTLY - the last install silently
+   replaced every previous one (audit: "Hook, Tracker, and Recorder
+   overwrite each other's ov.implementation"). Every layer of a
+   class+method now lives in ONE registry entry; a single dispatcher
+   per overload runs all active layers around exactly ONE call into
+   the original. Removing the last layer of a method restores the
+   original implementation - which is what makes Recorder/Monitor
+   Stop really unhook this time. */
+var LAYERS = {};   /* 'cls!method' -> { ovs: [overloads], parts: {kind: state} } */
+
+function noop_ret(ov) {
+    var rt = ov.returnType.name;
+    if (rt === 'int' || rt === 'long' || rt === 'short' || rt === 'byte')
+        return 0;
+    if (rt === 'float' || rt === 'double') return 0;
+    if (rt === 'boolean') return false;
+    if (rt === 'char') return '\u0000';
+    return null;
+}
+
+function dispatch_layers(K, ov, self, args) {
+    var i = K.indexOf('!');
+    var cls = K.substring(0, i), mn = K.substring(i + 1);
+    var L = LAYERS[K];
+    var p = L ? L.parts : {};
+    var hk = p.hook;
+    var out;
+    try {
+        if (hk && hk.on && hk.mode === 'noop') {
+            out = noop_ret(ov);
+        } else if (hk && hk.on) {
+            /* r22 semantics kept: the user fn gets receiver/args/orig();
+               a throw falls back to the original call */
+            try {
+                out = hk.fn(Java, send, CONSOLE(), self,
+                            Array.prototype.slice.call(args),
+                            function () {
+                                return ov.apply(self,
+                                    arguments.length ? arguments : args);
+                            });
+            } catch (e1) {
+                sendMsg('error', { fn: 'hook:' + K,
+                                   msg: String(e1.message || e1) });
+                out = ov.apply(self, args);
+            }
+            /* smali hooks return null to mean "default value" (r22) */
+            if (hk.mode === 'Smali' && out === null)
+                out = noop_ret(ov);
+        } else {
+            out = ov.apply(self, args);
+        }
+    } catch (e2) {
+        /* recorder row for the failing call, then rethrow (r22) */
+        try {
+            if (p.rec && REC.on && REC.ring.length < 4000)
+                REC.ring.push({ cls: cls, m: mn, a: jargs(args),
+                                r: '', x: String(e2).substring(0, 80) });
+        } catch (e3) {}
+        throw e2;
+    }
+    /* observer layers see the FINAL result; each is isolated */
+    try {
+        if (p.rec && REC.on && REC.ring.length < 4000)
+            REC.ring.push({ cls: cls, m: mn, a: jargs(args),
+                            r: jstr(out), x: '' });
+    } catch (e4) {}
+    try {
+        if (p.mon && MON.on) p.mon.fn(self, args);
+    } catch (e5) {}
+    try {
+        if (p.trk) {
+            var tk = trackers[p.trk.key];
+            if (tk && tk.on) {
+                sendMsg('trackerEvent', {
+                    name: p.trk.key,
+                    callers: jstack(5).filter(function (c) {
+                        return c !== p.trk.key;
+                    }).slice(0, 4),
+                    args: describe_safe(args),
+                    ret: field_repr(out), err: ''
+                });
+            }
+        }
+    } catch (e6) {}
+    try {
+        if (p.fld) field_layer_emit(p.fld, self);
+    } catch (e7) {}
+    return out;
+}
+
+/* field-tracker emission - r23: values through field_repr(), never
+   the app's toString() (the audit's Tracker Side Effects item) */
+function field_layer_emit(st, self) {
+    var tk = trackers[st.key];
+    if (!tk || !tk.on) return;
+    var v = st.stat ? field_repr(st.f.get(null))
+                    : (self ? field_repr(st.f.get(self)) : '?');
+    if (v !== st.last) {
+        sendMsg('trackerEvent', { name: st.key, callers: jstack(3),
+                                  args: st.last + ' -> ' + v,
+                                  ret: '', err: '' });
+        st.last = v;
+    } else {
+        sendMsg('trackerEvent', { name: st.key, callers: [],
+                                  args: v, ret: '', err: '' });
+    }
+}
+
+/* returns the number of overloads carrying this method's layers */
+function install_layer(cls, mn, kind, state) {
+    var K = cls + '!' + mn;
+    var L = LAYERS[K];
+    if (!L) {
+        var jc = Java.use(cls);   /* caller decides the <clinit> policy */
+        var node = null;
+        try { node = jc[mn]; } catch (eN) {}
+        var ovs = node && node.overloads;
+        if (!ovs || !ovs.length) return 0;
+        L = { ovs: ovs, parts: {} };
+        LAYERS[K] = L;
+        ovs.forEach(function (ov) {
+            ov.implementation = function () {
+                return dispatch_layers(K, ov, this, arguments);
+            };
+        });
+    }
+    L.parts[kind] = state || {};
+    return L.ovs.length;
+}
+
+function uninstall_layer(cls, mn, kind) {
+    var K = cls + '!' + mn;
+    var L = LAYERS[K];
+    if (!L) return;
+    delete L.parts[kind];
+    if (!Object.keys(L.parts).length) {
+        try {
+            L.ovs.forEach(function (ov) { ov.implementation = null; });
+        } catch (e) {}
+        delete LAYERS[K];
+    }
+}
+
+function uninstall_all(kind) {
+    Object.keys(LAYERS).forEach(function (K) {
+        var i = K.indexOf('!');
+        uninstall_layer(K.substring(0, i), K.substring(i + 1), kind);
+    });
+}
+
+/* ---------------- class access without premature <clinit> (r23) ------
+   frida-java-bridge runs ensureClassInitialized() on EVERY fresh
+   Java.use(), so hooking a class the app has not initialized yet
+   force-runs its static initializer (audit: "Class Initialization").
+   The bridge exposes no non-initializing path, so the agent only
+   Java.use()s classes that are ALREADY LOADED and defers everything
+   else: a one-time loadClass watcher installs the queued install the
+   moment the target app loads the class. */
+var gLoadedSet = null, gLoadedAt = 0;
+function dt_is_loaded(cls) {
+    var now = Date.now();
+    if (!gLoadedSet || now - gLoadedAt > 3000) {
+        try {
+            var all = Java.enumerateLoadedClassesSync();
+            var set = {};
+            for (var i = 0; i < all.length; i++) set[all[i]] = 1;
+            gLoadedSet = set;
+            gLoadedAt = now;
+        } catch (e0) {}
+    }
+    return !!(gLoadedSet && gLoadedSet[cls]);
+}
+
+function use_loaded(cls) {
+    if (!dt_is_loaded(cls))
+        throw new Error('class not loaded yet: ' + cls +
+                        ' (its <clinit> will not be forced)');
+    return Java.use(cls);
+}
+
+var gDeferred = [];        /* queued installs: {kind, cls, fn} */
+var gWatcherOvs = null;    /* loadClass overloads we hooked, for restore */
+function defer_install(kind, cls, fn) {
+    gDeferred.push({ kind: kind, cls: cls, fn: fn });
+    if (!gWatcherOvs) install_load_watcher();
+    sendMsg('info', { msg: 'class ' + cls + ' not loaded yet - ' + kind +
+                           ' deferred until it loads' });
+}
+function install_load_watcher() {
+    Java.perform(function () {
+        try {
+            var CL = Java.use('java.lang.ClassLoader');
+            var ovs = [];
+            CL.loadClass.overloads.forEach(function (ov) {
+                if (ov.argumentTypes.length !== 1) return;   /* name only */
+                ov.implementation = function (name) {
+                    var c = ov.apply(this, [name]);
+                    try { pump_deferred(String(name)); } catch (e0) {}
+                    return c;
+                };
+                ovs.push(ov);
+            });
+            gWatcherOvs = ovs;
+            agentLog('phase: loadClass watcher armed (' +
+                     ovs.length + ' overloads)');
+        } catch (e) {
+            gWatcherOvs = null;
+            sendMsg('warn', { msg: 'loadClass watcher failed: ' +
+                                  String(e.message || e) });
+        }
+    });
+}
+function stop_load_watcher() {
+    if (!gWatcherOvs) return;
+    try {
+        gWatcherOvs.forEach(function (ov) { ov.implementation = null; });
+    } catch (e0) {}
+    gWatcherOvs = null;
+    agentLog('phase: loadClass watcher removed (queue empty)');
+}
+function pump_deferred(loadedName) {
+    if (!gDeferred.length) { stop_load_watcher(); return; }
+    /* r23: entries are removed from the queue BEFORE they run - the
+       install itself calls Java.use(), which goes through the
+       loadClass hook again, and a re-entrant pump must never re-run
+       the same install (infinite recursion). */
+    var run = [], stay = [];
+    for (var i = 0; i < gDeferred.length; i++) {
+        (gDeferred[i].cls === loadedName ? run : stay).push(gDeferred[i]);
+    }
+    gDeferred = stay;
+    if (!gDeferred.length) stop_load_watcher();
+    for (var j = 0; j < run.length; j++) {
+        try { run[j].fn(); } catch (e1) {
+            sendMsg('error', { fn: 'deferred:' + run[j].kind,
+                               msg: String(e1.message || e1) });
+        }
+    }
 }
 
 var patches = {}, hooks = {}, trackers = {};
+
+/* r23: hook/tracker install bodies, factored out so the deferred
+   loader can run them when the target class finally loads */
+function do_addHook(cls, method, mode, code) {
+    var key = cls + '.' + method;
+    var jc = Java.use(cls);
+    var node = null;
+    try { node = jc[method]; } catch (eN) {}
+    if (!node || !node.overloads || !node.overloads.length) {
+        sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+        return;
+    }
+    if (mode === 'Java') {
+        var fn = new Function('Java', 'send', 'console', 'thiz',
+                              'args', 'orig', code);
+        var st = { mode: mode, on: true, code: code, fn: fn };
+        if (!install_layer(cls, method, 'hook', st)) {
+            sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+            return;
+        }
+        hooks[key] = st;
+        sendMsg('hookAdded', { name: key });
+    } else if (mode === 'noop') {
+        var st2 = { mode: mode, on: true, code: code, fn: null };
+        if (!install_layer(cls, method, 'hook', st2)) {
+            sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+            return;
+        }
+        hooks[key] = st2;
+        sendMsg('hookAdded', { name: key });
+    } else if (mode === 'Smali') {
+        var gen = 'H' + (Date.now() % 1000000);
+        var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
+                   '.super Ljava/lang/Object;\n' +
+                   '.method public static hook(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;\n' +
+                   /* r22/audit: default .locals - user code without a
+                      registers directive died in the assembler */
+                   (/^\s*\.(locals|registers)\b/m.test(code) ? '' : '    .locals 4\n') +
+                   code + '\n' +
+                   '.end method\n';
+        var art = smali_compile(skel);
+        if (art.err) {
+            sendMsg('hookFailed', { name: key, error: art.err });
+            return;
+        }
+        art.cls = 'com.dextool.hook.' + gen;
+        var loaded = smali_load(art);
+        if (!loaded.ok) {
+            sendMsg('hookFailed', { name: key, error: loaded.err });
+            return;
+        }
+        var st3 = { mode: mode, on: true, code: code,
+                    fn: function (J, S, C, thiz, a) {
+                        var arr = Java.array('java.lang.Object', a);
+                        return loaded.hook(thiz, arr);
+                    } };
+        if (!install_layer(cls, method, 'hook', st3)) {
+            sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+            return;
+        }
+        hooks[key] = st3;
+        sendMsg('smaliReady', { name: key, ok: 1, error: '' });
+        sendMsg('hookAdded', { name: key });
+    }
+}
+
+function do_addTracker(cls, method) {
+    var key = cls + '.' + method;
+    if (!install_layer(cls, method, 'trk', { key: key }))
+        throw new Error('method not found: ' + method);
+    trackers[key] = { on: true };
+    sendMsg('info', { msg: 'tracker added ' + key });
+}
+
+function do_trackField(cls, field) {
+    var key = cls + '.' + field;
+    var jc = Java.use(cls);
+    var f = jc.class.getDeclaredField(field);
+    f.setAccessible(true);
+    var stat = (f.getModifiers() & 8) !== 0;
+    var last = stat ? field_repr(f.get(null)) : '(instance)';
+    var ms = jc.class.getDeclaredMethods();
+    var installed = 0;
+    for (var i = 0; i < ms.length; i++) {
+        var mn;
+        try { mn = String(ms[i].getName()); } catch (e0) { continue; }
+        try {
+            installed += install_layer(cls, mn, 'fld',
+                                       { key: key, f: f, stat: stat,
+                                         last: last });
+        } catch (e1) {}
+    }
+    if (!installed) throw new Error('no hookable methods on ' + cls);
+    trackers[key] = { on: true };
+    sendMsg('info', { msg: 'field tracker added ' + key +
+                           ' (approximation, toString-safe)' });
+}
 
 /* r22/audit: static-field patch helpers - the ORIGINAL value is
    captured before the first write so OFF / delete can put it back */
@@ -1552,125 +2092,38 @@ rpc.exports = {
         else if (ml === 'smali') mode = 'Smali';
         else if (ml === 'noop') mode = 'noop';
         Java.perform(function () {
-            var hit = use_cls_parts(cls, method);
-            if (!hit) {
-                sendMsg('hookFailed', { name: key, error: 'class or method not found' });
+            /* r23: never force <clinit> - defer until the class loads */
+            if (!dt_is_loaded(cls)) {
+                defer_install('hook', cls, function () {
+                    try { do_addHook(cls, method, mode, code); }
+                    catch (eD) {
+                        sendMsg('hookFailed', { name: key,
+                                                error: String(eD.message || eD) });
+                    }
+                });
                 return;
             }
-            var jc = hit.jc;
-            try {
-                if (mode === 'Java') {
-                    var fn = new Function('Java', 'send', 'console', 'thiz',
-                                          'args', 'orig', code);
-                    jc[method].overloads.forEach(function (ov) {
-                        ov.implementation = function () {
-                            if (!hooks[key] || !hooks[key].on)
-                                return ov.apply(this, arguments);
-                            /* r22/audit: keep the receiver + args for
-                               orig() - `this` inside the closure is
-                               NOT the intercepted call's receiver */
-                            var self = this, orig_args = arguments;
-                            try {
-                                return fn(Java, send, CONSOLE(),
-                                          self, Array.prototype.slice.call(orig_args),
-                                          function () {
-                                              return ov.apply(self,
-                                                  arguments.length ? arguments : orig_args);
-                                          });
-                            } catch (e1) {
-                                sendMsg('error', { fn: 'hook:' + key,
-                                                   msg: String(e1.message || e1) });
-                                return ov.apply(this, arguments);
-                            }
-                        };
-                    });
-                    hooks[key] = { mode: mode, on: true, code: code };
-                    sendMsg('hookAdded', { name: key });
-                } else if (mode === 'noop') {
-                    jc[method].overloads.forEach(function (ov) {
-                        ov.implementation = function () {
-                            if (!hooks[key] || !hooks[key].on)
-                                return ov.apply(this, arguments);
-                            var rt = ov.returnType.name;
-                            if (rt === 'int' || rt === 'long' || rt === 'short' ||
-                                rt === 'byte') return 0;
-                            if (rt === 'float' || rt === 'double') return 0;
-                            if (rt === 'boolean') return false;
-                            if (rt === 'char') return '\u0000';
-                            return null;
-                        };
-                    });
-                    hooks[key] = { mode: mode, on: true, code: code };
-                    sendMsg('hookAdded', { name: key });
-                } else if (mode === 'Smali') {
-                    var gen = 'H' + (Date.now() % 1000000);
-                    var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
-                               '.super Ljava/lang/Object;\n' +
-                               '.method public static hook(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;\n' +
-                               /* r22/audit: default .locals - user code
-                                  without a registers directive died in
-                                  the assembler */
-                               (/^\s*\.(locals|registers)\b/m.test(code) ? '' : '    .locals 4\n') +
-                               code + '\n' +
-                               '.end method\n';
-                    var art = smali_compile(skel);
-                    if (art.err) {
-                        sendMsg('hookFailed', { name: key, error: art.err });
-                        return;
-                    }
-                    art.cls = 'com.dextool.hook.' + gen;
-                    var loaded = smali_load(art);
-                    if (!loaded.ok) {
-                        sendMsg('hookFailed', { name: key, error: loaded.err });
-                        return;
-                    }
-                    jc[method].overloads.forEach(function (ov) {
-                        ov.implementation = function () {
-                            if (!hooks[key] || !hooks[key].on)
-                                return ov.apply(this, arguments);
-                            try {
-                                var arr = Java.array('java.lang.Object',
-                                    Array.prototype.slice.call(arguments));
-                                var r = loaded.hook(this, arr);
-                                if (r === null) {
-                                    var rt = ov.returnType.name;
-                                    if (rt === 'int' || rt === 'long' || rt === 'short' ||
-                                        rt === 'byte') return 0;
-                                    if (rt === 'boolean') return false;
-                                    if (rt === 'char') return '\u0000';
-                                    if (rt === 'float' || rt === 'double') return 0;
-                                }
-                                return r;
-                            } catch (e1) {
-                                sendMsg('error', { fn: 'smali-hook:' + key,
-                                                   msg: String(e1.message || e1) });
-                                return ov.apply(this, arguments);
-                            }
-                        };
-                    });
-                    hooks[key] = { mode: mode, on: true, code: code };
-                    sendMsg('smaliReady', { name: key, ok: 1, error: '' });
-                    sendMsg('hookAdded', { name: key });
-                }
-            } catch (e) {
-                sendMsg('hookFailed', { name: key, error: String(e.message || e) });
+            try { do_addHook(cls, method, mode, code); }
+            catch (e0) {
+                sendMsg('hookFailed', { name: key,
+                                        error: String(e0.message || e0) });
             }
         });
     },
     setHookEnabled: function (cls, method, en) {
         var key = cls + '.' + method;
+        /* r23: hooks[key] IS the LAYERS part object - flipping .on is
+           enough, the dispatcher reads it live */
         if (hooks[key]) hooks[key].on = en;
         sendMsg('info', { msg: 'hook ' + key + ' -> ' + (en ? 'on' : 'off') });
     },
     removeHook: function (cls, method) {
         var key = cls + '.' + method;
         Java.perform(function () {
-            try {
-                var hit = use_cls_parts(cls, method);
-                if (hit) hit.jc[method].overloads.forEach(function (ov) {
-                    ov.implementation = null;
-                });
-            } catch (e) {}
+            /* r23: remove the layer - other layers on the same method
+               (tracker/recorder) survive, and the original
+               implementation returns when this was the last one */
+            uninstall_layer(cls, method, 'hook');
             delete hooks[key];
             sendMsg('info', { msg: 'hook removed ' + key });
         });
@@ -1681,90 +2134,67 @@ rpc.exports = {
         var key = cls + '.' + method;
         Java.perform(function () {
             try {
-                var jc = Java.use(cls);
-                jc[method].overloads.forEach(function (ov) {
-                    ov.implementation = function () {
-                        var out, err = '';
-                        try { out = ov.apply(this, arguments); }
-                        catch (e1) { err = String(e1).substring(0, 100); throw e1; }
-                        if (trackers[key] && trackers[key].on) {
-                            /* r22/audit: exclude the tracked method
-                               from its own callers list */
-                            var ev = { name: key,
-                                       callers: jstack(5).filter(function (c) {
-                                           return c !== key;
-                                       }).slice(0, 4),
-                                       args: describe(arguments), ret: jstr(out),
-                                       err: err };
-                            sendMsg('trackerEvent', ev);
+                if (!dt_is_loaded(cls)) {
+                    defer_install('tracker', cls, function () {
+                        try { do_addTracker(cls, method); }
+                        catch (eD) {
+                            sendMsg('error', { fn: 'addTracker',
+                                               msg: String(eD.message || eD) });
                         }
-                        return out;
-                    };
-                });
-                trackers[key] = { on: true };
-                sendMsg('info', { msg: 'tracker added ' + key });
+                    });
+                    return;
+                }
+                do_addTracker(cls, method);
             } catch (e) {
-                sendMsg('error', { fn: 'addTracker', msg: String(e.message || e) });
+                sendMsg('error', { fn: 'addTracker',
+                                   msg: String(e.message || e) });
             }
         });
     },
     trackField: function (cls, field) {
-        /* ART has no field read/write barriers: approximate by watching
-           the value before/after every declared method call of the class */
+        /* ART has no field read/write barriers: approximate by
+           watching the value before/after every declared method call
+           of the class. r23: values go through field_repr() - the old
+           jstr(f.get(...)) called the app's toString() INSIDE our
+           hooks (recursion/crash when toString is itself recorded). */
         var key = cls + '.' + field;
         Java.perform(function () {
             try {
-                var jc = Java.use(cls);
-                var f = jc.class.getDeclaredField(field);
-                f.setAccessible(true);
-                var st = (f.getModifiers() & 8) !== 0;
-                var last = st ? jstr(f.get(null)) : '(instance)';
-                jc.class.getDeclaredMethods().forEach(function (md) {
-                    var mn;
-                    try { mn = md.getName(); } catch (e0) { return; }
-                    var m;
-                    try { m = jc[mn]; } catch (e1) { return; }
-                    if (!m || !m.overloads) return;
-                    m.overloads.forEach(function (ov) {
-                        try {
-                            ov.implementation = function () {
-                                var r = ov.apply(this, arguments);
-                                try {
-                                    if (trackers[key] && trackers[key].on) {
-                                        var v = st ?
-                                            jstr(f.get(null)) :
-                                            (this ? jstr(f.get(this)) : '?');
-                                        if (v !== last) {
-                                            sendMsg('trackerEvent', {
-                                                name: key,
-                                                callers: jstack(3),
-                                                args: last + ' -> ' + v,
-                                                ret: '', err: ''
-                                            });
-                                            last = v;
-                                        } else {
-                                            sendMsg('trackerEvent', {
-                                                name: key, callers: [],
-                                                args: v, ret: '', err: ''
-                                            });
-                                        }
-                                    }
-                                } catch (e2) {}
-                                return r;
-                            };
-                        } catch (e3) {}
+                if (!dt_is_loaded(cls)) {
+                    defer_install('field tracker', cls, function () {
+                        try { do_trackField(cls, field); }
+                        catch (eD) {
+                            sendMsg('error', { fn: 'trackField',
+                                               msg: String(eD.message || eD) });
+                        }
                     });
-                });
-                trackers[key] = { on: true };
-                sendMsg('info', { msg: 'field tracker added ' + key + ' (approximation)' });
+                    return;
+                }
+                do_trackField(cls, field);
             } catch (e) {
-                sendMsg('error', { fn: 'trackField', msg: String(e.message || e) });
+                sendMsg('error', { fn: 'trackField',
+                                   msg: String(e.message || e) });
             }
         });
     },
     removeTracker: function (name) {
-        delete trackers[name];
-        sendMsg('info', { msg: 'tracker removed ' + name });
+        Java.perform(function () {
+            /* r23: the layer(s) are removed for real; the class's
+               methods return to their original implementations when
+               nothing else tracks/records/hooks them */
+            Object.keys(LAYERS).forEach(function (K) {
+                var L = LAYERS[K];
+                if (!L) return;
+                var i = K.indexOf('!');
+                var cls = K.substring(0, i), mn = K.substring(i + 1);
+                if (L.parts.trk && L.parts.trk.key === name)
+                    uninstall_layer(cls, mn, 'trk');
+                if (L.parts.fld && L.parts.fld.key === name)
+                    uninstall_layer(cls, mn, 'fld');
+            });
+            delete trackers[name];
+            sendMsg('info', { msg: 'tracker removed ' + name });
+        });
     },
 
     /* ---- recorder ---- */
@@ -1804,10 +2234,14 @@ rpc.exports = {
         });
     },
     stopRecorder: function () {
-        /* r12: REC.on=false now also aborts a still-running install
-           (see rec_install_chunk) */
+        /* r12: REC.on=false also aborts a still-running install
+           (see rec_install_chunk).
+           r23: uninstall_all('rec') removes the recorder layer from
+           every method - hooks are GONE, not just silent (the audit's
+           "hooks are never removed on stop"). */
         REC.on = false;
         REC.busy = false;
+        Java.perform(function () { uninstall_all('rec'); });
         rec_flush();
         sendMsg('recorderStopped', { installed: REC.installed });
     },
@@ -1823,6 +2257,9 @@ rpc.exports = {
     stopMonitor: function () {
         MON.on = false;
         mon_flush();
+        Java.perform(function () {
+            uninstall_all('mon');    /* r23: really unhook */
+        });
         sendMsg('monitorStopped', {});
     },
 
@@ -1881,13 +2318,12 @@ rpc.exports = {
     openClass: function (cls) {
         Java.perform(function () {
             try {
-                var jc = Java.use(cls);
-                /* r12: field VALUES are no longer read here.
-                   field_lines(jc, null) called f.get(null) on every
-                   static - and a static read can run the class's
-                   <clinit>, which may block forever inside app code.
-                   That was the "tap a class and the app hangs" bug
-                   (together with the menu-side nested lock). */
+                /* r12: field VALUES are no longer read here - a static
+                   read can run the class's <clinit> and block forever.
+                   r23: use_loaded() also refuses UNLOADED classes -
+                   Java.use() itself runs <clinit> through the bridge's
+                   ensureClassInitialized. */
+                var jc = use_loaded(cls);
                 sendMsg('classInfo', {
                     class: cls,
                     methods: method_lines(jc),
@@ -1904,7 +2340,7 @@ rpc.exports = {
     readStaticFields: function (cls) {
         Java.perform(function () {
             try {
-                var jc = Java.use(cls);
+                var jc = use_loaded(cls);   /* r23: no forced <clinit> */
                 var fs = jc.class.getDeclaredFields();
                 var out = [];
                 for (var i = 0; i < fs.length; i++) {
@@ -1929,25 +2365,61 @@ rpc.exports = {
     hideIme: function () { ime_hide(); },
     listInstances: function (cls) {
         Java.perform(function () {
-            var out = [];
+            var rows = [];
+            var gen = ++INST_GEN;
             try {
+                var jc = Java.use(cls);
                 Java.choose(cls, {
                     onMatch: function (inst) {
-                        var fl = field_lines(Java.use(cls), inst);
-                        out.push(jstr(inst) + '##' + fl.join(';'));
-                        if (out.length >= 20) return 'stop';
+                        try {
+                            /* r23: retain + structured fields; the old
+                               "##"/";" protocol corrupted values and
+                               the bare scan index gave later calls no
+                               receiver at all. The label is NOT run
+                               through jstr() - its | -> ! and # -> %
+                               rewrites were only needed by the old
+                               delimiter protocol. */
+                            var h = inst_put(inst);
+                            var lbl = '';
+                            try { lbl = String(inst); }
+                            catch (eL) { lbl = '(toString failed)'; }
+                            if (lbl.length > 160)
+                                lbl = lbl.substring(0, 157) + '...';
+                            rows.push({ str: lbl, handle: h,
+                                        fields: field_rows(jc, inst) });
+                        } catch (e0) {}
+                        if (rows.length >= 20) return 'stop';
                     },
                     onComplete: function () {
-                        sendMsg('instanceList', { class: cls, instances: out });
+                        sendMsg('instanceList', { class: cls, gen: gen,
+                                                  instances: rows });
                     }
                 });
             } catch (e) {
-                sendMsg('instanceList', { class: cls, instances: out });
+                sendMsg('instanceList', { class: cls, gen: gen,
+                                          instances: rows });
             }
         });
     },
-    setInstanceField: function (cls, index, field, value) {
+    setInstanceField: function (cls, index, field, value, handle) {
         Java.perform(function () {
+            var key = cls + '.' + field;
+            /* r23: a retained handle addresses the instance directly
+               (the scan-index path is only the fallback now) */
+            var recv = inst_get(handle);
+            if (recv) {
+                try {
+                    var jc = Java.use(cls);
+                    var f = jc.class.getDeclaredField(field);
+                    f.setAccessible(true);
+                    set_field_value(f, recv, value);
+                    sendMsg('patchApplied', { name: key });
+                } catch (e1) {
+                    sendMsg('patchFailed', { name: key,
+                                             error: String(e1.message || e1) });
+                }
+                return;
+            }
             try {
                 var found = [];
                 Java.choose(cls, {
@@ -1962,47 +2434,60 @@ rpc.exports = {
                             var jc = Java.use(cls);
                             var f = jc.class.getDeclaredField(field);
                             f.setAccessible(true);
-                            var t = f.getType().getName();
-                            if (t === 'int' || t === 'long' || t === 'short' ||
-                                t === 'byte') f.set(inst, parseInt(value, 10) || 0);
-                            else if (t === 'boolean') f.set(inst, value === 'true');
-                            else if (t === 'float' || t === 'double')
-                                f.set(inst, parseFloat(value) || 0.0);
-                            else if (t === 'char')
-                                f.set(inst, (value || 'a').charCodeAt(0));
-                            else f.set(inst, value);
-                            sendMsg('patchApplied', { name: cls + '.' + field });
-                        } catch (e1) {
-                            sendMsg('patchFailed', { name: cls + '.' + field,
-                                                     error: String(e1.message || e1) });
+                            set_field_value(f, inst, value);
+                            sendMsg('patchApplied', { name: key });
+                        } catch (e2) {
+                            sendMsg('patchFailed', { name: key,
+                                                     error: String(e2.message || e2) });
                         }
                     }
                 });
             } catch (e) {}
         });
     },
-    callMethod: function (cls, method, args) {
+    callMethod: function (cls, method, args, handle) {
         Java.perform(function () {
             try {
-                var jc = Java.use(cls);
+                /* r23: use_loaded - no forced <clinit> on unloaded
+                   classes */
+                var jc = use_loaded(cls);
+                var recv = inst_get(handle);
+                var node = null;
+                try { node = jc[method]; } catch (e0) {}
+                if (!node || !node.overloads || !node.overloads.length)
+                    throw new Error('method not found: ' + method);
+                var ovs = node.overloads;
+                var want = args ? args.length : 0;
                 var best = null;
-                jc[method].overloads.forEach(function (ov) {
-                    var np = ov.argumentTypes.length;
-                    if (np === (args ? args.length : 0)) { best = ov; }
-                });
-                if (!best) {
-                    jc[method].overloads.forEach(function (ov) {
-                        if (!best) best = ov;
-                    });
+                for (var i = 0; i < ovs.length; i++) {
+                    if (ovs[i].argumentTypes.length === want) {
+                        best = ovs[i];
+                        break;
+                    }
                 }
-                if (!best) throw new Error('no overload');
-                var r = call_with_args(best, args || [], false);
+                if (!best) best = ovs[0];
+                if (recv) {
+                    /* r23: instance-method call WITH a receiver (the
+                       audit's "callMethod fails because it has no
+                       receiver") */
+                    var r = call_with_args(best, args || [], false, recv);
+                    sendMsg('callResult', {
+                        class: cls, ok: 1, result: jstr(r), error: ''
+                    });
+                    return;
+                }
+                if (!is_static_method(jc, method))
+                    throw new Error('instance method - Find instances, ' +
+                        'pick one, then Call (a retained handle is ' +
+                        'required as the receiver)');
+                var r2 = call_with_args(best, args || [], false, null);
                 sendMsg('callResult', {
-                    class: cls, ok: 1, result: jstr(r), error: ''
+                    class: cls, ok: 1, result: jstr(r2), error: ''
                 });
             } catch (e) {
                 sendMsg('callResult', {
-                    class: cls, ok: 0, result: '', error: String(e.message || e)
+                    class: cls, ok: 0, result: '',
+                    error: String(e.message || e)
                 });
             }
         });
@@ -2188,8 +2673,8 @@ var FN_ARGS = {
     showIme:         [],
     hideIme:         [],
     listInstances:   ['class'],
-    setInstanceField:['class', 'index', 'field', 'value'],
-    callMethod:      ['class', 'method', 'args']
+    setInstanceField:['class', 'index', 'field', 'value', 'handle'],
+    callMethod:      ['class', 'method', 'args', 'handle']
 };
 
 /* r14: phased startup. gum_script_load_sync must ALWAYS return:
@@ -2214,6 +2699,6 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r22 loaded' });
+    sendMsg('ready', { msg: 'Dex-tool agent r23 loaded' });
     agentLog('phase: ready sent');
 }, 0);

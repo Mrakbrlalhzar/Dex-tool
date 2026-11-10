@@ -149,7 +149,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r22: third-party audit fixes - ONE ordered input queue with UTF-16 surrogate recombination, double-draw guard spans the real eglSwapBuffers, texture binding restored on unit 0, logger FILE* checked under the lock + private crash log rotated on retarget + existing sigaltstack kept + terminate survives no-exception, bridge queues early agent messages + logs uncaught JS errors, r21 IME host fixes kept)");
+    log_info("logger_init done (build r23: audit patch 2 - exact JSON message routing + dextool_hit_test click-through + ONE hook-layering registry for Hook/Tracker/Recorder/Monitor (stop really unhooks) + retained instance handles with structured instance protocol + loadClass-deferred installs (no forced <clinit>) + toString-safe field tracking + vertex-attrib state saved/restored + eglTerminate scoped to its own display + parked worlds forget stale GL names + agent-start failures shown in the UI, r22 ordered-input/audit fixes kept)");
 }
 
 /* r16: re-point the logs at the app's real private dir.

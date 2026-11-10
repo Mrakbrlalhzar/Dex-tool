@@ -19,7 +19,12 @@ public class DexToolApp extends Application {
         startLogcatThread();
         writeBootMarker();
         startCopierThread();
-        try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+        /* r23: the Thread.sleep(500) that ran HERE blocked the MAIN
+           thread half a second on every app start (the audit's
+           "Thread.sleep(500) on the main thread" item). Nothing below
+           depends on the daemon threads being up - the logcat process
+           and the copier start on their own threads - so the sleep is
+           simply gone. */
         installUncaughtHandler();
         try {
             System.loadLibrary("tool");
