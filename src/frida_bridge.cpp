@@ -51,6 +51,25 @@ static std::string raw_json_string(const std::string& j, const char* key) {
     return j.substr(p, i - p);
 }
 
+/* r24: escape a C string for inline embedding into a JSON envelope.
+   The GumJS failure text (err->message) is arbitrary text - pasted
+   in raw, quotes/backslashes inside it produced an INVALID envelope
+   the menu's jstr() then failed to parse (Settings stayed
+   "waiting" even though a message had arrived). */
+static std::string jesc_bridge(const char* s) {
+    std::string o;
+    for (; s && *s; s++) {
+        char c = *s;
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if ((unsigned char)c < 0x20) {
+            char b[8];
+            snprintf(b, sizeof(b), "\\u%04x", (unsigned char)c);
+            o += b;
+        } else o += c;
+    }
+    return o;
+}
+
 static const char kErrEnvelope[] = "{\"type\":\"error\"";
 
 /* r23: shared delivery to the menu (callback if registered, backlog
@@ -126,12 +145,19 @@ void frida_bridge_start(JavaVM*) {
         snprintf(m, sizeof(m), "[frida_bridge] create: %s\n",
                  err ? err->message : "(null)");
         log_crash_raw(m);
-        /* r23: the Settings tab now shows WHY the agent is not coming up */
-        char jm[640];
+        /* r23: the Settings tab now shows WHY the agent is not coming up.
+           r24: the message is JSON-escaped - err->message is arbitrary
+           text and the raw paste could break the envelope. */
+        char jm[768];
+        std::string em = jesc_bridge(err ? err->message : "(null)");
+        /* escape expansion can be 6x - cap the text so the envelope
+           is ALWAYS closed (a truncated tail would be invalid JSON
+           and the menu would drop the message) */
+        if (em.size() > 400) em = em.substr(0, 400);
         snprintf(jm, sizeof(jm),
                  "{\"type\":\"agentStatus\",\"payload\":{\"ok\":0,"
                  "\"msg\":\"script create failed: %s\"}}",
-                 err ? err->message : "(null)");
+                 em.c_str());
         deliver(jm);
         if (err) g_error_free(err);
         return;

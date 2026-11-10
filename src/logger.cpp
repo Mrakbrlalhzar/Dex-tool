@@ -149,7 +149,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r23: audit patch 2 - exact JSON message routing + dextool_hit_test click-through + ONE hook-layering registry for Hook/Tracker/Recorder/Monitor (stop really unhooks) + retained instance handles with structured instance protocol + loadClass-deferred installs (no forced <clinit>) + toString-safe field tracking + vertex-attrib state saved/restored + eglTerminate scoped to its own display + parked worlds forget stale GL names + agent-start failures shown in the UI, r22 ordered-input/audit fixes kept)");
+    log_info("logger_init done (build r24: audit patch 3 - field-tracker emits only on value change with 20 ms poll + 100 ms emit throttles (menu-freeze fix), dt_is_loaded forces one rebuild on cache miss, lazy LAYERS key parsing in the dispatcher, eaten gestures no longer leak UP, IME Enter forwarded to ImGui so the class filter searches, background-only opacity via SetNextWindowBgAlpha, escaped agentStatus JSON, IME ladder stops when the keyboard is up (isAcceptingText + session token), console keeps the newest 400 lines, child-scoped auto-scroll, dev-only push trigger, r23 click-through/layering/instance protocol kept)");
 }
 
 /* r16: re-point the logs at the app's real private dir.

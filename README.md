@@ -3,6 +3,66 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r24)
+
+Patch #3 of the audits: severe performance bugs (the menu froze on
+heavier apps - logcat "Skipped 40 frames! The application may be
+doing too much work on its main thread") plus logic and CI
+leftovers.
+
+- **Field-tracker flooding (agent):** `field_layer_emit` sent a
+  `trackerEvent` on EVERY method call of the tracked class, changed
+  value or not - hot classes flooded the bridge and froze the menu.
+  The field is now polled at most every 20 ms, events are emitted
+  only when the value actually changed, and at most once per 100 ms
+  per field.
+- **`dt_is_loaded` race (agent):** the 3 s loaded-class cache could
+  predate a class actually loading, and `loadClass` never fires
+  again for a class that is already loaded - the queued install
+  waited forever. A cache miss now forces ONE rebuild of the set
+  (once per cache generation) before the class is declared
+  unloaded.
+- **Dispatcher overhead (agent):** the LAYERS key was substring'd
+  on every hooked call; class/method names are parsed lazily now
+  (only recorder rows need them), and the touch dispatcher keeps
+  doing the minimum on the main thread.
+- **Eaten gestures no longer leak UP (agent):** `gTouchEat` was
+  cleared on UP/CANCEL before the consume check, so the app got an
+  UP for a gesture whose DOWN the menu had consumed. The flag is
+  captured first, cleared second, consumed last.
+- **Enter searches now (menu.cpp + agent):** the class filter
+  declares `EnterReturnsTrue`, but the phone IME's Done/Search only
+  hid the keyboard. `onEditorAction` forwards an `imeEnter` message
+  first; the menu injects a real `ImGuiKey_Enter` press (DOWN, then
+  UP next frame) before the field is released.
+- **Opacity is background-only (menu.cpp):** `style.Alpha` faded
+  everything - text included - on top of the window background
+  alpha. `style.Alpha` is gone; `SetNextWindowBgAlpha(s_opacity)`
+  is the single opacity source.
+- **agentStatus JSON escaping (frida_bridge.cpp):** the GumJS start
+  failure text (`err->message`) was pasted into the JSON envelope
+  unescaped; quotes inside it produced an envelope the menu could
+  not parse. Escaped now.
+- **IME ladder stops when the keyboard is up (agent):** every retry
+  re-sent `showSoftInput` and logged "showSoftInput sent -> true"
+  up to 4x per tap. Retries check `isAcceptingText()` (logged
+  once), and each show request carries a session token - a newer
+  request or Done/hide invalidates the pending ladder.
+- **Console keeps rolling (menu.cpp):** the 400-line guard dropped
+  every new line once full, so the console appeared to stop. It
+  keeps the newest 400 lines now.
+- **Auto-scroll targets the list (menu.cpp):** the Recorder/Script
+  auto-scroll ran after `EndChild()` and scrolled the PARENT
+  window; it now runs inside the child list.
+- **CI:** the push trigger is restricted to `dev` (it fired from
+  every branch and pushed to `dev`); the menu title says r24.
+- **Known limitation, documented:** frida-java-bridge's `Java.use`
+  ALWAYS forces `<clinit>` on a loaded-but-uninitialized class.
+  The loadClass deferral only avoids classes that are not loaded
+  YET - it cannot avoid initialization of loaded classes, because
+  the bridge offers no non-initializing use(). Stated here and in
+  the agent source instead of pretending it is fixed.
+
 ## Fixes in this version (r23)
 
 Patch #2 of the 47-item audit: the 22 open items plus the 7 partial
@@ -37,8 +97,10 @@ ones finished.
   index - no more stale text across classes.
 - **Class initialization:** hooks/trackers only `Java.use` classes
   that are ALREADY loaded; anything else is deferred and installed by
-  a `loadClass` watcher when the app loads the class (no forced
-  `<clinit>`).
+  a `loadClass` watcher when the app loads the class. Known
+  limitation (see r24 below): `Java.use` still forces `<clinit>` on
+  loaded-but-uninitialized classes - the bridge offers no
+  non-initializing use().
 - **Tracker side effects:** field/tracker values go through
   `field_repr()` - primitives and boxes only, everything else is
   `@class#identityHashCode`; the app's `toString()` is never called

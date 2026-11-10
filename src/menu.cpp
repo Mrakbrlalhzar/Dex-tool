@@ -339,7 +339,10 @@ static void post_rpc(const char* fn, const std::string& args) {
 static void push_console(const char* tag, const std::string& line) {
     char b[256];
     snprintf(b, sizeof(b), "%s %s", tag, line.c_str());
-    if (s_cons.size() < 400) s_cons.push_back(b);
+    /* r24: keep the NEWEST 400 lines - the old guard DROPPED every
+       line past 400, so the console simply appeared to stop */
+    s_cons.push_back(b);
+    if (s_cons.size() > 400) s_cons.erase(s_cons.begin());
 }
 
 /* ---------------- cross-linking ---------------- */
@@ -502,8 +505,10 @@ static void apply_theme() {
         case 1: ImGui::StyleColorsLight();   break;
         case 2: ImGui::StyleColorsClassic(); break;
     }
-    ImGuiStyle& st = ImGui::GetStyle();
-    st.Alpha = s_opacity;
+    /* r24: style.Alpha is GONE - it faded EVERYTHING (text, child
+       windows, the FAB) while the spec wants only the window
+       BACKGROUND transparent. menu_draw() uses
+       SetNextWindowBgAlpha(s_opacity), the single opacity source. */
     ImGui::GetIO().FontGlobalScale = 1.0f;   /* real size comes from the
                                                atlas, not from scaling */
 }
@@ -521,6 +526,8 @@ static void apply_theme() {
 static bool s_ime_active = false;   /* a text field owns ImGui focus */
 static bool s_ime_clear  = false;   /* drop active id next frame      */
 static ImGuiID s_ime_owner = 0;     /* r23: WHICH field owns the IME */
+static int  s_ime_enter = 0;        /* r24: 2 = inject Enter DOWN, 1 = UP */
+static bool s_ime_enter_rel = false; /* r24: release the field after the key */
 
 static void ime_show() { post_rpc("showIme", "{}"); }
 static void ime_hide() { post_rpc("hideIme", "{}"); }
@@ -530,15 +537,32 @@ static void ime_close_if_active() {
 }
 
 /* once per frame, before the menu window: if the user closed the
-   phone keyboard, release the ImGui field as well */
+   phone keyboard, release the ImGui field as well. r24: forward the
+   phone IME's Enter (Done/Search) as a real ImGui key press - DOWN
+   this frame, UP the next (both in one frame would be swallowed,
+   key state is sampled once per frame). The active InputText sees
+   the DOWN and, with EnterReturnsTrue (the class filter), fires
+   its search. */
 static void ime_frame_prelude() {
-    bool clear = false;
+    bool clear = false, enter_down = false, enter_up = false;
     MLK();
     clear = s_ime_clear;
     s_ime_clear = false;
     if (clear) s_ime_active = false;
+    if (s_ime_enter == 2) { s_ime_enter = 1; enter_down = true; }
+    else if (s_ime_enter == 1) {
+        s_ime_enter = 0; enter_up = true;
+        if (s_ime_enter_rel) {
+            s_ime_enter_rel = false;
+            if (s_ime_active) { s_ime_active = false; clear = true; }
+        }
+    }
     MULK();
     if (clear) ImGui::ClearActiveID();
+    if (enter_down || enter_up) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddKeyEvent(ImGuiKey_Enter, enter_down);
+    }
 }
 
 /* plain InputText wired to the system keyboard. r23: `extra` lets a
@@ -607,10 +631,21 @@ void menu_init() {
             s_cls_auto_done = false;  /* new agent: re-list classes */
             snprintf(s_agent_note, sizeof(s_agent_note), "%s",
                      jstr(j, "msg").c_str());
+        } else if (ty == "imeEnter") {
+            /* r24: the phone IME's Enter/Search - the menu injects a
+               real Enter key press over the next two frames so
+               fields with EnterReturnsTrue (class filter) search */
+            s_ime_enter = 2;
         } else if (ty == "imeHidden") {
             /* user closed the phone keyboard (Done / back):
-               drop ImGui focus so the next tap re-opens it */
-            if (s_ime_active) { s_ime_active = false; s_ime_clear = true; }
+               drop ImGui focus so the next tap re-opens it.
+               r24: with an Enter forward in flight the release is
+               DEFERRED - clearing now would deactivate the field
+               before the key arrives and the search would be lost. */
+            if (s_ime_active) {
+                if (s_ime_enter > 0) s_ime_enter_rel = true;
+                else { s_ime_active = false; s_ime_clear = true; }
+            }
         } else if (ty == "staticValues") {
             /* r12: static values are read on demand only - reading
                them during openClass() ran <clinit> of arbitrary
@@ -1090,10 +1125,14 @@ static void tab_recorder() {
             ImGui::PopID();
         }
     }
-    ImGui::EndChild();
-    mark_scroll_item(s_lst_scroll);
+    /* r24: auto-scroll must run INSIDE the child - after EndChild()
+       the GetScrollY/SetScrollHereY pair operated on the PARENT
+       window (the whole menu jumped instead of the list following
+       the new rows) */
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
         ImGui::SetScrollHereY(1.f);
+    ImGui::EndChild();
+    mark_scroll_item(s_lst_scroll);
     MULK();
 }
 
@@ -1161,10 +1200,11 @@ static void tab_script() {
     MLK();
     ImGui::BeginChild("consl", ImVec2(0, 200), true);
     for (auto& l : s_cons) ImGui::TextUnformatted(l.c_str());
-    ImGui::EndChild();
-    mark_scroll_item(s_lst_scroll);
+    /* r24: auto-scroll inside the child (see the Recorder tab) */
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
         ImGui::SetScrollHereY(1.f);
+    ImGui::EndChild();
+    mark_scroll_item(s_lst_scroll);
     MULK();
 }
 
@@ -1591,12 +1631,14 @@ void menu_draw() {
     ImGui::SetNextWindowSizeConstraints(
         ImVec2(420, 300), ImVec2(ds.x * .95f, ds.y * .95f));
     ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
-    /* r23 UI polish: opacity was applied TWICE - apply_theme() already
-       sets style.Alpha, and the SetNextWindowBgAlpha(s_opacity) here
-       multiplied the window background by the same value again
-       (0.92 rendered as ~0.85). style.Alpha is the single source. */
+    /* r24: the r23 "style.Alpha is the single source" call was wrong -
+       style.Alpha faded EVERYTHING (text included) while the spec
+       wants only the window BACKGROUND transparent. apply_theme() no
+       longer touches style.Alpha; SetNextWindowBgAlpha(s_opacity)
+       here is the single opacity source. */
+    ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.2 (r14)", &open,
+    ImGui::Begin("Dex-tool v1.2 (r24)", &open,
                  ImGuiWindowFlags_NoCollapse);
     if (!open) {
         MLK();
