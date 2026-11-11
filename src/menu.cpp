@@ -1435,25 +1435,18 @@ static void class_tab_content(ClassTab& c) {
 }
 
 static void tab_classes() {
-    /* r12: the full class list loads BY DEFAULT - no "+ search" gate.
-       The agent streams every loaded class in pages of 400; the
-       filter row just re-queries with a substring. */
+    /* r25 PERF FIX: r12's unconditional auto-load fired
+       Java.enumerateLoadedClassesSync() the INSTANT this tab
+       first opened. That call walks the whole process class
+       table (every classloader, bootclasspath included) and
+       ART briefly suspends every thread to do it safely - a
+       no-op on the sample app's tiny table, a multi-second
+       stall on a real app's (much bigger) one. The full list
+       is now an explicit tap, same as search already was
+       (r23) - nothing fires until the user asks for it. */
     MLK();
     bool agent_ready = s_agent_ready;
-    bool need_auto   = !s_cls_auto_done && !s_search_wait &&
-                       s_search_res.empty();
-    int  qid         = 0;
-    if (agent_ready && need_auto) {
-        s_cls_auto_done = true;
-        s_search_wait   = true;
-        qid = ++s_search_seq;
-        s_search_qid   = qid;      /* r23: generation armed at SEND time */
-        s_search_page0 = false;
-    }
     MULK();
-    if (qid)
-        post_rpc("listLoadedClasses",
-                 "{\"filter\":\"\",\"qid\":" + std::to_string(qid) + "}");
 
     bool do_search = false;
     MLK();
@@ -1467,7 +1460,12 @@ static void tab_classes() {
     ImGui::SameLine();
     if (ImGui::Button("Search##cls")) do_search = true;
     ImGui::SameLine();
-    if (s_search_wait) ImGui::TextDisabled("(listing...)");
+    if (!s_cls_auto_done && !s_search_wait && s_search_res.empty()) {
+        if (agent_ready && ImGui::Button("Load all##cls_load"))
+            do_search = true;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(can pause the app briefly on big apps)");
+    } else if (s_search_wait) ImGui::TextDisabled("(listing...)");
     else ImGui::TextDisabled("%ld of %ld loaded classes",
                              (long)s_search_shown, (long)s_search_total);
     ImGui::BeginChild("srch", ImVec2(0, 220), true);
@@ -1486,6 +1484,7 @@ static void tab_classes() {
     MULK();
     if (do_search) {
         MLK();
+        s_cls_auto_done = true;
         s_search_wait = true;
         int sqid = ++s_search_seq;
         s_search_qid   = sqid;     /* r23: generation armed at SEND time */

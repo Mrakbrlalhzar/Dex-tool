@@ -1936,7 +1936,14 @@ function dt_rebuild_loaded_set() {
 }
 function dt_is_loaded(cls) {
     var now = Date.now();
-    if (!gLoadedSet || now - gLoadedAt > 3000) {
+    /* r25 PERF FIX: enumerateLoadedClassesSync() suspends every
+       thread in the process to walk the class table safely -
+       cheap on the sample app, a noticeable stutter on a real
+       app's much bigger table. A 3 s TTL re-paid that cost on
+       every miss while adding a few hooks/trackers in a row;
+       20 s still catches a newly-loaded class well within the
+       loadClass watcher's own window, just less often. */
+    if (!gLoadedSet || now - gLoadedAt > 20000) {
         dt_rebuild_loaded_set();
         gLoadedRechecked = false;   /* new cache generation */
     }
