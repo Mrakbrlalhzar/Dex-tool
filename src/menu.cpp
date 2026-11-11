@@ -93,6 +93,30 @@ struct ClassTab {
     MethodSig call_sig;
     char call_args[8][128] = {};
     std::string call_result;
+    /* r25: method input/output patch editor. The agent probes ONE
+       call of the method (ioprobe layer), reports the captured
+       current values, and only the rows the user P-marked are
+       patched from then on. */
+    bool io_open  = false;              /* editor visible            */
+    bool io_wait  = false;              /* probe in flight           */
+    MethodSig io_sig;                   /* which method is edited    */
+    int  io_nargs = 0;
+    char io_arg_typ[8][64]  = {};       /* parameter types           */
+    char io_arg_cur[8][128] = {};       /* captured current values   */
+    char io_arg[8][128]     = {};       /* patch values (editable)   */
+    bool io_arg_on[8]       = {};       /* patch this argument       */
+    char io_ret_typ[64]     = {};
+    char io_ret_cur[128]    = {};
+    char io_ret[128]        = {};
+    bool io_ret_on          = false;
+    std::string io_result;
+    /* r25: members that contain the code-text search string - the
+       Methods/Fields lists paint these rows green */
+    std::vector<std::string> hits_m, hits_f;
+    bool hit(const std::vector<std::string>& v, const std::string& n) const {
+        for (auto& s : v) if (s == n) return true;
+        return false;
+    }
 };
 struct PatchRow { std::string cls, field, value; bool enabled=true;
                   std::string note; };
@@ -104,7 +128,9 @@ struct Tracker  { std::string name;              /* full Class.member */
                   bool is_field=false;
                   std::vector<TrackRow> log; };
 struct RecRow   { std::string cls, method, args, ret, extra; };
-struct MonRow   { std::string kind, url, method, origin, note; };
+/* r25: detail carries the payload/body preview shown in the detail
+   window (request body, response body peek, stream note) */
+struct MonRow   { std::string kind, url, method, origin, note, detail; };
 
 static std::vector<ClassTab>  s_classes;
 static std::vector<PatchRow>   s_patches;
@@ -127,6 +153,19 @@ static int  s_hmode=0, s_hedit=-1;
 static char s_tcls[200]={}, s_tmth[128]={};
 static char s_script[16384]="// Frida JS - Java, send, console are available\n";
 static char s_search[160]="";
+/* r25: 0 class name, 1 method name, 2 field name, 3 code text.
+   s_search_sys=false hides android/androidx/com.android/com.google/
+   java/javax/dalvik/kotlin packages (the field report asked for
+   "no Android and Google classes"); the checkbox brings them back. */
+static int  s_search_mode = 0;
+static bool s_search_sys  = false;
+/* r25: read-only source panel of the Hooks tab (real smali via the
+   bundled baksmali; Java decompilation is NOT bundled) */
+static char s_hsrc[16384] = "";
+static char s_hsrc_note[200] = "";
+static bool s_hsrc_have = false;
+/* r25: selected row of the Monitor list -> detail window */
+static int  s_mon_sel = -1;
 static std::vector<std::string> s_search_res;
 static bool s_cls_auto_done=false;   /* full class list requested once
                                         per agent session */
@@ -424,7 +463,7 @@ static RecRow parse_rec(const std::string& s) {
     r.extra = s.substr(p3 + 1);
     return r;
 }
-/* "kind|url|method|origin|note" */
+/* "kind|url|method|origin|note|detail" (r25: + payload preview) */
 static MonRow parse_mon(const std::string& s) {
     MonRow m;
     auto p1 = s.find('|'); if (p1 == std::string::npos) { m.note=s; return m; }
@@ -436,7 +475,10 @@ static MonRow parse_mon(const std::string& s) {
     auto p4 = s.find('|', p3+1);
     if (p4 == std::string::npos) { m.origin = s.substr(p3+1); return m; }
     m.origin = s.substr(p3+1, p4-p3-1);
-    m.note = s.substr(p4+1);
+    auto p5 = s.find('|', p4+1);
+    if (p5 == std::string::npos) { m.note = s.substr(p4+1); return m; }
+    m.note   = s.substr(p4+1, p5-p4-1);
+    m.detail = s.substr(p5+1);
     return m;
 }
 /* (r23: parse_inst() removed with the "a##n=v;n=v" instance protocol -
@@ -668,6 +710,65 @@ void menu_init() {
                 c->fields.clear();
                 for (auto& f : jarr(j, "fields"))
                     c->fields.push_back(parse_field(f));
+                /* r25: members whose code contains the active
+                   code-text search string (empty unless the last
+                   search was mode 3) - painted green below */
+                c->hits_m = jarr(j, "hits_m");
+                c->hits_f = jarr(j, "hits_f");
+            }
+        } else if (ty == "methodSrc") {
+            /* r25: real smali of one method (bundled baksmali) for
+               the read-only source panel of the Hooks tab */
+            if (jstr(j, "class") == s_hcls &&
+                jstr(j, "method") == s_hmth) {
+                if (jnum(j, "ok")) {
+                    std::string src = jstr(j, "src");
+                    snprintf(s_hsrc, sizeof(s_hsrc), "%s", src.c_str());
+                    snprintf(s_hsrc_note, sizeof(s_hsrc_note),
+                             "smali (bytecode) of %s.%s",
+                             s_hcls, s_hmth);
+                    s_hsrc_have = true;
+                } else {
+                    s_hsrc[0] = 0;
+                    s_hsrc_have = false;
+                    snprintf(s_hsrc_note, sizeof(s_hsrc_note),
+                             "source: %s", jstr(j, "error").c_str());
+                }
+            }
+        } else if (ty == "methodIO") {
+            /* r25: captured input/output values of ONE call - fills
+               the per-method IO patch editor. The reply must match
+               the method the user probed, or an IO opened on a
+               second method would be filled by the first probe. */
+            ClassTab* c = find_tab(jstr(j, "class"));
+            if (c && c->io_wait && jstr(j, "method") == c->io_sig.name) {
+                c->io_wait = false;
+                if (!jnum(j, "ok")) {
+                    c->io_result = "probe: " + jstr(j, "error");
+                } else {
+                    int idx = 0;
+                    for (auto& o : jobjarr(j, "params")) {
+                        if (idx >= 8) break;
+                        snprintf(c->io_arg_typ[idx], sizeof(c->io_arg_typ[idx]),
+                                 "%s", jstr(o, "t").c_str());
+                        std::string v = jstr(o, "v");
+                        snprintf(c->io_arg_cur[idx], sizeof(c->io_arg_cur[idx]),
+                                 "%s", v.c_str());
+                        snprintf(c->io_arg[idx], sizeof(c->io_arg[idx]),
+                                 "%s", v.c_str());
+                        c->io_arg_on[idx] = false;   /* only edited+P rows patch */
+                        idx++;
+                    }
+                    c->io_nargs = idx;
+                    snprintf(c->io_ret_typ, sizeof(c->io_ret_typ),
+                             "%s", jstr(j, "rettyp").c_str());
+                    std::string rv = jstr(j, "ret");
+                    snprintf(c->io_ret_cur, sizeof(c->io_ret_cur), "%s", rv.c_str());
+                    snprintf(c->io_ret, sizeof(c->io_ret), "%s", rv.c_str());
+                    c->io_ret_on = false;
+                    c->io_open = true;
+                    c->io_result.clear();
+                }
             }
         } else if (ty == "classList") {
             /* r11: the agent streams the full result in pages of 400;
@@ -950,7 +1051,7 @@ static void tab_patches() {
 
 /* ===================== Hooks ===================== */
 static void tab_hooks() {
-    const char* modes[] = {"Java(JS)", "Smali", "noop"};
+    const char* modes[] = {"Java(JS)", "Smali", "Nop (auto)"};
     if (s_hedit >= 0 && s_hedit < (int)s_hooks.size()) {
         HookRow& e = s_hooks[s_hedit];
         snprintf(s_hcls,  sizeof(s_hcls), "%s", e.cls.c_str());
@@ -966,7 +1067,52 @@ static void tab_hooks() {
                               ImVec2(-1, 90));
     ImGui::TextDisabled("Java: fn(Java,send,console,thiz,args,orig). "
                         "Smali: body of static hook(Object thiz, Object[] args); "
-                        "p0=thiz p1=args, must return an Object.");
+                        "p0=thiz p1=args, must return an Object. "
+                        "Nop(auto): skips the body and returns the "
+                        "default for the method's return type.");
+    /* r25: read-only SOURCE panel - the real method body, disassembled
+       on-device by the bundled baksmali. Java decompilation is not
+       bundled (a decompiler is heavy and would run inside the host
+       process), so BOTH modes show the bytecode: in Smali mode it is
+       the exact language the hook is written in; in Java mode it is
+       the same logic the Frida hook wraps. Copy the body into the
+       editor and adapt it. */
+    if (ImGui::CollapsingHeader("Method source##hsrc")) {
+        if (ImGui::SmallButton("Load source")) {
+            if (s_hcls[0] && s_hmth[0]) {
+                std::string a = "{\"class\":\"" + jesc(s_hcls)
+                              + "\",\"method\":\"" + jesc(s_hmth) + "\"}";
+                post_rpc("getMethodSrc", a);
+                snprintf(s_hsrc_note, sizeof(s_hsrc_note),
+                         "disassembling...");
+                s_hsrc_have = false;
+            } else {
+                snprintf(s_hsrc_note, sizeof(s_hsrc_note),
+                         "fill Class + Method first");
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", s_hsrc_note);
+        if (s_hsrc_have) {
+            ImGui::BeginChild("hsrcbx", ImVec2(0, 170), true);
+            ImGui::TextUnformatted(s_hsrc);
+            /* r24 pattern kept: auto-scroll must run INSIDE the child */
+            ImGui::EndChild();
+            mark_scroll_item(s_lst_scroll);
+            if (s_hmode == 1 && ImGui::SmallButton("Copy body -> editor")) {
+                /* strip the .method header and .end method so the text
+                   fits the smali hook skeleton (which adds its own
+                   signature); .locals/labels come along */
+                std::string src = s_hsrc;
+                auto b = src.find('\n');
+                if (b != std::string::npos) src = src.substr(b + 1);
+                auto e = src.rfind(".end method");
+                if (e != std::string::npos) src = src.substr(0, e);
+                snprintf(s_hcode, sizeof(s_hcode), "%s", src.c_str());
+            }
+        }
+    }
+    ImGui::Separator();
     if (ImGui::Button("Add Hook") && s_hcls[0] && s_hmth[0]) {
         std::string a = "{\"class\":\"" + jesc(s_hcls)
                       + "\",\"method\":\"" + jesc(s_hmth)
@@ -1173,8 +1319,9 @@ static void tab_monitor() {
             snprintf(lbl, sizeof(lbl), "[%s] %s %s%s",
                      m.kind.c_str(), m.method.c_str(), m.url.c_str(),
                      org.c_str());
-            if (ImGui::Selectable(lbl) && !m.origin.empty())
-                menu_open_class(cls_of_member(m.origin));  /* cross-link */
+            /* r25: a click opens the DETAIL window (payload + origin
+               method); the cross-link moved into that window */
+            if (ImGui::Selectable(lbl)) s_mon_sel = i;
             if (!m.note.empty())
                 ImGui::TextDisabled("    %s", m.note.c_str());
             ImGui::PopID();
@@ -1182,6 +1329,46 @@ static void tab_monitor() {
     }
     ImGui::EndChild();
     mark_scroll_item(s_lst_scroll);
+    /* r25: detail window - more info about the clicked log row:
+       kind, HTTP method, URL, the app method that sent/received it
+       (clickable), note and the payload preview. */
+    if (s_mon_sel >= 0) {
+        if (s_mon_sel >= (int)s_mon.size()) s_mon_sel = -1;
+        else ImGui::OpenPopup("monDetail");
+    }
+    if (ImGui::BeginPopupModal("monDetail", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (s_mon_sel < 0 || s_mon_sel >= (int)s_mon.size()) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        } else {
+            MonRow& m = s_mon[s_mon_sel];
+            ImGui::Text("type:    %s", m.kind.c_str());
+            ImGui::Text("http:    %s", m.method.c_str());
+            ImGui::Text("url:     %s", m.url.c_str());
+            ImGui::Text("origin:  %s",
+                        m.origin.empty() ? "(unknown)" : m.origin.c_str());
+            if (!m.origin.empty() && ImGui::SmallButton("Open class")) {
+                menu_open_class(cls_of_member(m.origin));
+            }
+            if (!m.note.empty())
+                ImGui::Text("note:    %s", m.note.c_str());
+            if (!m.detail.empty()) {
+                ImGui::TextDisabled("payload preview:");
+                ImGui::BeginChild("mondet", ImVec2(460, 200), true);
+                ImGui::TextWrapped("%s", m.detail.c_str());
+                ImGui::EndChild();
+                mark_scroll_item(s_lst_scroll);
+            } else {
+                ImGui::TextDisabled("(no payload captured)");
+            }
+            if (ImGui::Button("Close##mond")) {
+                s_mon_sel = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    }
     MULK();
 }
 
@@ -1361,6 +1548,69 @@ static void class_tab_content(ClassTab& c) {
             }
             ImGui::Separator();
         }
+        /* r25: method INPUT/OUTPUT patch editor - the agent probes
+           one call (ioprobe), the captured values are shown, only
+           the P-marked rows are patched from then on. */
+        if (c.io_open) {
+            ImGui::TextColored(ImVec4(0, 1, 0, 1), "patch IO %s.%s",
+                               c.cname.c_str(), c.io_sig.name.c_str());
+            ImGui::TextDisabled("P = patch this item; only marked "
+                                "items are changed. Values refresh "
+                                "on the next probed call.");
+            for (int k = 0; k < c.io_nargs && k < 8; k++) {
+                ImGui::PushID(3000 + k);
+                ImGui::Checkbox("##ioe", &c.io_arg_on[k]);
+                ImGui::SameLine();
+                ImGui::Text("arg%d (%s) = %s", k, c.io_arg_typ[k],
+                            c.io_arg_cur[k]);
+                ImGui::SetNextItemWidth(220);
+                ime_textfield("##iov", c.io_arg[k], sizeof(c.io_arg[k]));
+                ImGui::PopID();
+            }
+            ImGui::Checkbox("##ioeR", &c.io_ret_on);
+            ImGui::SameLine();
+            ImGui::Text("ret (%s) = %s", c.io_ret_typ, c.io_ret_cur);
+            ImGui::SetNextItemWidth(220);
+            ime_textfield("##iovR", c.io_ret, sizeof(c.io_ret));
+            if (ImGui::Button("Apply patch")) {
+                std::string a = "{\"class\":\"" + jesc(c.cname)
+                              + "\",\"method\":\"" + jesc(c.io_sig.name)
+                              + "\",\"args\":[";
+                int n = 0;
+                for (int k = 0; k < c.io_nargs && k < 8; k++) {
+                    if (!c.io_arg_on[k]) continue;
+                    if (n++) a += ",";
+                    a += "{\"i\":" + std::to_string(k)
+                       + ",\"v\":\"" + jesc(c.io_arg[k]) + "\"}";
+                }
+                a += "],\"ret\":{";
+                a += std::string("\"on\":") + (c.io_ret_on ? "true" : "false");
+                a += ",\"v\":\"" + jesc(c.io_ret) + "\"}}";
+                post_rpc("setMethodIO", a);
+                c.io_result = "...";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Stop patching")) {
+                std::string a = "{\"class\":\"" + jesc(c.cname)
+                              + "\",\"method\":\"" + jesc(c.io_sig.name)
+                              + "\",\"args\":[],\"ret\":{\"on\":false,\"v\":\"\"}}";
+                post_rpc("setMethodIO", a);
+                c.io_result = "patching stopped";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Refresh values")) {
+                std::string a = "{\"class\":\"" + jesc(c.cname)
+                              + "\",\"method\":\"" + jesc(c.io_sig.name) + "\"}";
+                post_rpc("getMethodIO", a);
+                c.io_wait = true;
+                c.io_result = "waiting for the next call...";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Close##ioc")) c.io_open = false;
+            if (!c.io_result.empty())
+                ImGui::TextWrapped("%s", c.io_result.c_str());
+            ImGui::Separator();
+        }
         ImGui::BeginChild("clsm", ImVec2(0, 0), true);
         ImGuiListClipper clip;
         clip.Begin((int)c.methods.size());
@@ -1368,9 +1618,16 @@ static void class_tab_content(ClassTab& c) {
             for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
                 MethodSig& m = c.methods[i];
                 ImGui::PushID(i);
+                /* r25: code-text hits are painted green (field spec:
+                   "methods or fields that have this string should be
+                   marked in green") */
+                bool hitm = c.hit(c.hits_m, m.name);
+                if (hitm) ImGui::PushStyleColor(ImGuiCol_Text,
+                           ImVec4(0.25f, 0.95f, 0.35f, 1.f));
                 ImGui::BulletText("%s(%s) -> %s",
                                   m.name.c_str(), m.params.c_str(),
                                   m.ret.c_str());
+                if (hitm) ImGui::PopStyleColor();
                 if (ImGui::SmallButton("Call##mc")) {
                     c.call_open  = true;
                     c.call_sig   = m;
@@ -1394,6 +1651,45 @@ static void class_tab_content(ClassTab& c) {
                     s_hcode[0] = 0;
                     s_next_tab = "Hooks";
                 }
+                ImGui::SameLine();
+                /* r25: one-tap Nop - auto return value by the method's
+                   return type (void -> return, numeric -> 0, boolean
+                   -> false, object/array -> null), no code needed */
+                if (ImGui::SmallButton("Nop##mn")) {
+                    std::string a = "{\"class\":\"" + jesc(c.cname)
+                                  + "\",\"method\":\"" + jesc(m.name)
+                                  + "\",\"mode\":\"noop\",\"code\":\"\"}";
+                    post_rpc("addHook", a);
+                    MLK();
+                    s_hooks.push_back({c.cname, m.name, 2, "", true, "..."});
+                    MULK();
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Src##ms")) {
+                    /* load the real method body (baksmali) and jump to
+                       the Hooks tab source panel */
+                    snprintf(s_hcls, sizeof(s_hcls), "%s", c.cname.c_str());
+                    snprintf(s_hmth, sizeof(s_hmth), "%s", m.name.c_str());
+                    std::string a = "{\"class\":\"" + jesc(c.cname)
+                                  + "\",\"method\":\"" + jesc(m.name) + "\"}";
+                    post_rpc("getMethodSrc", a);
+                    snprintf(s_hsrc_note, sizeof(s_hsrc_note),
+                             "disassembling...");
+                    s_hsrc_have = false;
+                    s_next_tab = "Hooks";
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("IO##mi")) {
+                    /* probe one call and open the IO patch editor */
+                    c.io_sig   = m;
+                    c.io_wait  = true;
+                    c.io_open  = true;
+                    c.io_nargs = 0;
+                    c.io_result = "waiting for the next call...";
+                    std::string a = "{\"class\":\"" + jesc(c.cname)
+                                  + "\",\"method\":\"" + jesc(m.name) + "\"}";
+                    post_rpc("getMethodIO", a);
+                }
                 ImGui::PopID();
             }
         }
@@ -1413,8 +1709,13 @@ static void class_tab_content(ClassTab& c) {
         for (int i = 0; i < (int)c.fields.size(); i++) {
             FieldInfo& f = c.fields[i];
             ImGui::PushID(i);
+            /* r25: code-text hits are painted green */
+            bool hitf = c.hit(c.hits_f, f.name);
+            if (hitf) ImGui::PushStyleColor(ImGuiCol_Text,
+                       ImVec4(0.25f, 0.95f, 0.35f, 1.f));
             ImGui::BulletText("%s : %s = %s", f.name.c_str(),
                               f.type.c_str(), f.value.c_str());
+            if (hitf) ImGui::PopStyleColor();
             if (ImGui::SmallButton("Patch##fp")) {
                 snprintf(s_pcls, sizeof(s_pcls), "%s", c.cname.c_str());
                 snprintf(s_pfld, sizeof(s_pfld), "%s", f.name.c_str());
@@ -1435,21 +1736,49 @@ static void class_tab_content(ClassTab& c) {
 }
 
 static void tab_classes() {
-    /* r25 PERF FIX: r12's unconditional auto-load fired
-       Java.enumerateLoadedClassesSync() the INSTANT this tab
-       first opened. That call walks the whole process class
-       table (every classloader, bootclasspath included) and
-       ART briefly suspends every thread to do it safely - a
-       no-op on the sample app's tiny table, a multi-second
-       stall on a real app's (much bigger) one. The full list
-       is now an explicit tap, same as search already was
-       (r23) - nothing fires until the user asks for it. */
+    /* r12: the full class list loads BY DEFAULT - no "+ search" gate.
+       The agent streams every loaded class in pages of 400; the
+       filter row just re-queries with a substring. */
     MLK();
     bool agent_ready = s_agent_ready;
+    bool need_auto   = !s_cls_auto_done && !s_search_wait &&
+                       s_search_res.empty();
+    int  qid         = 0;
+    if (agent_ready && need_auto) {
+        s_cls_auto_done = true;
+        s_search_wait   = true;
+        qid = ++s_search_seq;
+        s_search_qid   = qid;      /* r23: generation armed at SEND time */
+        s_search_page0 = false;
+    }
     MULK();
+    /* r25: the AUTO default list is always a plain, sorted class
+       listing (mode 0) - a user who left the mode on Code text
+       would otherwise trigger a full dex scan just by opening the
+       tab. The System gate still applies. */
+    if (qid)
+        post_rpc("listLoadedClasses",
+                 "{\"filter\":\"\",\"qid\":" + std::to_string(qid)
+                 + ",\"mode\":0"
+                 + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}");
 
     bool do_search = false;
     MLK();
+    /* r25: 4 search modes + the system-class gate. Mode 3 (code
+       text) runs the dexlib2/baksmali scan on the agent; modes 0-2
+       are name matches. Search fires on Enter / button only. */
+    const char* smodes[] = {"Class name", "Method name",
+                            "Field name", "Code text"};
+    ImGui::SetNextItemWidth(150.f);
+    if (ImGui::Combo("Mode##smode", &s_search_mode, smodes, 4))
+        do_search = !s_search_wait;      /* re-run with the new mode */
+    ImGui::SameLine();
+    if (ImGui::Checkbox("System", &s_search_sys))
+        do_search = !s_search_wait;      /* re-run with the new gate */
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("show android/androidx/com.android/com.google/"
+                          "java/javax/dalvik/kotlin classes too (off by "
+                          "default - the field spec asked them hidden)");
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 150.f);
     /* r23: search on Enter / button ONLY - every keystroke used to
        re-run enumerateLoadedClasses on the agent (30k+ names per
@@ -1460,12 +1789,7 @@ static void tab_classes() {
     ImGui::SameLine();
     if (ImGui::Button("Search##cls")) do_search = true;
     ImGui::SameLine();
-    if (!s_cls_auto_done && !s_search_wait && s_search_res.empty()) {
-        if (agent_ready && ImGui::Button("Load all##cls_load"))
-            do_search = true;
-        ImGui::SameLine();
-        ImGui::TextDisabled("(can pause the app briefly on big apps)");
-    } else if (s_search_wait) ImGui::TextDisabled("(listing...)");
+    if (s_search_wait) ImGui::TextDisabled("(listing...)");
     else ImGui::TextDisabled("%ld of %ld loaded classes",
                              (long)s_search_shown, (long)s_search_total);
     ImGui::BeginChild("srch", ImVec2(0, 220), true);
@@ -1484,14 +1808,15 @@ static void tab_classes() {
     MULK();
     if (do_search) {
         MLK();
-        s_cls_auto_done = true;
         s_search_wait = true;
         int sqid = ++s_search_seq;
         s_search_qid   = sqid;     /* r23: generation armed at SEND time */
         s_search_page0 = false;
         MULK();
         std::string a = "{\"filter\":\"" + jesc(s_search)
-                       + "\",\"qid\":" + std::to_string(sqid) + "}";
+                       + "\",\"qid\":" + std::to_string(sqid)
+                       + ",\"mode\":" + std::to_string(s_search_mode)
+                       + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}";
         post_rpc("listLoadedClasses", a);
     }
     ImGui::Separator();
@@ -1598,6 +1923,21 @@ static void draw_fab(ImVec2 ds) {
     ImGui::PopStyleVar();
 }
 
+/* ===================== frame pump (r25) =====================
+   0/1/2 level for dextool_want_frames(); the agent postInvalidate()s
+   the host DecorView at this rate so render-on-demand hosts keep
+   producing frames while the menu is up. Without it the menu only
+   advanced when the host happened to swap ("menu hangs, lags and
+   freezes on other apps ... when I touch the app, the touch I had
+   previously made on the menu works"). */
+int menu_frame_pump_level() {
+    MLK();
+    bool vis = s_visible;
+    MULK();
+    if (vis) return 2;                    /* full rate */
+    return overlay_ready() ? 1 : 0;       /* FAB-only slow pump  */
+}
+
 /* ===================== main window ===================== */
 void menu_draw() {
     ImGuiIO& io = ImGui::GetIO();
@@ -1637,7 +1977,7 @@ void menu_draw() {
        here is the single opacity source. */
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.2 (r24)", &open,
+    ImGui::Begin("Dex-tool v1.2 (r25)", &open,
                  ImGuiWindowFlags_NoCollapse);
     if (!open) {
         MLK();

@@ -1,9 +1,50 @@
 'use strict';
-/* Dex-tool agent (r24). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r25). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
 
-   r24 changes (patch #3 - performance on heavy apps + logic/CI
+   r25 changes (field report: menu hangs/lags/freezes on OTHER apps +
+   feature requests for the Hooks/Monitor/Classes sections):
+   - FRAME PUMP (the freeze fix): the menu is drawn inside the
+     eglSwapBuffers hook, so a host that renders on demand (most
+     non-game apps) only advanced the menu when it happened to
+     redraw - queued menu touches waited for the next swap ("when
+     I touch the app, the touch I had previously made on the menu
+     works"). The agent now polls dextool_want_frames() from a 30 ms
+     timer and DecorView.postInvalidate()s the captured activity
+     while frames are wanted: full rate with the menu up, slow rate
+     (FAB only) when it is hidden.
+   - METHOD SOURCE VIEW: "Src" on a method (or Load source in the
+     Hooks tab) disassembles the REAL method body on-device with a
+     bundled baksmali (org.smali 2.5.2 - baksmali is not on Google
+     Maven for 3.x) and shows it in a read-only panel; Smali mode
+     can copy the body into the hook editor. Java decompilation is
+     NOT bundled (too heavy to run inside the host process) - both
+     modes show the bytecode.
+   - ONE-TAP NOP: the "Nop" button adds a noop hook that returns the
+     default value for the method's return type (void -> plain
+     return, numeric -> 0, boolean -> false, object/array -> null).
+   - METHOD INPUT/OUTPUT PATCHING: "IO" probes one call of the
+     method, reports the captured current values (toString-safe),
+     and only the checkbox-marked rows are patched from then on
+     (args replaced before the original call, return value replaced
+     after).
+   - NETWORK MONITOR: okhttp calls now log a REQUEST row AND a
+     RESPONSE row (response body peeked up to 4 KB, request body
+     when accessible); HttpURLConnection.getInputStream is hooked
+     too. Clicking a row opens a detail window: type, http method,
+     URL, the app method that sent/received it (clickable), note and
+     the payload preview.
+   - CLASSES TAB: the list is sorted alphabetically and android/
+     androidx/com.android/com.google/java/javax/dalvik/kotlin
+     classes are HIDDEN by default (System checkbox brings them
+     back). Search has 4 modes: class name, method name, field name
+     and CODE TEXT - the last one scans every method's const-string
+     instructions and static String field values of the app's dex
+     files (chunked, cancellable, capped at 4000 hits); classes it
+     reports get their matched methods/fields painted GREEN when
+     opened.
+   - r24 changes (patch #3 - performance on heavy apps + logic/CI
    leftovers from the latest static audit; the menu froze and
    logcat showed "Skipped 40 frames! The application may be doing
    too much work on its main thread"):
@@ -431,6 +472,7 @@ function field_repr(v) {
 var gAddChar = null, gBackspace = null, gWantMouse = null;
 var gNativeTouch = null, gSetMap = null;
 var gHitTest = null, gDisplaySize = null;   /* r23 */
+var gWantFrames = null;                     /* r25 frame pump */
 
 function ensure_native_fns() {
     if (gNativeTouch) return true;
@@ -453,6 +495,10 @@ function ensure_native_fns() {
         if (h) gHitTest = new NativeFunction(h, 'bool', ['float', 'float']);
         var d = Module.findExportByName('libtool.so', 'dextool_display_size');
         if (d) gDisplaySize = new NativeFunction(d, 'int', []);
+        /* r25: frame-pump level (0/1/2); older builds leave it null
+           and the pump simply never runs */
+        var wf = Module.findExportByName('libtool.so', 'dextool_want_frames');
+        if (wf) gWantFrames = new NativeFunction(wf, 'int', []);
         return true;
     } catch (e) { return false; }
 }
@@ -472,6 +518,59 @@ function ensure_native_fns() {
 var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
 var gMapLastTouch = 0;
 var gTouchEat = false;   /* r23: the current gesture started on the menu */
+
+/* ---------------- r25 frame pump ----------------
+   The menu lives inside the host's eglSwapBuffers. Games swap every
+   frame; most other apps render ON DEMAND - they can go seconds
+   without swapping, and every menu touch/keystroke we queued just
+   waited for the next swap. That is the exact field report: "the
+   menu hangs, lags, and freezes ... when I touch the app, the touch
+   I had previously made on the menu works". While the overlay wants
+   frames (dextool_want_frames: 2 = menu up, 1 = FAB only, 0 = no)
+   we postInvalidate() the captured activity's DecorView, which
+   makes the host produce real frames on its own UI/RenderThreads.
+   postInvalidate() is the thread-safe variant, so calling it from
+   this JS thread is fine. IME.act is the Java.retain()-ed activity
+   captured by the touch hook (r18) - a retained GLOBAL reference,
+   valid here.
+
+   Rates: 30 ms tick; level 2 invalidates every tick (~30 fps),
+   level 1 every 4th tick (~8 fps - just keeps the FAB tappable on
+   idle hosts without burning their battery all day). A host that
+   renders continuously (games) coalesces the extra invalidations -
+   no measurable cost. */
+var gPumpTick = 0, gPumpLogged = 0, gPumpMissLogged = 0;
+function pump_frames() {
+    try {
+        if (!gWantFrames) return;
+        var lvl = 0;
+        try { lvl = gWantFrames(); } catch (eL) { return; }
+        if (!lvl || !IME || !IME.act) return;
+        gPumpTick++;
+        if (lvl === 1 && (gPumpTick % 4) !== 0) return;
+        if (!gPumpLogged) {
+            gPumpLogged = 1;
+            agentLog('frame pump: on (level ' + lvl + ')');
+        }
+        var w = null, dv = null;
+        try { w = IME.act.getWindow(); } catch (eW) { return; }
+        if (!w) return;
+        try { dv = w.getDecorView(); } catch (eD) { return; }
+        if (!dv) return;
+        /* r20/r21 lesson: wrappers may not resolve every member -
+           typeof-check before the call and log it ONCE */
+        if (typeof dv.postInvalidate !== 'function') {
+            if (!gPumpMissLogged) {
+                gPumpMissLogged = 1;
+                agentLog('frame pump: decor.postInvalidate typeof ' +
+                    (typeof dv.postInvalidate) + ' - pump disabled');
+            }
+            return;
+        }
+        dv.postInvalidate();
+    } catch (e) {}
+}
+setInterval(pump_frames, 30);
 function report_map(view) {
     try {
         if (!view) return;
@@ -1407,7 +1506,7 @@ function installTouchHook() {
             return this.dispatchTouchEvent(ev);         /* original call */
         };
         agentLog('phase: dispatchTouchEvent hook ok');
-        sendMsg('info', { msg: 'touch hook installed (r24, screen coords + hit-test click-through + UP-leak fix + IME activity capture + map refresh on DOWN)' });
+        sendMsg('info', { msg: 'touch hook installed (r25, screen coords + hit-test click-through + UP-leak fix + IME activity capture + map refresh on DOWN + frame pump)' });
     });
 }
 
@@ -1539,13 +1638,26 @@ function rec_install_chunk(list, batch) {
 }
 
 /* ---------------- monitor ---------------- */
+/* r25: pipe-line sanitizer WITHOUT the 160-char cap of jstr() - the
+   detail field carries payload previews up to 2000 chars. '|' and
+   '#' are rewritten exactly like jstr does (the C++ side splits
+   rows on '|'). */
+function jpipe(v, cap) {
+    try {
+        var n = cap || 2000;
+        var s = (v === null || v === undefined) ? '' : String(v);
+        if (s.length > n) s = s.substring(0, n);
+        return s.replace(/\|/g, '!').replace(/#/g, '%');
+    } catch (e) { return '?'; }
+}
 var MON = { on: false, ring: [], origins: {}, okhttp: null };
-function mon_push(kind, url, method, origin, note) {
+function mon_push(kind, url, method, origin, note, detail) {
     if (!MON.on) return;
     if (MON.ring.length > 600) MON.ring.shift();
     MON.ring.push({
         k: kind, u: (url || '').substring(0, 120),
-        m: method || '', o: origin || '', n: (note || '').substring(0, 120)
+        m: method || '', o: origin || '', n: (note || '').substring(0, 120),
+        d: jpipe(detail, 2000)
     });
 }
 function mon_origin(site) {
@@ -1569,7 +1681,8 @@ function mon_flush() {
     if (!MON.ring.length) return;
     var items = MON.ring.splice(0, MON.ring.length);
     sendMsg('monitorEvent', { items: items.map(function (e) {
-        return e.k + '|' + e.u + '|' + e.m + '|' + e.o + '|' + e.n;
+        return e.k + '|' + e.u + '|' + e.m + '|' + e.o + '|' + e.n +
+               '|' + (e.d || '');
     }) });
 }
 setInterval(function () { if (MON.on) mon_flush(); }, 600);
@@ -1579,28 +1692,66 @@ function mon_install() {
         /* r23: monitor hooks go through the layering registry, so
            stopMonitor removes them again (r22 left them installed
            forever - the audit's "stopMonitor doesn't unhook") */
+        /* r25: payload previews. Request body: okhttp has no direct
+           read without consuming the stream - write it into an okio
+           Buffer (safe: body peeks are what okhttp's own interceptors
+           do). Response body: Response.peekBody() clones up to N
+           bytes without consuming the original. Both best-effort. */
+        function req_body_repr(req) {
+            try {
+                var b = req.body();
+                if (!b) return '';
+                var Buffer = Java.use('okio.Buffer');
+                var buf = Buffer.$new();
+                b.writeTo(buf);
+                return buf.readUtf8();
+            } catch (e) { return ''; }
+        }
+        function resp_body_repr(resp) {
+            try {
+                var pb = resp.peekBody(4096);
+                var s = pb.string();
+                try { pb.close(); } catch (e0) {}
+                return s;
+            } catch (e) { return ''; }
+        }
         var okhttpOk = false;
         try {
             if (dt_is_loaded('okhttp3.RealCall')) {
                 install_layer('okhttp3.RealCall', 'execute', 'mon', {
-                    fn: function (self) {
+                    /* r25: observer signature carries the RESULT */
+                    fn: function (self, a, out) {
                         try {
                             var req = self.request();
                             var url = String(req.url());
-                            mon_push('http', url, String(req.method()),
-                                     mon_origin('okhttp:' + url),
-                                     'headers ' + req.headers().size());
+                            var org = mon_origin('okhttp:' + url);
+                            mon_push('http-req', url,
+                                     String(req.method()), org,
+                                     'headers ' + req.headers().size(),
+                                     req_body_repr(req));
+                            /* the response row: code + peeked body */
+                            try {
+                                var cn = String(out.$className || '');
+                                if (cn === 'okhttp3.Response') {
+                                    mon_push('http-resp', url,
+                                             'resp ' + String(out.code()),
+                                             org, '',
+                                             resp_body_repr(out));
+                                }
+                            } catch (eR) {}
                         } catch (e) {}
                     }
                 });
                 install_layer('okhttp3.RealCall', 'enqueue', 'mon', {
-                    fn: function (self) {
+                    fn: function (self, a, out) {
                         try {
                             var req = self.request();
                             var url = String(req.url());
-                            mon_push('http', url, String(req.method()),
+                            mon_push('http-req', url,
+                                     String(req.method()),
                                      mon_origin('okhttp:' + url),
-                                     'async, headers ' + req.headers().size());
+                                     'async, headers ' + req.headers().size(),
+                                     req_body_repr(req));
                         } catch (e) {}
                     }
                 });
@@ -1611,13 +1762,32 @@ function mon_install() {
         /* HttpURLConnection: URL at connect time */
         try {
             install_layer('java.net.URL', 'openConnection', 'mon', {
-                fn: function (self) {
+                fn: function (self, a, out) {
                     try {
                         mon_push('urlconn', String(self.toString()), 'open',
-                                 mon_origin('url:' + self.toString()), '');
+                                 mon_origin('url:' + self.toString()), '', '');
                     } catch (e) {}
                 }
             });
+        } catch (e) {}
+        /* r25: the RESPONSE side of plain HttpURLConnection - the
+           stream itself cannot be previewed without consuming it,
+           so the row marks that the response started and shows the
+           originating method */
+        try {
+            if (dt_is_loaded('java.net.HttpURLConnection')) {
+                install_layer('java.net.HttpURLConnection',
+                              'getInputStream', 'mon', {
+                    fn: function (self, a, out) {
+                        try {
+                            var u = String(self.getURL());
+                            mon_push('urlconn-resp', u, 'read',
+                                     mon_origin('url:' + u),
+                                     'response stream open', '');
+                        } catch (e) {}
+                    }
+                });
+            }
         } catch (e) {}
 
         /* SSL: best-effort note only; full plaintext would need
@@ -1625,7 +1795,7 @@ function mon_install() {
         try {
             Java.use('javax.net.ssl.SSLSocket');
             mon_push('ssl', 'engine', 'note',
-                     '', 'SSLSocket reachable');
+                     '', 'SSLSocket reachable', '');
         } catch (e) {}
 
         sendMsg('monitorInfo', {
@@ -1639,6 +1809,28 @@ function mon_install() {
 /* (r23: use_cls_parts() removed - layer installs resolve the member
    themselves) */
 
+/* r25: text -> typed argument value, shared by callMethod and the
+   IO patch layer (only edited rows are patched; empty text means
+   the type's default). */
+function coerce_arg(t, s) {
+    if (s === undefined || s === null || s === '') {
+        if (t === 'int' || t === 'short' || t === 'byte' ||
+            t === 'long' || t === 'float' || t === 'double') return 0;
+        if (t === 'boolean') return false;
+        if (t === 'char') return '\u0000';
+        return null;
+    }
+    if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
+        return parseInt(s, 10) || 0;
+    if (t === 'float' || t === 'double')
+        return parseFloat(s) || 0.0;
+    if (t === 'boolean') return s === 'true';
+    if (t === 'char') return s.length ? s.charCodeAt(0) : '\u0000';
+    if (t.lastIndexOf('[') === 0) return null;
+    if (s === 'null') return null;
+    return s;
+}
+
 function call_with_args(ov, argStrings, isCtor, recv) {
     /* map the text args onto the overload's parameter types.
        r23: `recv` is the retained-instance receiver for instance
@@ -1647,22 +1839,7 @@ function call_with_args(ov, argStrings, isCtor, recv) {
     var params = ov.argumentTypes;
     var real = [];
     for (var i = 0; i < params.length; i++) {
-        var t = params[i].name, s = argStrings[i];
-        if (s === undefined || s === null || s === '') {
-            if (t === 'int' || t === 'short' || t === 'byte' ||
-                t === 'long' || t === 'float' || t === 'double') { real.push(0); continue; }
-            if (t === 'boolean') { real.push(false); continue; }
-            if (t === 'char') { real.push('\u0000'); continue; }
-            real.push(null); continue;
-        }
-        if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
-            real.push(parseInt(s, 10) || 0);
-        else if (t === 'float' || t === 'double')
-            real.push(parseFloat(s) || 0.0);
-        else if (t === 'boolean') real.push(s === 'true');
-        else if (t === 'char') real.push(s.length ? s.charCodeAt(0) : '\u0000');
-        else if (t.lastIndexOf('[') === 0) real.push(null);
-        else real.push(s);
+        real.push(coerce_arg(params[i].name, argStrings[i]));
     }
     return ov.apply(recv || null, real);
 }
@@ -1768,30 +1945,51 @@ function noop_ret(ov) {
 function dispatch_layers(K, L, ov, self, args) {
     var p = L ? L.parts : {};
     var hk = p.hook;
+    /* r25: IO patch layer - only the checkbox-marked arguments are
+       replaced before the original call; the return value is
+       replaced after. Non-marked rows keep the caller's values. */
+    var io = (p.io && p.io.on) ? p.io : null;
+    var eff = args;
+    if (io) {
+        try {
+            var at = ov.argumentTypes;
+            var a2 = Array.prototype.slice.call(args);
+            var any = false;
+            for (var kk in io.args) {
+                var ii = kk | 0;
+                if (ii >= a2.length) continue;
+                a2[ii] = coerce_arg(at[ii] ? at[ii].name : 'java.lang.Object',
+                                    io.args[kk]);
+                any = true;
+            }
+            if (any) eff = a2;
+        } catch (eI) {}
+    }
     var out;
     try {
         if (hk && hk.on && hk.mode === 'noop') {
             out = noop_ret(ov);
         } else if (hk && hk.on) {
             /* r22 semantics kept: the user fn gets receiver/args/orig();
-               a throw falls back to the original call */
+               a throw falls back to the original call. r25: the fn sees
+               the PATCHED args when an IO layer is active. */
             try {
                 out = hk.fn(Java, send, CONSOLE(), self,
-                            Array.prototype.slice.call(args),
+                            Array.prototype.slice.call(eff),
                             function () {
                                 return ov.apply(self,
-                                    arguments.length ? arguments : args);
+                                    arguments.length ? arguments : eff);
                             });
             } catch (e1) {
                 sendMsg('error', { fn: 'hook:' + K,
                                    msg: String(e1.message || e1) });
-                out = ov.apply(self, args);
+                out = ov.apply(self, eff);
             }
             /* smali hooks return null to mean "default value" (r22) */
             if (hk.mode === 'Smali' && out === null)
                 out = noop_ret(ov);
         } else {
-            out = ov.apply(self, args);
+            out = ov.apply(self, eff);
         }
     } catch (e2) {
         /* recorder row for the failing call, then rethrow (r22) */
@@ -1815,8 +2013,35 @@ function dispatch_layers(K, L, ov, self, args) {
         }
     } catch (e4) {}
     try {
-        if (p.mon && MON.on) p.mon.fn(self, args);
+        if (p.mon && MON.on) p.mon.fn(self, args, out);
     } catch (e5) {}
+    try {
+        /* r25: one-shot IO probe - report the captured values of
+           this call, then remove itself */
+        if (p.ioprobe && p.ioprobe.want) {
+            p.ioprobe.want = false;
+            var pr = { params: [] };
+            try {
+                var pt = ov.argumentTypes;
+                for (var pi = 0; pi < pt.length; pi++) {
+                    pr.params.push({
+                        t: String(pt[pi].name),
+                        v: field_repr(args[pi])
+                    });
+                }
+            } catch (eP) {}
+            sendMsg('methodIO', {
+                class: p.ioprobe.cls, method: p.ioprobe.mn,
+                ok: 1, error: '',
+                params: pr.params,
+                rettyp: String(ov.returnType.name),
+                ret: field_repr(out)
+            });
+            try {
+                uninstall_layer(p.ioprobe.cls, p.ioprobe.mn, 'ioprobe');
+            } catch (eU) {}
+        }
+    } catch (e5b) {}
     try {
         if (p.trk) {
             var tk = trackers[p.trk.key];
@@ -1835,6 +2060,11 @@ function dispatch_layers(K, L, ov, self, args) {
     try {
         if (p.fld) field_layer_emit(p.fld, self);
     } catch (e7) {}
+    /* r25: IO return patch AFTER every observer saw the real value */
+    if (io && io.ret !== null && io.ret !== undefined) {
+        try { out = coerce_arg(String(ov.returnType.name), io.ret); }
+        catch (e8) {}
+    }
     return out;
 }
 
@@ -1936,14 +2166,7 @@ function dt_rebuild_loaded_set() {
 }
 function dt_is_loaded(cls) {
     var now = Date.now();
-    /* r25 PERF FIX: enumerateLoadedClassesSync() suspends every
-       thread in the process to walk the class table safely -
-       cheap on the sample app, a noticeable stutter on a real
-       app's much bigger table. A 3 s TTL re-paid that cost on
-       every miss while adding a few hooks/trackers in a row;
-       20 s still catches a newly-loaded class well within the
-       loadClass watcher's own window, just less often. */
-    if (!gLoadedSet || now - gLoadedAt > 20000) {
+    if (!gLoadedSet || now - gLoadedAt > 3000) {
         dt_rebuild_loaded_set();
         gLoadedRechecked = false;   /* new cache generation */
     }
@@ -2211,11 +2434,12 @@ rpc.exports = {
     addHook: function (cls, method, mode, code) {
         var key = cls + '.' + method;
         /* r22/audit: the menu labels are 'Java(JS)' / 'Smali' /
-           'noop' - normalise them or Java hooks never install */
+           'Nop (auto)' - normalise them or Java hooks never install.
+           r25: the one-tap Nop button sends 'noop' directly. */
         var ml = String(mode).toLowerCase();
         if (ml.indexOf('java') === 0) mode = 'Java';
         else if (ml === 'smali') mode = 'Smali';
-        else if (ml === 'noop') mode = 'noop';
+        else if (ml === 'noop' || ml === 'nop') mode = 'noop';
         Java.perform(function () {
             /* r23: never force <clinit> - defer until the class loads */
             if (!dt_is_loaded(cls)) {
@@ -2404,36 +2628,49 @@ rpc.exports = {
     },
 
     /* ---- classes ---- */
-    listLoadedClasses: function (filter, qid) {
+    listLoadedClasses: function (filter, qid, mode, sys) {
         Java.perform(function () {
             try {
                 var all = Java.enumerateLoadedClassesSync();
                 var f = (filter || '').toLowerCase();
-                var out = [];
-                for (var i = 0; i < all.length; i++) {
-                    if (!f || all[i].toLowerCase().indexOf(f) !== -1)
-                        out.push(all[i]);
-                }
-                /* r11: stream the FULL result in pages of 400. The r10
-                   version sent one message capped at 800 names, so the
-                   Classes tab never displayed all classes. */
-                var PAGE = 400;
-                var pages = Math.max(1, Math.ceil(out.length / PAGE));
-                var q = (typeof qid === 'number') ? qid : 0;
-                var idx = 0;
-                var send_page = function () {
-                    var chunk = out.slice(idx, idx + PAGE);
-                    idx += PAGE;
-                    sendMsg('classList', {
-                        qid: q, page: Math.floor((idx - PAGE) / PAGE),
-                        pages: pages, total: all.length,
-                        shown: Math.min(idx, out.length),
-                        classes: chunk
+                var md = (typeof mode === 'number') ? mode : 0;
+                var includeSys = (sys === true || sys === 1);
+                gLastSearch = { f: f, mode: md };   /* r25: green marks */
+                if (!includeSys) {
+                    all = all.filter(function (n) {
+                        return !is_system_cls(n);
                     });
-                    if (idx < out.length)
-                        setTimeout(send_page, 15);
-                };
-                send_page();
+                }
+                /* r25: alphabetical order (field spec) */
+                all.sort();
+                if (!f || md === 0) {
+                    var out0 = f ? all.filter(function (n) {
+                        return n.toLowerCase().indexOf(f) !== -1;
+                    }) : all;
+                    page_out(out0, qid, all.length);
+                    return;
+                }
+                /* modes 1-3: chunked scan over the app's dex files
+                   (capped at 4000 hits, cancellable by a newer qid) */
+                if (SCAN.on)
+                    sendMsg('info', { msg: 'search: previous scan replaced' });
+                var want = {};
+                for (var i = 0; i < all.length; i++) want[all[i]] = 1;
+                SCAN.on = true;
+                SCAN.qid = (typeof qid === 'number') ? qid : 0;
+                SCAN.f = f;
+                SCAN.md = md;
+                SCAN.want = want;
+                SCAN.matches = [];
+                SCAN.hits = {};
+                SCAN.dexes = null;
+                SCAN.di = 0;
+                SCAN.it = null;
+                SCAN.total = all.length;
+                sendMsg('info', { msg: 'search: scanning ' +
+                                       all.length + ' loaded class(es) ' +
+                                       '(mode ' + md + ')' });
+                setTimeout(scan_step, 15);
             } catch (e) {
                 sendMsg('error', { fn: 'listLoadedClasses',
                                    msg: String(e.message || e) });
@@ -2449,14 +2686,162 @@ rpc.exports = {
                    Java.use() itself runs <clinit> through the bridge's
                    ensureClassInitialized. */
                 var jc = use_loaded(cls);
+                /* r25: members matching the last search, for the GREEN
+                   marks. Modes 1/2 recompute from reflection (cheap);
+                   mode 3 reuses the scan's per-class hit lists. */
+                var hm = [], hf = [];
+                var fl = gLastSearch.f || '';
+                if (fl) {
+                    if (gLastSearch.mode === 1) {
+                        var ms = jc.class.getDeclaredMethods();
+                        for (var i = 0; i < ms.length; i++) {
+                            var nm;
+                            try { nm = String(ms[i].getName()); }
+                            catch (eN) { continue; }
+                            if (nm.toLowerCase().indexOf(fl) !== -1 &&
+                                hm.indexOf(nm) === -1) hm.push(nm);
+                        }
+                    } else if (gLastSearch.mode === 2) {
+                        var fs = jc.class.getDeclaredFields();
+                        for (var j = 0; j < fs.length; j++) {
+                            var fn;
+                            try { fn = String(fs[j].getName()); }
+                            catch (eF) { continue; }
+                            if (fn.toLowerCase().indexOf(fl) !== -1 &&
+                                hf.indexOf(fn) === -1) hf.push(fn);
+                        }
+                    } else if (gLastSearch.mode === 3) {
+                        var h3 = gLastScanHits[cls];
+                        if (h3) { hm = h3.m || []; hf = h3.f || []; }
+                    }
+                }
                 sendMsg('classInfo', {
                     class: cls,
                     methods: method_lines(jc),
-                    fields: field_lines_light(jc)
+                    fields: field_lines_light(jc),
+                    hits_m: hm,
+                    hits_f: hf
                 });
             } catch (e) {
-                sendMsg('classInfo', { class: cls, methods: [], fields: [] });
+                sendMsg('classInfo', { class: cls, methods: [], fields: [],
+                                       hits_m: [], hits_f: [] });
                 sendMsg('error', { fn: 'openClass', msg: String(e.message || e) });
+            }
+        });
+    },
+    /* r25: the REAL body of one method, disassembled on-device by the
+       bundled baksmali (org.jf 2.5.2). Java decompilation is not
+       bundled - the source panel shows the bytecode, which is what
+       Smali hooks are written in anyway. */
+    getMethodSrc: function (cls, method) {
+        Java.perform(function () {
+            var done = function (ok, src, err) {
+                sendMsg('methodSrc', { class: cls, method: method,
+                                       ok: ok ? 1 : 0,
+                                       src: ok ? src : '',
+                                       error: ok ? '' : String(err) });
+            };
+            try {
+                var L = baksmali_libs();
+                if (!L) throw new Error('baksmali dex unavailable ' +
+                                        '(smali-fat.jar failed to load)');
+                var type = 'L' + cls.replace(/\./g, '/') + ';';
+                var dexes = dex_files();
+                if (!dexes || !dexes.length)
+                    throw new Error('app dex files not found');
+                var cdef = null;
+                for (var d = 0; d < dexes.length && !cdef; d++) {
+                    try {
+                        var it = dexes[d].getClasses().iterator();
+                        while (it.hasNext()) {
+                            var c = it.next();
+                            if (String(c.getType()) === type) {
+                                cdef = c;
+                                break;
+                            }
+                        }
+                    } catch (e0) {}
+                }
+                if (!cdef)
+                    throw new Error('class not in the app dex files: ' + cls);
+                var ctx = Java.use('android.app.ActivityThread')
+                              .currentApplication();
+                var dir = ctx.getFilesDir().getAbsolutePath() +
+                          '/dxt-src-' + (Date.now() % 1000000);
+                Java.use('java.io.File').$new(dir).mkdirs();
+                var handler = L.CFH.$new(
+                    Java.use('java.io.File').$new(dir), '.smali');
+                var opts = L.Opts.$new();
+                var ok = L.Baksmali.disassembleClass(cdef, handler, opts);
+                if (!ok) throw new Error('baksmali failed for ' + cls);
+                var sp = dir + '/' + cls.replace(/\./g, '/') + '.smali';
+                var text = read_file_text(sp);
+                rm_rf(Java.use('java.io.File').$new(dir));
+                var src = extract_method_blocks(text, method);
+                if (!src)
+                    throw new Error('no bytecode found for ' + method +
+                        ' (abstract/native methods have none)');
+                done(true, src, '');
+            } catch (e) {
+                done(false, '', e.message || e);
+            }
+        });
+    },
+    /* r25: arm a ONE-SHOT probe on the method - its next call reports
+       the current input/output values (toString-safe) into the IO
+       patch editor. */
+    getMethodIO: function (cls, method) {
+        Java.perform(function () {
+            try {
+                if (!dt_is_loaded(cls))
+                    throw new Error('class not loaded yet: ' + cls);
+                var n = install_layer(cls, method, 'ioprobe',
+                                      { want: true, cls: cls, mn: method });
+                if (!n) throw new Error('method not found: ' + method);
+                sendMsg('info', { msg: 'IO probe armed on ' + cls + '.' +
+                                       method + ' - values arrive on ' +
+                                       'its next call' });
+            } catch (e) {
+                sendMsg('methodIO', { class: cls, method: method,
+                                      ok: 0, error: String(e.message || e),
+                                      params: [], rettyp: '', ret: '' });
+            }
+        });
+    },
+    /* r25: persistent IO patch - the menu sends ONLY the rows the
+       user marked (args entries), so presence == patched. An empty
+       args list with ret.on=false removes the patch layer. */
+    setMethodIO: function (cls, method, args, ret) {
+        Java.perform(function () {
+            var key = cls + '.' + method;
+            try {
+                var map = {};
+                if (args) {
+                    for (var i = 0; i < args.length; i++) {
+                        var a = args[i];
+                        if (!a) continue;
+                        map[String(a.i | 0)] =
+                            String(a.v === undefined || a.v === null ?
+                                   '' : a.v);
+                    }
+                }
+                var retPatch = (ret && ret.on) ?
+                    String(ret.v === undefined || ret.v === null ?
+                           '' : ret.v) : null;
+                var any = false;
+                for (var k in map) { any = true; break; }
+                if (!any && retPatch === null) {
+                    uninstall_layer(cls, method, 'io');
+                    sendMsg('info', { msg: 'IO patch removed ' + key });
+                    return;
+                }
+                if (!install_layer(cls, method, 'io',
+                                   { on: true, args: map, ret: retPatch }))
+                    throw new Error('method not found: ' + method);
+                sendMsg('info', { msg: 'IO patch armed ' + key });
+            } catch (e) {
+                sendMsg('error', { fn: 'setMethodIO',
+                                   msg: String(e.message || e) });
             }
         });
     },
@@ -2646,8 +3031,13 @@ function CONSOLE() {
 }
 
 /* ---------------- smali assemble + load (runtime dex) ---------------- */
-function smali_compile(src) {
-    var out = { err: '', dex: null };
+/* r25: the loader/ClassFactory for smali-fat.jar is created ONCE and
+   cached - the same factory also serves the org.jf 2.5.2 dexlib2 +
+   baksmali classes used by the method-source view and the code-text
+   search (the CI step merges them into the same dex). */
+var gSmaliFactory = null;
+function smali_factory() {
+    if (gSmaliFactory) return gSmaliFactory;
     Java.perform(function () {
         try {
             var ctx = null;
@@ -2655,7 +3045,7 @@ function smali_compile(src) {
                 var AT = Java.use('android.app.ActivityThread');
                 ctx = AT.currentApplication();
             } catch (e0) { ctx = null; }
-            if (!ctx) { out.err = 'no app context'; return; }
+            if (!ctx) return;
             var files = ctx.getFilesDir().getAbsolutePath();
             var jar = files + '/smali-fat.jar';
             var File = Java.use('java.io.File');
@@ -2681,7 +3071,24 @@ function smali_compile(src) {
             /* r22/audit: loadClass() returns a java.lang.Class
                wrapper, which has no static main(): go through a
                ClassFactory bound to this loader */
-            var F = Java.ClassFactory.get(loader);
+            gSmaliFactory = Java.ClassFactory.get(loader);
+        } catch (e) {
+            agentLog('smali factory: ' + String(e.message || e));
+            gSmaliFactory = null;
+        }
+    });
+    return gSmaliFactory;
+}
+
+function smali_compile(src) {
+    var out = { err: '', dex: null };
+    Java.perform(function () {
+        try {
+            var F = smali_factory();
+            if (!F) { out.err = 'no app context / smali-fat.jar unusable'; return; }
+            var ctx = Java.use('android.app.ActivityThread').currentApplication();
+            var files = ctx.getFilesDir().getAbsolutePath();
+            var File = Java.use('java.io.File');
             var tmp = files + '/dxt-' + (Date.now() % 1000000);
             var inF  = tmp + '.smali';
             var outF = tmp + '.dex';
@@ -2757,6 +3164,316 @@ function smali_load(art) {
     return r;
 }
 
+/* ================= r25: on-device dex access (org.jf 2.5.2) ======
+   The CI step merges org.smali 2.5.2 baksmali + dexlib2 + util into
+   smali-fat.jar (org.jf.* packages - the com.android.tools.smali
+   3.0.7 assembler coexists untouched). This gives the agent the
+   app's REAL bytecode:
+   - method source view: Baksmali.disassembleClass per class
+   - code-text search: const-string instructions + static String
+     field values of every class of the host APK
+   Scope: classes inside the host APK (base + splits). Classes from
+   dynamic InMemoryDexClassLoaders are outside this window. */
+var gBak = null;
+function baksmali_libs() {
+    if (gBak) return gBak;
+    try {
+        var F = smali_factory();
+        if (!F) return null;
+        gBak = {
+            DexFileFactory: F.use('org.jf.dexlib2.DexFileFactory'),
+            Opcodes:        F.use('org.jf.dexlib2.Opcodes'),
+            Baksmali:       F.use('org.jf.baksmali.Baksmali'),
+            Opts:           F.use('org.jf.baksmali.BaksmaliOptions'),
+            CFH:            F.use('org.jf.util.ClassFileNameHandler'),
+            StrRef:         F.use('org.jf.dexlib2.iface.reference.StringReference'),
+            RefIns:         F.use('org.jf.dexlib2.iface.instruction.ReferenceInstruction'),
+            StrVal:         F.use('org.jf.dexlib2.iface.value.StringEncodedValue')
+        };
+        return gBak;
+    } catch (e) {
+        agentLog('baksmali libs: ' + String(e.message || e));
+        return null;
+    }
+}
+
+function apk_paths() {
+    var out = [];
+    try {
+        var AT = Java.use('android.app.ActivityThread');
+        var app = AT.currentApplication();
+        if (app) {
+            var ai = app.getApplicationInfo();
+            out.push(String(ai.sourceDir));
+            var sp = ai.splitSourceDirs;
+            if (sp) for (var i = 0; i < sp.length; i++) out.push(String(sp[i]));
+        }
+    } catch (e) {}
+    return out;
+}
+
+/* parsed dex files of the host APK, cached 60 s (parse of a big
+   multi-dex APK takes seconds and the search re-enters per chunk) */
+var gDexes = null, gDexesAt = 0;
+function dex_files() {
+    var now = Date.now();
+    if (gDexes && now - gDexesAt < 60000) return gDexes;
+    var L = baksmali_libs();
+    if (!L) return null;
+    var out = [];
+    var paths = apk_paths();
+    var opc = L.Opcodes.getDefault();
+    for (var i = 0; i < paths.length; i++) {
+        try {
+            var cont = L.DexFileFactory.loadDexContainer(
+                Java.use('java.io.File').$new(paths[i]), opc);
+            var it = cont.getDexFiles().iterator();
+            while (it.hasNext()) out.push(it.next());
+        } catch (e) {}
+    }
+    gDexes = out;
+    gDexesAt = now;
+    return out;
+}
+
+/* r25 system gate: the field report asked the class list to hide
+   "classes related to Android and Google" */
+function is_system_cls(n) {
+    return n.indexOf('android.') === 0 ||
+           n.indexOf('androidx.') === 0 ||
+           n.indexOf('com.android.') === 0 ||
+           n.indexOf('com.google.') === 0 ||
+           n.indexOf('java.') === 0 ||
+           n.indexOf('javax.') === 0 ||
+           n.indexOf('dalvik.') === 0 ||
+           n.indexOf('kotlin.') === 0 ||
+           n.indexOf('kotlinx.') === 0;
+}
+
+/* one const-string of an instruction, '' if it is not one */
+function ins_const_string(L, ins) {
+    try {
+        var op = String(ins.getOpcode());
+        if (op.indexOf('CONST_STRING') !== 0) return '';
+        var ri = Java.cast(ins, L.RefIns);
+        var ref = ri.getReference();
+        var sr = Java.cast(ref, L.StrRef);
+        return String(sr.getString());
+    } catch (e) { return ''; }
+}
+
+/* shared classList paging (r11 protocol: pages of 400, qid'd) */
+function page_out(list, qid, total) {
+    var PAGE = 400;
+    var pages = Math.max(1, Math.ceil(list.length / PAGE));
+    var q = (typeof qid === 'number') ? qid : 0;
+    var idx = 0;
+    var send_page = function () {
+        var chunk = list.slice(idx, idx + PAGE);
+        idx += PAGE;
+        sendMsg('classList', {
+            qid: q, page: Math.floor((idx - PAGE) / PAGE),
+            pages: pages, total: total,
+            shown: Math.min(idx, list.length),
+            classes: chunk
+        });
+        if (idx < list.length)
+            setTimeout(send_page, 15);
+    };
+    send_page();
+}
+
+/* ---- chunked code/member scan (modes 1-3) ----
+   150 classDefs per 15 ms tick so the JS thread never stalls;
+   a newer qid abandons the run. Result classes are sorted and
+   paged out; per-class member hits are kept for the green marks
+   in the class view (openClass reads gLastScanHits). */
+var SCAN = { on: false, qid: -1, f: '', md: 0, want: {}, wantList: [],
+             matches: [], hits: {}, dexes: null, di: 0, it: null,
+             total: 0 };
+var gLastScanHits = {};
+var gLastSearch = { f: '', mode: 0 };
+
+function scan_finish() {
+    SCAN.on = false;
+    gLastScanHits = SCAN.hits;
+    var matches = SCAN.matches.slice().sort();
+    sendMsg('info', { msg: 'search: ' + matches.length +
+                           ' matching class(es) (scan done)' });
+    page_out(matches, SCAN.qid, SCAN.total);
+}
+
+function scan_step() {
+    if (!SCAN.on) return;
+    var L = baksmali_libs();
+    if (!L) { SCAN.on = false;
+              sendMsg('error', { fn: 'listLoadedClasses',
+                  msg: 'dexlib2 unavailable (smali-fat.jar failed)' });
+              return; }
+    try {
+        if (!SCAN.dexes) SCAN.dexes = dex_files();
+    } catch (eD) { SCAN.on = false;
+              sendMsg('error', { fn: 'listLoadedClasses',
+                  msg: String(eD.message || eD) });
+              return; }
+    if (!SCAN.dexes || !SCAN.dexes.length) {
+        SCAN.on = false;
+        sendMsg('info', { msg: 'search: app dex files not found' });
+        page_out([], SCAN.qid, SCAN.total);
+        return;
+    }
+    var budget = 150;
+    while (budget-- > 0) {
+        if (SCAN.matches.length >= 4000) { scan_finish(); return; }
+        if (SCAN.di >= SCAN.dexes.length) { scan_finish(); return; }
+        if (!SCAN.it) {
+            try {
+                SCAN.it = SCAN.dexes[SCAN.di].getClasses().iterator();
+            } catch (eI) { SCAN.di++; continue; }
+        }
+        if (!SCAN.it.hasNext()) { SCAN.di++; SCAN.it = null; continue; }
+        var cd = null;
+        try { cd = SCAN.it.next(); } catch (eN) { continue; }
+        var tn = '';
+        try { tn = String(cd.getType()); } catch (eT) { continue; }
+        if (tn.length < 3) continue;
+        var cls = tn.substring(1, tn.length - 1);
+        if (!SCAN.want[cls]) continue;
+        var matched = false, mh = null, fh = null;
+        try {
+            if (SCAN.md === 1) {                       /* method name */
+                var mit = cd.getMethods().iterator();
+                while (mit.hasNext()) {
+                    var mm = mit.next();
+                    var mn = String(mm.getName());
+                    if (mn.toLowerCase().indexOf(SCAN.f) !== -1) {
+                        matched = true;
+                        mh = [mn];
+                        break;
+                    }
+                }
+            } else if (SCAN.md === 2) {                /* field name */
+                var fit = cd.getFields().iterator();
+                while (fit.hasNext()) {
+                    var ff = fit.next();
+                    var fn = String(ff.getName());
+                    if (fn.toLowerCase().indexOf(SCAN.f) !== -1) {
+                        matched = true;
+                        fh = [fn];
+                        break;
+                    }
+                }
+            } else {                                   /* code text   */
+                var m2 = cd.getMethods().iterator();
+                while (m2.hasNext()) {
+                    var m3 = m2.next();
+                    var impl = null;
+                    try { impl = m3.getImplementation(); } catch (e0) {}
+                    if (!impl) continue;
+                    var iit = impl.getInstructions().iterator();
+                    while (iit.hasNext()) {
+                        var s = ins_const_string(L, iit.next());
+                        if (s && s.toLowerCase().indexOf(SCAN.f) !== -1) {
+                            matched = true;
+                            var nm = String(m3.getName());
+                            if (!mh) mh = [];
+                            if (mh.indexOf(nm) === -1 && mh.length < 40)
+                                mh.push(nm);
+                            break;
+                        }
+                    }
+                    if (matched) break;
+                }
+                if (!fh) fh = [];
+                if (!matched || fh.length < 40) {
+                    /* static String initial values count as "field
+                       code" (the spec's premium-in-a-field case) */
+                    var sfit = null;
+                    try { sfit = cd.getStaticFields().iterator(); }
+                    catch (e1) {}
+                    while (sfit && sfit.hasNext()) {
+                        var sf = sfit.next();
+                        var sfn = '';
+                        try { sfn = String(sf.getName()); } catch (e2) {}
+                        try {
+                            var ev = sf.getInitialValue();
+                            if (ev) {
+                                var sv = Java.cast(ev, L.StrVal).getValue();
+                                if (sv && String(sv).toLowerCase()
+                                          .indexOf(SCAN.f) !== -1) {
+                                    matched = true;
+                                    if (fh.indexOf(sfn) === -1 && fh.length < 40)
+                                        fh.push(sfn);
+                                }
+                            }
+                        } catch (e3) {}
+                    }
+                }
+            }
+        } catch (eScan) {}
+        if (matched) {
+            SCAN.matches.push(cls);
+            SCAN.hits[cls] = { m: mh || [], f: fh || [] };
+        }
+    }
+    setTimeout(scan_step, 15);
+}
+
+/* read a small text file (the per-class smali dump) */
+function read_file_text(path) {
+    var FIS = Java.use('java.io.FileInputStream');
+    var fis = FIS.$new(path);
+    var all = [], chunk = Java.array('byte', new Array(8192).fill(0));
+    var k;
+    while ((k = fis.read(chunk)) > 0) {
+        for (var c = 0; c < k; c++) all.push(chunk[c]);
+    }
+    fis.close();
+    return Java.use('java.lang.String').$new(
+        Java.array('byte', all), 'UTF-8');
+}
+
+function rm_rf(f) {
+    try {
+        if (f.isDirectory()) {
+            var ls = f.listFiles();
+            if (ls) for (var i = 0; i < ls.length; i++) rm_rf(ls[i]);
+        }
+        f.delete();
+    } catch (e) {}
+}
+
+/* extract every ".method ... name(...) ... .end method" block */
+function extract_method_blocks(text, method) {
+    var lines = text.split('\n');
+    var out = [], cur = null;
+    for (var i = 0; i < lines.length; i++) {
+        var ln = lines[i];
+        if (cur === null) {
+            if (ln.indexOf('.method') === 0) {
+                /* ".method public static foo(I)V" - the name token
+                   sits right before the '(' */
+                var body = ln.substring(8);
+                var po = body.indexOf('(');
+                if (po !== -1) {
+                    var head = body.substring(0, po).trim();
+                    var sp = head.lastIndexOf(' ');
+                    var nm = (sp === -1) ? head : head.substring(sp + 1);
+                    if (nm === method) cur = [ln];
+                }
+            }
+        } else {
+            cur.push(ln);
+            if (ln.indexOf('.end method') === 0) {
+                out.push(cur.join('\n'));
+                cur = null;
+                if (out.join('\n').length > 60000) break;
+            }
+        }
+    }
+    return out.join('\n\n');
+}
+
 /* ---------------- receive loop (menu -> agent) ---------------- */
 recv(function onMsg(msg) {
     if (!msg) { recv(onMsg); return; }
@@ -2792,7 +3509,10 @@ var FN_ARGS = {
     startMonitor:    [],
     stopMonitor:     [],
     evalScript:      ['src'],
-    listLoadedClasses: ['filter', 'qid'],
+    listLoadedClasses: ['filter', 'qid', 'mode', 'sys'],
+    getMethodSrc:    ['class', 'method'],
+    getMethodIO:     ['class', 'method'],
+    setMethodIO:     ['class', 'method', 'args', 'ret'],
     openClass:       ['class'],
     readStaticFields: ['class'],
     showIme:         [],
@@ -2824,6 +3544,6 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r24 loaded' });
+    sendMsg('ready', { msg: 'Dex-tool agent r25 loaded' });
     agentLog('phase: ready sent');
 }, 0);

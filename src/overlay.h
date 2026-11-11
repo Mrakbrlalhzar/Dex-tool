@@ -45,6 +45,15 @@ JNIEXPORT bool dextool_want_mouse();
    live ImGui windows of the last frame and must be consumed. */
 JNIEXPORT bool dextool_hit_test(float x, float y);
 JNIEXPORT int  dextool_display_size();  /* (w<<16)|h, 0 until the overlay is up */
+/* r25: frame-pump level the agent should drive with DecorView
+   postInvalidate(): 0 = overlay down (never invalidate), 1 = menu
+   hidden but the FAB is up (slow pump keeps it tappable), 2 = menu
+   visible (full-rate pump). Render-on-demand hosts never swap
+   buffers on their own, so without this pump the queued menu
+   touches were only processed when the app happened to redraw -
+   the field's "menu hangs/freezes, but touching the app makes the
+   earlier menu touch work" report. */
+JNIEXPORT int  dextool_want_frames();
 JNIEXPORT void dextool_agent_log(const char* msg); /* r14: agent phase markers -> logs */
 #ifdef __cplusplus
 }

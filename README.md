@@ -3,6 +3,69 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r25)
+
+Field report: the menu worked on one app but HANGS, LAGS and FREEZES
+on other apps ("when I touch the app, the touch I had previously
+made on the menu works"), plus feature requests for the Hooks,
+Monitor and Classes sections.
+
+- **Frame pump (the freeze fix):** the menu is drawn inside the
+  host's `eglSwapBuffers` hook - it only advances when the host
+  renders a frame. Games render continuously, but most other apps
+  render ON DEMAND and can go seconds without swapping; every
+  queued menu touch/keystroke just waited for the next swap, which
+  is exactly the reported "touch the app and the earlier menu touch
+  works". The agent now polls `dextool_want_frames()` (new JNI
+  export, 0/1/2) from a 30 ms timer and `postInvalidate()`s the
+  captured activity's DecorView while frames are wanted: full rate
+  with the menu visible, slow rate (FAB only) while hidden.
+  `postInvalidate()` is the thread-safe variant, works on the JS
+  thread, and continuous-rendering hosts coalesce the extra
+  invalidations.
+- **Method source view (Hooks tab + "Src" button):** the real body
+  of the method, disassembled on-device by a bundled baksmali
+  (org.smali 2.5.2 - baksmali is not on Google Maven for 3.x; the
+  org.jf packages coexist with the com.android.tools.smali 3.0.7
+  assembler). Smali mode gets a "Copy body -> editor" button. Java
+  decompilation is NOT bundled - a decompiler is heavy and would
+  run inside the host process, so both modes show the bytecode.
+- **One-tap Nop:** the Classes > Methods rows have a Nop button that
+  adds a noop hook immediately - it returns the default value for
+  the method's return type (void -> plain return, numeric -> 0,
+  boolean -> false, object/array -> null). The Hooks mode combo
+  label is now "Nop (auto)".
+- **Method input/output patching ("IO" button):** arms a one-shot
+  probe; the method's next call reports its captured current
+  argument values and return value (toString-safe rendering) into
+  an editor. Only the checkbox-marked rows are patched from then
+  on - arguments are replaced before the original call, the return
+  value after. "Refresh values" re-probes, "Stop patching" unhooks.
+- **Network monitor:** okhttp calls now log a REQUEST row AND a
+  RESPONSE row - the response body is peeked (up to 4 KB, without
+  consuming the original) and the request body is read through an
+  okio Buffer when accessible; `HttpURLConnection.getInputStream`
+  is hooked for the response side of plain-HTTP apps. Clicking any
+  row opens a DETAIL window: type, http method, URL, the app
+  method that sent/received it (clickable - opens the class), the
+  note and the payload preview.
+- **Classes tab:** the list is SORTED ALPHABETICALLY and android/
+  androidx/com.android/com.google/java/javax/dalvik/kotlin classes
+  are HIDDEN by default (a System checkbox brings them back).
+  Search has 4 modes: class name, method name, field name and CODE
+  TEXT - the last one scans every method's const-string
+  instructions and every static String field value of the app's
+  dex files (dexlib2, chunked 150 classDefs/15 ms so the agent
+  never stalls, capped at 4000 hits, cancellable by a newer
+  search). Classes a code-text search reports get their matched
+  methods/fields painted GREEN when opened (modes 1/2 mark name
+  matches the same way).
+- **Known limitations, documented:** only classes inside the host
+  APK (base + split APKs) are scannable for source/code-text;
+  classes from dynamic `InMemoryDexClassLoader`s are outside the
+  window. The monitor still cannot see inside TLS - payload
+  previews come from the Java layer (okhttp/URLConnection).
+
 ## Fixes in this version (r24)
 
 Patch #3 of the audits: severe performance bugs (the menu froze on

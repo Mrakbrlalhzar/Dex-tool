@@ -280,6 +280,17 @@ extern "C" JNIEXPORT int dextool_display_size() {
     return ((int)g_disp_w << 16) | (int)g_disp_h;
 }
 
+/* r25: frame-pump level for the agent (see overlay.h). The menu is
+   drawn inside the eglSwapBuffers hook - a host that renders on
+   demand (most non-game apps) can go seconds without a swap, and
+   every queued menu touch/char just waits for the next one. The
+   agent calls this from a 30 ms timer and postInvalidate()s the
+   host's DecorView while we want frames, which makes the host
+   produce real frames and keeps the menu interactive. */
+extern "C" JNIEXPORT int dextool_want_frames() {
+    return menu_frame_pump_level();
+}
+
 extern "C" JNIEXPORT void dextool_add_char(int cp) {
     std::lock_guard<std::mutex> lk(g_char_mtx);
     if (g_pending_in.size() < 8192) g_pending_in.push_back(InEv{(unsigned)cp, false});

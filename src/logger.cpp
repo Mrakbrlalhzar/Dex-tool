@@ -149,7 +149,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r24: audit patch 3 - field-tracker emits only on value change with 20 ms poll + 100 ms emit throttles (menu-freeze fix), dt_is_loaded forces one rebuild on cache miss, lazy LAYERS key parsing in the dispatcher, eaten gestures no longer leak UP, IME Enter forwarded to ImGui so the class filter searches, background-only opacity via SetNextWindowBgAlpha, escaped agentStatus JSON, IME ladder stops when the keyboard is up (isAcceptingText + session token), console keeps the newest 400 lines, child-scoped auto-scroll, dev-only push trigger, r23 click-through/layering/instance protocol kept)");
+    log_info("logger_init done (build r25: frame pump keeps render-on-demand hosts redrawing so the menu no longer hangs/lags/freezes on other apps, method source view via bundled baksmali (smali, editable into Smali hooks), one-tap Nop button (auto return value by method logic), method input/output patching with live values and per-item enable, network monitor logs requests AND responses with a click-to-open detail window (payload preview + originating method), class list sorted alphabetically with Android/Google/kotlin system classes filtered by default, 4 search modes: class name, method name, field name, code-text (const-string + static String values, matched members marked green), r24 field-tracker throttles/dispatcher lazy-parse/UP-leak fix kept)");
 }
 
 /* r16: re-point the logs at the app's real private dir.
