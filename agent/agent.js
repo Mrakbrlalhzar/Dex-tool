@@ -1,3 +1,7 @@
+/* Dex-tool agent (r29): no agent changes this round - the
+instance UI merged into the Inspector on the menu
+side. r28 added hookHit, dumpLoadedClasses /
+dumpObject and the package name in ready. */
 'use strict';
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
 var gAgentLog = null;
@@ -2587,6 +2591,6 @@ setTimeout(function () {
         var appR = ATr.currentApplication();
         if (appR) pkgR = String(appR.getPackageName());
     } catch (eP) {}
-    sendMsg('ready', { msg: 'Dex-tool agent r28 loaded', pkg: pkgR });
+    sendMsg('ready', { msg: 'Dex-tool agent r29 loaded', pkg: pkgR });
     agentLog('phase: ready sent');
 }, 0);

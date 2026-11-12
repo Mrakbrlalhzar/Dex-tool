@@ -125,7 +125,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r28: the real IL2CPP Tool structure - one window, main tabs Tools/Tracer/Patches/Dumper/Recorder/Monitor/Script/Settings, Tools holds the inner tabber with the leading + button and closeable explorer tabs plus one tab per opened class and one [0x..] tab per object (the floating r26 windows are gone), methods are colored tree nodes with Call/Patch/Trace sub-tabs, Tracer tab lists traced methods with hit counts and a Quick Restore popup, hit flashes are painted on the background draw list from throttled hookHit events, Dumper tab writes dextool-classes.txt / object JSON via the agent, Settings uses the 7-step Scale combo and an Info section with the package name)");
+    log_info("logger_init done (build r29: single-tap FAB toggle, the menu resizes by dragging its left/right/bottom edges, Class Families and Full Method View are movable windows, instance find/create/manual/Saved Objects merged into the Inspector Instances sub-tab and the Object Finder popup is gone, method-arg picking opens the class Instances tab with a picking banner, list heights follow the menu size via fit_h, duplicated forward declarations cleaned)");
 }
 void logger_retarget(const char* base_dir) {
     if (!base_dir || !base_dir[0]) return;

@@ -1,3 +1,8 @@
+/* Dex-tool menu (r29): single-tap FAB toggle, resize by dragging the
+   left/right/bottom edges, Class Families + Full Method View as
+   movable windows, instances (find/create/saved/arg-pick) merged
+   into the Inspector's Instances sub-tab, list heights follow the
+   menu size (fit_h). The Object Finder popup is gone. */
 #include "menu.h"
 #include "overlay.h"
 #include "frida_bridge.h"
@@ -30,6 +35,11 @@ static bool  s_agent_ready = false;
 static char  s_agent_note[160] = "";
 static bool  s_ovl_ready   = false;
 static std::vector<float> s_regions;
+static float fit_h(float frac, float min_h) {
+    /* r29: list heights follow the menu window size */
+    float h = ImGui::GetContentRegionAvail().y * frac;
+    return h < min_h ? min_h : h;
+}
 static void mark_rect(float x, float y, float w, float h, float speed) {
     if (w <= 1 || h <= 1 || speed <= 0.01f) return;
     s_regions.push_back(x); s_regions.push_back(y);
@@ -53,6 +63,8 @@ struct ClassTab {
     std::vector<FieldInfo> fields;
     std::vector<InstInfo>  instances;
     int  sel_inst = -1;
+    bool inst_wait = false;             /* r29: heap scan in flight */
+    bool inst_creat = false;            /* r29: $new in flight      */
     int  gen = -1;                      /* r23: instance-list generation; part of the editor buffer key */
     int  sub = 0;                       /* 0 Instances 1 Static Fields 2 Methods 3 Fields */
     int  expanded = -1;                 /* index into methods, -1 none   */
@@ -110,18 +122,6 @@ struct ExplorerWin {
     int  filter_by = 0;           /* 0 Class 1 Method 2 Field        */
     bool advanced = false;        /* string search inside class code */
 };
-struct ObjFinder {
-    bool open = false;
-    char cls[200] = {};
-    char typ[96]  = {};
-    char manual[128] = {};
-    std::vector<InstInfo> results;
-    bool waiting  = false;        /* Java.choose scan in flight      */
-    bool creating = false;        /* $new in flight                  */
-    int  ctx_uid  = -1;           /* inspector that opened it        */
-    int  ctx_arg  = -1;           /* >=0: fill caller arg N; -1: the inspector */
-};
-static ObjFinder s_of;
 static std::vector<ExplorerWin> s_explorers;
 static std::vector<std::string> s_families;   /* com.game, com.android... */
 static bool s_expl_req = false;               /* "+" pressed               */
@@ -220,8 +220,15 @@ static char  s_dump_path[512] = "";
 static char  s_dump_note[192] = "";
 static char  s_dobj_note[192] = "";
 static std::string s_pkg = "(unknown)";
-static bool s_open_objfinder = false;
 static bool s_open_fmview    = false;
+/* r29: instances live in the Inspector's Instances sub-tab; these
+   hold the "pick for method arg" target while a pick is active */
+static int  s_arg_uid = -1;      /* class tab owning the arg      */
+static int  s_arg_idx = -1;      /* arg N                          */
+static char s_arg_typ[96] = {};
+static char s_arg_cls[200] = {}; /* class being picked for        */
+static bool s_fam_open = false;  /* r29: Class Families window    */
+static int  s_fam_uid = -1;      /* explorer that opened it       */
 static std::string jesc(const std::string& s) {
     std::string r;
     r.reserve(s.size() + 8);
@@ -856,6 +863,7 @@ void menu_init() {
                 c->instances = list;
                 c->gen = (int)jnum(j, "gen");
                 c->sel_inst = -1;
+                c->inst_wait = false;
             }
             for (auto& t : s_objtabs) {
                 if (t.cls != jstr(j, "class")) continue;
@@ -867,10 +875,6 @@ void menu_init() {
                     }
                 }
             }
-            if (s_of.open && s_of.cls == jstr(j, "class")) {
-                s_of.results = list;
-                s_of.waiting = false;
-            }
             if (s_pscan.cls == jstr(j, "class")) {
                 s_pscan.list = list;
                 s_pscan.waiting = false;
@@ -879,10 +883,11 @@ void menu_init() {
             InstInfo in;
             in.str    = jstr(j, "str");
             in.handle = jnum(j, "handle", -1);
-            if (s_of.open && s_of.cls == jstr(j, "class")) {
-                s_of.results.push_back(in);
-                s_of.creating = false;
-                s_of.waiting  = false;
+            ClassTab* cc = find_tab(jstr(j, "class"));
+            if (cc) {
+                cc->instances.push_back(in);
+                cc->inst_creat = false;
+                cc->inst_wait  = false;
             }
             push_console("[finder]", "created " + jstr(j, "class") +
                          " -> handle " + std::to_string(in.handle));
@@ -1199,7 +1204,7 @@ static void tab_tracer() {
         if (ImGui::CollapsingHeader(hdr)) {
             ImGui::TextDisabled("%lu events", (unsigned long)t.log.size());
             ImGui::BeginChild(("tl" + std::to_string(i)).c_str(),
-                              ImVec2(0, 200), true);
+                              ImVec2(0, fit_h(.45f, 110)), true);
             for (auto& r : t.log) {
                 for (auto& c : r.callers) {
                     if (ImGui::SmallButton(("@ " + c).c_str()))
@@ -1294,7 +1299,7 @@ static void tab_tracer() {
             ImGui::SameLine();
             ImGui::TextDisabled("%s", s_hsrc_note);
             if (s_hsrc_have) {
-                ImGui::BeginChild("hsrcbx", ImVec2(0, 170), true);
+                ImGui::BeginChild("hsrcbx", ImVec2(0, fit_h(.40f, 120)), true);
                 ImGui::TextUnformatted(s_hsrc);
                 ImGui::EndChild();
                 mark_scroll_item(s_lst_scroll);
@@ -1395,7 +1400,7 @@ static void tab_recorder() {
         ImGui::SetTooltip("stop installing hooks after this many methods");
     ImGui::TextDisabled("status: %s | %lu rows (newest last)",
                         s_rec_stat, (unsigned long)s_rec.size());
-    ImGui::BeginChild("recl", ImVec2(0, 260), true);
+    ImGui::BeginChild("recl", ImVec2(0, fit_h(.55f, 140)), true);
     ImGuiListClipper clip;
     clip.Begin((int)s_rec.size());
     while (clip.Step()) {
@@ -1442,7 +1447,7 @@ static void tab_monitor() {
     MLK();
     ImGui::TextDisabled("best-effort | %s | %lu rows",
                         s_mon_stat, (unsigned long)s_mon.size());
-    ImGui::BeginChild("monl", ImVec2(0, 260), true);
+    ImGui::BeginChild("monl", ImVec2(0, fit_h(.55f, 140)), true);
     ImGuiListClipper clip;
     clip.Begin((int)s_mon.size());
     while (clip.Step()) {
@@ -1514,7 +1519,7 @@ static void tab_script() {
     if (ImGui::Button("Clear console")) { MLK(); s_cons.clear(); MULK(); }
     ImGui::Separator();
     MLK();
-    ImGui::BeginChild("consl", ImVec2(0, 200), true);
+    ImGui::BeginChild("consl", ImVec2(0, fit_h(.40f, 110)), true);
     for (auto& l : s_cons) ImGui::TextUnformatted(l.c_str());
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
         ImGui::SetScrollHereY(1.f);
@@ -1526,6 +1531,8 @@ static void open_obj_tab(const std::string& cls, long handle,
                          const std::string& str);
 static void explorer_body(ExplorerWin& e);
 static void class_tab_body(ClassTab& c);
+static void of_deliver(ClassTab* dst, long handle,
+                       const std::string& str);
 static std::string s_dup_req;
 static void run_search(const char* text, int mode, bool cs) {
     MLK();
@@ -1545,30 +1552,77 @@ static void run_search(const char* text, int mode, bool cs) {
     post_rpc("listLoadedClasses", a);
 }
 static void inst_view(ClassTab& c) {
+    /* r29: the single place to find / create / pick instances (the
+       Object Finder popup and the Inspector button are merged in) */
+    MLK();
+    bool picking = (s_arg_uid >= 0 && s_arg_cls[0] &&
+                    c.cname == s_arg_cls);
+    if (picking)
+        ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1),
+                           "picking an instance for arg%d (%s)",
+                           s_arg_idx, s_arg_typ);
     if (ImGui::Button("Find instances##fi")) {
         std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
         post_rpc("listInstances", a);
+        c.inst_wait = true;
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("tap [0x..] to open an object tab");
-    if (c.instances.empty()) {
-        ImGui::TextDisabled("no instances loaded - tap Find instances");
+    if (ImGui::Button("Create instance##ci")) {
+        post_rpc("createInstance",
+                 "{\"class\":\"" + jesc(c.cname) + "\"}");
+        c.inst_creat = true;
     }
+    ImGui::SameLine();
+    if (picking && ImGui::SmallButton("Cancel pick##cp")) {
+        s_arg_uid = -1; s_arg_idx = -1; s_arg_cls[0] = 0;
+    }
+    static char s_man[128] = {};      /* manual handle/value entry */
+    ImGui::SetNextItemWidth(200);
+    ime_textfield("##ivman", s_man, sizeof(s_man));
+    ImGui::SameLine();
+    if (ImGui::Button("Use##ivman") && s_man[0]) {
+        bool used = false;
+        for (auto& cc : s_classes)
+            if (picking && cc.uid == s_arg_uid && s_arg_idx >= 0 &&
+                s_arg_idx < 8) {
+                snprintf(cc.call_args[s_arg_idx],
+                         sizeof(cc.call_args[0]), "%s", s_man);
+                used = true;
+                break;
+            }
+        if (!used) c.of_note = std::string("manual: ") + s_man;
+        if (picking) { s_arg_uid = -1; s_arg_idx = -1; s_arg_cls[0] = 0; }
+        s_man[0] = 0;
+    }
+    ImGui::TextDisabled("tap [0x..] for an object tab; click a row to"
+                        " select it");
+    if (c.inst_wait)  ImGui::TextDisabled("(scanning the heap...)");
+    if (c.inst_creat) ImGui::TextDisabled("(constructing...)");
     for (int i = 0; i < (int)c.instances.size(); i++) {
         ImGui::PushID(i);
+        InstInfo& in = c.instances[i];
         bool sel = (c.sel_inst == i);
         char lbl[256];
-        snprintf(lbl, sizeof(lbl), "#%d %s", i,
-                 c.instances[i].str.c_str());
-        if (ImGui::Selectable(lbl, sel)) c.sel_inst = i;
+        snprintf(lbl, sizeof(lbl), "#%d %s", i, in.str.c_str());
+        if (ImGui::Selectable(lbl, sel))
+            of_deliver(picking ? nullptr : &c, in.handle, in.str);
         ImGui::SameLine();
         char ob[48];
-        snprintf(ob, sizeof(ob), "[0x%lx]##ot", c.instances[i].handle);
+        snprintf(ob, sizeof(ob), "[0x%lx]##ot", in.handle);
         if (ImGui::SmallButton(ob))
-            open_obj_tab(c.cname, c.instances[i].handle,
-                         c.instances[i].str);
+            open_obj_tab(c.cname, in.handle, in.str);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Save##ivsv")) {
+            bool have = false;
+            for (auto& sv : s_saved)
+                if (sv.handle == in.handle) { have = true; break; }
+            if (!have)
+                s_saved.push_back({c.cname, in.str, in.handle});
+        }
         ImGui::PopID();
     }
+    if (c.instances.empty() && !c.inst_wait && !c.inst_creat)
+        ImGui::TextDisabled("no instances yet - tap Find instances");
     if (c.sel_inst >= 0 && c.sel_inst < (int)c.instances.size()) {
         InstInfo& in = c.instances[c.sel_inst];
         ImGui::Separator();
@@ -1603,7 +1657,7 @@ static void inst_view(ClassTab& c) {
             ImGui::Text("  value:");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(140);
-            ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper */
+            ime_textfield("##fv", nv[f], sizeof(nv[f]));
             ImGui::SameLine();
             if (ImGui::Button("Set##fs")) {
                 long h = in.handle;
@@ -1617,7 +1671,34 @@ static void inst_view(ClassTab& c) {
             ImGui::PopID();
         }
     }
+    /* r29: Saved Objects moved here from the Object Finder */
+    if (ImGui::CollapsingHeader("Saved Objects")) {
+        for (int k = 0; k < (int)s_saved.size(); ) {
+            ImGui::PushID(9500 + k);
+            SavedObj& sv = s_saved[k];
+            char lbl2[280];
+            snprintf(lbl2, sizeof(lbl2), "%s [0x%lx]",
+                     short_name(sv.cls).c_str(), sv.handle);
+            if (ImGui::Button(lbl2, ImVec2(
+                    ImGui::GetContentRegionAvail().x - 70.f, 0)))
+                of_deliver(picking ? nullptr : &c,
+                           sv.handle, sv.str);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove")) {
+                s_saved.erase(s_saved.begin() + k);
+                ImGui::PopID();
+                continue;
+            }
+            ImGui::PopID();
+            k++;
+        }
+        if (s_saved.empty())
+            ImGui::TextDisabled("Nothing...");
+    }
+    mark_scroll_item(s_lst_scroll);
+    MULK();
 }
+
 static void static_fields_view(ClassTab& c) {
     MLK();
     if (ImGui::SmallButton("Read static values"))
@@ -1708,18 +1789,16 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
                 std::string(c.call_args[k]) : "(pick instance)";
             if (ImGui::BeginCombo("##co", prev.c_str())) {
                 if (ImGui::Selectable(
-                        "Find / Create Object (Object Finder)...")) {
-                    snprintf(s_of.cls, sizeof(s_of.cls), "%s",
+                        "Find / Create Object (Inspector)...")) {
+                    /* r29: pick in the Inspector's Instances sub-tab */
+                    snprintf(s_arg_typ, sizeof(s_arg_typ), "%s",
                              ps[k].c_str());
-                    snprintf(s_of.typ, sizeof(s_of.typ), "%s",
+                    snprintf(s_arg_cls, sizeof(s_arg_cls), "%s",
                              ps[k].c_str());
-                    s_of.ctx_uid = c.uid;
-                    s_of.ctx_arg = k;
-                    s_of.open    = true;
-                    s_of.results.clear();
-                    s_of.waiting  = false;
-                    s_of.creating = false;
-                    s_open_objfinder = true;   /* r28: deferred popup */
+                    s_arg_uid = c.uid;
+                    s_arg_idx = k;
+                    ClassTab* ct = open_inspector(ps[k], true);
+                    if (ct) ct->sub = 0;
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::Separator();
@@ -1766,7 +1845,7 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
         ImGui::TextDisabled("receiver: instance #%d", c.sel_inst);
     else
         ImGui::TextDisabled("instance methods need a receiver - pick "
-                            "one on the Instances tab or via Inspector");
+                            "one on the Instances tab above");
     ImGui::SetNextItemWidth(130);
     if (ImGui::InputInt("Call Count", &c.call_count)) {
         if (c.call_count < 1)    c.call_count = 1;
@@ -1831,7 +1910,7 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
         ImGui::TextDisabled("Call Results:");
         ImGui::SameLine();
         if (ImGui::SmallButton("Clear##clg")) c.call_log.clear();
-        ImGui::BeginChild("calllog", ImVec2(0, 150), true);
+        ImGui::BeginChild("calllog", ImVec2(0, fit_h(.30f, 90)), true);
         for (auto& l : c.call_log)
             ImGui::TextWrapped("%s", l.c_str());
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
@@ -1971,7 +2050,7 @@ static void trace_tab(ClassTab& c, const MethodSig& m) {
         Tracker& t = s_trackers[ti];
         ImGui::TextDisabled("tracking - %lu events (full log: Tracer tab)",
                             (unsigned long)t.log.size());
-        ImGui::BeginChild("texp", ImVec2(0, 160), true);
+        ImGui::BeginChild("texp", ImVec2(0, fit_h(.35f, 100)), true);
         for (auto& r : t.log) {
             for (auto& cl : r.callers) {
                 if (ImGui::SmallButton(("@ " + cl).c_str()))
@@ -2030,7 +2109,7 @@ static void trace_tab(ClassTab& c, const MethodSig& m) {
         s_hsrc_have = false;
     }
     if (s_hsrc_have && c.cname == s_hcls && m.name == s_hmth) {
-        ImGui::BeginChild("txsrc", ImVec2(0, 170), true);
+        ImGui::BeginChild("txsrc", ImVec2(0, fit_h(.40f, 110)), true);
         ImGui::TextUnformatted(s_hsrc);
         ImGui::EndChild();
         mark_scroll_item(s_lst_scroll);
@@ -2175,10 +2254,6 @@ static void methods_view(ClassTab& c) {
     mark_scroll_item(s_lst_scroll);
     MULK();
 }
-static void open_obj_tab(const std::string& cls, long handle,
-                         const std::string& str);
-static void explorer_body(ExplorerWin& e);
-static void class_tab_body(ClassTab& c);
 static void obj_tab_body(ObjTab& t) {
     MLK();
     char ttl[80];
@@ -2339,149 +2414,100 @@ static void open_obj_tab(const std::string& cls, long handle,
     s_objfocus = handle;
     MULK();
 }
-static void of_deliver(long handle, const std::string& str) {
+static void of_deliver(ClassTab* dst, long handle, const std::string& str) {
+    /* r29: while a method-arg pick is active the value goes to the
+       arg owner (s_arg_uid), otherwise to the listed class tab */
     MLK();
-    if (s_of.ctx_arg >= 0) {
-        for (auto& c : s_classes) {
-            if (c.uid == s_of.ctx_uid) {
+    int  uid  = s_arg_uid;
+    int  argn = s_arg_idx;
+    s_arg_uid = -1;
+    s_arg_idx = -1;
+    s_arg_cls[0] = 0;
+    if (uid >= 0) {
+        for (auto& c : s_classes)
+            if (c.uid == uid) {
                 char tok[40];
                 snprintf(tok, sizeof(tok), "@handle:%ld", handle);
-                if (s_of.ctx_arg < 8)
-                    snprintf(c.call_args[s_of.ctx_arg],
+                if (argn >= 0 && argn < 8)
+                    snprintf(c.call_args[argn],
                              sizeof(c.call_args[0]), "%s", tok);
                 break;
             }
-        }
-    } else {
-        for (auto& c : s_classes) {
-            if (c.uid == s_of.ctx_uid) {
-                c.of_handle = handle;
-                std::string t = str;
-                if (t.size() > 120) t = t.substr(0, 117) + "...";
-                c.of_note = "selected: " + t;
-                for (int k = 0; k < (int)c.instances.size(); k++)
-                    if (c.instances[k].handle == handle) {
-                        c.sel_inst = k;
-                        break;
-                    }
+    } else if (dst) {
+        dst->of_handle = handle;
+        std::string t = str;
+        if (t.size() > 120) t = t.substr(0, 117) + "...";
+        dst->of_note = "selected: " + t;
+        for (int k = 0; k < (int)dst->instances.size(); k++)
+            if (dst->instances[k].handle == handle) {
+                dst->sel_inst = k;
                 break;
             }
-        }
     }
     MULK();
-    s_of.open = false;
 }
-static void objfinder_popup() {
-    if (!s_of.open) return;
+
+static void families_window() {
+    /* r29: the family dropdown became a movable/resizable window */
+    if (!s_fam_open) return;
+    MLK();
+    ExplorerWin* e = nullptr;
+    for (auto& x : s_explorers)
+        if (x.id == s_fam_uid) { e = &x; break; }
+    if (!e) { MULK(); s_fam_open = false; return; }
     ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(
-        ImVec2(io.DisplaySize.x * 0.6f, 0),
-        ImVec2(io.DisplaySize.x * 0.6f, io.DisplaySize.y / 1.5f));
-    if (!ImGui::BeginPopup("ObjFinderPopup",
-                           ImGuiWindowFlags_HorizontalScrollbar))
+        ImVec2(240, 180),
+        ImVec2(io.DisplaySize.x * .9f, io.DisplaySize.y * .9f));
+    ImGui::SetNextWindowPos(
+        ImVec2(io.DisplaySize.x * .3f, io.DisplaySize.y * .25f),
+        ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Class Families", &s_fam_open)) {
+        ImGui::End();
+        MULK();
         return;
-    MLK();   /* s_of.results is written by the GumJS callback thread */
-    ImGui::Text("class: %s", s_of.cls);
-    if (s_of.ctx_arg >= 0)
-        ImGui::TextDisabled("selecting for arg%d (%s)",
-                            s_of.ctx_arg, s_of.typ);
-    else
-        ImGui::TextDisabled("selecting for the Inspector");
-    if (ImGui::Button("Find Objects")) {
-        s_of.results.clear();
-        s_of.waiting = true;
-        post_rpc("listInstances", "{\"class\":\"" + jesc(s_of.cls) + "\"}");
     }
+    std::vector<const char*> famc;
+    for (auto& f : s_families) famc.push_back(f.c_str());
+    int nf = (int)famc.size();
+    if (e->family >= nf || e->family < 0) e->family = 0;
+    ime_textfield("Search families...##fsearch",
+                  e->fam_search, sizeof(e->fam_search));
     ImGui::SameLine();
-    if (ImGui::Button("Create Object")) {
-        s_of.creating = true;
-        post_rpc("createInstance", "{\"class\":\"" + jesc(s_of.cls) + "\"}");
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Close##ofx")) s_of.open = false;
-    ImGui::SetNextItemWidth(180);
-    ime_textfield("##ofman", s_of.manual, sizeof(s_of.manual));
-    ImGui::SameLine();
-    if (ImGui::Button("Use##ofman") && s_of.manual[0]) {
-        if (s_of.ctx_arg >= 0) {
-            for (auto& c : s_classes)
-                if (c.uid == s_of.ctx_uid && s_of.ctx_arg < 8) {
-                    snprintf(c.call_args[s_of.ctx_arg],
-                             sizeof(c.call_args[0]), "%s", s_of.manual);
-                    break;
-                }
-        } else {
-            for (auto& c : s_classes)
-                if (c.uid == s_of.ctx_uid) {
-                    c.of_note = std::string("manual: ") + s_of.manual;
-                    break;
-                }
-        }
-        s_of.open = false;
-    }
+    if (ImGui::SmallButton("All##fwall")) e->all_fam = true;
     ImGui::Separator();
-    ImGui::BeginChild("oflst", ImVec2(0, 0), true);
-    int N = (int)s_of.results.size();
-    for (int k = 0; k < N; k++) {
-        ImGui::PushID(k);
-        InstInfo& in = s_of.results[k];
-        char lbl[220];
-        snprintf(lbl, sizeof(lbl), "%s (%d/%d)",
-                 short_name(s_of.cls).c_str(), k, N);
-        if (ImGui::Selectable(lbl))
-            of_deliver(in.handle, in.str);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Save##ofsv")) {
-            bool have = false;
-            for (auto& sv : s_saved)
-                if (sv.handle == in.handle) { have = true; break; }
-            if (!have)
-                s_saved.push_back({s_of.cls, in.str, in.handle});
+    for (int f = 0; f < nf; f++) {
+        if (!contains_ci(s_families[f], e->fam_search))
+            continue;
+        bool sel = (!e->all_fam && e->family == f);
+        if (ImGui::Selectable(famc[f], sel)) {
+            e->family  = f;
+            e->all_fam = false;
         }
-        ImGui::TextDisabled("    %s", in.str.c_str());
-        ImGui::PopID();
     }
-    if (s_of.waiting)  ImGui::TextDisabled("(scanning the heap...)");
-    if (s_of.creating) ImGui::TextDisabled("(constructing...)");
-    if (N == 0 && !s_of.waiting && !s_of.creating)
-        ImGui::TextDisabled("no results yet - tap Find Objects");
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Saved Objects")) {
-        for (int k = 0; k < (int)s_saved.size(); ) {
-            ImGui::PushID(9500 + k);
-            SavedObj& sv = s_saved[k];
-            char lbl[280];
-            snprintf(lbl, sizeof(lbl), "%s [0x%lx]",
-                     short_name(sv.cls).c_str(), sv.handle);
-            if (ImGui::Button(lbl, ImVec2(
-                    ImGui::GetContentRegionAvail().x - 70.f, 0)))
-                of_deliver(sv.handle, sv.str);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Remove")) {
-                s_saved.erase(s_saved.begin() + k);
-                ImGui::PopID();
-                continue;
-            }
-            ImGui::PopID();
-            k++;
-        }
-        if (s_saved.empty())
-            ImGui::TextDisabled("Nothing...");
-    }
-    ImGui::EndChild();
+    if (nf == 0)
+        ImGui::TextDisabled("no families yet - run a class search");
     mark_scroll_item(s_lst_scroll);
     MULK();
-    ImGui::EndPopup();
+    ImGui::End();
 }
-static void fm_popup() {
+
+static void fm_window() {
     if (!s_fm_open) return;
     ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(
+        ImVec2(io.DisplaySize.x * .62f, io.DisplaySize.y * .7f),
+        ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(
-        ImVec2(io.DisplaySize.x / 1.2f, 0),
-        ImVec2(io.DisplaySize.x / 1.2f, io.DisplaySize.y / 2));
-    if (!ImGui::BeginPopup("fmPopup",
-                           ImGuiWindowFlags_HorizontalScrollbar)) {
-        s_fm_open = false;   /* clicked away: do not force-reopen */
+        ImVec2(320, 220),
+        ImVec2(io.DisplaySize.x * .95f, io.DisplaySize.y * .95f));
+    ImGui::SetNextWindowPos(
+        ImVec2(io.DisplaySize.x * .5f, io.DisplaySize.y * .4f),
+        ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Full Method View", &s_fm_open,
+                      ImGuiWindowFlags_HorizontalScrollbar)) {
+        ImGui::End();
         return;
     }
     MLK();   /* s_fm_* are written by the GumJS callback thread too */
@@ -2507,7 +2533,7 @@ static void fm_popup() {
         mark_scroll_item(s_lst_scroll);
     }
     MULK();
-    ImGui::EndPopup();
+    ImGui::End();
 }
 static void explorer_body(ExplorerWin& e) {
     bool do_search = false;
@@ -2525,30 +2551,17 @@ static void explorer_body(ExplorerWin& e) {
     for (auto& f : s_families) famc.push_back(f.c_str());
     int nf = (int)famc.size();
     if (e.family >= nf || e.family < 0) e.family = 0;
+    /* r29: the family picker opens the movable Class Families window */
     ImGui::SetNextItemWidth(
         ImGui::GetContentRegionAvail().x - 90.f);
     const char* fprev = nf ? famc[e.family]
                             : "(no classes yet)";
-    if (ImGui::BeginCombo("##fam",
-                          e.all_fam ? "(All families)" : fprev)) {
-        ImGui::SetNextItemWidth(-1.f);
-        ime_textfield("Search families...##fsearch",
-                      e.fam_search, sizeof(e.fam_search));
-        ImGui::Separator();
-        if (ImGui::Selectable("(All families)##fsearchall",
-                              e.all_fam))
-            e.all_fam = true;
-        ImGui::Separator();
-        for (int f = 0; f < nf; f++) {
-            if (!contains_ci(s_families[f], e.fam_search))
-                continue;
-            bool sel = (!e.all_fam && e.family == f);
-            if (ImGui::Selectable(famc[f], sel)) {
-                e.family  = f;
-                e.all_fam = false;
-            }
-        }
-        ImGui::EndCombo();
+    char famlbl[180];
+    snprintf(famlbl, sizeof(famlbl), "%s##fambtn",
+             e.all_fam ? "(All families)" : fprev);
+    if (ImGui::Button(famlbl)) {
+        s_fam_uid = e.id;
+        s_fam_open = true;
     }
     ImGui::SameLine();
     ImGui::Checkbox("All", &e.all_fam);
@@ -2616,20 +2629,6 @@ static void class_tab_body(ClassTab& c) {
     ImGui::PushTextWrapPos();
     ImGui::TextUnformatted(c.cname.c_str());
     ImGui::PopTextWrapPos();
-    if (ImGui::SmallButton("Inspector##ct")) {
-        snprintf(s_of.cls, sizeof(s_of.cls), "%s", c.cname.c_str());
-        snprintf(s_of.typ, sizeof(s_of.typ), "%s", "this");
-        s_of.ctx_uid = c.uid;
-        s_of.ctx_arg = -1;
-        s_of.open    = true;
-        s_of.results.clear();
-        s_of.waiting  = false;
-        s_of.creating = false;
-        s_open_objfinder = true;   /* r28: popup instead of window */
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("find / create objects of this class");
-    ImGui::SameLine();
     if (ImGui::SmallButton("Refresh##ct"))
         open_inspector(c.cname, false);
     ImGui::SameLine();
@@ -2819,8 +2818,10 @@ static void draw_fab(ImVec2 ds) {
                  ImGuiWindowFlags_NoSavedSettings |
                  ImGuiWindowFlags_AlwaysAutoResize |
                  ImGuiWindowFlags_NoFocusOnAppearing);
-    if (ImGui::Button(s_visible ? "HIDE" : "MENU", ImVec2(64, 44))) {
-    }
+    /* r29: a fast tap completes within one frame - handle the press
+       directly (the empty handler needed a second tap before) */
+    bool fab_press = ImGui::Button(s_visible ? "HIDE" : "MENU",
+                                   ImVec2(64, 44));
     if (ImGui::IsItemActive()) {
         if (!s_fab_drag) {
             s_fab_drag  = true;
@@ -2840,14 +2841,88 @@ static void draw_fab(ImVec2 ds) {
         }
     } else if (s_fab_drag) {
         s_fab_drag = false;
-        if (!s_fab_moved) {           /* it was a tap, not a drag */
+        if (!s_fab_moved && !fab_press) {
+            /* tap released just off the button: still a tap */
             s_visible = !s_visible;
             s_conf_dirty = true;
         }
     }
+    if (fab_press && !s_fab_moved) {  /* r29: single tap toggles */
+        s_visible = !s_visible;
+        s_conf_dirty = true;
+    }
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
+}
+static void draw_resize_handles() {
+    /* r29: touch-friendly resize - drag the left/right/bottom edges
+       (12px strips, highlighted while touched); the top bar stays
+       the move handle */
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+    ImGuiIO& io = ImGui::GetIO();
+    const float T  = 12.f;
+    const float th = ImGui::GetFrameHeight();
+    static int   s_rz = -1;          /* 0 left 1 right 2 bottom */
+    static ImVec2 m0(0, 0), p0(0, 0), s0(0, 0);
+    struct RzDef { const char* id; ImVec2 o, sz; };
+    RzDef defs[3] = {
+        { "##rzl", ImVec2(0, th),        ImVec2(T, ws.y - th - T) },
+        { "##rzr", ImVec2(ws.x - T, th), ImVec2(T, ws.y - th - T) },
+        { "##rzb", ImVec2(0, ws.y - T),  ImVec2(ws.x, T) },
+    };
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    bool any_active = false;
+    for (int i = 0; i < 3; i++) {
+        ImGui::SetCursorScreenPos(
+            ImVec2(wp.x + defs[i].o.x, wp.y + defs[i].o.y));
+        ImGui::InvisibleButton(defs[i].id, defs[i].sz);
+        bool hov = ImGui::IsItemHovered();
+        bool act = ImGui::IsItemActive();
+        if (hov || act)
+            dl->AddRectFilled(
+                ImVec2(wp.x + defs[i].o.x, wp.y + defs[i].o.y),
+                ImVec2(wp.x + defs[i].o.x + defs[i].sz.x,
+                       wp.y + defs[i].o.y + defs[i].sz.y),
+                act ? IM_COL32(120, 200, 255, 90)
+                    : IM_COL32(160, 160, 160, 45));
+        if (act) {
+            any_active = true;
+            if (s_rz != i) {
+                s_rz = i;
+                m0 = io.MousePos;
+                p0 = wp;
+                s0 = ws;
+            }
+        }
+    }
+    if (any_active && s_rz >= 0) {
+        float dx = io.MousePos.x - m0.x;
+        float dy = io.MousePos.y - m0.y;
+        ImVec2 np = p0, ns = s0;
+        if (s_rz == 0) {
+            float right = p0.x + s0.x;
+            np.x = p0.x + dx;
+            if (np.x < 0) np.x = 0;
+            if (np.x > right - 420.f) np.x = right - 420.f;
+            ns.x = right - np.x;
+        } else if (s_rz == 1) {
+            ns.x = s0.x + dx;
+        } else {
+            ns.y = s0.y + dy;
+        }
+        if (ns.x > io.DisplaySize.x * .95f)
+            ns.x = io.DisplaySize.x * .95f;
+        if (ns.y > io.DisplaySize.y * .95f)
+            ns.y = io.DisplaySize.y * .95f;
+        if (np.y + ns.y > io.DisplaySize.y)
+            ns.y = io.DisplaySize.y - np.y;
+        ImGui::SetWindowPos(np);
+        ImGui::SetWindowSize(ns);
+    } else if (!any_active) {
+        s_rz = -1;
+    }
 }
 int menu_frame_pump_level() {
     MLK();
@@ -2933,7 +3008,7 @@ void menu_draw() {
     }
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r28)", &open, wflags);
+    ImGui::Begin("Dex-tool v1.3 (r29)", &open, wflags);
     if (!open) {
         MLK();
         s_visible = false;
@@ -2965,16 +3040,18 @@ void menu_draw() {
     }
     if (s_clip_msg[0] && conf_now_ms() - s_clip_ms < 2500)
         ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1), "%s", s_clip_msg);
-    if (s_open_objfinder) {
-        s_open_objfinder = false;
-        ImGui::OpenPopup("ObjFinderPopup");
-    }
     if (s_open_fmview) {
         s_open_fmview = false;
         ImGui::OpenPopup("fmPopup");
     }
-    objfinder_popup();
-    fm_popup();
+    /* r29: full method view is a movable window now */
+    if (s_open_fmview) {
+        s_open_fmview = false;
+        s_fm_open = true;
+    }
+    families_window();
+    fm_window();
+    if (!s_fullscreen) draw_resize_handles();
     ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
     ImGui::End();
     mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);

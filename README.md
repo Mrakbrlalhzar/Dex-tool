@@ -3,6 +3,41 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Fixes in this version (r29)
+
+The fix-spec round: a code review plus the six reported UI issues.
+No new library was needed - ImGui + Frida cover everything.
+
+- **Single tap works.** The MENU/HIDE toggle ignored taps that
+  complete within one frame: Button returned pressed into an empty
+  handler and the toggle ran only through the multi-frame drag path,
+  so a second tap was needed. The press now toggles directly;
+  dragging the button still only moves it.
+- **Resize by dragging the edges.** Left/right/bottom edge strips
+  (12 px, highlighted while touched) resize the menu; the top bar
+  stays the move handle. The 420x300 minimum and the 95% screen
+  maximum are kept.
+- **Class Families is a window.** The family dropdown became a
+  movable, resizable Class Families window (340x420 on first use)
+  with the search box and an All shortcut inside.
+- **Full Method View is a window.** Same conversion - movable,
+  resizable, scrollbar kept.
+- **Instance and Inspector merged.** The Object Finder popup and the
+  Inspector button are gone; Find instances / Create instance /
+  manual handle entry / Saved Objects all live in the Inspector's
+  Instances sub-tab. Picking an instance for a method argument opens
+  that class's Instances tab with a green "picking for argN" banner
+  and a Cancel pick button.
+- **Lists follow the menu size.** Recorder, Monitor, console, trace,
+  source and Call-Results boxes now take a fraction of the remaining
+  window height (fit_h) instead of fixed pixel heights, so nothing
+  needs menu resizing to be seen.
+- **Cleanup.** Duplicated forward declarations removed; the
+  ObjFinder struct and the s_open_objfinder deferred-popup path
+  deleted with the merge; instanceCreated now appends to the class
+  tab's instance list directly.
+
+
 ## Fixes in this version (r28)
 
 The menu was reshaped into the structure of the reference source the
