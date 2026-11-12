@@ -7,23 +7,13 @@
 #include <string>
 #include <cstdio>
 #include <cstring>
-
 static GumScriptBackend* g_backend = nullptr;
 static GumScript*        g_script  = nullptr;
 static GMainLoop*        g_loop    = nullptr;
 static GMainContext*     g_ctx     = nullptr;
 static std::mutex        g_pmtx;
 static MsgCallback       g_cb;
-/* r22/audit: agent messages that arrive before menu_init()
-   registers the callback (the one-shot "ready" usually does) are
-   kept and replayed when it does */
 static std::deque<std::string> g_backlog;
-
-/* GumJS `msg` for send(x) is: {"type":"send","payload":<x>}.
-   menu.cpp wants <x> (the agent's own JSON object), not the whole
-   envelope, so extract the payload substring. Log every agent
-   "error" message verbatim - r6 could never match it because the
-   escaping inside the envelope hid the quotes. */
 static std::string extract_payload(const char* msg) {
     if (!msg) return "";
     std::string m(msg);
@@ -31,13 +21,10 @@ static std::string extract_payload(const char* msg) {
     if (p == std::string::npos) return "";
     p += 10;   /* "payload": is 10 chars incl. quotes+colon */
     while (p < m.size() && m[p] == ' ') p++;
-    /* payload runs to the end of the envelope object */
     size_t e = m.rfind('}');
     if (e == std::string::npos || e < p) return "";
     return m.substr(p, e - p);
 }
-
-/* raw (still JSON-escaped) value of a string key, or "" */
 static std::string raw_json_string(const std::string& j, const char* key) {
     std::string k = std::string("\"") + key + "\":\"";
     size_t p = j.find(k);
@@ -50,12 +37,6 @@ static std::string raw_json_string(const std::string& j, const char* key) {
     }
     return j.substr(p, i - p);
 }
-
-/* r24: escape a C string for inline embedding into a JSON envelope.
-   The GumJS failure text (err->message) is arbitrary text - pasted
-   in raw, quotes/backslashes inside it produced an INVALID envelope
-   the menu's jstr() then failed to parse (Settings stayed
-   "waiting" even though a message had arrived). */
 static std::string jesc_bridge(const char* s) {
     std::string o;
     for (; s && *s; s++) {
@@ -69,13 +50,7 @@ static std::string jesc_bridge(const char* s) {
     }
     return o;
 }
-
 static const char kErrEnvelope[] = "{\"type\":\"error\"";
-
-/* r23: shared delivery to the menu (callback if registered, backlog
-   otherwise) - also used by the START-FAILURE paths below, so a
-   GumJS backend/script failure reaches the UI as an agentStatus
-   message instead of dying silently in the crash log. */
 static void deliver(const std::string& pl) {
     MsgCallback local;
     {
@@ -88,15 +63,10 @@ static void deliver(const std::string& pl) {
     }
     if (local && !pl.empty()) local(pl);
 }
-
 static void on_message(const gchar* msg, GBytes*, gpointer) {
     if (!msg) return;
     std::string pl = extract_payload(msg);
     if (pl.empty() && strncmp(msg, kErrEnvelope, sizeof(kErrEnvelope) - 1) == 0) {
-        /* r22/audit: an uncaught JS exception raised by GumJS itself
-           arrives as {"type":"error",...} with NO "payload" key, so
-           it used to be dropped silently. Log it and forward the
-           description to the menu in the agent's own shape. */
         std::string d  = raw_json_string(msg, "description");
         std::string st = raw_json_string(msg, "stack");
         char em[1200];
@@ -130,7 +100,6 @@ void frida_bridge_start(JavaVM*) {
     g_backend = gum_script_backend_obtain_qjs();
     if (!g_backend) {
         log_crash_raw("[frida_bridge] FATAL: no QJS backend\n");
-        /* r23: tell the menu instead of leaving it on "waiting" forever */
         deliver("{\"type\":\"agentStatus\",\"payload\":{\"ok\":0,"
                 "\"msg\":\"no GumJS QuickJS backend (gum_init failed?)\"}}");
         return;
@@ -145,14 +114,8 @@ void frida_bridge_start(JavaVM*) {
         snprintf(m, sizeof(m), "[frida_bridge] create: %s\n",
                  err ? err->message : "(null)");
         log_crash_raw(m);
-        /* r23: the Settings tab now shows WHY the agent is not coming up.
-           r24: the message is JSON-escaped - err->message is arbitrary
-           text and the raw paste could break the envelope. */
         char jm[768];
         std::string em = jesc_bridge(err ? err->message : "(null)");
-        /* escape expansion can be 6x - cap the text so the envelope
-           is ALWAYS closed (a truncated tail would be invalid JSON
-           and the menu would drop the message) */
         if (em.size() > 400) em = em.substr(0, 400);
         snprintf(jm, sizeof(jm),
                  "{\"type\":\"agentStatus\",\"payload\":{\"ok\":0,"
@@ -169,18 +132,14 @@ void frida_bridge_start(JavaVM*) {
     g_main_loop_run(g_loop);
     log_info("[frida_bridge] loop exited");
 }
-
 void frida_post(const std::string& json) {
     if (!g_script) {
-        /* r22/audit: say so instead of vanishing - the menu's first
-           messages used to disappear without a trace */
         log_debug("[frida_post] dropped: agent not loaded yet");
         return;
     }
     std::lock_guard<std::mutex> lk(g_pmtx);
     gum_script_post(g_script, json.c_str(), nullptr);
 }
-
 void frida_set_message_callback(MsgCallback cb) {
     std::deque<std::string> pending;
     {

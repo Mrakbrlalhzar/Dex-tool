@@ -1,407 +1,5 @@
 'use strict';
-/* Dex-tool agent (r27). All Java logic lives here (frida-java-bridge);
-   libtool.so only feeds input/GL. Messages both ways are JSON via
-   send()/recv(); the C++ menu decodes them in menu.cpp.
-
-   r27 changes (UI spec v2 - menu.cpp only, the agent is UNCHANGED:
-   the object-parameter dropdowns reuse listInstances): family popup
-   "Search families..." filter, wrapped class-name title, long-press
-   method menu, Call/Patch/Trace/Hook sub-tabs, Fields tree node.
-   r26 changes (menu restructure per the field spec - Class Explorer
-   windows, Inspector windows, Caller/Patcher/Tracer/Hooker sub-tabs,
-   Object Finder):
-   - callMethod gained count (N calls, per-call callResult with
-     idx/of) and main (Java.scheduleOnMainThread - the spec's "Call
-     in Main Thread" button).
-   - Object args travel as {"handle":N} - call_with_args resolves the
-     retained instance, so the Object Finder can feed an actual object
-     into any parameter (the old text-only args could not).
-   - createInstance: the Object Finder's "Create Object" - $new() via
-     the no-arg constructor, retained like a Java.choose match.
-   - listLoadedClasses gained cs (case-sensitive compare for mode 0
-     and the dex scan; the Explorer Options popup checkbox).
-   - r25 changes (field report: menu hangs/lags/freezes on OTHER apps +
-   feature requests for the Hooks/Monitor/Classes sections):
-   - FRAME PUMP (the freeze fix): the menu is drawn inside the
-     eglSwapBuffers hook, so a host that renders on demand (most
-     non-game apps) only advanced the menu when it happened to
-     redraw - queued menu touches waited for the next swap ("when
-     I touch the app, the touch I had previously made on the menu
-     works"). The agent now polls dextool_want_frames() from a 30 ms
-     timer and DecorView.postInvalidate()s the captured activity
-     while frames are wanted: full rate with the menu up, slow rate
-     (FAB only) when it is hidden.
-   - METHOD SOURCE VIEW: "Src" on a method (or Load source in the
-     Hooks tab) disassembles the REAL method body on-device with a
-     bundled baksmali (org.smali 2.5.2 - baksmali is not on Google
-     Maven for 3.x) and shows it in a read-only panel; Smali mode
-     can copy the body into the hook editor. Java decompilation is
-     NOT bundled (too heavy to run inside the host process) - both
-     modes show the bytecode.
-   - ONE-TAP NOP: the "Nop" button adds a noop hook that returns the
-     default value for the method's return type (void -> plain
-     return, numeric -> 0, boolean -> false, object/array -> null).
-   - METHOD INPUT/OUTPUT PATCHING: "IO" probes one call of the
-     method, reports the captured current values (toString-safe),
-     and only the checkbox-marked rows are patched from then on
-     (args replaced before the original call, return value replaced
-     after).
-   - NETWORK MONITOR: okhttp calls now log a REQUEST row AND a
-     RESPONSE row (response body peeked up to 4 KB, request body
-     when accessible); HttpURLConnection.getInputStream is hooked
-     too. Clicking a row opens a detail window: type, http method,
-     URL, the app method that sent/received it (clickable), note and
-     the payload preview.
-   - CLASSES TAB: the list is sorted alphabetically and android/
-     androidx/com.android/com.google/java/javax/dalvik/kotlin
-     classes are HIDDEN by default (System checkbox brings them
-     back). Search has 4 modes: class name, method name, field name
-     and CODE TEXT - the last one scans every method's const-string
-     instructions and static String field values of the app's dex
-     files (chunked, cancellable, capped at 4000 hits); classes it
-     reports get their matched methods/fields painted GREEN when
-     opened.
-   - r24 changes (patch #3 - performance on heavy apps + logic/CI
-   leftovers from the latest static audit; the menu froze and
-   logcat showed "Skipped 40 frames! The application may be doing
-   too much work on its main thread"):
-   - Field-tracker flooding fixed: field_layer_emit() sent a
-     trackerEvent on EVERY method call of the tracked class,
-     changed or not (the old else-branch). Values are polled at
-     most every 20 ms, emitted only when the value actually
-     changed, and at most once per 100 ms per field - hot classes
-     no longer flood the bridge.
-   - dt_is_loaded() race fixed: the 3 s loaded-class cache could
-     predate a class actually loading, and loadClass would never
-     fire again - the queued install waited forever. A cache miss
-     now forces ONE rebuild of the set (once per cache
-     generation) before the class is declared unloaded.
-   - Dispatcher overhead: cls/mn are parsed from the LAYERS key
-     LAZILY (only recorder rows need them) instead of substring'ing
-     the key on every hooked call; the dispatchTouchEvent hook
-     keeps doing the minimum on the main thread.
-   - Eaten gestures no longer leak UP: gTouchEat was cleared on
-     UP/CANCEL BEFORE the consume check, so the app received an
-     UP for a gesture whose DOWN the menu had consumed. The flag
-     is captured first and consumed after.
-   - IME ladder stops when the keyboard is already up: retries
-     now check isAcceptingText() (logged once), and every show
-     request carries a session token - newer requests and
-     Done/hide invalidate the pending ladder instead of
-     re-sending showSoftInput 4x per tap.
-   - Enter is forwarded to ImGui: onEditorAction sends an
-     "imeEnter" message BEFORE imeHidden; the menu injects
-     ImGuiKey_Enter (DOWN, then UP next frame) so fields with
-     EnterReturnsTrue (the class filter) actually search.
-
-   r23 changes (patch #2 of the 47-item audit - 22 open + 7 partial
-   items finished):
-   - ONE layering registry (LAYERS) per class+method: Hook, Tracker,
-     field-Tracker, Recorder and Monitor now STACK on the same method
-     instead of overwriting each other's ov.implementation. A single
-     dispatcher runs recorder -> monitor -> tracker -> field-diff ->
-     user hook; removing the last layer of a method restores the
-     original implementation.
-   - Recorder Stop and Monitor Stop really UNHOOK: their layer is
-     removed and the method's original implementation returns (the
-     r22 stop only flipped a flag and left every hook installed).
-   - listInstances retains every instance (Java.retain) and returns a
-     structured protocol {str, handle, fields:[{n,t,v}]} - the old
-     "toString##name=value;name=value" string corrupted every value
-     containing | # or ;. setInstanceField/callMethod address the
-     instance by HANDLE, so instance methods finally have a receiver
-     (callMethod without a handle now refuses non-static calls with a
-     hint instead of failing on ov.apply(null)).
-   - Class access avoids premature <clinit> where possible: hook and
-     tracker installs only Java.use classes that are ALREADY loaded;
-     anything else is DEFERRED and installed by a loadClass watcher
-     when the target loads the class (frida-java-bridge always runs
-     ensureClassInitialized in use(), so "not loaded yet" is the one
-     case we can avoid triggering).
-   - trackField/tracker values no longer call toString() inside
-     hooks: field_repr() stringifies primitives and boxes only, and
-     reports '@class#identityHashCode' for anything else - no more
-     recursion/crash through an app's own toString (which this agent
-     may itself be recording).
-   - Click-through: the dispatchTouchEvent hook asks
-     dextool_hit_test(rawX, rawY) BEFORE the app sees the gesture and
-     consumes the whole gesture when it starts on a live menu window
-     (menu.cpp publishes every ImGui window rect each frame; the old
-     gWantMouse path still called the app's dispatch and leaked taps).
-   - Touch map view choice: the probe now scores SurfaceView/
-     TextureView candidates against the overlay's ACTUAL GL surface
-     size (dextool_display_size) instead of blindly taking the
-     largest, and overlay.cpp dropped its coordinate clamping - taps
-     outside the view no longer snap onto edge widgets (both axes
-     were already proportional since r15).
-   - IME focus: before the hidden EditText takes focus the app's
-     currently-focused view is retained; ime_hide / Done / imeHidden
-     restore focus to it and clear the EditText - the app gets its
-     focus state back instead of the 1x1 view keeping it forever.
-   - Everything from r22 (script new Function fix, mode
-     normalisation, orig() receiver/args, patch snapshot/restore,
-     ordered input queue + UTF-16, code-point deletions, OkHttp
-     enqueue, readable console, smali loader hardening) and r21
-     (addContentView host attach, ime_read_text cast chain) is kept.
-
-   r22 changes (third-party audit, the 18 patch-fixed items ported
-   here and MERGED with the r21 IME code - the audit's raw patch
-   targeted a pre-r19 snapshot and its ime_on_text hunk would have
-   clobbered the r21 fixes):
-   - Script tab runs user code now: the LAST argument of
-     new Function() is the body - the old call made "src" the body
-     and passed the code as a parameter VALUE, so nothing executed.
-   - Java(JS) hooks install: the menu label 'Java(JS)' is
-     normalised to 'Java' (mode strings are compared literally).
-   - orig() in Java hooks keeps the REAL receiver + arguments.
-   - Patch OFF/delete RESTORES the original value (snapshotted
-     before the first write); noop/'char' fallbacks return
-     '\u0000' instead of 'a'.
-   - Recorder pre-filters enumerateLoadedClassesSync() ONCE (the
-     install loop counted skipped classes against its 12-class
-     batch, so a package filter took ~a minute over 30k names).
-   - Tracker callers no longer list the tracked method itself.
-   - Monitor also hooks OkHttp enqueue (async requests).
-   - Script console output is readable via cstr() (no 160-char
-     cut, no '|'->'!' rewrite, objects JSON-stringified).
-   - Smali jar: extracted to a temp file + rename (a killed
-     process cannot leave a truncated jar), setReadOnly() for
-     Android 14+ (writable dex refused), assembled via
-     ClassFactory.get(loader) (loadClass returns a Class wrapper
-     without static main()) trying both Main class names, source
-     written as UTF-8.
-   - smali_load uses the single-ByteBuffer InMemoryDexClassLoader
-     ctor (the ByteBuffer[] one needs API 27; minSdk is 26).
-   - IME deletions are counted in CODE POINTS: an astral char went
-     in as 2 UTF-16 units but ImGui deletes one CHARACTER per
-     backspace, so unit-counting over-deleted the field.
-     Insertions stay per-UTF-16-unit; overlay.cpp (r22) routes the
-     halves through io.AddInputCharacterUTF16() so pairs
-     recombine.
-   - Touch map also refreshed on ACTION_DOWN (throttled), not just
-     on moves.
-   - Dead code removed: DOTS/DMAX, parse_rules, lit_to_java,
-     CONS_Lines/CONS_Dummy batching, gDispSize lookup.
-
-   r21 changes (two field reports on the r20 build, both pinned by
-   the r20 stage tags):
-   - "stage decor.addView: decor.addView typeof undefined": on this
-     bridge the wrapper returned by win.getDecorView() does not
-     resolve ViewGroup methods, so the hidden EditText could never
-     be attached. Fix per field fix-spec: attach through
-     act.addContentView(edit, lp) instead - a plain public Activity
-     method on the same wrapper whose hashCode/getWindow/
-     getSystemService all work (proven by the successful r20 run
-     that opened the keyboard). The win/decor stages are gone; the
-     r19 early guard now probes BOTH act.getWindow and
-     act.addContentView before any state mutation.
-   - first keystroke typed "[object Object]" into the menu and then
-     nothing: the Editable handed to afterTextChanged() had no
-     bridged toString either, so ed.toString() fell through to
-     QuickJS's Object.prototype.toString - it does NOT throw, it
-     silently returns that constant, the watcher stores it as
-     IME.prev and every later diff comes out empty. Fix:
-     ime_read_text() re-wraps the Editable through
-     Java.cast(ed, CharSequence).toString() (the same cast
-     machinery as the proven cast to InputMethodManager), falls
-     back to a java.lang.Object cast, then to
-     CharSequence.toString.call(ed); every path rejects the
-     "[object Object]" poison literal and a total read failure
-     returns null - ime_on_text() then SKIPS the delta (the
-     fix-spec fallback cur = '' would have fired backspaces for
-     the whole field).
-   - everything from r20 (stage tags, one-shot view-map probe) and
-     r19 (retain + probe/rewrap, defensive factory resolution,
-     delegating ime_ensure alias) is kept.
-
-   r20 changes (field report on r19: the r19 diagnostics worked -
-   the payload now reads {"fn":"ime_create_edit","msg":"not a
-   function"}, once per ladder attempt. The failure is INSIDE
-   the hidden-EditText factory):
-   - root finding: the GumJS backend is QuickJS, and QuickJS
-     reports any call through a missing/broken callee as a bare
-     "not a function" - NO callee name (V8 would say
-     "x.y is not a function"). Every r19 typeof guard passed
-     silently (no "lacks act.getWindow", no probe/rewrap
-     failure, no "no background-clear API"), so the dying call
-     is one of the unguarded ones between act.getWindow() and
-     setOnEditorActionListener() - indistinguishable from a
-     bare message.
-   - fix: ime_stage(name, fn) wraps EVERY call in the IME path
-     (factory + ime_try_show); each callee is typeof-verified
-     BEFORE the call and each failure rethrows as
-     "stage <name>: <original>", so the next [agent error]
-     names the exact call, e.g. "stage decor.addView: not a
-     function". No behavior change on success.
-   - one-shot view-map probe after the first activity capture:
-     report_map()/find_gl_view() swallow their own errors, so
-     the same failure class could hide there; the probe logs
-     "view map probe ok/failed: <reason>" once.
-   - everything from r19 (retain + probe/rewrap, defensive
-     factory resolution, delegating ime_ensure alias) is kept.
-
-   r19 changes (field report: tapping a text field logged
-   "[agent error] ... ime_ensure ... not a function" and the
-   keyboard never opened):
-   - the truncated log line cannot distinguish a TypeError thrown
-     AT the ime_ensure() call site from one thrown INSIDE
-     ime_ensure() and reported through its own {fn:'ime_ensure'}
-     error channel. Both shapes are now impossible, and any future
-     failure names the exact missing member:
-     - the EditText factory is renamed to ime_create_edit() (the
-       canonical name) and the bare ime_ensure() INVOCATION is
-       replaced: ime_try_show() resolves the factory through
-       typeof checks and, if a binding were ever lost, logs BOTH
-       typeofs instead of throwing a bare "ime_ensure is not a
-       function" that halts the IME flow.
-     - ime_ensure() stays defined as a DELEGATING legacy alias ->
-       ime_create_edit(), so stale references in any build of
-       this script resolve to the REAL factory (an EMPTY stub
-       would make ime_try_show() bail and the keyboard would
-       never open - do not replace the alias with a no-op).
-     - ime_set_act() VERIFIES the Java.retain() result before
-       trusting it: probes the retained wrapper for a real
-       Activity method and, if a bridge ever returned a bare
-       handle object, re-wraps it through Java.cast() (which
-       also promotes the handle to a global reference).
-     - ime_create_edit() typeof-guards the Activity/View methods
-       it touches (act.getWindow, setBackgroundDrawable/
-       setBackground, setAlpha): if a member is missing the log
-       names it exactly, no more bare "X is not a function".
-
-   r18 changes (field report: SIGABRT with "JNI DETECTED ERROR IN
-   APPLICATION: use of invalid jobject" - the keyboard never opened
-   and, when the IME path was forced, the app itself crashed):
-   - root cause: the r17 touch-hook capture stored `this` RAW in the
-     long-lived IME.act. A wrapper handed to a hook implementation
-     is only valid for the duration of that callback (its JNI
-     reference is LOCAL and dies when the callback returns); the
-     later getSystemService()/showSoftInput() on the stale object
-     aborts the process. The official bridge docs state exactly
-     this and provide Java.retain() for it: "Duplicates a JavaScript
-     wrapper for later use outside replacement method".
-   - IME.act is stored through ime_set_act() now, which keeps a
-     Java.retain()-ed GLOBAL reference (valid after the callback,
-     on any thread) and releases the previous one when the tracked
-     activity changes, so switches never leak. The bridge does not
-     export Java.release(), so cleanup uses the wrapper's $dispose()
-     ("eagerly deletes the underlying JNI global reference"), with
-     Java.release() preferred if a bridge ever provides it.
-   - retention covers ALL capture sources, not just the touch hook:
-     onResume, the Application lifecycle callback, the
-     ActivityThread walk and the Java.choose heap scan hand out
-     equally callback-scoped wrappers - patching only the touch
-     hook would have left the same crash one resume away.
-   - capture logging: "ime: activity captured & retained via <src>"
-     fires per NEW activity (identity-checked with .equals), i.e.
-     on first capture AND on switches; the r17 once-per-agent flag
-     is retired. The "IME host activity" info line moved into
-     ime_set_act so every source reports identically, exactly once.
-
-   r17 changes (field report: on many hosts the touch hook ran but
-   no Activity capture ever reached IME.act, so ime_show() fell
-   back to the fragile ActivityThread walk / heap scan, those
-   fallbacks failed to find the resumed activity, and
-   showSoftInput was never called):
-   - the dispatchTouchEvent hook forwarded taps to native but never
-     assigned IME.act - only the onResume hook did, and that hook
-     is lost when the agent attaches after the first resume (hot
-     start: no further resume fires until the user leaves and
-     returns). The touch hook assigns IME.act = this on EVERY
-     event now - the tap that opens the menu is itself proof of a
-     live, resumed activity. Logged once ("ime: activity captured
-     via touch hook"), not at event rate.
-   - find_current_activity_sync() checked only the paused/stopped
-     record flags: a finishing or destroyed Activity passed, then
-     getSystemService() succeeded but showSoftInput silently
-     no-opped - indistinguishable from "keyboard broken". The walk
-     skips dead activities now (not even eligible as the
-     last-resort fallback), and so does the Java.choose heap scan,
-     which can surface destroyed-but-not-yet-collected instances.
-   - diagnostics rebuilt: the "no activity yet" warning carries the
-     walk's diagnosis as payload, ime_try_show() logs a skipped
-     attempt instead of a silent false, showSoftInput's real
-     return value is logged, and a final stage line reports the
-     post-ladder bridge state with the reason when it stayed down.
-   - kept from r16: the async resolver callback performs the show
-     itself (ime_act_resolved -> ime_try_show(false)).
-
-   r16 changes (field report: the keyboard STILL failed to open):
-   - the async resolve_current_activity() callback stored IME.act
-     but never attempted the show: when every synchronous retry
-     missed and the heap scan landed after the retry ladder was
-     done, showSoftInput never ran. The callback performs the show
-     itself now (ime_act_resolved), scheduled on the main thread,
-     without touching any text.
-   - the retry ladder resolved the activity SYNCHRONOUSLY only;
-     an activity found only by the async heap scan was never
-     picked up. The ladder runs resolve_current_activity() now
-     (sync walk first, heap scan second).
-   - ime_try_show() reset the hidden EditText on EVERY attempt;
-     a retry landing while the user was already typing wiped the
-     field. Only the first attempt of a focus session resets.
-
-   r15 changes (code-audit fixes):
-   - IME: activity resolution is now ASYNC-correct. Java.choose
-     fires onMatch LATER - the r14 fallback read the result before
-     the callback ran and always got null. Split into
-     find_current_activity_sync() (ActivityThread walk) and
-     resolve_current_activity(cb) (sync walk first, heap scan
-     second, result consumed strictly inside the callbacks).
-   - IME: the showSoftInput retry ladder is armed even when no
-     activity is known yet; every retry re-resolves and retries,
-     so the hidden EditText + TextWatcher are created as soon as
-     any activity appears (the r14 early return skipped them).
-   - touch: the hook forwards getRawX()/getRawY() (SCREEN coords)
-     and the map is measured with getLocationOnScreen() of the
-     largest SurfaceView/GLSurfaceView/TextureView (content view
-     fallback) - one coordinate space on both sides of the
-     transform; overlay.cpp scales BOTH axes, the -80 px bias
-     default is gone.
-
-   r12 changes (field issues from the r11 run):
-   - keyboard: the menu pops the PHONE's own keyboard (system IME).
-     showIme/hideIme focus a hidden 1x1 EditText on the resumed
-     activity; a TextWatcher diffs .toString() (the METHOD - the r10
-     bug was String(editable) -> "[object Object]") and forwards the
-     deltas as dextool_add_char()/dextool_backspace(). The r11 drawn
-     keyboard is gone.
-   - classes: the Classes tab lists ALL loaded classes by default
-     (listLoadedClasses with an empty filter, still paged 400/qid).
-   - openClass: no static field VALUE reads anymore - f.get(null) can
-     run the class's <clinit>, which may block forever inside app
-     code (that, plus a nested-lock deadlock in menu.cpp, froze the
-     app when a class was opened). Values on demand via
-     readStaticFields.
-   - recorder: Stop now also aborts a running installation; progress
-     messages are throttled (the r11 log flooded ~200
-     recorderProgress lines per install) and install chunks are
-     smaller so the JS thread never stalls for seconds.
-   - touch map: measured on Activity.onResume AND on every touch
-     (throttled); onWindowFocusChanged never fired on the field host.
-
-   r14 changes (field issues from the r13 run):
-   - keyboard never opened: ime_show() called act.getSystemService()
-     with `act` undefined, so EVERY show attempt died with a
-     ReferenceError before showSoftInput, and the retry (scheduled
-     after the throw) never ran. Fixed; the activity is resolved
-     from four sources (lifecycle callbacks, onResume hook,
-     ActivityThread walk, heap-scan fallback) and showSoftInput is
-     retried at 150/450/900 ms.
-   - SIGABRT at agent load in some hosts ("opened and run but no
-     menu", CRASH signal=6 right after "script created"): all Java
-     init is deferred out of gum_script_load_sync and each phase is
-     marked via the native dextool_agent_log export.
-   - "small clone of our menu" in popup surfaces: the overlay
-     refuses to adopt the parked ImGui world into surfaces far
-     smaller than the parked DisplaySize (native side, r14).
-*/
-
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
-
-/* r14: native phase logging. dextool_agent_log writes straight into
-   dextool-crash.log + dextool-debug.log from libtool.so, so markers
-   survive even when the GumJS message pump never runs again. */
 var gAgentLog = null;
 function agentLog(msg) {
     try {
@@ -430,10 +28,6 @@ function jargs(a) {
         return Array.prototype.map.call(a, jstr).join(',').substring(0, 240);
     } catch (e) { return '?'; }
 }
-/* (r23: describe() removed - describe_safe()/field_repr() render
-   tracker values without calling the app's toString()) */
-
-/* Java stack of the calling thread, app frames only, capped */
 function jstack(limit) {
     try {
         var st = Java.use('java.lang.Thread').currentThread().getStackTrace();
@@ -448,14 +42,6 @@ function jstack(limit) {
         return out;
     } catch (e) { return []; }
 }
-
-/* r23: recursion-safe value renderer for tracker/field reads.
-   jstr()/String(v) call the app's toString() INSIDE our hooks - when
-   the recorded/tracked class's own toString (or something it calls)
-   comes back through a hook, that recurses, floods the ring and can
-   crash (the audit's "Tracker Side Effects" item). Only primitives
-   and their boxes get real text here; every other object is reported
-   as '@class#identityHashCode'. */
 var gSysCls = null;
 function field_repr(v) {
     try {
@@ -482,15 +68,10 @@ function field_repr(v) {
         return String(v).substring(0, 160);   /* plain JS values */
     } catch (e) { return '?'; }
 }
-
-/* r22/audit: parse_rules()/lit_to_java() removed - dead code,
-   nothing called them */
-
 var gAddChar = null, gBackspace = null, gWantMouse = null;
 var gNativeTouch = null, gSetMap = null;
 var gHitTest = null, gDisplaySize = null;   /* r23 */
 var gWantFrames = null;                     /* r25 frame pump */
-
 function ensure_native_fns() {
     if (gNativeTouch) return true;
     try {
@@ -505,57 +86,18 @@ function ensure_native_fns() {
         gNativeTouch = new NativeFunction(t, 'void', ['float', 'float', 'int']);
         gSetMap    = new NativeFunction(s, 'void', ['int', 'int', 'int', 'int']);
         if (w) gWantMouse = new NativeFunction(w, 'bool', []);
-        /* r23: click-through filter + the owner surface's real size
-           (both exports exist since r23; older libtool builds simply
-           leave them null and the hooks fall back to r22 behaviour) */
         var h = Module.findExportByName('libtool.so', 'dextool_hit_test');
         if (h) gHitTest = new NativeFunction(h, 'bool', ['float', 'float']);
         var d = Module.findExportByName('libtool.so', 'dextool_display_size');
         if (d) gDisplaySize = new NativeFunction(d, 'int', []);
-        /* r25: frame-pump level (0/1/2); older builds leave it null
-           and the pump simply never runs */
         var wf = Module.findExportByName('libtool.so', 'dextool_want_frames');
         if (wf) gWantFrames = new NativeFunction(wf, 'int', []);
         return true;
     } catch (e) { return false; }
 }
-
-/* r15: measure where the overlay's GL view sits ON SCREEN and tell
-   the overlay. Two changes vs r14:
-   - getLocationOnScreen() (screen space) instead of
-     getLocationInWindow() (window space): the hook now forwards
-     getRawX()/getRawY(), so both sides of the transform share the
-     same origin and no device-specific Y bias is needed.
-   - the view measured is the largest SurfaceView / GLSurfaceView /
-     TextureView in the window (that is the surface the overlay
-     actually draws onto); android.R.id.content stays as fallback.
-   Still called from Activity.onResume and throttled from every
-   touch, so a relayout at any point in the app's life still
-   updates the map. */
 var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
 var gMapLastTouch = 0;
 var gTouchEat = false;   /* r23: the current gesture started on the menu */
-
-/* ---------------- r25 frame pump ----------------
-   The menu lives inside the host's eglSwapBuffers. Games swap every
-   frame; most other apps render ON DEMAND - they can go seconds
-   without swapping, and every menu touch/keystroke we queued just
-   waited for the next swap. That is the exact field report: "the
-   menu hangs, lags, and freezes ... when I touch the app, the touch
-   I had previously made on the menu works". While the overlay wants
-   frames (dextool_want_frames: 2 = menu up, 1 = FAB only, 0 = no)
-   we postInvalidate() the captured activity's DecorView, which
-   makes the host produce real frames on its own UI/RenderThreads.
-   postInvalidate() is the thread-safe variant, so calling it from
-   this JS thread is fine. IME.act is the Java.retain()-ed activity
-   captured by the touch hook (r18) - a retained GLOBAL reference,
-   valid here.
-
-   Rates: 30 ms tick; level 2 invalidates every tick (~30 fps),
-   level 1 every 4th tick (~8 fps - just keeps the FAB tappable on
-   idle hosts without burning their battery all day). A host that
-   renders continuously (games) coalesces the extra invalidations -
-   no measurable cost. */
 var gPumpTick = 0, gPumpLogged = 0, gPumpMissLogged = 0;
 function pump_frames() {
     try {
@@ -574,8 +116,6 @@ function pump_frames() {
         if (!w) return;
         try { dv = w.getDecorView(); } catch (eD) { return; }
         if (!dv) return;
-        /* r20/r21 lesson: wrappers may not resolve every member -
-           typeof-check before the call and log it ONCE */
         if (typeof dv.postInvalidate !== 'function') {
             if (!gPumpMissLogged) {
                 gPumpMissLogged = 1;
@@ -604,17 +144,10 @@ function report_map(view) {
 }
 function content_view(activity) {
     try {
-        /* 0x01020002 = android.R.id.content */
         return activity.getWindow().getDecorView()
                         .findViewById(0x01020002);
     } catch (e) { return null; }
 }
-/* the view the overlay actually renders onto. r23: candidates are
-   SCORED against the overlay's real GL surface size
-   (dextool_display_size) instead of blindly taking the largest - an
-   ad/video SurfaceView bigger than the game surface used to win and
-   the map then belonged to the wrong view. Falls back to the largest
-   candidate, then to android.R.id.content. */
 function gl_surface_hint() {
     try {
         if (!gDisplaySize && !ensure_native_fns()) return null;
@@ -658,7 +191,6 @@ function find_gl_view(activity) {
             var c = cands[k];
             var score = -Math.abs(c.w * c.h);
             if (hint && hint.w > 0 && hint.h > 0) {
-                /* closest total area wins, aspect-compatible preferred */
                 score = -Math.abs(Math.log((c.w * c.h + 1) /
                                            (hint.w * hint.h + 1))) * 100;
                 var ar1 = c.w / c.h, ar2 = hint.w / hint.h;
@@ -671,34 +203,12 @@ function find_gl_view(activity) {
     } catch (e3) {}
     return content_view(activity);
 }
-
-/* ---------------- system IME bridge (r12) ----------------
-   Pops the PHONE's own soft keyboard when a menu field is focused.
-   A 1x1 transparent EditText is added to the resumed activity's
-   window; its TextWatcher diffs each new text against the previous
-   one (via .toString() - NOT String(), which is what turned the r10
-   bridge into "[object Object]") and forwards the delta to
-   libtool.so as dextool_add_char()/dextool_backspace(). */
-/* r18: assign IME.act ONLY through ime_set_act() below. A wrapper
-   handed to a hook or callback is a JNI LOCAL reference - valid
-   for the duration of that callback only; stored raw and used
-   later, it aborts the process with "JNI DETECTED ERROR IN
-   APPLICATION: use of invalid jobject" (SIGABRT). ime_set_act()
-   keeps a retained (global) reference instead and releases the
-   previous one when the tracked activity changes. */
 var IME = { act: null, edit: null, actHash: 0, prev: '',
             silent: false, cnt: 0, everLogged: false,
             mapProbed: false,                   /* r20: one-shot view-map probe */
             restore: null,                      /* r23: app view whose focus we borrowed */
             showSeq: 0,                         /* r24: show-request session token */
             upLogged: false };                  /* r24: "already up" logged once per session */
-
-/* r18: release the previous retained activity. The bridge does not
-   export Java.release(), so the documented cleanup is the
-   wrapper's $dispose() ("eagerly deletes the underlying JNI
-   global reference"); Java.release() is preferred if some bridge
-   ever provides it. Best-effort: if neither exists, the JS-GC
-   finalizer releases the ref eventually. */
 function ime_release_act(obj) {
     try {
         if (!obj) return;
@@ -706,12 +216,6 @@ function ime_release_act(obj) {
         if (typeof obj.$dispose === 'function') obj.$dispose();
     } catch (e) {}
 }
-/* r23: the hidden EditText STEALS focus from the app while the
-   keyboard is open (unavoidable - the IME needs a focused view) -
-   the fix is to give it BACK: remember the app's focused view before
-   ours takes it, and restore + clearFocus when the keyboard closes
-   (ime_hide, the IME's Done button, or the menu closing). Retained
-   like IME.act: the wrapper is callback-scoped otherwise. */
 function ime_set_restore(v) {
     try {
         if (IME.restore && v) {
@@ -729,12 +233,6 @@ function ime_restore_focus() {
         if (IME.restore) IME.restore.requestFocus();
     } catch (e1) {}
 }
-
-/* r18: the ONLY writer of IME.act. Stores a Java.retain()-ed
-   wrapper (global reference, valid after the producing callback
-   returned and from any thread), releases the previous retained
-   activity when the tracked one changes, and logs each real
-   capture transition exactly once. */
 function ime_set_act(obj, how) {
     if (!obj) return false;
     try {
@@ -743,19 +241,8 @@ function ime_set_act(obj, how) {
             try { same = IME.act.equals(obj); } catch (eQ) { same = false; }
             if (same) return false;   /* already tracked - reuse */
             ime_release_act(IME.act);
-            /* r23: the saved focus view belonged to the OLD activity */
             if (IME.restore) { ime_release_act(IME.restore); IME.restore = null; }
         }
-        /* r19: retain, then VERIFY the retained wrapper actually
-           exposes Activity methods before trusting it. Every
-           bridge checked (frida-java-bridge 5.x) returns a full
-           method-capable Proxy from retain(), but if any build
-           ever handed back a bare handle object, the first
-           method call in the factory below would throw
-           "X is not a function" and the keyboard would die
-           with an undiagnosable log. The probe is one typeof;
-           the re-wrap goes through Java.cast(), which promotes
-           the handle to a global reference again. */
         var kept = null;
         try {
             kept = Java.retain(obj);   /* promote to GLOBAL ref */
@@ -785,15 +272,6 @@ function ime_set_act(obj, how) {
         return false;
     }
 }
-
-/* r21: read the watcher's Editable as a JS string. The r12-era
-   ed.toString() is POISON on this bridge: the Editable handed to
-   afterTextChanged() gets no bridged toString, so QuickJS falls
-   through to Object.prototype.toString - no exception, just the
-   constant "[object Object]" (the same poison the r10 String()
-   bug produced, now through a third path). Every path here
-   either returns a real string or null; the poison literal is
-   rejected as well. */
 var imeReadWarned = false;
 function ime_read_text(ed) {
     try {
@@ -822,34 +300,20 @@ function ime_read_text(ed) {
     }
     return null;
 }
-
 function ime_on_text(ed) {
     try {
         if (!ensure_native_fns()) return;
-        /* r21: a failed read must NOT run the delta - diffing
-           against '' would fire backspaces for the whole field
-           (the fix-spec fallback had exactly that hazard). Skip
-           this change and keep IME.prev; the next successful read
-           diffs against the last KNOWN text and recovers. */
         var cur = ime_read_text(ed);
         if (cur === null) return;
         cur = String(cur);
         if (IME.silent) { IME.prev = cur; return; }   /* programmatic */
         var prev = IME.prev;
         if (cur === prev) return;
-        /* longest common prefix / suffix -> the delta */
         var s = 0;
         while (s < prev.length && s < cur.length && prev[s] === cur[s]) s++;
         var e = 0;
         while (e < prev.length - s && e < cur.length - s &&
                prev[prev.length - 1 - e] === cur[cur.length - 1 - e]) e++;
-        /* r22/audit: deletions are counted in CODE POINTS - an
-           astral char entered as 2 UTF-16 units, but ImGui deletes
-           one CHARACTER per backspace, so counting UTF-16 units
-           over-deleted the field. Insertions stay per-UTF-16-unit;
-           overlay.cpp (r22) keeps this order in ONE queue and
-           recombines surrogate halves via
-           io.AddInputCharacterUTF16(). */
         var gone = prev.substring(s, prev.length - e), delN = 0;
         for (var gi = 0; gi < gone.length; gi++) {
             var gc = gone.charCodeAt(gi);
@@ -861,7 +325,6 @@ function ime_on_text(ed) {
         IME.prev = cur;
     } catch (e) {}
 }
-
 function ime_reset_text() {
     try {
         IME.silent = true;
@@ -870,16 +333,6 @@ function ime_reset_text() {
         IME.silent = false;
     } catch (e) { IME.silent = false; }
 }
-
-/* r20: QuickJS (the GumJS QJS backend) reports ANY call through a
-   missing or non-callable value as a bare "not a function" -
-   WITHOUT the callee name (V8 says "x.y is not a function",
-   QuickJS does not). The r19 field log ("msg":"not a function"
-   under fn:ime_create_edit, 5x per tap = the whole retry
-   ladder) therefore proved the failure is inside the factory
-   but not WHICH call dies. Every risky call in the IME path is
-   wrapped in a stage tag now: the next error payload reads
-   "stage <name>: <original message>" and pins the exact call. */
 function ime_stage(name, fn) {
     try { return fn(); }
     catch (eS) {
@@ -887,23 +340,11 @@ function ime_stage(name, fn) {
             String((eS && eS.message) || eS));
     }
 }
-
-/* r19: renamed from ime_ensure() to ime_create_edit() - the
-   canonical factory name. Every Activity/View method touched
-   here is typeof-guarded now: if a bridge or OEM build lacks a
-   member, the log names the exact member instead of a bare
-   "X is not a function" that is impossible to triage. */
 function ime_create_edit(act) {
     var h = 0;
     try { h = act.hashCode(); } catch (e0) {}
     if (IME.edit && IME.actHash === h) return IME.edit;
     try {
-        /* r21: sanity-probe the retained wrapper BEFORE any
-           mutation. getWindow is the r19 Activity probe (kept);
-           addContentView is now the attach call itself, so a
-           missing member is caught here - before IME.edit and
-           IME.prev are wiped - instead of on every ladder
-           attempt. */
         if (typeof act.getWindow !== 'function' ||
             typeof act.addContentView !== 'function') {
             sendMsg('error', { fn: 'ime_create_edit',
@@ -914,15 +355,6 @@ function ime_create_edit(act) {
         }
         IME.edit = null;               /* activity switched */
         IME.prev = '';
-        /* r20: every step below is stage-tagged - see ime_stage().
-           Each callee is typeof-verified BEFORE the call, so a
-           missing member is named exactly; a present-but-throwing
-           member surfaces as "stage <name>: <original>".
-           r21: the win/getDecorView stages are GONE - on this
-           bridge the DecorView wrapper does not resolve ViewGroup
-           methods (decor.addView typeof undefined, 35x in the
-           field log), so the EditText is attached through
-           act.addContentView() below instead. */
         var edit = ime_stage('EditText.$new', function () {
             var ET = Java.use('android.widget.EditText');
             if (typeof ET.$new !== 'function')
@@ -931,10 +363,6 @@ function ime_create_edit(act) {
             return ET.$new(act);
         });
         ime_stage('clear background', function () {
-            /* r19: setBackgroundDrawable is deprecated-but-present on
-               every current API; setBackground is the modern name.
-               Use whichever this bridge exposes; if neither exists,
-               say so instead of throwing. */
             if (typeof edit.setBackgroundDrawable === 'function')
                 edit.setBackgroundDrawable(null);   /* 1x1, transparent */
             else if (typeof edit.setBackground === 'function')
@@ -956,11 +384,6 @@ function ime_create_edit(act) {
             if (typeof act.addContentView !== 'function')
                 throw new Error('act.addContentView typeof ' +
                     (typeof act.addContentView));
-            /* lands the edit in android.R.id.content - the same
-               attached window hierarchy a decor.addView() used to
-               reach, but through the Activity methods this bridge
-               resolves; lp (FrameLayout.LayoutParams) matches
-               that container exactly. */
             act.addContentView(edit, lp);
         });
         var tag = (++IME.cnt) + '_' + (Date.now() % 1000000);
@@ -991,17 +414,10 @@ function ime_create_edit(act) {
                 implements: [Java.use('android.widget.TextView$OnEditorActionListener')],
                 methods: {
                     onEditorAction: function (v, actionId, ev) {
-                        /* r24: Done/Search on the phone IME now SEARCHES -
-                           the filter field declares EnterReturnsTrue but the
-                           old handler only hid the keyboard. Forward a real
-                           Enter key press FIRST (the menu injects it as a
-                           two-frame key event), then release the field so
-                           the next tap on it re-opens the keyboard. */
                         IME.showSeq++;            /* keyboard closing: ladder stops */
                         sendMsg('imeEnter', {});
                         sendMsg('imeHidden', {});
                         ime_reset_text();
-                        /* r23: give the app its focused view back */
                         ime_restore_focus();
                         return false;
                     }
@@ -1026,36 +442,15 @@ function ime_create_edit(act) {
         return null;
     }
 }
-/* r19: legacy alias (fix-spec step 3) - delegates to the canonical
-   ime_create_edit() factory so any leftover ime_ensure() reference
-   in any build of this script resolves to the REAL factory. An
-   EMPTY stub here would make ime_try_show() bail (edit === null)
-   and the keyboard would never open - keep the delegation. */
 function ime_ensure(act) {
     return ime_create_edit(act);
 }
-
 function ime_try_show(reset) {
-    /* one complete attempt on the main thread: create the hidden
-       EditText (+ TextWatcher) if needed, focus it, and send
-       showSoftInput. Returns true only if showSoftInput was sent.
-       r16: reset only when the caller says so - the first attempt
-       of a focus session passes true, retries and async-resolved
-       shows pass false. Resetting on every attempt wiped user
-       input when a retry landed while typing was already under
-       way. */
     try {
         if (!IME.act) {
-            /* r17: stage log - the silent false return made "why
-               did the keyboard not show" undiagnosable */
             agentLog('ime: try_show skipped - no activity yet');
             return false;
         }
-        /* r19 (fix-spec step 2): the bare ime_ensure() INVOCATION
-           is replaced by the canonical ime_create_edit() factory,
-           resolved defensively - if either binding were ever lost
-           the log names both typeofs instead of throwing a bare
-           "ime_ensure is not a function" that halts the flow. */
         var makeEdit = (typeof ime_create_edit === 'function')
             ? ime_create_edit : ime_ensure;
         if (typeof makeEdit !== 'function') {
@@ -1068,8 +463,6 @@ function ime_try_show(reset) {
         var edit = makeEdit(IME.act);
         if (!edit) return false;
         if (reset !== false) ime_reset_text();
-        /* r23: remember which app view currently holds focus BEFORE our
-           hidden EditText steals it, so it can be handed back later */
         try {
             var cur = IME.act.getWindow().getCurrentFocus();
             if (cur) {
@@ -1079,9 +472,6 @@ function ime_try_show(reset) {
                 if (!isOurs) ime_set_restore(cur);
             }
         } catch (eF) {}
-        /* r20: same stage tagging as the factory - if the factory
-           passes and the next failure lands here, the payload
-           names the exact call instead of a bare TypeError. */
         ime_stage('edit.requestFocus', function () {
             edit.requestFocus();
         });
@@ -1091,10 +481,6 @@ function ime_try_show(reset) {
         });
         ime_stage('showSoftInput', function () {
             var sent = imm.showSoftInput(edit, 0);
-            /* r17: log the REAL result - false here (window token not
-               ready, focus not granted yet) was invisible before and
-               is the classic "sent but nothing happened" failure that
-               the retry ladder exists for */
             agentLog('ime: showSoftInput sent -> ' + sent);
         });
         return true;
@@ -1103,22 +489,8 @@ function ime_try_show(reset) {
         return false;
     }
 }
-
-/* r16: shared handler for an asynchronously resolved activity.
-   The r15 callback only stored IME.act - when every sync retry
-   missed (ActivityThread walk empty right after resume) and the
-   heap scan landed AFTER the retry ladder had finished, nothing
-   ever called showSoftInput and the keyboard never opened. The
-   callback now attempts the show itself:
-   - the UI work (ime_create_edit creates a view) must run on the
-     main thread, hence Java.scheduleOnMainThread;
-   - no ime_reset_text() here: by the time the async scan lands
-     the user may already be typing. */
 function ime_act_resolved(a, how) {
     if (!a) return;
-    /* r18: retained through ime_set_act, NOT stored raw - the
-       walk/heap-scan wrapper is callback-scoped exactly like the
-       touch hook's `this` (same invalid-jobject abort). */
     ime_set_act(a, 'async resolve (' + how + ')');
     Java.scheduleOnMainThread(function () {
         try {
@@ -1127,28 +499,12 @@ function ime_act_resolved(a, how) {
         } catch (e2) {}
     });
 }
-
 function ime_show() {
-    /* r24: every show request starts a NEW session - pending retries
-       of an older ladder are invalidated (they used to pile up when
-       fields were tapped quickly and kept re-sending showSoftInput
-       long after their keyboard was gone) */
     var seq = ++IME.showSeq;
     IME.upLogged = false;
     Java.perform(function () {
         Java.scheduleOnMainThread(function () {
             try {
-                /* r15: NO early return before the retries. The r14
-                   version bailed out when IME.act was still null and
-                   the whole retry ladder sat behind that return - the
-                   hidden EditText and TextWatcher were never created
-                   and the keyboard never opened. Now: resolve the
-                   activity as far as possible RIGHT NOW (sync walk;
-                   the async heap scan fills IME.act in the
-                   background), then arm the retry ladder
-                   UNCONDITIONALLY - each retry re-resolves and makes
-                   a full attempt, so the bridge comes up as soon as
-                   any activity appears. */
                 var walkErr = null;   /* r17: warn payload, belt+braces */
                 if (!IME.act) {
                     try { ime_set_act(find_current_activity_sync(),
@@ -1159,63 +515,28 @@ function ime_show() {
                     }
                 }
                 if (!IME.act) {
-                    /* r17 FIX: the warning carries its payload now -
-                       WHY no activity was found (the walk's own
-                       diagnosis: exception / no records / only dead
-                       or paused ones) instead of a bare "[msg]" that
-                       made IME failures impossible to triage */
                     sendMsg('warn', { msg: 'IME: no activity yet (' +
                         (walkErr ? 'walk threw: ' + walkErr
                                  : String(find_current_activity_sync.lastDiag ||
                                           'unknown')) +
                         ') - async resolve, retries armed' });
-                    /* r16 CRITICAL FIX: the r15 callback only stored
-                       the activity and returned - if the heap scan
-                       landed after the retries were exhausted,
-                       showSoftInput never ran. The callback attempts
-                       the show itself now. */
                     resolve_current_activity(function (a) {
                         ime_act_resolved(a, 'async');
                     });
                 }
-                /* r18: the "IME host activity" info line moved into
-                   ime_set_act (fires on the FIRST capture from any
-                   source); removed here - no double logging. */
                 ime_try_show(true);   /* r16: only the first attempt resets */
-                /* the first show right after focus often loses the
-                   race with the window - retry on a ladder; each
-                   retry also re-resolves the activity (the r14
-                   ladder lived behind the early return and never
-                   ran when IME.act was null) */
                 [150, 450, 900, 1500].forEach(function (delay) {
                     setTimeout(function () {
                         Java.scheduleOnMainThread(function () {
                             try {
-                                /* r24: stale ladder (a newer show request
-                                   or Done/hide superseded it) - stop */
                                 if (seq !== IME.showSeq) return;
                                 if (!IME.act) {
-                                    /* r16: BOTH resolution layers run
-                                       in the ladder. resolve_current_
-                                       activity walks ActivityThread
-                                       synchronously first and only
-                                       falls back to the async heap
-                                       scan; the callback attempts the
-                                       show itself when it wins. The
-                                       r15 ladder ran the sync walk
-                                       only, so an activity that was
-                                       heap-scan-only was never found
-                                       here. */
                                     resolve_current_activity(function (a) {
                                         ime_act_resolved(a,
                                             'retry ' + delay + 'ms');
                                     });
                                     return;
                                 }
-                                /* r24: keyboard already up - the ladder
-                                   STOPS instead of re-sending showSoftInput
-                                   4x per tap (the "showSoftInput sent ->
-                                   true" console flooding) */
                                 var up = false;
                                 try {
                                     var IMMgr = Java.use('android.view.inputmethod.InputMethodManager');
@@ -1237,10 +558,6 @@ function ime_show() {
                         });
                     }, delay);
                 });
-                /* r17: final stage line - one entry that says whether
-                   the bridge actually came up once the ladder is
-                   done, with the reason when it did not. Without it
-                   "keyboard never opened" arrived with zero clues. */
                 setTimeout(function () {
                     Java.perform(function () {
                         if (IME.edit)
@@ -1257,20 +574,6 @@ function ime_show() {
         });
     });
 }
-
-/* r15: activity resolution, two layers.
-   find_current_activity_sync(): walk ActivityThread.mActivities
-   (IBinder -> ActivityClientRecord) and return a live activity;
-   works with ArrayMap and HashMap because both expose values().
-   Prefers a record that is neither paused nor stopped. No hook
-   timing involved, so it also covers the very first resume that
-   the onResume hook may have missed. Purely synchronous.
-   resolve_current_activity(cb): sync walk first; if that comes up
-   empty, scan the heap with Java.choose. Java.choose is
-   ASYNCHRONOUS - the r14 fallback read `found` right after the
-   call, before onMatch ever ran, so it ALWAYS returned null. The
-   result is now consumed strictly inside the callbacks: onMatch
-   stores it in IME.act and invokes cb. */
 function find_current_activity_sync() {
     var best = null;
     var seen = 0, deadSkipped = 0, threw = null;
@@ -1285,13 +588,6 @@ function find_current_activity_sync() {
             try { a = rec.activity.value; } catch (e1) { continue; }
             if (a === null) continue;
             seen++;
-            /* r17 FIX: skip dying activities. The r16 walk checked
-               only paused/stopped from the client record - a
-               finishing or destroyed Activity passed, and ime_show()
-               then called getSystemService() on a dead window: no
-               throw, but showSoftInput silently no-ops. Dead
-               records are not even eligible for the last-resort
-               fallback; paused/stopped still are. */
             var dead = false;
             try { dead = a.isFinishing() || a.isDestroyed(); }
             catch (eZ) {}
@@ -1303,9 +599,6 @@ function find_current_activity_sync() {
             if (!paused && !stopped) return a;
         }
     } catch (e4) { threw = String(e4.message || e4); }
-    /* r17: stage diagnostics - an empty walk explains itself, and
-       the reason is exposed on the function object so the "no
-       activity yet" warning can carry it as real payload */
     var diag;
     if (threw !== null) {
         diag = 'walk threw: ' + threw;
@@ -1321,20 +614,13 @@ function find_current_activity_sync() {
     find_current_activity_sync.lastDiag = diag;
     return best;
 }
-
 function resolve_current_activity(cb) {
     var a = null;
     try { a = find_current_activity_sync(); } catch (e0) {}
     if (a) { try { cb(a); } catch (e1) {} return; }
-    /* r15: heap scan - ASYNC; the result is handled in onMatch */
     try {
         Java.choose('android.app.Activity', {
             onMatch: function (act) {
-                /* r17 FIX (same defect as the sync walk): the heap
-                   also holds DESTROYED activities until GC collects
-                   them. Handing ime_show() one of those reproduces
-                   the exact field failure - so keep scanning past
-                   dead instances and only stop at a live one. */
                 var dead = false;
                 try { dead = act.isFinishing() || act.isDestroyed(); }
                 catch (eX) {}
@@ -1347,13 +633,6 @@ function resolve_current_activity(cb) {
         });
     } catch (e4) {}
 }
-
-/* r13: keep IME.act fresh for every future resume via Application
-   callbacks. Unlike the Activity.onResume implementation hook this
-   fires for all activities even when the agent lost the race with the
-   first resume, and it also tracks activity SWITCHES. It deliberately
-   does NOT call report_map(): onResume (and the throttled touch
-   path) already re-measure the view rect there. */
 function install_lifecycle() {
     Java.perform(function () {
         try {
@@ -1366,9 +645,6 @@ function install_lifecycle() {
                     onActivityCreated: function (a, b) {},
                     onActivityStarted: function (a) {},
                     onActivityResumed: function (a) {
-                        /* r18: retained via ime_set_act - the callback
-                           argument is as callback-scoped as a hook's
-                           `this` (same invalid-jobject abort class) */
                         try { ime_set_act(a, 'lifecycle'); } catch (e0) {}
                     },
                     onActivityPaused: function (a) {},
@@ -1381,8 +657,6 @@ function install_lifecycle() {
             agentLog('phase: lifecycle tracker armed');
             sendMsg('info', { msg: 'lifecycle tracker armed' });
         } catch (e) {
-            /* the Application exists before any activity, so a few
-               short retries always succeed */
             if (install_lifecycle.tries === undefined) install_lifecycle.tries = 0;
             if (install_lifecycle.tries++ < 20)
                 setTimeout(install_lifecycle, 250);
@@ -1391,7 +665,6 @@ function install_lifecycle() {
         }
     });
 }
-
 function ime_hide() {
     IME.showSeq++;            /* r24: keyboard closing - ladder stops */
     Java.perform(function () {
@@ -1402,16 +675,11 @@ function ime_hide() {
                 var imm = Java.cast(IME.act.getSystemService('input_method'), IMMgr);
                 imm.hideSoftInputFromWindow(IME.edit.getWindowToken(), 0);
                 ime_reset_text();
-                /* r23: the hidden 1x1 EditText used to KEEP the app's
-                   focus forever - hand the previously focused view back */
                 ime_restore_focus();
             } catch (e) {}
         });
     });
 }
-
-
-/* ---------------- input + view mapping on the host activity -------- */
 function installTouchHook() {
     if (!ensure_native_fns()) {
         sendMsg('error', { fn: 'installTouchHook', msg: 'libtool.so natives missing' });
@@ -1423,9 +691,6 @@ function installTouchHook() {
         try {
             Activity.onResume.implementation = function () {
                 var r = this.onResume();
-                /* r18: retained via ime_set_act - raw `this` is a JNI
-                   LOCAL reference that dies when this callback returns;
-                   using it later is the exact r17 crash */
                 try { ime_set_act(this, 'onResume'); } catch (e0) {}
                 try { report_map(find_gl_view(this)); } catch (e) {}
                 return r;
@@ -1438,33 +703,10 @@ function installTouchHook() {
         }
         agentLog('phase: hooking Activity.dispatchTouchEvent');
         Activity.dispatchTouchEvent.implementation = function (ev) {
-            /* MAIN THREAD */
-            /* r18 FIX (root cause of the r17 field crash): the r17
-               capture stored `this` RAW in the long-lived IME.act.
-               A wrapper handed to a hook implementation is only
-               valid for the duration of that callback - its JNI
-               local reference dies when the callback returns, and
-               the later getSystemService()/showSoftInput() on
-               IME.act then aborts the process with "JNI DETECTED
-               ERROR IN APPLICATION: use of invalid jobject"
-               (SIGABRT): keyboard dead AND app dead. ime_set_act()
-               stores a Java.retain()-ed GLOBAL reference instead
-               (valid after the callback, on any thread) and
-               releases the previous retained activity when the
-               tracked one changes, so nothing leaks. The tap that
-               opens the menu is still proof of a live, resumed
-               activity (r17 rationale kept); the identity check
-               keeps this branch cheap and the log per-activity,
-               not per-event. */
             try {
                 if (!IME.act || !IME.act.equals(this))
                     ime_set_act(this, 'touch hook');
             } catch (eAct) {}
-            /* r20: one-shot view-map probe. report_map() and
-               find_gl_view() swallow their own errors, so the same
-               failure class that kills the IME factory would hide
-               here. Run the measurement once after the first
-               capture and log the outcome verbatim. */
             if (IME.act && !IME.mapProbed) {
                 IME.mapProbed = true;
                 try {
@@ -1478,29 +720,11 @@ function installTouchHook() {
             try {
                 var act = ev.getAction() & 0xff;
                 var down = (act === 0);
-                /* r15: raw SCREEN coords (getRawX/getRawY) - the
-                   same space the map is measured in
-                   (getLocationOnScreen), so overlay.cpp's transform
-                   is exact on BOTH axes */
                 var rx = ev.getRawX(), ry = ev.getRawY();
                 gNativeTouch(rx, ry, act);
-                /* r23 click-through: ask the overlay whether this
-                   gesture STARTS on a live menu window BEFORE the app
-                   sees anything. The r22 attempt returned true when
-                   WantCaptureMouse was set but still CALLED
-                   this.dispatchTouchEvent(ev) for down/up first - the
-                   tap reached the app anyway (the audit's
-                   "taps on the menu still leak to the host app").
-                   The hit test reads the window rects menu.cpp/overlay
-                   publish each frame, mapped through the touch map. */
                 if (down && gHitTest) {
                     try { gTouchEat = !!gHitTest(rx, ry); } catch (eH) {}
                 }
-                /* r24: capture BEFORE clearing - the old order cleared
-                   the flag on UP/CANCEL first, so the consume check
-                   below never saw it and the app received an UP for a
-                   gesture whose DOWN the menu had eaten ("eaten
-                   gestures leak UP") */
                 var eat = gTouchEat;
                 if (act === 1 || act === 3) gTouchEat = false;  /* UP/CANCEL */
                 if (act === 0 || act === 2) {   /* r22/audit: throttled map
@@ -1512,11 +736,6 @@ function installTouchHook() {
                     }
                 }
                 if (eat) {
-                    /* menu owns the whole gesture: ImGui already got
-                       every event via gNativeTouch above; the app
-                       never does - INCLUDING the UP/CANCEL that ends
-                       it (r24). MOVE/UP keep flowing to ImGui so
-                       drags and button releases work. */
                     return true;                     /* consume */
                 }
             } catch (e) {}
@@ -1526,10 +745,6 @@ function installTouchHook() {
         sendMsg('info', { msg: 'touch hook installed (r25, screen coords + hit-test click-through + UP-leak fix + IME activity capture + map refresh on DOWN + frame pump)' });
     });
 }
-
-/* ---------------- class info ---------------- */
-/* (r23: field_lines() removed with the "n:t=v;n=v" instance protocol;
-   instances now use the structured field_rows() below) */
 function method_lines(jc) {
     var out = [];
     var ms = jc.class.getDeclaredMethods();
@@ -1542,10 +757,6 @@ function method_lines(jc) {
     }
     return out;
 }
-/* r12: names+types only - NO value reads. f.get(null) can trigger
-   the class's <clinit>, which may block the agent thread forever
-   (the "open a class and the app freezes" bug). Static values are
-   read on demand via readStaticFields. */
 function field_lines_light(jc) {
     var out = [];
     var fs = jc.class.getDeclaredFields();
@@ -1560,10 +771,6 @@ function field_lines_light(jc) {
     }
     return out;
 }
-
-/* r23: structured instance fields - values through field_repr()
-   (toString-safe); replaces the mangled "n:t=v;n:t=v" protocol whose
-   delimiters corrupted values containing | # or ; */
 function field_rows(jc, inst) {
     var out = [];
     try {
@@ -1582,12 +789,6 @@ function field_rows(jc, inst) {
     } catch (e2) {}
     return out;
 }
-
-/* ---------------- recorder ----------------
-   r11: scoped. Only classes matching the package filter are hooked and
-   installation stops at cap methods; the r10 version hooked every
-   method of every class in the process (tens of thousands of ArtMethod
-   hook slots on a 32-bit process) and died with SIGABRT mid-install. */
 var REC = { on: false, busy: false, ring: [], installed: 0, flushBusy: false,
             lastProg: 0 };
 function rec_wanted(name, filter) {
@@ -1606,13 +807,7 @@ function rec_flush() {
     }) });
 }
 setInterval(rec_flush, 500);
-
 function rec_install_chunk(list, batch) {
-    /* r12: Stop must also abort a still-running installation (the
-       r11 Stop left the loop hooking classes, so the Recorder tab
-       looked stuck on "installing ...").
-       r23: every method goes through the layering registry, so
-       stopRecorder can remove all recorder layers again. */
     if (!REC.on) {
         REC.busy = false;
         sendMsg('recorderStopped', { installed: REC.installed });
@@ -1637,8 +832,6 @@ function rec_install_chunk(list, batch) {
             }
         } catch (e3) {}
     }
-    /* r12: throttle progress - the r11 log flooded ~200
-       recorderProgress messages for a single install */
     var now = Date.now();
     if (now - REC.lastProg > 250) {
         REC.lastProg = now;
@@ -1653,12 +846,6 @@ function rec_install_chunk(list, batch) {
         sendMsg('recorderStarted', { installed: REC.installed });
     }
 }
-
-/* ---------------- monitor ---------------- */
-/* r25: pipe-line sanitizer WITHOUT the 160-char cap of jstr() - the
-   detail field carries payload previews up to 2000 chars. '|' and
-   '#' are rewritten exactly like jstr does (the C++ side splits
-   rows on '|'). */
 function jpipe(v, cap) {
     try {
         var n = cap || 2000;
@@ -1703,17 +890,8 @@ function mon_flush() {
     }) });
 }
 setInterval(function () { if (MON.on) mon_flush(); }, 600);
-
 function mon_install() {
     Java.perform(function () {
-        /* r23: monitor hooks go through the layering registry, so
-           stopMonitor removes them again (r22 left them installed
-           forever - the audit's "stopMonitor doesn't unhook") */
-        /* r25: payload previews. Request body: okhttp has no direct
-           read without consuming the stream - write it into an okio
-           Buffer (safe: body peeks are what okhttp's own interceptors
-           do). Response body: Response.peekBody() clones up to N
-           bytes without consuming the original. Both best-effort. */
         function req_body_repr(req) {
             try {
                 var b = req.body();
@@ -1736,7 +914,6 @@ function mon_install() {
         try {
             if (dt_is_loaded('okhttp3.RealCall')) {
                 install_layer('okhttp3.RealCall', 'execute', 'mon', {
-                    /* r25: observer signature carries the RESULT */
                     fn: function (self, a, out) {
                         try {
                             var req = self.request();
@@ -1746,7 +923,6 @@ function mon_install() {
                                      String(req.method()), org,
                                      'headers ' + req.headers().size(),
                                      req_body_repr(req));
-                            /* the response row: code + peeked body */
                             try {
                                 var cn = String(out.$className || '');
                                 if (cn === 'okhttp3.Response') {
@@ -1775,8 +951,6 @@ function mon_install() {
                 okhttpOk = true;
             }
         } catch (e) { okhttpOk = false; }
-
-        /* HttpURLConnection: URL at connect time */
         try {
             install_layer('java.net.URL', 'openConnection', 'mon', {
                 fn: function (self, a, out) {
@@ -1787,10 +961,6 @@ function mon_install() {
                 }
             });
         } catch (e) {}
-        /* r25: the RESPONSE side of plain HttpURLConnection - the
-           stream itself cannot be previewed without consuming it,
-           so the row marks that the response started and shows the
-           originating method */
         try {
             if (dt_is_loaded('java.net.HttpURLConnection')) {
                 install_layer('java.net.HttpURLConnection',
@@ -1806,29 +976,17 @@ function mon_install() {
                 });
             }
         } catch (e) {}
-
-        /* SSL: best-effort note only; full plaintext would need
-           SSL_read/SSL_write native hooks */
         try {
             Java.use('javax.net.ssl.SSLSocket');
             mon_push('ssl', 'engine', 'note',
                      '', 'SSLSocket reachable', '');
         } catch (e) {}
-
         sendMsg('monitorInfo', {
             note: 'okhttp ' + (okhttpOk ? 'hooked' : 'absent') +
                    ', urlconn hooked'
         });
     });
 }
-
-/* ---------------- helpers for exports ---------------- */
-/* (r23: use_cls_parts() removed - layer installs resolve the member
-   themselves) */
-
-/* r25: text -> typed argument value, shared by callMethod and the
-   IO patch layer (only edited rows are patched; empty text means
-   the type's default). */
 function coerce_arg(t, s) {
     if (s === undefined || s === null || s === '') {
         if (t === 'int' || t === 'short' || t === 'byte' ||
@@ -1847,15 +1005,7 @@ function coerce_arg(t, s) {
     if (s === 'null') return null;
     return s;
 }
-
 function call_with_args(ov, argStrings, isCtor, recv) {
-    /* map the text args onto the overload's parameter types.
-       r23: `recv` is the retained-instance receiver for instance
-       methods (the old call was ov.apply(null, ...) - no receiver,
-       so instance methods could never be invoked).
-       r26: an arg may be {"handle":N} - a retained instance picked
-       in the Object Finder is passed as the ACTUAL object (the old
-       text-only args could only ever send strings/null). */
     var params = ov.argumentTypes;
     var real = [];
     for (var i = 0; i < params.length; i++) {
@@ -1872,13 +1022,10 @@ function call_with_args(ov, argStrings, isCtor, recv) {
     }
     return ov.apply(recv || null, real);
 }
-
-/* r26: case-sensitivity for the dex scan matches (Explorer Options) */
 function scan_hit(s) {
     if (SCAN.cs) return s.indexOf(SCAN.fRaw) !== -1;
     return s.toLowerCase().indexOf(SCAN.f) !== -1;
 }
-
 var gModCls = null;
 function is_static_method(jc, method) {
     try {
@@ -1893,9 +1040,6 @@ function is_static_method(jc, method) {
     } catch (e1) {}
     return false;
 }
-
-/* r23: recursion-safe args renderer for tracker events (field_repr
-   per value instead of String(v) - see the note above field_repr) */
 function describe_safe(a) {
     try {
         var s = '';
@@ -1908,12 +1052,6 @@ function describe_safe(a) {
         return s;
     } catch (e) { return '?'; }
 }
-
-/* r23: retained-instance registry (the audit's "Instance-method
-   Call": callMethod/setInstanceField had NO receiver - instances
-   were addressed by a bare scan index that died when the scan
-   returned). Handles are Java.retain()ed global references; the
-   table is capped and evicts oldest-first. */
 var gInstHandles = {};     /* id -> retained wrapper */
 var INST_ID = 0, INST_GEN = 0;
 var INST_LIMIT = 200;
@@ -1938,7 +1076,6 @@ function inst_get(handle) {
     if (typeof handle !== 'number' || handle <= 0) return null;
     return gInstHandles[handle] || null;
 }
-
 function set_field_value(f, recv, value) {
     var t = String(f.getType().getName());
     if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
@@ -1950,19 +1087,7 @@ function set_field_value(f, recv, value) {
         f.set(recv, (value || 'a').charCodeAt(0));
     else f.set(recv, value);
 }
-
-/* ---------------- unified hook layering registry (r23) ----------------
-   Hook, Tracker, field-Tracker, Recorder and Monitor used to assign
-   ov.implementation INDEPENDENTLY - the last install silently
-   replaced every previous one (audit: "Hook, Tracker, and Recorder
-   overwrite each other's ov.implementation"). Every layer of a
-   class+method now lives in ONE registry entry; a single dispatcher
-   per overload runs all active layers around exactly ONE call into
-   the original. Removing the last layer of a method restores the
-   original implementation - which is what makes Recorder/Monitor
-   Stop really unhook this time. */
 var LAYERS = {};   /* 'cls!method' -> { ovs: [overloads], parts: {kind: state} } */
-
 function noop_ret(ov) {
     var rt = ov.returnType.name;
     if (rt === 'int' || rt === 'long' || rt === 'short' || rt === 'byte')
@@ -1972,17 +1097,20 @@ function noop_ret(ov) {
     if (rt === 'char') return '\u0000';
     return null;
 }
-
-/* r24: L comes in from the hook closure (no registry lookup per
-   call) and cls/mn are parsed from K LAZILY - only recorder rows
-   need them, the hot path does not (the old version substring'd
-   the key on EVERY hooked call of every class) */
 function dispatch_layers(K, L, ov, self, args) {
     var p = L ? L.parts : {};
+    try {
+        if (p.hook || p.trk) {
+            L.hits = (L.hits || 0) + 1;
+            var nowH = Date.now();
+            if (!L.hitAt || nowH - L.hitAt >= 500) {
+                L.hitAt = nowH;
+                sendMsg('hookHit', { name: K.replace('!', '.'),
+                                     count: L.hits });
+            }
+        }
+    } catch (eH) {}
     var hk = p.hook;
-    /* r25: IO patch layer - only the checkbox-marked arguments are
-       replaced before the original call; the return value is
-       replaced after. Non-marked rows keep the caller's values. */
     var io = (p.io && p.io.on) ? p.io : null;
     var eff = args;
     if (io) {
@@ -2005,9 +1133,6 @@ function dispatch_layers(K, L, ov, self, args) {
         if (hk && hk.on && hk.mode === 'noop') {
             out = noop_ret(ov);
         } else if (hk && hk.on) {
-            /* r22 semantics kept: the user fn gets receiver/args/orig();
-               a throw falls back to the original call. r25: the fn sees
-               the PATCHED args when an IO layer is active. */
             try {
                 out = hk.fn(Java, send, CONSOLE(), self,
                             Array.prototype.slice.call(eff),
@@ -2020,14 +1145,12 @@ function dispatch_layers(K, L, ov, self, args) {
                                    msg: String(e1.message || e1) });
                 out = ov.apply(self, eff);
             }
-            /* smali hooks return null to mean "default value" (r22) */
             if (hk.mode === 'Smali' && out === null)
                 out = noop_ret(ov);
         } else {
             out = ov.apply(self, eff);
         }
     } catch (e2) {
-        /* recorder row for the failing call, then rethrow (r22) */
         try {
             if (p.rec && REC.on && REC.ring.length < 4000) {
                 var i = K.indexOf('!');   /* r24: lazy - rows only */
@@ -2038,7 +1161,6 @@ function dispatch_layers(K, L, ov, self, args) {
         } catch (e3) {}
         throw e2;
     }
-    /* observer layers see the FINAL result; each is isolated */
     try {
         if (p.rec && REC.on && REC.ring.length < 4000) {
             var j = K.indexOf('!');   /* r24: lazy - rows only */
@@ -2051,8 +1173,6 @@ function dispatch_layers(K, L, ov, self, args) {
         if (p.mon && MON.on) p.mon.fn(self, args, out);
     } catch (e5) {}
     try {
-        /* r25: one-shot IO probe - report the captured values of
-           this call, then remove itself */
         if (p.ioprobe && p.ioprobe.want) {
             p.ioprobe.want = false;
             var pr = { params: [] };
@@ -2095,24 +1215,12 @@ function dispatch_layers(K, L, ov, self, args) {
     try {
         if (p.fld) field_layer_emit(p.fld, self);
     } catch (e7) {}
-    /* r25: IO return patch AFTER every observer saw the real value */
     if (io && io.ret !== null && io.ret !== undefined) {
         try { out = coerce_arg(String(ov.returnType.name), io.ret); }
         catch (e8) {}
     }
     return out;
 }
-
-/* field-tracker emission - r23: values through field_repr(), never
-   the app's toString() (the audit's Tracker Side Effects item).
-   r24 PERF FIX: the old else-branch sent a trackerEvent on EVERY
-   method call of the class even when the value had NOT changed -
-   on a hot class that flooded the bridge and froze the menu
-   (logcat: "Skipped 40 frames!"). Now: the field is read at most
-   every 20 ms, and an event is emitted only when the value
-   ACTUALLY changed and at most once per 100 ms per field. While
-   throttled, st.last is kept, so the next allowed emission shows
-   the full old -> new transition. */
 function field_layer_emit(st, self) {
     var tk = trackers[st.key];
     if (!tk || !tk.on) return;
@@ -2129,8 +1237,6 @@ function field_layer_emit(st, self) {
     st.last = v;
     st.nextEmit = now + 100;
 }
-
-/* returns the number of overloads carrying this method's layers */
 function install_layer(cls, mn, kind, state) {
     var K = cls + '!' + mn;
     var L = LAYERS[K];
@@ -2144,7 +1250,6 @@ function install_layer(cls, mn, kind, state) {
         LAYERS[K] = L;
         ovs.forEach(function (ov) {
             ov.implementation = function () {
-                /* r24: L closed over - no registry lookup per call */
                 return dispatch_layers(K, L, ov, this, arguments);
             };
         });
@@ -2152,7 +1257,6 @@ function install_layer(cls, mn, kind, state) {
     L.parts[kind] = state || {};
     return L.ovs.length;
 }
-
 function uninstall_layer(cls, mn, kind) {
     var K = cls + '!' + mn;
     var L = LAYERS[K];
@@ -2165,30 +1269,12 @@ function uninstall_layer(cls, mn, kind) {
         delete LAYERS[K];
     }
 }
-
 function uninstall_all(kind) {
     Object.keys(LAYERS).forEach(function (K) {
         var i = K.indexOf('!');
         uninstall_layer(K.substring(0, i), K.substring(i + 1), kind);
     });
 }
-
-/* ---------------- class access without premature <clinit> (r23) ------
-   frida-java-bridge runs ensureClassInitialized() on EVERY fresh
-   Java.use(), so hooking a class the app has not initialized yet
-   force-runs its static initializer (audit: "Class Initialization").
-   The bridge exposes no non-initializing path, so the agent only
-   Java.use()s classes that are ALREADY LOADED and defers everything
-   else: a one-time loadClass watcher installs the queued install the
-   moment the target app loads the class.
-
-   KNOWN LIMITATION (r24, documented instead of papered over): the
-   deferral only avoids classes that are NOT LOADED YET. A class that
-   is loaded but never initialized still gets its <clinit> forced by
-   Java.use() - frida-java-bridge always calls
-   ensureClassInitialized() and offers no non-initializing use().
-   There is no fix on this bridge; apps whose <clinit> misbehaves
-   when probed will still be affected. */
 var gLoadedSet = null, gLoadedAt = 0, gLoadedRechecked = false;
 function dt_rebuild_loaded_set() {
     try {
@@ -2206,26 +1292,18 @@ function dt_is_loaded(cls) {
         gLoadedRechecked = false;   /* new cache generation */
     }
     if (gLoadedSet && gLoadedSet[cls]) return true;
-    /* r24 RACE FIX: the 3 s cache could predate the class actually
-       loading - and loadClass never fires again for an already-
-       loaded class - so the queued install waited forever (the
-       audit's "deferred forever"). On a miss, force ONE rebuild of
-       the set (once per cache generation, so a burst of misses does
-       not re-enumerate per class) before declaring it unloaded. */
     if (!gLoadedRechecked) {
         gLoadedRechecked = true;
         dt_rebuild_loaded_set();
     }
     return !!(gLoadedSet && gLoadedSet[cls]);
 }
-
 function use_loaded(cls) {
     if (!dt_is_loaded(cls))
         throw new Error('class not loaded yet: ' + cls +
                         ' (its <clinit> will not be forced)');
     return Java.use(cls);
 }
-
 var gDeferred = [];        /* queued installs: {kind, cls, fn} */
 var gWatcherOvs = null;    /* loadClass overloads we hooked, for restore */
 function defer_install(kind, cls, fn) {
@@ -2268,10 +1346,6 @@ function stop_load_watcher() {
 }
 function pump_deferred(loadedName) {
     if (!gDeferred.length) { stop_load_watcher(); return; }
-    /* r23: entries are removed from the queue BEFORE they run - the
-       install itself calls Java.use(), which goes through the
-       loadClass hook again, and a re-entrant pump must never re-run
-       the same install (infinite recursion). */
     var run = [], stay = [];
     for (var i = 0; i < gDeferred.length; i++) {
         (gDeferred[i].cls === loadedName ? run : stay).push(gDeferred[i]);
@@ -2285,11 +1359,7 @@ function pump_deferred(loadedName) {
         }
     }
 }
-
 var patches = {}, hooks = {}, trackers = {};
-
-/* r23: hook/tracker install bodies, factored out so the deferred
-   loader can run them when the target class finally loads */
 function do_addHook(cls, method, mode, code) {
     var key = cls + '.' + method;
     var jc = Java.use(cls);
@@ -2322,8 +1392,6 @@ function do_addHook(cls, method, mode, code) {
         var skel = '.class public final Lcom/dextool/hook/' + gen + ';\n' +
                    '.super Ljava/lang/Object;\n' +
                    '.method public static hook(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;\n' +
-                   /* r22/audit: default .locals - user code without a
-                      registers directive died in the assembler */
                    (/^\s*\.(locals|registers)\b/m.test(code) ? '' : '    .locals 4\n') +
                    code + '\n' +
                    '.end method\n';
@@ -2352,7 +1420,6 @@ function do_addHook(cls, method, mode, code) {
         sendMsg('hookAdded', { name: key });
     }
 }
-
 function do_addTracker(cls, method) {
     var key = cls + '.' + method;
     if (!install_layer(cls, method, 'trk', { key: key }))
@@ -2360,7 +1427,6 @@ function do_addTracker(cls, method) {
     trackers[key] = { on: true };
     sendMsg('info', { msg: 'tracker added ' + key });
 }
-
 function do_trackField(cls, field) {
     var key = cls + '.' + field;
     var jc = Java.use(cls);
@@ -2384,9 +1450,6 @@ function do_trackField(cls, field) {
     sendMsg('info', { msg: 'field tracker added ' + key +
                            ' (approximation, toString-safe)' });
 }
-
-/* r22/audit: static-field patch helpers - the ORIGINAL value is
-   captured before the first write so OFF / delete can put it back */
 function patch_store(f, t, value) {
     if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
         f.set(null, parseInt(value, 10) || 0);
@@ -2422,10 +1485,7 @@ function patch_restore(cls, field, key) {
         }
     });
 }
-
-/* ---------------- rpc exports (called from the menu) ---------------- */
 rpc.exports = {
-    /* ---- patches: static-field value replacement ---- */
     addPatch: function (cls, field, value) {
         var key = cls + '.' + field;
         Java.perform(function () {
@@ -2436,8 +1496,6 @@ rpc.exports = {
                 var t = String(f.getType().getName());
                 var st = (f.getModifiers() & 8) !== 0;
                 if (!st) throw new Error('not a static field (instances: Classes tab)');
-                /* r22/audit: snapshot the ORIGINAL value once, before
-                   the first write, so OFF/delete can restore it */
                 var prev = patches[key];
                 var snap = (prev && prev.snap) ? prev.snap : patch_snapshot(f, t);
                 patch_store(f, t, value);
@@ -2452,8 +1510,6 @@ rpc.exports = {
         var key = cls + '.' + field;
         var p = patches[key];
         if (p) p.on = en;
-        /* r22/audit: OFF now RESTORES the snapshotted original
-           (the old identity-set was a no-op) */
         if (!en) patch_restore(cls, field, key);
         else rpc.exports.addPatch(cls, field, p ? p.v : '');
         sendMsg('info', { msg: 'patch ' + key + ' -> ' + (en ? 'on' : 'off') });
@@ -2464,19 +1520,13 @@ rpc.exports = {
         delete patches[key];
         sendMsg('info', { msg: 'patch removed ' + key });
     },
-
-    /* ---- hooks: Java(JS) / Smali / noop ---- */
     addHook: function (cls, method, mode, code) {
         var key = cls + '.' + method;
-        /* r22/audit: the menu labels are 'Java(JS)' / 'Smali' /
-           'Nop (auto)' - normalise them or Java hooks never install.
-           r25: the one-tap Nop button sends 'noop' directly. */
         var ml = String(mode).toLowerCase();
         if (ml.indexOf('java') === 0) mode = 'Java';
         else if (ml === 'smali') mode = 'Smali';
         else if (ml === 'noop' || ml === 'nop') mode = 'noop';
         Java.perform(function () {
-            /* r23: never force <clinit> - defer until the class loads */
             if (!dt_is_loaded(cls)) {
                 defer_install('hook', cls, function () {
                     try { do_addHook(cls, method, mode, code); }
@@ -2496,24 +1546,17 @@ rpc.exports = {
     },
     setHookEnabled: function (cls, method, en) {
         var key = cls + '.' + method;
-        /* r23: hooks[key] IS the LAYERS part object - flipping .on is
-           enough, the dispatcher reads it live */
         if (hooks[key]) hooks[key].on = en;
         sendMsg('info', { msg: 'hook ' + key + ' -> ' + (en ? 'on' : 'off') });
     },
     removeHook: function (cls, method) {
         var key = cls + '.' + method;
         Java.perform(function () {
-            /* r23: remove the layer - other layers on the same method
-               (tracker/recorder) survive, and the original
-               implementation returns when this was the last one */
             uninstall_layer(cls, method, 'hook');
             delete hooks[key];
             sendMsg('info', { msg: 'hook removed ' + key });
         });
     },
-
-    /* ---- trackers ---- */
     addTracker: function (cls, method) {
         var key = cls + '.' + method;
         Java.perform(function () {
@@ -2536,11 +1579,6 @@ rpc.exports = {
         });
     },
     trackField: function (cls, field) {
-        /* ART has no field read/write barriers: approximate by
-           watching the value before/after every declared method call
-           of the class. r23: values go through field_repr() - the old
-           jstr(f.get(...)) called the app's toString() INSIDE our
-           hooks (recursion/crash when toString is itself recorded). */
         var key = cls + '.' + field;
         Java.perform(function () {
             try {
@@ -2563,9 +1601,6 @@ rpc.exports = {
     },
     removeTracker: function (name) {
         Java.perform(function () {
-            /* r23: the layer(s) are removed for real; the class's
-               methods return to their original implementations when
-               nothing else tracks/records/hooks them */
             Object.keys(LAYERS).forEach(function (K) {
                 var L = LAYERS[K];
                 if (!L) return;
@@ -2580,8 +1615,6 @@ rpc.exports = {
             sendMsg('info', { msg: 'tracker removed ' + name });
         });
     },
-
-    /* ---- recorder ---- */
     startRecorder: function (filter, cap) {
         if (REC.on || REC.busy) return;
         Java.perform(function () {
@@ -2594,14 +1627,10 @@ rpc.exports = {
             REC.filter = (filter === undefined || filter === null) ? '' :
                           String(filter);
             if (!REC.filter) REC.filter = pkg;   /* default: own package */
-            /* '.' sent by the UI means everything; agent: use it directly */
             if (filter === '.') REC.filter = '.';
             REC.cap = (typeof cap === 'number' && cap > 0) ?
                       Math.floor(cap) : 1500;
             var list = Java.enumerateLoadedClassesSync();
-            /* r22/audit: filter ONCE - the install loop counted
-               skipped classes against its 12-class batch, so a
-               package filter took ~a minute over 30k names */
             list = list.filter(function (n) { return rec_wanted(n, REC.filter); });
             REC.on = true;
             REC.busy = true;
@@ -2612,25 +1641,16 @@ rpc.exports = {
             sendMsg('recorderProgress', { installed: 0, total: list.length });
             sendMsg('info', { msg: 'recorder scope: filter="' + REC.filter +
                                    '" cap=' + REC.cap });
-            /* r12: smaller chunks (12 classes) - a chunk of 25 with
-               big classes stalled the JS thread for seconds */
             setTimeout(function () { rec_install_chunk(list, 12); }, 50);
         });
     },
     stopRecorder: function () {
-        /* r12: REC.on=false also aborts a still-running install
-           (see rec_install_chunk).
-           r23: uninstall_all('rec') removes the recorder layer from
-           every method - hooks are GONE, not just silent (the audit's
-           "hooks are never removed on stop"). */
         REC.on = false;
         REC.busy = false;
         Java.perform(function () { uninstall_all('rec'); });
         rec_flush();
         sendMsg('recorderStopped', { installed: REC.installed });
     },
-
-    /* ---- monitor ---- */
     startMonitor: function () {
         if (MON.on) return;
         MON.on = true;
@@ -2646,14 +1666,8 @@ rpc.exports = {
         });
         sendMsg('monitorStopped', {});
     },
-
-    /* ---- script console ---- */
     evalScript: function (src) {
         try {
-            /* r22/audit: the LAST argument of new Function() is the
-               BODY - the old call made "src" the body (a parameter
-               name) and passed the user's code as a parameter VALUE,
-               so the Script tab ran nothing */
             var r = (new Function('Java', 'send', 'console', String(src)))(
                         Java, send, CONSOLE());
             if (r !== undefined) sendMsg('scriptResult', { result: cstr(r) });
@@ -2661,8 +1675,66 @@ rpc.exports = {
             sendMsg('scriptError', { msg: String(e && e.stack ? e.stack : e) });
         }
     },
-
-    /* ---- classes ---- */
+    dumpLoadedClasses: function () {
+        Java.perform(function () {
+            var path = '', n = 0, err = '';
+            try {
+                var AT = Java.use('android.app.ActivityThread');
+                var ctx = AT.currentApplication();
+                var FOS = Java.use('java.io.FileOutputStream');
+                path = ctx.getFilesDir().getAbsolutePath() +
+                       '/dextool-classes.txt';
+                var fos = FOS.$new(path);
+                var all = Java.enumerateLoadedClassesSync();
+                all.sort();
+                var SJ = Java.use('java.lang.String');
+                for (var i = 0; i < all.length; i++) {
+                    fos.write(SJ.$new(all[i] + '\n').getBytes('UTF-8'));
+                    n++;
+                }
+                fos.close();
+            } catch (e0) { err = String(e0.message || e0); }
+            sendMsg('dumpReady', { kind: 'classes', path: path,
+                                   count: n, error: err });
+        });
+    },
+    dumpObject: function (cls, handle) {
+        Java.perform(function () {
+            var path = '', err = '';
+            try {
+                var inst = inst_get(handle);
+                if (!inst) throw new Error('handle 0x' +
+                    (handle >>> 0).toString(16) + ' is gone (GC)');
+                var jc = Java.use(cls);
+                var AT = Java.use('android.app.ActivityThread');
+                var ctx = AT.currentApplication();
+                path = ctx.getFilesDir().getAbsolutePath() +
+                       '/dextool-object-' +
+                       String(cls).replace(/\./g, '_') +
+                       '-0x' + (handle >>> 0).toString(16) + '.json';
+                var rows = field_rows(jc, inst);
+                var ts = '';
+                try { ts = String(inst); }
+                catch (eT) { ts = '(toString failed)'; }
+                var j = '{\n  "class": ' + JSON.stringify(String(cls)) +
+                        ',\n  "handle": ' + handle +
+                        ',\n  "toString": ' + JSON.stringify(ts) +
+                        ',\n  "fields": [\n';
+                for (var i = 0; i < rows.length; i++) {
+                    j += '    ' + JSON.stringify({
+                             n: rows[i].n, t: rows[i].t, v: rows[i].v
+                         }) + (i + 1 < rows.length ? ',' : '') + '\n';
+                }
+                j += '  ]\n}\n';
+                var fos = Java.use('java.io.FileOutputStream').$new(path);
+                fos.write(Java.use('java.lang.String')
+                              .$new(j).getBytes('UTF-8'));
+                fos.close();
+            } catch (e0) { err = String(e0.message || e0); }
+            sendMsg('dumpReady', { kind: 'object', path: path,
+                                   count: 0, error: err });
+        });
+    },
     listLoadedClasses: function (filter, qid, mode, sys, cs) {
         Java.perform(function () {
             try {
@@ -2671,7 +1743,6 @@ rpc.exports = {
                 var f = fRaw.toLowerCase();
                 var md = (typeof mode === 'number') ? mode : 0;
                 var includeSys = (sys === true || sys === 1);
-                /* r26: Case sensitive (Explorer Options popup) */
                 var csm = (cs === true || cs === 1);
                 gLastSearch = { f: f, fRaw: fRaw, mode: md, cs: csm };
                 if (!includeSys) {
@@ -2679,7 +1750,6 @@ rpc.exports = {
                         return !is_system_cls(n);
                     });
                 }
-                /* r25: alphabetical order (field spec) */
                 all.sort();
                 if (!fRaw || md === 0) {
                     var out0 = fRaw ? all.filter(function (n) {
@@ -2689,8 +1759,6 @@ rpc.exports = {
                     page_out(out0, qid, all.length);
                     return;
                 }
-                /* modes 1-3: chunked scan over the app's dex files
-                   (capped at 4000 hits, cancellable by a newer qid) */
                 if (SCAN.on)
                     sendMsg('info', { msg: 'search: previous scan replaced' });
                 var want = {};
@@ -2721,15 +1789,7 @@ rpc.exports = {
     openClass: function (cls) {
         Java.perform(function () {
             try {
-                /* r12: field VALUES are no longer read here - a static
-                   read can run the class's <clinit> and block forever.
-                   r23: use_loaded() also refuses UNLOADED classes -
-                   Java.use() itself runs <clinit> through the bridge's
-                   ensureClassInitialized. */
                 var jc = use_loaded(cls);
-                /* r25: members matching the last search, for the GREEN
-                   marks. Modes 1/2 recompute from reflection (cheap);
-                   mode 3 reuses the scan's per-class hit lists. */
                 var hm = [], hf = [];
                 var fl = gLastSearch.f || '';
                 if (fl) {
@@ -2774,10 +1834,6 @@ rpc.exports = {
             }
         });
     },
-    /* r25: the REAL body of one method, disassembled on-device by the
-       bundled baksmali (org.jf 2.5.2). Java decompilation is not
-       bundled - the source panel shows the bytecode, which is what
-       Smali hooks are written in anyway. */
     getMethodSrc: function (cls, method) {
         Java.perform(function () {
             var done = function (ok, src, err) {
@@ -2832,9 +1888,6 @@ rpc.exports = {
             }
         });
     },
-    /* r25: arm a ONE-SHOT probe on the method - its next call reports
-       the current input/output values (toString-safe) into the IO
-       patch editor. */
     getMethodIO: function (cls, method) {
         Java.perform(function () {
             try {
@@ -2853,9 +1906,6 @@ rpc.exports = {
             }
         });
     },
-    /* r25: persistent IO patch - the menu sends ONLY the rows the
-       user marked (args entries), so presence == patched. An empty
-       args list with ret.on=false removes the patch layer. */
     setMethodIO: function (cls, method, args, ret) {
         Java.perform(function () {
             var key = cls + '.' + method;
@@ -2890,8 +1940,6 @@ rpc.exports = {
             }
         });
     },
-    /* r12: on-demand static values for the open class (Fields tab
-       "Read static values" button) */
     readStaticFields: function (cls) {
         Java.perform(function () {
             try {
@@ -2915,7 +1963,6 @@ rpc.exports = {
             }
         });
     },
-    /* ---- system keyboard (r12) ---- */
     showIme: function () { ime_show(); },
     hideIme: function () { ime_hide(); },
     listInstances: function (cls) {
@@ -2927,13 +1974,6 @@ rpc.exports = {
                 Java.choose(cls, {
                     onMatch: function (inst) {
                         try {
-                            /* r23: retain + structured fields; the old
-                               "##"/";" protocol corrupted values and
-                               the bare scan index gave later calls no
-                               receiver at all. The label is NOT run
-                               through jstr() - its | -> ! and # -> %
-                               rewrites were only needed by the old
-                               delimiter protocol. */
                             var h = inst_put(inst);
                             var lbl = '';
                             try { lbl = String(inst); }
@@ -2959,8 +1999,6 @@ rpc.exports = {
     setInstanceField: function (cls, index, field, value, handle) {
         Java.perform(function () {
             var key = cls + '.' + field;
-            /* r23: a retained handle addresses the instance directly
-               (the scan-index path is only the fallback now) */
             var recv = inst_get(handle);
             if (recv) {
                 try {
@@ -3000,10 +2038,6 @@ rpc.exports = {
             } catch (e) {}
         });
     },
-    /* r26: count = call N times with the same args (the Caller tab's
-       Call Count input; every call reports its own callResult with
-       idx/of), main = run each call on the app's MAIN thread via
-       Java.scheduleOnMainThread (the spec's "Call in Main Thread"). */
     callMethod: function (cls, method, args, handle, count, main) {
         var n = 1;
         if (typeof count === 'number' && count > 0) n = Math.min(count, 50);
@@ -3012,8 +2046,6 @@ rpc.exports = {
         var once = function () {
             Java.perform(function () {
                 try {
-                    /* r23: use_loaded - no forced <clinit> on unloaded
-                       classes */
                     var jc = use_loaded(cls);
                     var recv = inst_get(handle);
                     var node = null;
@@ -3032,7 +2064,6 @@ rpc.exports = {
                     if (!best) best = ovs[0];
                     var r;
                     if (recv) {
-                        /* r23: instance-method call WITH a receiver */
                         r = call_with_args(best, args || [], false, recv);
                     } else {
                         if (!is_static_method(jc, method))
@@ -3064,11 +2095,6 @@ rpc.exports = {
         if (onMain) Java.scheduleOnMainThread(once);
         else once();
     },
-
-    /* r26: Object Finder "Create Object" - $new() through the no-arg
-       constructor, retained like a Java.choose match. Creating an
-       instance REQUIRES the class, so the <clinit> cost of Java.use
-       is accepted here (use_loaded would refuse to ever create one). */
     createInstance: function (cls) {
         Java.perform(function () {
             try {
@@ -3089,11 +2115,6 @@ rpc.exports = {
         });
     }
 };
-
-/* console for user scripts. r22/audit: cstr() gives readable text
-   (jstr() rewrites '|' and '#' and cuts at 160 chars for the
-   delimiter protocol - wrong for a console line); the dead
-   CONS_Lines/CONS_Dummy batching is gone. */
 function cstr(v) {
     try {
         if (v === null) return 'null';
@@ -3115,12 +2136,6 @@ function CONSOLE() {
         warn:  function () { line('WARN ', arguments); }
     };
 }
-
-/* ---------------- smali assemble + load (runtime dex) ---------------- */
-/* r25: the loader/ClassFactory for smali-fat.jar is created ONCE and
-   cached - the same factory also serves the org.jf 2.5.2 dexlib2 +
-   baksmali classes used by the method-source view and the code-text
-   search (the CI step merges them into the same dex). */
 var gSmaliFactory = null;
 function smali_factory() {
     if (gSmaliFactory) return gSmaliFactory;
@@ -3136,8 +2151,6 @@ function smali_factory() {
             var jar = files + '/smali-fat.jar';
             var File = Java.use('java.io.File');
             if (!File.$new(jar).exists()) {
-                /* r22/audit: extract to a temp file + rename(2), so
-                   a killed process cannot leave a truncated jar */
                 var FOS0 = Java.use('java.io.FileOutputStream');
                 var tmpJar = jar + '.tmp';
                 var is = ctx.getAssets().open('smali-fat.jar');
@@ -3148,15 +2161,10 @@ function smali_factory() {
                 fos.close(); is.close();
                 File.$new(tmpJar).renameTo(File.$new(jar));
             }
-            /* r22/audit: Android 14+ refuses to load a WRITABLE
-               dex/jar (targetSdk 34) */
             File.$new(jar).setReadOnly();
             var PC = Java.use('dalvik.system.PathClassLoader');
             var CL = Java.use('java.lang.ClassLoader');
             var loader = PC.$new(jar, CL.getSystemClassLoader());
-            /* r22/audit: loadClass() returns a java.lang.Class
-               wrapper, which has no static main(): go through a
-               ClassFactory bound to this loader */
             gSmaliFactory = Java.ClassFactory.get(loader);
         } catch (e) {
             agentLog('smali factory: ' + String(e.message || e));
@@ -3165,7 +2173,6 @@ function smali_factory() {
     });
     return gSmaliFactory;
 }
-
 function smali_compile(src) {
     var out = { err: '', dex: null };
     Java.perform(function () {
@@ -3215,7 +2222,6 @@ function smali_compile(src) {
     });
     return out;
 }
-
 function smali_load(art) {
     var r = { ok: false, err: '', hook: null };
     var dexBytes = art && art.dex;
@@ -3226,8 +2232,6 @@ function smali_load(art) {
             var IMDC = Java.use('dalvik.system.InMemoryDexClassLoader');
             var CL = Java.use('java.lang.ClassLoader');
             var bb = ByteBuffer.wrap(dexBytes);
-            /* r22/audit: single-buffer constructor - the ByteBuffer[]
-               one needs API 27+, the sample's minSdk is 26 */
             var loader = IMDC.$new(bb, CL.getSystemClassLoader());
             var cls = loader.loadClass(art.cls);
             var methods = cls.getDeclaredMethods();
@@ -3249,17 +2253,6 @@ function smali_load(art) {
     });
     return r;
 }
-
-/* ================= r25: on-device dex access (org.jf 2.5.2) ======
-   The CI step merges org.smali 2.5.2 baksmali + dexlib2 + util into
-   smali-fat.jar (org.jf.* packages - the com.android.tools.smali
-   3.0.7 assembler coexists untouched). This gives the agent the
-   app's REAL bytecode:
-   - method source view: Baksmali.disassembleClass per class
-   - code-text search: const-string instructions + static String
-     field values of every class of the host APK
-   Scope: classes inside the host APK (base + splits). Classes from
-   dynamic InMemoryDexClassLoaders are outside this window. */
 var gBak = null;
 function baksmali_libs() {
     if (gBak) return gBak;
@@ -3282,7 +2275,6 @@ function baksmali_libs() {
         return null;
     }
 }
-
 function apk_paths() {
     var out = [];
     try {
@@ -3297,9 +2289,6 @@ function apk_paths() {
     } catch (e) {}
     return out;
 }
-
-/* parsed dex files of the host APK, cached 60 s (parse of a big
-   multi-dex APK takes seconds and the search re-enters per chunk) */
 var gDexes = null, gDexesAt = 0;
 function dex_files() {
     var now = Date.now();
@@ -3321,9 +2310,6 @@ function dex_files() {
     gDexesAt = now;
     return out;
 }
-
-/* r25 system gate: the field report asked the class list to hide
-   "classes related to Android and Google" */
 function is_system_cls(n) {
     return n.indexOf('android.') === 0 ||
            n.indexOf('androidx.') === 0 ||
@@ -3335,8 +2321,6 @@ function is_system_cls(n) {
            n.indexOf('kotlin.') === 0 ||
            n.indexOf('kotlinx.') === 0;
 }
-
-/* one const-string of an instruction, '' if it is not one */
 function ins_const_string(L, ins) {
     try {
         var op = String(ins.getOpcode());
@@ -3347,8 +2331,6 @@ function ins_const_string(L, ins) {
         return String(sr.getString());
     } catch (e) { return ''; }
 }
-
-/* shared classList paging (r11 protocol: pages of 400, qid'd) */
 function page_out(list, qid, total) {
     var PAGE = 400;
     var pages = Math.max(1, Math.ceil(list.length / PAGE));
@@ -3368,18 +2350,11 @@ function page_out(list, qid, total) {
     };
     send_page();
 }
-
-/* ---- chunked code/member scan (modes 1-3) ----
-   150 classDefs per 15 ms tick so the JS thread never stalls;
-   a newer qid abandons the run. Result classes are sorted and
-   paged out; per-class member hits are kept for the green marks
-   in the class view (openClass reads gLastScanHits). */
 var SCAN = { on: false, qid: -1, f: '', md: 0, want: {}, wantList: [],
              matches: [], hits: {}, dexes: null, di: 0, it: null,
              total: 0 };
 var gLastScanHits = {};
 var gLastSearch = { f: '', mode: 0 };
-
 function scan_finish() {
     SCAN.on = false;
     gLastScanHits = SCAN.hits;
@@ -3388,7 +2363,6 @@ function scan_finish() {
                            ' matching class(es) (scan done)' });
     page_out(matches, SCAN.qid, SCAN.total);
 }
-
 function scan_step() {
     if (!SCAN.on) return;
     var L = baksmali_libs();
@@ -3472,8 +2446,6 @@ function scan_step() {
                 }
                 if (!fh) fh = [];
                 if (!matched || fh.length < 40) {
-                    /* static String initial values count as "field
-                       code" (the spec's premium-in-a-field case) */
                     var sfit = null;
                     try { sfit = cd.getStaticFields().iterator(); }
                     catch (e1) {}
@@ -3503,8 +2475,6 @@ function scan_step() {
     }
     setTimeout(scan_step, 15);
 }
-
-/* read a small text file (the per-class smali dump) */
 function read_file_text(path) {
     var FIS = Java.use('java.io.FileInputStream');
     var fis = FIS.$new(path);
@@ -3517,7 +2487,6 @@ function read_file_text(path) {
     return Java.use('java.lang.String').$new(
         Java.array('byte', all), 'UTF-8');
 }
-
 function rm_rf(f) {
     try {
         if (f.isDirectory()) {
@@ -3527,8 +2496,6 @@ function rm_rf(f) {
         f.delete();
     } catch (e) {}
 }
-
-/* extract every ".method ... name(...) ... .end method" block */
 function extract_method_blocks(text, method) {
     var lines = text.split('\n');
     var out = [], cur = null;
@@ -3536,8 +2503,6 @@ function extract_method_blocks(text, method) {
         var ln = lines[i];
         if (cur === null) {
             if (ln.indexOf('.method') === 0) {
-                /* ".method public static foo(I)V" - the name token
-                   sits right before the '(' */
                 var body = ln.substring(8);
                 var po = body.indexOf('(');
                 if (po !== -1) {
@@ -3558,8 +2523,6 @@ function extract_method_blocks(text, method) {
     }
     return out.join('\n\n');
 }
-
-/* ---------------- receive loop (menu -> agent) ---------------- */
 recv(function onMsg(msg) {
     if (!msg) { recv(onMsg); return; }
     try {
@@ -3569,16 +2532,11 @@ recv(function onMsg(msg) {
             var vals = names.map(function (n) { return a[n]; });
             rpc.exports[msg.fn].apply(rpc.exports, vals);
         }
-        /* r12: showIme/hideIme drive the phone keyboard; fields are
-           in FN_ARGS below. Unknown types fall through silently. */
     } catch (e) {
         sendMsg('error', { fn: 'recv', msg: String(e.message || e) });
     }
     recv(onMsg);
 });
-
-/* argument-name table: menu sends {class:..., method:...}; exports
-   were declared as function(cls, method, ...) positionally */
 var FN_ARGS = {
     addPatch:        ['class', 'field', 'value'],
     setPatchEnabled: ['class', 'field', 'enabled'],
@@ -3607,13 +2565,6 @@ var FN_ARGS = {
     callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
     createInstance:  ['class']
 };
-
-/* r14: phased startup. gum_script_load_sync must ALWAYS return:
-   the r13 field crash ("script created, loading agent" then
-   CRASH signal=6 with zero JS messages) died inside top-level
-   Java init. Every Java-touching step now runs from the JS job
-   queue AFTER load completes, and each step is phase-marked into
-   the native logs, so an abort pins the exact phase. */
 agentLog('phase: deferred init scheduled');
 setTimeout(function () {
     try {
@@ -3630,6 +2581,12 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r27 loaded' });
+    var pkgR = '';
+    try {
+        var ATr = Java.use('android.app.ActivityThread');
+        var appR = ATr.currentApplication();
+        if (appR) pkgR = String(appR.getPackageName());
+    } catch (eP) {}
+    sendMsg('ready', { msg: 'Dex-tool agent r28 loaded', pkg: pkgR });
     agentLog('phase: ready sent');
 }, 0);

@@ -12,73 +12,12 @@
 #include <cstdlib>
 #include <cctype>
 #include <algorithm>
+#include <unordered_map>
 #include <pthread.h>
 #include <ctime>
-
-/* =====================================================================
-   Dex-tool menu (r27)
-   - r27 = UI spec v2 integrated (the runtime_tool_imgui_mock design):
-     * family dropdown popup: a "Search families..." input at the
-       very top filters the PACKAGE list in real time (package names
-       only - it never touches the class search)
-     * class windows: the full class name is the title line and
-       wraps to the window width
-     * methods: LONG PRESS (>= 0.55 s) opens the context menu, next
-       to right-click and the "..." button
-     * method sub-tabs renamed: Call / Patch / Trace / Hook
-     * object parameters: a real DROPDOWN (auto instance scan of the
-       parameter's class + "Find / Create Object..." entry; the
-       free-form value input is kept below)
-     * the fields list lives under a "Fields" tree node
-     * "Call Count" input and "Call Results:" log per spec,
-       "Manual Input" in the Patch tab (NOP = void methods)
-   - r26 UI RESTRUCTURE per the field spec:
-     * topmost main tabs, exact order: Classes, Patches, Trackers,
-       Hooks, Recorder, Monitor, Script, Settings
-     * secondary tab bar: the OPENED classes, with a "+" button on the
-       far right that opens a new Class Explorer WINDOW
-     * Class Explorer windows: family dropdown + All checkbox, search
-       field + Filter button, pink Options popup (Case Sensitive,
-       Filter by Class/Method/Field, Advanced code-text search, System
-       classes gate) and the filtered class list
-     * Class Inspector windows (one per opened class): Inspector button
-       (Object Finder), Static Fields, Methods list (tap = expand into
-       Caller / Patcher / Tracer / Hooker sub-tabs; right-click or the
-       "..." button = context menu: Open in new window / Full Method
-       View / Copy Method Name / Copy Class Name), Fields list;
-       minimize "-" and close "X" buttons in the window
-     * Caller tab: one input per parameter (primitives = text, objects
-       = Find button -> Object Finder), Call Count, Call + Call in
-       Main Thread buttons, per-call results log
-     * Patcher tab: manual value + Patch NOP + Redirect (the r25 live
-       IO-probe editor kept inside it)
-     * Tracer tab: track this method + live event log
-     * Hooker tab: Java/Smali/Nop hook editor for this method
-     * Object Finder window: Find Objects (Java.choose), Create Object
-       ($new), manual reference, results list; a click fills the
-       caller parameter or the inspector's selected instance
-   - every tab of the spec; text input via the PHONE's keyboard (system
-     IME; focusing a field posts showIme to the agent)
-   - DEADLOCK FIX ("open a class and the app freezes"): g_mtx is a
-     RECURSIVE mutex now. tab_classes() used to lock it a second time
-     while already holding it, and class_tab_content() nested again -
-     the render thread self-deadlocked inside the eglSwapBuffers hook,
-     which froze the host's GL thread: the whole app hung.
-   - cross-linking: clicking a row in Tracker / Recorder / Monitor opens
-     that class in an inspector window (menu_open_class)
-   - the recorder/monitor lists are fed by the agent in throttled
-     batches; the recorder is scoped (package filter + method cap)
-   - scrollable areas are published to the overlay, which converts
-     drags inside them into wheel events at the configured speed
-   - UI state persists to <logdir>/dextool-ui.conf
-   ===================================================================== */
-
-/* recursive: tab_classes / the class views / menu_open_class nest */
 static pthread_mutex_t g_mtx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 #define MLK()   pthread_mutex_lock(&g_mtx)
 #define MULK()  pthread_mutex_unlock(&g_mtx)
-
-/* ---------------- settings ---------------- */
 static float s_font_size  = 18.0f;
 static float s_opacity    = 0.92f;
 static int   s_theme      = 0;
@@ -87,13 +26,9 @@ static float s_lst_scroll = 1.2f;   /* inner list drag speed */
 static bool  s_visible    = true;
 static bool  s_show_fab   = true;
 static float s_y_off      = 0.0f;   /* manual touch Y bias (px); r15: default 0 - the screen-space touch map is mathematically exact, the slider stays for exotic hosts */
-
-/* ---------------- agent / overlay status ---------------- */
 static bool  s_agent_ready = false;
 static char  s_agent_note[160] = "";
 static bool  s_ovl_ready   = false;
-
-/* ---------------- scroll region publication ---------------- */
 static std::vector<float> s_regions;
 static void mark_rect(float x, float y, float w, float h, float speed) {
     if (w <= 1 || h <= 1 || speed <= 0.01f) return;
@@ -101,18 +36,12 @@ static void mark_rect(float x, float y, float w, float h, float speed) {
     s_regions.push_back(w); s_regions.push_back(h);
     s_regions.push_back(speed);
 }
-/* call right after EndChild(): the child window is the last item */
 static void mark_scroll_item(float speed) {
     ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
     mark_rect(a.x, a.y, b.x - a.x, b.y - a.y, speed);
 }
-
-/* ---------------- data model ---------------- */
 struct MethodSig { std::string name, params, ret; };
 struct FieldInfo { std::string name, type, value; };
-/* r23: instances arrive as structured JSON objects (see jobjarr);
-   handle is the agent's retained-instance id for setInstanceField /
-   callMethod - the old index-only addressing had no receiver at all */
 struct InstInfo  { std::string str; long handle = -1;
                    std::vector<FieldInfo> fields; };
 struct ClassTab {
@@ -126,29 +55,20 @@ struct ClassTab {
     int  sel_inst = -1;
     int  gen = -1;                      /* r23: instance-list generation; part of the editor buffer key */
     int  sub = 0;                       /* 0 Instances 1 Static Fields 2 Methods 3 Fields */
-    /* r26 method expansion: which method row is open + its sub-tab */
     int  expanded = -1;                 /* index into methods, -1 none   */
     int  msub = 0;                      /* 0 Call 1 Patch 2 Trace 3 Hook */
-    /* inline method-call editor (r26 Caller tab) */
     MethodSig call_sig;
     char call_args[8][128] = {};
     char call_typ[8][64]   = {};        /* r26: parameter types          */
     int  call_nargs = 0;
     int  call_count = 1;                /* r26: Call Count input         */
     std::vector<std::string> call_log;  /* r26: per-call results         */
-    /* r26 Patcher tab */
     char patch_val[256] = {};           /* manual value                  */
     std::string patch_note;
-    /* r26 Hooker tab */
     int  hook_mode = 0;
     char hook_code[4096] = {};
-    /* r26 Object Finder selection (Inspector button) */
     long of_handle = -1;
     std::string of_note;
-    /* r25: method input/output patch editor. The agent probes ONE
-       call of the method (ioprobe layer), reports the captured
-       current values, and only the rows the user P-marked are
-       patched from then on. */
     bool io_open  = false;              /* editor visible            */
     bool io_wait  = false;              /* probe in flight           */
     MethodSig io_sig;                   /* which method is edited    */
@@ -162,8 +82,6 @@ struct ClassTab {
     char io_ret[128]        = {};
     bool io_ret_on          = false;
     std::string io_result;
-    /* r25: members that contain the code-text search string - the
-       Methods/Fields lists paint these rows green */
     std::vector<std::string> hits_m, hits_f;
     bool hit(const std::vector<std::string>& v, const std::string& n) const {
         for (auto& s : v) if (s == n) return true;
@@ -180,13 +98,7 @@ struct Tracker  { std::string name;              /* full Class.member */
                   bool is_field=false;
                   std::vector<TrackRow> log; };
 struct RecRow   { std::string cls, method, args, ret, extra; };
-/* r25: detail carries the payload/body preview shown in the detail
-   window (request body, response body peek, stream note) */
 struct MonRow   { std::string kind, url, method, origin, note, detail; };
-
-/* r26: Class Explorer windows - the "+" button opens one; each has
-   its own search structure (field spec) while the agent result page
-   stream stays global (one qid at a time, like r25) */
 struct ExplorerWin {
     int  id = 0;
     bool open = true;
@@ -198,8 +110,6 @@ struct ExplorerWin {
     int  filter_by = 0;           /* 0 Class 1 Method 2 Field        */
     bool advanced = false;        /* string search inside class code */
 };
-/* r26: Object Finder window state (opened from a Caller object
-   parameter or the Inspector button of an inspector window) */
 struct ObjFinder {
     bool open = false;
     char cls[200] = {};
@@ -216,9 +126,6 @@ static std::vector<ExplorerWin> s_explorers;
 static std::vector<std::string> s_families;   /* com.game, com.android... */
 static bool s_expl_req = false;               /* "+" pressed               */
 static int  s_expl_seq = 0;
-/* r27: object-parameter dropdowns auto-scan the parameter's class
-   (listInstances) when their combo opens for the first time; the
-   instanceList reply fills this per-dropdown buffer. */
 static struct ParamScan {
     int uid = -1;                 /* inspector window the dropdown is in */
     int arg = -1;                 /* parameter index                     */
@@ -229,17 +136,13 @@ static struct ParamScan {
 static int  s_tab_uid_seq = 0;
 static int  s_focus_expl = 0;                 /* explorer id to raise     */
 static std::string s_focus_win;               /* inspector title to raise */
-/* r26: Full Method View window (method context menu) */
 static bool        s_fm_open = false;
 static std::string s_fm_cls, s_fm_mth;
 static char        s_fm_src[16384] = "";
 static char        s_fm_note[200] = "";
 static bool        s_fm_have = false;
-/* r26: clipboard echo - ImGui::SetClipboardText needs a backend the
-   touch bridge does not provide, so the toast IS the user feedback */
 static char s_clip_msg[192] = "";
 static long s_clip_ms = 0;
-
 static std::vector<ClassTab>  s_classes;
 static std::vector<PatchRow>   s_patches;
 static std::vector<HookRow>    s_hooks;
@@ -247,13 +150,11 @@ static std::vector<Tracker>    s_trackers;
 static std::vector<RecRow>     s_rec;
 static std::vector<MonRow>     s_mon;
 static std::vector<std::string> s_cons;      /* script console */
-
 static bool  s_rec_on=false;  static char s_rec_stat[128]="idle";
 static int   s_rec_installed=0, s_rec_total=0;
 static char  s_rec_filter[120]="";           /* empty = host package */
 static int   s_rec_cap=1500;                 /* method cap */
 static bool  s_mon_on=false;  static char s_mon_stat[160]="off";
-
 static char s_pcls[200]={}, s_pfld[128]={}, s_pval[256]={};
 static int  s_pedit=-1;
 static char s_hcls[200]={}, s_hmth[128]={}, s_hcode[4096]={};
@@ -261,20 +162,12 @@ static int  s_hmode=0, s_hedit=-1;
 static char s_tcls[200]={}, s_tmth[128]={};
 static char s_script[16384]="// Frida JS - Java, send, console are available\n";
 static char s_search[160]="";
-/* r25: 0 class name, 1 method name, 2 field name, 3 code text.
-   s_search_sys=false hides android/androidx/com.android/com.google/
-   java/javax/dalvik/kotlin packages (the field report asked for
-   "no Android and Google classes"); the checkbox brings them back.
-   r26: s_search_cs = case-sensitive compare (Explorer Options). */
 static int  s_search_mode = 0;
 static bool s_search_sys  = false;
 static bool s_search_cs   = false;
-/* r25: read-only source panel of the Hooks tab (real smali via the
-   bundled baksmali; Java decompilation is NOT bundled) */
 static char s_hsrc[16384] = "";
 static char s_hsrc_note[200] = "";
 static bool s_hsrc_have = false;
-/* r25: selected row of the Monitor list -> detail window */
 static int  s_mon_sel = -1;
 static std::vector<std::string> s_search_res;
 static bool s_cls_auto_done=false;   /* full class list requested once
@@ -287,8 +180,48 @@ static bool s_search_page0=false;    /* r23: set when a NEW qid is sent;
                                         the list - stale pages of an older
                                         qid are dropped, not mixed in */
 static std::string s_next_tab;           /* top tab to select */
-
-/* ---------------- JSON helpers ---------------- */
+static bool    s_fullscreen = false;
+static ImVec2  s_fs_last_pos(0, 0), s_fs_last_size(0, 0);
+static bool    s_fs_restore = false;
+static int     s_scale = 3;
+static const char* k_scale_names[7] = { "Smallest", "Smaller", "Small",
+                                        "Default", "Large", "Larger",
+                                        "Largest" };
+static const float k_scale_px[7]    = { 10.f, 13.f, 16.f, 18.f, 22.f,
+                                        26.f, 32.f };
+struct HitFlash { std::string name; long count; float time; float gone; };
+static std::vector<HitFlash> s_flash;
+static void flash_hit(const std::string& name, long count) {
+    for (auto& f : s_flash) {
+        if (f.name == name) {
+            f.count = count; f.time = 2.f; f.gone = 10.f;
+            return;
+        }
+    }
+    s_flash.push_back({name, count, 2.f, 10.f});
+    if (s_flash.size() > 10) s_flash.erase(s_flash.begin());
+}
+static std::unordered_map<std::string, long> s_hits;
+struct ObjTab {
+    long handle = -1;
+    std::string cls, str;
+    std::vector<FieldInfo> fields;
+    int  sel = -1;               /* field row being edited            */
+    char edit[256] = {};         /* its edit buffer                   */
+};
+static std::vector<ObjTab> s_objtabs;
+static long s_objfocus = -1;     /* handle of the tab to select       */
+struct SavedObj { std::string cls, str; long handle = -1; };
+static std::vector<SavedObj> s_saved;
+static bool  s_dump_wait = false;
+static bool  s_dump_done = false;
+static long  s_dump_count = 0;
+static char  s_dump_path[512] = "";
+static char  s_dump_note[192] = "";
+static char  s_dobj_note[192] = "";
+static std::string s_pkg = "(unknown)";
+static bool s_open_objfinder = false;
+static bool s_open_fmview    = false;
 static std::string jesc(const std::string& s) {
     std::string r;
     r.reserve(s.size() + 8);
@@ -310,9 +243,6 @@ static std::string jesc(const std::string& s) {
     }
     return r;
 }
-
-/* unescape a JSON string body (agent -> menu direction); r6/r7 fed
-   escaped text (with \" and \\n) straight into the UI */
 static std::string junesc(const std::string& s) {
     std::string r;
     r.reserve(s.size());
@@ -356,8 +286,6 @@ static std::string junesc(const std::string& s) {
     }
     return r;
 }
-
-/* string array; skips \" so values containing quotes survive */
 static std::vector<std::string> jarr(const std::string& j, const char* key) {
     std::vector<std::string> r;
     std::string k = std::string("\"")+key+"\":";
@@ -382,7 +310,6 @@ static std::vector<std::string> jarr(const std::string& j, const char* key) {
     }
     return r;
 }
-
 static std::string jstr(const std::string& j, const char* key) {
     std::string k = std::string("\"")+key+"\":\"";
     auto p = j.find(k);
@@ -398,7 +325,6 @@ static std::string jstr(const std::string& j, const char* key) {
     if (i > p) val = j.substr(p, i - p);
     return junesc(val);
 }
-
 static long jnum(const std::string& j, const char* key, long dflt=0) {
     std::string k = std::string("\"")+key+"\":";
     auto p = j.find(k);
@@ -413,19 +339,9 @@ static long jnum(const std::string& j, const char* key, long dflt=0) {
     }
     return any ? (neg ? -v : v) : dflt;
 }
-
 static bool jhas(const std::string& j, const char* key) {
-    /* r23: colon-anchored - the old substring test matched "key"
-       INSIDE string values (a class named ...ok... satisfied
-       jhas(j,"ok")); the key must now be followed by ':' to count */
     return j.find(std::string("\"") + key + "\":") != std::string::npos;
 }
-
-/* r23: EXACT value of the top-level "type" field. The whole message
-   dispatch used to be a chain of jhas() substring tests, so a payload
-   that merely CONTAINED the word ("...ready...", a URL holding
-   "info", a class name ending in "error") hijacked the branch meant
-   for another message. Every branch now compares this exact string. */
 static std::string jtype(const std::string& j) {
     const std::string k = "\"type\":\"";
     auto p = j.find(k);
@@ -438,13 +354,6 @@ static std::string jtype(const std::string& j) {
     }
     return j.substr(p, i - p);
 }
-
-/* r23: array of JSON OBJECTS; each element is returned as its
-   balanced {...} substring (nesting + quoted braces handled).
-   The instance list used a "toString##name=value;name=value" string
-   protocol whose | # ; delimiters corrupted every value that
-   contained those characters - the audit's "value corruption on
-   edit". Fields now travel as structured JSON. */
 static std::vector<std::string> jobjarr(const std::string& j,
                                         const char* key) {
     std::vector<std::string> r;
@@ -477,25 +386,17 @@ static std::vector<std::string> jobjarr(const std::string& j,
     }
     return r;
 }
-
 static void post_rpc(const char* fn, const std::string& args) {
     std::string m = "{\"type\":\"rpc\",\"fn\":\"";
     m += fn; m += "\",\"args\":"; m += args; m += "}";
     frida_post(m);
 }
-
 static void push_console(const char* tag, const std::string& line) {
     char b[256];
     snprintf(b, sizeof(b), "%s %s", tag, line.c_str());
-    /* r24: keep the NEWEST 400 lines - the old guard DROPPED every
-       line past 400, so the console simply appeared to stop */
     s_cons.push_back(b);
     if (s_cons.size() > 400) s_cons.erase(s_cons.begin());
 }
-
-/* ---------------- cross-linking ----------------
-   r26: class windows carry a STABLE uid so titles/ids survive
-   insertion of further windows ("Open in new window"). */
 static std::string short_name(const std::string& cls) {
     auto d = cls.rfind('.');
     return (d == std::string::npos) ? cls : cls.substr(d + 1);
@@ -503,9 +404,6 @@ static std::string short_name(const std::string& cls) {
 static std::string win_title(const ClassTab& c) {
     return short_name(c.cname) + "##t" + std::to_string(c.uid);
 }
-/* open (or refresh) a class inspector window; r26: switch_tab=false
-   from the Explorer / secondary bar (the Classes main tab is already
-   up, the inspector window must not fight the tab selection) */
 static ClassTab* open_inspector(const std::string& name, bool switch_tab) {
     if (name.empty()) return nullptr;
     ClassTab* out = nullptr;
@@ -521,9 +419,8 @@ static ClassTab* open_inspector(const std::string& name, bool switch_tab) {
         out = &s_classes.back();
     }
     s_focus_win = win_title(*out);
-    if (switch_tab) s_next_tab = "Classes";
+    if (switch_tab) s_next_tab = "Tools";   /* r28 */
     MULK();
-    /* refresh from the agent (methods/fields); reply fills the tab */
     std::string a = "{\"class\":\"" + jesc(name) + "\"}";
     post_rpc("openClass", a);
     return out;
@@ -531,19 +428,15 @@ static ClassTab* open_inspector(const std::string& name, bool switch_tab) {
 void menu_open_class(const std::string& name) {
     (void)open_inspector(name, true);
 }
-
 static ClassTab* find_tab(const std::string& n) {
     for (auto& c : s_classes) if (c.cname == n) return &c;
     return nullptr;
 }
-
 static int find_tracker(const std::string& n) {
     for (size_t i = 0; i < s_trackers.size(); i++)
         if (s_trackers[i].name == n) return (int)i;
     return -1;
 }
-
-/* parse "Class.method(arg,args) -> ret" and "name:type=value" */
 static MethodSig parse_sig(const std::string& s) {
     MethodSig m;
     auto po = s.find('(');
@@ -572,7 +465,6 @@ static FieldInfo parse_field(const std::string& s) {
     f.value = s.substr(e + 1);
     return f;
 }
-/* "cls.method|args|ret|extra" (agent batches) */
 static RecRow parse_rec(const std::string& s) {
     RecRow r;
     auto p1 = s.find('|');
@@ -590,7 +482,6 @@ static RecRow parse_rec(const std::string& s) {
     r.extra = s.substr(p3 + 1);
     return r;
 }
-/* "kind|url|method|origin|note|detail" (r25: + payload preview) */
 static MonRow parse_mon(const std::string& s) {
     MonRow m;
     auto p1 = s.find('|'); if (p1 == std::string::npos) { m.note=s; return m; }
@@ -608,18 +499,11 @@ static MonRow parse_mon(const std::string& s) {
     m.detail = s.substr(p5+1);
     return m;
 }
-/* (r23: parse_inst() removed with the "a##n=v;n=v" instance protocol -
-   instances are structured JSON now, see the instanceList branch) */
-
-/* strip the trailing ".method" from a caller string "pkg.Cls.method" */
 static std::string cls_of_member(const std::string& s) {
     auto d = s.rfind('.');
     if (d == std::string::npos || d == 0) return s;
     return s.substr(0, d);
 }
-
-/* r26: family of a class = first two package components (com.game).
-   The Explorer family dropdown is built from these. */
 static std::string family_of(const std::string& cls) {
     auto d1 = cls.find('.');
     if (d1 == std::string::npos) return cls;
@@ -627,8 +511,6 @@ static std::string family_of(const std::string& cls) {
     if (d2 == std::string::npos) return cls;
     return cls.substr(0, d2);
 }
-/* r27: case-insensitive substring (the mock's Contains(hay, nd,
-   false)); used by the family popup's "Search families..." filter */
 static bool contains_ci(const std::string& hay, const char* nd) {
     if (!nd || !nd[0]) return true;
     std::string a, b = nd;
@@ -637,8 +519,6 @@ static bool contains_ci(const std::string& hay, const char* nd) {
     for (char& ch : b)  ch = (char)tolower((unsigned char)ch);
     return a.find(b) != std::string::npos;
 }
-/* r26: split a parameter list on TOP-LEVEL commas only - generic
-   depth (Map<String,Integer>) and array brackets must not split */
 static std::vector<std::string> split_params(const std::string& p) {
     std::vector<std::string> ps;
     std::string cur;
@@ -657,8 +537,6 @@ static std::vector<std::string> split_params(const std::string& p) {
     }
     return ps;
 }
-/* r26: primitive parameter types get plain text inputs (field spec);
-   everything else is an object with a Find button (Object Finder) */
 static bool is_prim_type(const std::string& t) {
     std::string s = t;
     if (s == "int32")   s = "int";
@@ -668,18 +546,14 @@ static bool is_prim_type(const std::string& t) {
            s == "char" || s == "float" || s == "double" ||
            s == "boolean" || s == "java.lang.String";
 }
-
-/* ---------------- UI persistence ---------------- */
 static char  s_conf_path[512] = "";
 static bool  s_conf_dirty = false;
 static long  s_conf_last_ms = 0;
-
 static long conf_now_ms() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
-
 static void conf_load() {
     snprintf(s_conf_path, sizeof(s_conf_path), "%s/dextool-ui.conf",
              logger_base_dir());
@@ -699,10 +573,20 @@ static void conf_load() {
         else if (!strcmp(k, "lst"))    s_lst_scroll = v;
         else if (!strcmp(k, "ybias"))  s_y_off    = v;   /* r15: key renamed from yoff so a stale saved -80 cannot fight the new mapping */
         else if (!strcmp(k, "fab"))    s_show_fab = v > 0.5f;
+        else if (!strcmp(k, "scale"))  s_scale    = (int)v;   /* r28 */
     }
     fclose(f);
+    if (s_scale < 0 || s_scale > 6) {
+        s_scale = 3;
+        float best = 1e9f;
+        for (int i = 0; i < 7; i++) {
+            float d = k_scale_px[i] - s_font_size;
+            if (d < 0) d = -d;
+            if (d < best) { best = d; s_scale = i; }
+        }
+    }
+    s_font_size = k_scale_px[s_scale];
 }
-
 static void conf_save() {
     FILE* f = fopen(s_conf_path, "w");
     if (!f) return;
@@ -713,14 +597,11 @@ static void conf_save() {
     fprintf(f, "lst=%g\n",    s_lst_scroll);
     fprintf(f, "ybias=%g\n",  s_y_off);
     fprintf(f, "fab=%d\n",   s_show_fab ? 1 : 0);
+    fprintf(f, "scale=%d\n", s_scale);              /* r28 */
     fclose(f);
     s_conf_dirty = false;
     s_conf_last_ms = conf_now_ms();
 }
-
-/* r26: copy text - ImGui::SetClipboardText plus an on-screen echo;
-   the touch bridge provides no system-clipboard backend, so the
-   toast below the tabs is the feedback the user actually sees */
 static void copy_text(const std::string& what, const std::string& text) {
     ImGui::SetClipboardText(text.c_str());
     std::string t = text;
@@ -729,52 +610,25 @@ static void copy_text(const std::string& what, const std::string& text) {
              what.c_str(), t.c_str());
     s_clip_ms = conf_now_ms();
 }
-
-/* ---------------- theme ---------------- */
 static void apply_theme() {
     switch (s_theme) {
         case 0: ImGui::StyleColorsDark();    break;
         case 1: ImGui::StyleColorsLight();   break;
         case 2: ImGui::StyleColorsClassic(); break;
     }
-    /* r24: style.Alpha is GONE - it faded EVERYTHING (text, child
-       windows, the FAB) while the spec wants only the window
-       BACKGROUND transparent. menu_draw() uses
-       SetNextWindowBgAlpha(s_opacity), the single opacity source. */
     ImGui::GetIO().FontGlobalScale = 1.0f;   /* real size comes from the
                                                atlas, not from scaling */
 }
-
-/* ===================== system keyboard (IME) bridge =====================
-   r12. The r11 drawn keyboard is GONE. A text field that gains focus
-   asks the agent to pop the PHONE's own soft keyboard: the menu posts
-   showIme / hideIme over the frida bridge; the agent focuses a hidden
-   1x1 EditText on the resumed activity, and its TextWatcher converts
-   IME edits into dextool_add_char()/dextool_backspace() calls.
-   overlay.cpp drains those into ImGui as ordinary character events,
-   so the ACTIVE field receives the text with no extra plumbing here.
-   Closing the IME (Done / back) sends imeHidden, which releases the
-   ImGui field - so the next tap on it re-opens the keyboard. */
 static bool s_ime_active = false;   /* a text field owns ImGui focus */
 static bool s_ime_clear  = false;   /* drop active id next frame      */
 static ImGuiID s_ime_owner = 0;     /* r23: WHICH field owns the IME */
 static int  s_ime_enter = 0;        /* r24: 2 = inject Enter DOWN, 1 = UP */
 static bool s_ime_enter_rel = false; /* r24: release the field after the key */
-
 static void ime_show() { post_rpc("showIme", "{}"); }
 static void ime_hide() { post_rpc("hideIme", "{}"); }
-
 static void ime_close_if_active() {
     if (s_ime_active) { s_ime_active = false; ime_hide(); }
 }
-
-/* once per frame, before the menu window: if the user closed the
-   phone keyboard, release the ImGui field as well. r24: forward the
-   phone IME's Enter (Done/Search) as a real ImGui key press - DOWN
-   this frame, UP the next (both in one frame would be swallowed,
-   key state is sampled once per frame). The active InputText sees
-   the DOWN and, with EnterReturnsTrue (the class filter), fires
-   its search. */
 static void ime_frame_prelude() {
     bool clear = false, enter_down = false, enter_up = false;
     MLK();
@@ -796,10 +650,6 @@ static void ime_frame_prelude() {
         io.AddKeyEvent(ImGuiKey_Enter, enter_down);
     }
 }
-
-/* plain InputText wired to the system keyboard. r23: `extra` lets a
-   caller add flags (the class filter uses EnterReturnsTrue so a
-   keystroke no longer re-queries enumerateLoadedClasses). */
 static bool ime_textfield(const char* label, char* buf, size_t cap,
                           ImGuiInputTextFlags extra = 0) {
     bool used = ImGui::InputText(label, buf, cap,
@@ -809,12 +659,6 @@ static bool ime_textfield(const char* label, char* buf, size_t cap,
         s_ime_owner  = ImGui::GetItemID();
         ime_show();
     } else if (ImGui::IsItemDeactivated()) {
-        /* r23 IME focus order: ImGui fires the OLD field's deactivation
-           one frame AFTER the NEW field activated - the old code called
-           ime_close_if_active() then, which hid the keyboard the new
-           field had just opened ("tapping a field while another is
-           active closes the keyboard"). Only the OWNING field
-           deactivating releases the IME. */
         if (s_ime_active && ImGui::GetItemID() == s_ime_owner) {
             s_ime_active = false;
             ime_hide();
@@ -825,8 +669,6 @@ static bool ime_textfield(const char* label, char* buf, size_t cap,
     }
     return used;
 }
-
-/* same for multiline editors (script editor, hook code) */
 static bool ime_multiline(const char* label, char* buf, size_t cap,
                           ImVec2 size) {
     bool used = ImGui::InputTextMultiline(label, buf, cap, size);
@@ -845,9 +687,6 @@ static bool ime_multiline(const char* label, char* buf, size_t cap,
     }
     return used;
 }
-
-
-/* ---------------- message callback (GumJS thread) ---------------- */
 void menu_init() {
     apply_theme();
     conf_load();
@@ -855,33 +694,40 @@ void menu_init() {
     overlay_request_font_rebuild(s_font_size);
     frida_set_message_callback([](const std::string& j) {
         MLK();
-        /* r23: dispatch on the EXACT "type" value (jtype) instead of
-           jhas() substring tests - see jtype() above. */
         std::string ty = jtype(j);
         if (ty == "ready") {
             s_agent_ready = true;
             s_cls_auto_done = false;  /* new agent: re-list classes */
             snprintf(s_agent_note, sizeof(s_agent_note), "%s",
                      jstr(j, "msg").c_str());
+            s_pkg = jstr(j, "pkg");
         } else if (ty == "imeEnter") {
-            /* r24: the phone IME's Enter/Search - the menu injects a
-               real Enter key press over the next two frames so
-               fields with EnterReturnsTrue (class filter) search */
             s_ime_enter = 2;
         } else if (ty == "imeHidden") {
-            /* user closed the phone keyboard (Done / back):
-               drop ImGui focus so the next tap re-opens it.
-               r24: with an Enter forward in flight the release is
-               DEFERRED - clearing now would deactivate the field
-               before the key arrives and the search would be lost. */
             if (s_ime_active) {
                 if (s_ime_enter > 0) s_ime_enter_rel = true;
                 else { s_ime_active = false; s_ime_clear = true; }
             }
+        } else if (ty == "hookHit") {
+            {
+                std::string nm = jstr(j, "name");
+                long ct = jnum(j, "count");
+                if (!nm.empty()) {
+                    s_hits[nm] = ct;
+                    flash_hit(nm, ct);
+                }
+            }
+        } else if (ty == "dumpReady") {
+            std::string derr = jstr(j, "error");
+            s_dump_wait = false;
+            s_dump_done = derr.empty();
+            s_dump_count = jnum(j, "count");
+            snprintf(s_dump_path, sizeof(s_dump_path), "%s",
+                     jstr(j, "path").c_str());
+            snprintf(s_dump_note, sizeof(s_dump_note), "%s",
+                     derr.empty() ? ""
+                                  : ("dump: " + derr).c_str());
         } else if (ty == "staticValues") {
-            /* r12: static values are read on demand only - reading
-               them during openClass() ran <clinit> of arbitrary
-               classes and could block the agent forever */
             ClassTab* c = find_tab(jstr(j, "class"));
             if (c) {
                 for (auto& f : jarr(j, "fields")) {
@@ -900,17 +746,10 @@ void menu_init() {
                 c->fields.clear();
                 for (auto& f : jarr(j, "fields"))
                     c->fields.push_back(parse_field(f));
-                /* r25: members whose code contains the active
-                   code-text search string (empty unless the last
-                   search was mode 3) - painted green below */
                 c->hits_m = jarr(j, "hits_m");
                 c->hits_f = jarr(j, "hits_f");
             }
         } else if (ty == "methodSrc") {
-            /* r25: real smali of one method (bundled baksmali) for
-               the read-only source panel of the Hooks tab.
-               r26: the Full Method View window gets the reply first
-               when it is the one that asked. */
             if (s_fm_open && jstr(j, "class") == s_fm_cls &&
                 jstr(j, "method") == s_fm_mth) {
                 if (jnum(j, "ok")) {
@@ -943,10 +782,6 @@ void menu_init() {
                 }
             }
         } else if (ty == "methodIO") {
-            /* r25: captured input/output values of ONE call - fills
-               the per-method IO patch editor. The reply must match
-               the method the user probed, or an IO opened on a
-               second method would be filled by the first probe. */
             ClassTab* c = find_tab(jstr(j, "class"));
             if (c && c->io_wait && jstr(j, "method") == c->io_sig.name) {
                 c->io_wait = false;
@@ -978,16 +813,8 @@ void menu_init() {
                 }
             }
         } else if (ty == "classList") {
-            /* r11: the agent streams the full result in pages of 400;
-               the r10 single message was capped at 800 names, which is
-               why "Classes" never displayed all classes */
             long qid  = jnum(j, "qid");
             long page = jnum(j, "page");
-            /* r23: generation counter - pages of an OUTDATED qid are
-               DROPPED, never mixed in. The old `page == 0` force-adopt
-               let a slow first page of an older query clobber the
-               fresh list (stale search pages). The first page of the
-               CURRENT qid clears the buffer once. */
             if (qid == (long)s_search_qid) {
                 if (!s_search_page0) {
                     s_search_res.clear();
@@ -998,9 +825,6 @@ void menu_init() {
                 s_search_shown = (int)jnum(j, "shown");
                 if (page + 1 >= jnum(j, "pages")) {
                     s_search_wait = false;
-                    /* r26: rebuild the Explorer family dropdown from
-                       the COMPLETE list (partial pages would leave
-                       families out) */
                     s_families.clear();
                     for (auto& n : s_search_res) {
                         std::string f = family_of(n);
@@ -1013,15 +837,6 @@ void menu_init() {
                 }
             }
         } else if (ty == "instanceList") {
-            /* r23: structured instances - {str, handle, fields:[{n,t,v}]}.
-               The old "##"/";" string protocol corrupted every value
-               containing | # or ;, and index-only addressing gave
-               setInstanceField/callMethod NO receiver at all. gen keys
-               the editor buffers; handle addresses the retained
-               instance on the agent side.
-               r26: the SAME scan feeds the Object Finder when it is
-               open for this class (its own copy, independent of any
-               inspector tab). */
             std::vector<InstInfo> list;
             for (auto& o : jobjarr(j, "instances")) {
                 InstInfo in;
@@ -1042,17 +857,25 @@ void menu_init() {
                 c->gen = (int)jnum(j, "gen");
                 c->sel_inst = -1;
             }
+            for (auto& t : s_objtabs) {
+                if (t.cls != jstr(j, "class")) continue;
+                for (auto& in2 : list) {
+                    if (in2.handle == t.handle) {
+                        t.fields = in2.fields;
+                        if (!in2.str.empty()) t.str = in2.str;
+                        break;
+                    }
+                }
+            }
             if (s_of.open && s_of.cls == jstr(j, "class")) {
                 s_of.results = list;
                 s_of.waiting = false;
             }
-            /* r27: the object-parameter dropdown scan */
             if (s_pscan.cls == jstr(j, "class")) {
                 s_pscan.list = list;
                 s_pscan.waiting = false;
             }
         } else if (ty == "instanceCreated") {
-            /* r26: Object Finder "Create Object" result */
             InstInfo in;
             in.str    = jstr(j, "str");
             in.handle = jnum(j, "handle", -1);
@@ -1064,8 +887,6 @@ void menu_init() {
             push_console("[finder]", "created " + jstr(j, "class") +
                          " -> handle " + std::to_string(in.handle));
         } else if (ty == "callResult") {
-            /* r26: per-call results (Caller tab log); callMethod with
-               count > 1 sends one message PER call (idx/of) */
             ClassTab* c = find_tab(jstr(j, "class"));
             if (c) {
                 long idx = jnum(j, "idx", 0), of = jnum(j, "of", 0);
@@ -1154,9 +975,6 @@ void menu_init() {
                     if (h.cls + "." + h.method == n) h.note = jstr(j, "error");
             }
         } else if (ty == "agentStatus") {
-            /* r23: the native bridge posts this when the GumJS script
-               itself failed to start - it used to only land in the
-               crash log while the menu kept saying "waiting" forever. */
             if (!jnum(j, "ok")) {
                 s_agent_ready = false;
                 snprintf(s_agent_note, sizeof(s_agent_note), "FAILED: %.120s",
@@ -1174,18 +992,27 @@ void menu_init() {
         MULK();
     });
 }
-
-/* ===================== Settings ===================== */
 static void tab_settings() {
     ImGuiIO& io = ImGui::GetIO();
-    if (ImGui::SliderFloat("Font Size", &s_font_size, 12.f, 32.f, "%.0f px")) {
-        /* apply on release: rebuilding the atlas mid-drag every frame
-           would stutter */
+    ImGui::Separator();
+    ImGui::Text("Display");
+    if (s_scale < 0 || s_scale > 6) s_scale = 3;
+    if (ImGui::BeginCombo("Scale##Global", k_scale_names[s_scale])) {
+        for (int i = 0; i < 7; i++) {
+            bool sel = (i == s_scale);
+            if (ImGui::Selectable(k_scale_names[i], sel)) {
+                s_scale    = i;
+                s_font_size = k_scale_px[i];
+                overlay_request_font_rebuild(s_font_size);
+                s_conf_dirty = true;
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
     }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        overlay_request_font_rebuild(s_font_size);
-        s_conf_dirty = true;
-    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("font size preset (the reference's "
+                          "Smallest..Largest scale)");
     if (ImGui::SliderFloat("Opacity", &s_opacity, .3f, 1.f))
         s_conf_dirty = true;
     const char* th[] = {"Dark", "Light", "Classic"};
@@ -1196,9 +1023,6 @@ static void tab_settings() {
         s_conf_dirty = true;
     if (ImGui::SliderFloat("List Scroll Speed",    &s_lst_scroll, .2f, 4.f))
         s_conf_dirty = true;
-    /* r11: manual correction for the status-bar class of offsets. The
-       measured/estimated view map already subtracts the bar; this knob
-       is for hosts where neither can be derived. */
     if (ImGui::SliderFloat("Touch Y offset", &s_y_off, -80.f, 80.f, "%+.0f px")) {
         overlay_set_touch_bias(s_y_off);
         s_conf_dirty = true;
@@ -1214,17 +1038,15 @@ static void tab_settings() {
         ImGui::TextColored(ImVec4(1, .6f, 0, 1),
             "Menu hidden with no toggle button - it was re-enabled.");
     if (!s_show_fab && !s_visible) { s_show_fab = true; s_conf_dirty = true; }
-
     ImGui::Separator();
-    ImGui::TextColored(ImVec4(.5f, .8f, 1.f, 1), "Status");
+    ImGui::Text("Info");
+    ImGui::Text("Package: %s", s_pkg.c_str());
     s_ovl_ready = overlay_ready();
     float dw=0, dh=0;
     overlay_get_display_size(&dw, &dh);
     ImGui::Text("Overlay: %s (%.0fx%.0f)",
                 s_ovl_ready ? "up" : "waiting",
                 dw, dh);
-    /* r23: failed agent starts are visible now (frida_bridge posts
-       agentStatus) - it used to stay "waiting" forever */
     if (!s_agent_ready && s_agent_note[0] &&
         strncmp(s_agent_note, "FAILED", 6) == 0)
         ImGui::TextColored(ImVec4(1, .4f, .4f, 1),
@@ -1238,9 +1060,13 @@ static void tab_settings() {
     ImGui::Text("Input:   %s", mb);
     ImGui::Text("Display: %.0fx%.0f  FPS %.0f", io.DisplaySize.x,
                 io.DisplaySize.y, io.Framerate);
+#ifdef __aarch64__
+    ImGui::Text("Arch: %s", "arm64-v8a");
+#else
+    ImGui::Text("Arch: %s", "armeabi-v7a");
+#endif
+    ImGui::Separator();
 }
-
-/* ===================== Patches ===================== */
 static void tab_patches() {
     if (s_pedit >= 0 && s_pedit < (int)s_patches.size()) {
         PatchRow& e = s_patches[s_pedit];
@@ -1265,7 +1091,6 @@ static void tab_patches() {
     ImGui::SameLine();
     if (ImGui::Button("Clear")) s_pcls[0]=s_pfld[0]=s_pval[0]=0;
     ImGui::Separator();
-
     MLK();
     for (int i = 0; i < (int)s_patches.size(); i++) {
         ImGui::PushID(i);
@@ -1302,145 +1127,80 @@ static void tab_patches() {
     }
     MULK();
 }
-
-/* ===================== Hooks ===================== */
-static void tab_hooks() {
-    const char* modes[] = {"Java(JS)", "Smali", "Nop (auto)"};
-    if (s_hedit >= 0 && s_hedit < (int)s_hooks.size()) {
-        HookRow& e = s_hooks[s_hedit];
-        snprintf(s_hcls,  sizeof(s_hcls), "%s", e.cls.c_str());
-        snprintf(s_hmth,  sizeof(s_hmth), "%s", e.method.c_str());
-        snprintf(s_hcode, sizeof(s_hcode), "%s", e.code.c_str());
-        s_hmode = e.mode;
-        s_hedit = -1;
-    }
-    ime_textfield("Class##hc",  s_hcls, sizeof(s_hcls));
-    ime_textfield("Method##hm", s_hmth, sizeof(s_hmth));
-    ImGui::Combo("Mode##hmd", &s_hmode, modes, 3);
-    ime_multiline("Code##hcd", s_hcode, sizeof(s_hcode),
-                              ImVec2(-1, 90));
-    ImGui::TextDisabled("Java: fn(Java,send,console,thiz,args,orig). "
-                        "Smali: body of static hook(Object thiz, Object[] args); "
-                        "p0=thiz p1=args, must return an Object. "
-                        "Nop(auto): skips the body and returns the "
-                        "default for the method's return type.");
-    /* r25: read-only SOURCE panel - the real method body, disassembled
-       on-device by the bundled baksmali. Java decompilation is not
-       bundled (a decompiler is heavy and would run inside the host
-       process), so BOTH modes show the bytecode: in Smali mode it is
-       the exact language the hook is written in; in Java mode it is
-       the same logic the Frida hook wraps. Copy the body into the
-       editor and adapt it. */
-    if (ImGui::CollapsingHeader("Method source##hsrc")) {
-        if (ImGui::SmallButton("Load source")) {
-            if (s_hcls[0] && s_hmth[0]) {
-                std::string a = "{\"class\":\"" + jesc(s_hcls)
-                              + "\",\"method\":\"" + jesc(s_hmth) + "\"}";
-                post_rpc("getMethodSrc", a);
-                snprintf(s_hsrc_note, sizeof(s_hsrc_note),
-                         "disassembling...");
-                s_hsrc_have = false;
-            } else {
-                snprintf(s_hsrc_note, sizeof(s_hsrc_note),
-                         "fill Class + Method first");
-            }
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", s_hsrc_note);
-        if (s_hsrc_have) {
-            ImGui::BeginChild("hsrcbx", ImVec2(0, 170), true);
-            ImGui::TextUnformatted(s_hsrc);
-            /* r24 pattern kept: auto-scroll must run INSIDE the child */
-            ImGui::EndChild();
-            mark_scroll_item(s_lst_scroll);
-            if (s_hmode == 1 && ImGui::SmallButton("Copy body -> editor")) {
-                /* strip the .method header and .end method so the text
-                   fits the smali hook skeleton (which adds its own
-                   signature); .locals/labels come along */
-                std::string src = s_hsrc;
-                auto b = src.find('\n');
-                if (b != std::string::npos) src = src.substr(b + 1);
-                auto e = src.rfind(".end method");
-                if (e != std::string::npos) src = src.substr(0, e);
-                snprintf(s_hcode, sizeof(s_hcode), "%s", src.c_str());
-            }
-        }
-    }
-    ImGui::Separator();
-    if (ImGui::Button("Add Hook") && s_hcls[0] && s_hmth[0]) {
-        std::string a = "{\"class\":\"" + jesc(s_hcls)
-                      + "\",\"method\":\"" + jesc(s_hmth)
-                      + "\",\"mode\":\"" + modes[s_hmode]
-                      + "\",\"code\":\"" + jesc(s_hcode) + "\"}";
-        post_rpc("addHook", a);
-        MLK();
-        s_hooks.push_back({s_hcls, s_hmth, s_hmode, s_hcode, true, "..."});
-        MULK();
-        s_hcls[0] = s_hmth[0] = s_hcode[0] = 0;
-    }
-    ImGui::Separator();
-
+static void tab_tracer() {
     MLK();
-    for (int i = 0; i < (int)s_hooks.size(); i++) {
-        ImGui::PushID(i);
-        HookRow& h = s_hooks[i];
-        if (ImGui::Checkbox("##he", &h.enabled)) {
-            char a[700];
-            snprintf(a, sizeof(a),
-                     "{\"class\":\"%s\",\"method\":\"%s\",\"enabled\":%s}",
-                     jesc(h.cls).c_str(), jesc(h.method).c_str(),
-                     h.enabled ? "true" : "false");
-            post_rpc("setHookEnabled", a);
-            h.note = "...";
-        }
-        ImGui::SameLine();
-        ImGui::Text("[%s] %s.%s", modes[h.mode], h.cls.c_str(),
-                    h.method.c_str());
-        if (!h.note.empty()) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1, .4f, .4f, 1), "[%s]", h.note.c_str());
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Edit##hu")) s_hedit = i;
-        ImGui::SameLine();
-        if (ImGui::SmallButton("X##hx")) {
-            char a[700];
-            snprintf(a, sizeof(a),
-                     "{\"class\":\"%s\",\"method\":\"%s\"}",
-                     jesc(h.cls).c_str(), jesc(h.method).c_str());
-            post_rpc("removeHook", a);
-            s_hooks.erase(s_hooks.begin() + i);
-            ImGui::PopID(); MULK(); return;
-        }
-        ImGui::PopID();
-    }
+    int ntr = (int)s_trackers.size(), nhk = (int)s_hooks.size();
     MULK();
-}
-
-/* ===================== Tracker ===================== */
-static void tab_tracker() {
-    ime_textfield("Class##tc",  s_tcls, sizeof(s_tcls));
-    ime_textfield("Method##tm", s_tmth, sizeof(s_tmth));
-    if (ImGui::Button("Track") && s_tcls[0] && s_tmth[0]) {
-        std::string a = "{\"class\":\"" + jesc(s_tcls)
-                      + "\",\"method\":\"" + jesc(s_tmth) + "\"}";
-        post_rpc("addTracker", a);
-        MLK();
-        s_trackers.push_back({std::string(s_tcls) + "." + std::string(s_tmth),
-                              false, {}});
-        MULK();
-        s_tcls[0] = s_tmth[0] = 0;
+    ImGui::Text("Traced method count : %d", ntr + nhk);
+    if (ntr + nhk == 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 80, 80, 255));
+        ImGui::Text("No traced method has been called yet");
+        ImGui::PopStyleColor();
+        ImGui::TextDisabled("open a class in Tools, expand a method and "
+                            "use its Trace tab - or add one below");
+    } else if (ImGui::Button("Quick Restore")) {
+        ImGui::OpenPopup("QuickRestorePopup");
+    }
+    if (ImGui::BeginPopup("QuickRestorePopup",
+                          ImGuiWindowFlags_HorizontalScrollbar)) {
+        ImGui::TextColored(ImVec4(0.8, 0.8, 0, 1),
+                           "tap a row to remove its trace");
+        ImGui::Separator();
+        for (int i = 0; i < ntr; ) {
+            MLK();
+            std::string nm = s_trackers[i].name;
+            bool isf = s_trackers[i].is_field;
+            MULK();
+            ImGui::PushID(7000 + i);
+            if (ImGui::Button((nm + (isf ? " (field)" : ""))
+                                  .c_str(),
+                              ImVec2(ImGui::GetContentRegionAvail().x, 0))) {
+                std::string a = "{\"name\":\"" + jesc(nm) + "\"}";
+                post_rpc("removeTracker", a);
+                MLK();
+                s_trackers.erase(s_trackers.begin() + i);
+                MULK();
+                ntr--;
+            } else { ImGui::PopID(); i++; continue; }
+            ImGui::PopID();
+        }
+        for (int i = 0; i < nhk; ) {
+            MLK();
+            std::string nm = s_hooks[i].cls + "." + s_hooks[i].method;
+            MULK();
+            ImGui::PushID(7500 + i);
+            if (ImGui::Button(nm.c_str(),
+                              ImVec2(ImGui::GetContentRegionAvail().x, 0))) {
+                std::string a = "{\"class\":\"" + jesc(s_hooks[i].cls)
+                              + "\",\"method\":\"" + jesc(s_hooks[i].method)
+                              + "\"}";
+                post_rpc("removeHook", a);
+                MLK();
+                s_hooks.erase(s_hooks.begin() + i);
+                MULK();
+                nhk--;
+            } else { ImGui::PopID(); i++; continue; }
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
     }
     ImGui::Separator();
+    ImGui::BeginChild("tracerlist", ImVec2(0, 0), false);
     MLK();
     for (int i = 0; i < (int)s_trackers.size(); i++) {
-        ImGui::PushID(i);
+        ImGui::PushID(8000 + i);
         Tracker& t = s_trackers[i];
-        if (ImGui::CollapsingHeader(t.name.c_str())) {
+        long hits = 0;
+        auto hi = s_hits.find(t.name);
+        if (hi != s_hits.end()) hits = hi->second;
+        char hdr[600];
+        snprintf(hdr, sizeof(hdr), "%s (%ldx)##tr%d", t.name.c_str(),
+                 hits, i);
+        if (ImGui::CollapsingHeader(hdr)) {
             ImGui::TextDisabled("%lu events", (unsigned long)t.log.size());
-            ImGui::BeginChild(("tl" + t.name).c_str(), ImVec2(0, 200), true);
+            ImGui::BeginChild(("tl" + std::to_string(i)).c_str(),
+                              ImVec2(0, 200), true);
             for (auto& r : t.log) {
-                /* every caller line is clickable -> opens that class */
                 for (auto& c : r.callers) {
                     if (ImGui::SmallButton(("@ " + c).c_str()))
                         menu_open_class(cls_of_member(c));
@@ -1457,27 +1217,155 @@ static void tab_tracker() {
                 std::string a = "{\"name\":\"" + jesc(t.name) + "\"}";
                 post_rpc("removeTracker", a);
                 s_trackers.erase(s_trackers.begin() + i);
-                ImGui::PopID(); MULK(); return;
+                ImGui::PopID();
+                MULK();
+                ImGui::EndChild();
+                return;
             }
         }
         ImGui::PopID();
     }
+    static const char* hmodes[] = {"Java(JS)", "Smali", "Nop (auto)"};
+    for (int i = 0; i < (int)s_hooks.size(); i++) {
+        ImGui::PushID(8500 + i);
+        HookRow& h = s_hooks[i];
+        long hits = 0;
+        std::string key = h.cls + "." + h.method;
+        auto hi = s_hits.find(key);
+        if (hi != s_hits.end()) hits = hi->second;
+        if (ImGui::Checkbox("##he", &h.enabled)) {
+            char a[700];
+            snprintf(a, sizeof(a),
+                     "{\"class\":\"%s\",\"method\":\"%s\",\"enabled\":%s}",
+                     jesc(h.cls).c_str(), jesc(h.method).c_str(),
+                     h.enabled ? "true" : "false");
+            post_rpc("setHookEnabled", a);
+            h.note = "...";
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(("open##ho" + std::to_string(i)).c_str()))
+            menu_open_class(h.cls);
+        ImGui::SameLine();
+        ImGui::Text("[%s] %s (%ldx)", hmodes[h.mode], key.c_str(), hits);
+        if (!h.note.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1, .4f, .4f, 1), "[%s]",
+                               h.note.c_str());
+        }
+        ImGui::PopID();
+    }
     MULK();
+    ImGui::EndChild();
+    mark_scroll_item(s_lst_scroll);
+    if (ImGui::CollapsingHeader("Manual add")) {
+        static const char* modes[] = {"Java(JS)", "Smali", "Nop (auto)"};
+        if (s_hedit >= 0 && s_hedit < (int)s_hooks.size()) {
+            HookRow& e = s_hooks[s_hedit];
+            snprintf(s_hcls,  sizeof(s_hcls), "%s", e.cls.c_str());
+            snprintf(s_hmth,  sizeof(s_hmth), "%s", e.method.c_str());
+            snprintf(s_hcode, sizeof(s_hcode), "%s", e.code.c_str());
+            s_hmode = e.mode;
+            s_hedit = -1;
+        }
+        ime_textfield("Class##hc",  s_hcls, sizeof(s_hcls));
+        ime_textfield("Method##hm", s_hmth, sizeof(s_hmth));
+        ImGui::Combo("Mode##hmd", &s_hmode, modes, 3);
+        ime_multiline("Code##hcd", s_hcode, sizeof(s_hcode),
+                                  ImVec2(-1, 90));
+        ImGui::TextDisabled("Java: fn(Java,send,console,thiz,args,orig). "
+                            "Smali: body of static hook(Object thiz, Object[] args); "
+                            "p0=thiz p1=args, must return an Object. "
+                            "Nop(auto): skips the body and returns the "
+                            "default for the method's return type.");
+        if (ImGui::CollapsingHeader("Method source##hsrc")) {
+            if (ImGui::SmallButton("Load source")) {
+                if (s_hcls[0] && s_hmth[0]) {
+                    std::string a = "{\"class\":\"" + jesc(s_hcls)
+                                  + "\",\"method\":\"" + jesc(s_hmth) + "\"}";
+                    post_rpc("getMethodSrc", a);
+                    snprintf(s_hsrc_note, sizeof(s_hsrc_note),
+                             "disassembling...");
+                    s_hsrc_have = false;
+                } else {
+                    snprintf(s_hsrc_note, sizeof(s_hsrc_note),
+                             "fill Class + Method first");
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", s_hsrc_note);
+            if (s_hsrc_have) {
+                ImGui::BeginChild("hsrcbx", ImVec2(0, 170), true);
+                ImGui::TextUnformatted(s_hsrc);
+                ImGui::EndChild();
+                mark_scroll_item(s_lst_scroll);
+                if (s_hmode == 1 && ImGui::SmallButton("Copy body -> editor")) {
+                    std::string src = s_hsrc;
+                    auto b = src.find('\n');
+                    if (b != std::string::npos) src = src.substr(b + 1);
+                    auto e = src.rfind(".end method");
+                    if (e != std::string::npos) src = src.substr(0, e);
+                    snprintf(s_hcode, sizeof(s_hcode), "%s", src.c_str());
+                }
+            }
+        }
+        if (ImGui::Button("Add Hook") && s_hcls[0] && s_hmth[0]) {
+            std::string a = "{\"class\":\"" + jesc(s_hcls)
+                          + "\",\"method\":\"" + jesc(s_hmth)
+                          + "\",\"mode\":\"" + modes[s_hmode]
+                          + "\",\"code\":\"" + jesc(s_hcode) + "\"}";
+            post_rpc("addHook", a);
+            MLK();
+            s_hooks.push_back({s_hcls, s_hmth, s_hmode, s_hcode, true, "..."});
+            MULK();
+            s_hcls[0] = s_hmth[0] = s_hcode[0] = 0;
+        }
+        ImGui::Separator();
+        ime_textfield("Class##tc",  s_tcls, sizeof(s_tcls));
+        ime_textfield("Method##tm", s_tmth, sizeof(s_tmth));
+        if (ImGui::Button("Track") && s_tcls[0] && s_tmth[0]) {
+            std::string a = "{\"class\":\"" + jesc(s_tcls)
+                          + "\",\"method\":\"" + jesc(s_tmth) + "\"}";
+            post_rpc("addTracker", a);
+            MLK();
+            s_trackers.push_back({std::string(s_tcls) + "." +
+                                  std::string(s_tmth), false, {}});
+            MULK();
+            s_tcls[0] = s_tmth[0] = 0;
+        }
+    }
 }
-
-/* ===================== Recorder ===================== */
+static void tab_dumper() {
+    if (s_dump_wait) ImGui::Text("Dumping...");
+    if (ImGui::Button("DUMP")) {
+        if (!s_dump_wait) {
+            s_dump_wait = true;
+            s_dump_done = false;
+            snprintf(s_dump_note, sizeof(s_dump_note), "writing...");
+            post_rpc("dumpLoadedClasses", "{}");
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", s_dump_note);
+    if (s_dump_done) {
+        ImGui::TextColored(ImVec4(0, 1, .4f, 1), "Done - %ld classes",
+                           s_dump_count);
+        ImGui::TextDisabled("saved in the app files dir:");
+        ImGui::PushTextWrapPos();
+        ImGui::TextUnformatted(s_dump_path);
+        ImGui::PopTextWrapPos();
+        if (ImGui::Button("Copy path"))
+            copy_text("path", s_dump_path);
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled("Per-object dumps: Tools > [0x..] object tab > "
+                        "Dump to file.");
+}
 static void tab_recorder() {
     MLK();
     if (!s_rec_on) {
         MULK();
         if (ImGui::Button("Start")) {
             s_rec_on = true;
-            /* r11: scoped recorder. The Start button passes the package
-               filter and the method cap; the agent enumerates classes
-               of that package ONLY and stops installing once the cap is
-               reached, instead of hooking every method of every class in
-               the process (which could not finish in the 32-bit field
-               run and looked like a crash). */
             std::string a = "{\"filter\":\"" + jesc(s_rec_filter)
                            + "\",\"cap\":" + std::to_string(s_rec_cap) + "}";
             post_rpc("startRecorder", a);
@@ -1525,18 +1413,12 @@ static void tab_recorder() {
             ImGui::PopID();
         }
     }
-    /* r24: auto-scroll must run INSIDE the child - after EndChild()
-       the GetScrollY/SetScrollHereY pair operated on the PARENT
-       window (the whole menu jumped instead of the list following
-       the new rows) */
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
         ImGui::SetScrollHereY(1.f);
     ImGui::EndChild();
     mark_scroll_item(s_lst_scroll);
     MULK();
 }
-
-/* ===================== Monitor ===================== */
 static void tab_monitor() {
     MLK();
     if (!s_mon_on) {
@@ -1573,8 +1455,6 @@ static void tab_monitor() {
             snprintf(lbl, sizeof(lbl), "[%s] %s %s%s",
                      m.kind.c_str(), m.method.c_str(), m.url.c_str(),
                      org.c_str());
-            /* r25: a click opens the DETAIL window (payload + origin
-               method); the cross-link moved into that window */
             if (ImGui::Selectable(lbl)) s_mon_sel = i;
             if (!m.note.empty())
                 ImGui::TextDisabled("    %s", m.note.c_str());
@@ -1583,9 +1463,6 @@ static void tab_monitor() {
     }
     ImGui::EndChild();
     mark_scroll_item(s_lst_scroll);
-    /* r25: detail window - more info about the clicked log row:
-       kind, HTTP method, URL, the app method that sent/received it
-       (clickable), note and the payload preview. */
     if (s_mon_sel >= 0) {
         if (s_mon_sel >= (int)s_mon.size()) s_mon_sel = -1;
         else ImGui::OpenPopup("monDetail");
@@ -1625,8 +1502,6 @@ static void tab_monitor() {
     }
     MULK();
 }
-
-/* ===================== Script ===================== */
 static void tab_script() {
     ime_multiline("##sc", s_script, sizeof(s_script),
                               ImVec2(-1, 160));
@@ -1641,24 +1516,17 @@ static void tab_script() {
     MLK();
     ImGui::BeginChild("consl", ImVec2(0, 200), true);
     for (auto& l : s_cons) ImGui::TextUnformatted(l.c_str());
-    /* r24: auto-scroll inside the child (see the Recorder tab) */
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
         ImGui::SetScrollHereY(1.f);
     ImGui::EndChild();
     mark_scroll_item(s_lst_scroll);
     MULK();
 }
-
-/* ===================== Classes =====================
-   r26 restructure: the Classes MAIN tab hosts the secondary bar
-   (opened-class tabs + the "+" button); search moved into the Class
-   Explorer windows; class content moved into floating Inspector
-   windows. */
-/* deferred "Open in new window": pushing into s_classes while the
-   window loop holds references would REALLOCATE the vector under
-   them - the duplicate is created after the loop instead */
+static void open_obj_tab(const std::string& cls, long handle,
+                         const std::string& str);
+static void explorer_body(ExplorerWin& e);
+static void class_tab_body(ClassTab& c);
 static std::string s_dup_req;
-
 static void run_search(const char* text, int mode, bool cs) {
     MLK();
     snprintf(s_search, sizeof(s_search), "%s", text);
@@ -1676,13 +1544,13 @@ static void run_search(const char* text, int mode, bool cs) {
                    + ",\"cs\":" + (cs ? "true" : "false") + "}";
     post_rpc("listLoadedClasses", a);
 }
-
-/* ---- Instances (receiver picker + live field editor) ---- */
 static void inst_view(ClassTab& c) {
     if (ImGui::Button("Find instances##fi")) {
         std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
         post_rpc("listInstances", a);
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("tap [0x..] to open an object tab");
     if (c.instances.empty()) {
         ImGui::TextDisabled("no instances loaded - tap Find instances");
     }
@@ -1693,19 +1561,18 @@ static void inst_view(ClassTab& c) {
         snprintf(lbl, sizeof(lbl), "#%d %s", i,
                  c.instances[i].str.c_str());
         if (ImGui::Selectable(lbl, sel)) c.sel_inst = i;
+        ImGui::SameLine();
+        char ob[48];
+        snprintf(ob, sizeof(ob), "[0x%lx]##ot", c.instances[i].handle);
+        if (ImGui::SmallButton(ob))
+            open_obj_tab(c.cname, c.instances[i].handle,
+                         c.instances[i].str);
         ImGui::PopID();
     }
     if (c.sel_inst >= 0 && c.sel_inst < (int)c.instances.size()) {
         InstInfo& in = c.instances[c.sel_inst];
         ImGui::Separator();
         ImGui::Text("fields of #%d:", c.sel_inst);
-        /* edit buffers are (re)filled only when a different instance
-           is picked, not every frame - otherwise the user's typing
-           would be overwritten before it ever reaches the agent.
-           r23: the key used to be the BARE index - picking instance
-           0 of another class kept the stale text of the previous
-           class (nv_for still matched). The key is class + list
-           generation + index now. */
         static char        nv[32][128];
         static std::string nv_key;
         static int         nv_idx = -1;
@@ -1731,9 +1598,7 @@ static void inst_view(ClassTab& c) {
                 std::string a = "{\"class\":\"" + jesc(c.cname)
                               + "\",\"field\":\"" + jesc(fi.name) + "\"}";
                 post_rpc("trackField", a);
-                MLK();
                 s_trackers.push_back({c.cname + "." + fi.name, true, {}});
-                MULK();
             }
             ImGui::Text("  value:");
             ImGui::SameLine();
@@ -1741,10 +1606,6 @@ static void inst_view(ClassTab& c) {
             ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper */
             ImGui::SameLine();
             if (ImGui::Button("Set##fs")) {
-                /* r23: address the instance by the agent's retained
-                   handle when one exists - the index-only request
-                   had NO receiver, so f.set() failed on every
-                   instance field (same fix as callMethod below) */
                 long h = in.handle;
                 std::string a = "{\"class\":\"" + jesc(c.cname)
                               + "\",\"handle\":" + std::to_string(h)
@@ -1757,10 +1618,6 @@ static void inst_view(ClassTab& c) {
         }
     }
 }
-
-/* ---- Static Fields (field spec: its own section) ----
-   The agent marks every field "(static)"/"(instance)" until the
-   values are read on demand, so the split is client-side. */
 static void static_fields_view(ClassTab& c) {
     MLK();
     if (ImGui::SmallButton("Read static values"))
@@ -1800,9 +1657,6 @@ static void static_fields_view(ClassTab& c) {
     }
     MULK();
 }
-
-/* ---- Fields (all fields, the spec's plain "Fields List") ----
-   spec v2: the list renders under a "Fields" TREE NODE */
 static void fields_view(ClassTab& c) {
     MLK();
     ImGui::TextDisabled("%lu fields (static values: Static Fields tab)",
@@ -1835,9 +1689,6 @@ static void fields_view(ClassTab& c) {
     ImGui::TreePop();
     MULK();
 }
-
-/* ---- expanded-method sub-tabs (field spec: Caller / Patcher /
-   Tracer / Hooker) ---- */
 static void caller_tab(ClassTab& c, const MethodSig& m) {
     std::vector<std::string> ps = split_params(m.params);
     int na = (int)ps.size();
@@ -1851,12 +1702,6 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
             ImGui::SetNextItemWidth(210);
             ime_textfield(lb, c.call_args[k], sizeof(c.call_args[k]));
         } else {
-            /* spec v2: object parameters are a DROPDOWN. First open
-               auto-scans the parameter's class (listInstances) and
-               the popup lists the found instances (tap = fill the
-               retained @handle); "Find / Create Object..." opens the
-               full Object Finder (Java.choose / $new / manual). The
-               free-form value input is kept below. */
             ImGui::Text("%s", lb);
             ImGui::SetNextItemWidth(-52.f);
             std::string prev = c.call_args[k][0] ?
@@ -1874,6 +1719,7 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
                     s_of.results.clear();
                     s_of.waiting  = false;
                     s_of.creating = false;
+                    s_open_objfinder = true;   /* r28: deferred popup */
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::Separator();
@@ -1988,14 +1834,12 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
         ImGui::BeginChild("calllog", ImVec2(0, 150), true);
         for (auto& l : c.call_log)
             ImGui::TextWrapped("%s", l.c_str());
-        /* r24 pattern: auto-scroll INSIDE the child */
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
             ImGui::SetScrollHereY(1.f);
         ImGui::EndChild();
         mark_scroll_item(s_lst_scroll);
     }
 }
-
 static void patcher_tab(ClassTab& c, const MethodSig& m) {
     ImGui::TextDisabled("Patch NOP: skip the body (void methods return "
                         "immediately; others return the default for "
@@ -2008,9 +1852,7 @@ static void patcher_tab(ClassTab& c, const MethodSig& m) {
                       + "\",\"method\":\"" + jesc(m.name)
                       + "\",\"mode\":\"noop\",\"code\":\"\"}";
         post_rpc("addHook", a);
-        MLK();
         s_hooks.push_back({c.cname, m.name, 2, "", true, "..."});
-        MULK();
         c.patch_note = "NOP armed on " + m.name;
     }
     ImGui::SameLine();
@@ -2036,7 +1878,6 @@ static void patcher_tab(ClassTab& c, const MethodSig& m) {
     }
     if (!c.patch_note.empty())
         ImGui::TextColored(ImVec4(0, 1, 0, 1), "%s", c.patch_note.c_str());
-    /* r25 live IO editor kept: probe one call, patch the marked rows */
     if (ImGui::CollapsingHeader("Live IO patch (probe)##ioh")) {
         if (!c.io_open) {
             if (ImGui::SmallButton("Probe next call values")) {
@@ -2109,24 +1950,26 @@ static void patcher_tab(ClassTab& c, const MethodSig& m) {
         }
     }
 }
-
-static void tracer_tab(ClassTab& c, const MethodSig& m) {
+static void trace_tab(ClassTab& c, const MethodSig& m) {
     std::string tname = c.cname + "." + m.name;
+    long hits = 0;
+    auto hi = s_hits.find(tname);
+    if (hi != s_hits.end()) hits = hi->second;
+    if (hits > 0)
+        ImGui::Text("Hit Count %ld", hits);
     int ti = find_tracker(tname);
     if (ti < 0) {
         if (ImGui::Button("Track this method")) {
             std::string a = "{\"class\":\"" + jesc(c.cname)
                           + "\",\"method\":\"" + jesc(m.name) + "\"}";
             post_rpc("addTracker", a);
-            MLK();
             s_trackers.push_back({tname, false, {}});
-            MULK();
         }
         ImGui::SameLine();
         ImGui::TextDisabled("not tracking yet");
     } else {
         Tracker& t = s_trackers[ti];
-        ImGui::TextDisabled("tracking - %lu events (full log: Trackers)",
+        ImGui::TextDisabled("tracking - %lu events (full log: Tracer tab)",
                             (unsigned long)t.log.size());
         ImGui::BeginChild("texp", ImVec2(0, 160), true);
         for (auto& r : t.log) {
@@ -2148,12 +1991,10 @@ static void tracer_tab(ClassTab& c, const MethodSig& m) {
             s_trackers.erase(s_trackers.begin() + ti);
         }
     }
-}
-
-static void hooker_tab(ClassTab& c, const MethodSig& m) {
-    const char* modes[] = {"Java(JS)", "Smali", "Nop (auto)"};
-    ImGui::Combo("Mode##hx26", &c.hook_mode, modes, 3);
-    ime_multiline("Code##hx26", c.hook_code, sizeof(c.hook_code),
+    ImGui::Separator();
+    static const char* modes[] = {"Java(JS)", "Smali", "Nop (auto)"};
+    ImGui::Combo("Mode##hx28", &c.hook_mode, modes, 3);
+    ime_multiline("Code##hx28", c.hook_code, sizeof(c.hook_code),
                   ImVec2(-1, 90));
     ImGui::TextDisabled("Java: fn(Java,send,console,thiz,args,orig). "
                         "Smali: body of static hook(Object thiz, Object[] args); "
@@ -2164,14 +2005,22 @@ static void hooker_tab(ClassTab& c, const MethodSig& m) {
                       + "\",\"mode\":\"" + modes[c.hook_mode]
                       + "\",\"code\":\"" + jesc(c.hook_code) + "\"}";
         post_rpc("addHook", a);
-        MLK();
         s_hooks.push_back({c.cname, m.name, c.hook_mode, c.hook_code,
                            true, "..."});
-        MULK();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Remove hook")) {
+        std::string a = "{\"class\":\"" + jesc(c.cname)
+                      + "\",\"method\":\"" + jesc(m.name) + "\"}";
+        post_rpc("removeHook", a);
+        for (int k = (int)s_hooks.size() - 1; k >= 0; k--) {
+            if (s_hooks[k].cls == c.cname && s_hooks[k].method == m.name) {
+                s_hooks.erase(s_hooks.begin() + k);
+            }
+        }
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Method source")) {
-        /* r25 pipeline: the real bytecode into the Hooks tab panel */
         snprintf(s_hcls, sizeof(s_hcls), "%s", c.cname.c_str());
         snprintf(s_hmth, sizeof(s_hmth), "%s", m.name.c_str());
         std::string a = "{\"class\":\"" + jesc(c.cname)
@@ -2179,26 +2028,37 @@ static void hooker_tab(ClassTab& c, const MethodSig& m) {
         post_rpc("getMethodSrc", a);
         snprintf(s_hsrc_note, sizeof(s_hsrc_note), "disassembling...");
         s_hsrc_have = false;
-        s_next_tab = "Hooks";
+    }
+    if (s_hsrc_have && c.cname == s_hcls && m.name == s_hmth) {
+        ImGui::BeginChild("txsrc", ImVec2(0, 170), true);
+        ImGui::TextUnformatted(s_hsrc);
+        ImGui::EndChild();
+        mark_scroll_item(s_lst_scroll);
+        if (c.hook_mode == 1 &&
+            ImGui::SmallButton("Copy body -> editor##tx")) {
+            std::string src = s_hsrc;
+            auto b = src.find('\n');
+            if (b != std::string::npos) src = src.substr(b + 1);
+            auto e = src.rfind(".end method");
+            if (e != std::string::npos) src = src.substr(0, e);
+            snprintf(c.hook_code, sizeof(c.hook_code), "%s", src.c_str());
+        }
+    } else if (!s_hsrc_have && c.cname == s_hcls && m.name == s_hmth) {
+        ImGui::TextDisabled("%s", s_hsrc_note);
     }
 }
-
-/* the expanded method body: exactly the 4 sub-tabs of the spec
-   (v2 naming: Call / Patch / Trace / Hook) */
 static void method_body(ClassTab& c, const MethodSig& m) {
     ImGui::Indent();
     if (ImGui::BeginTabBar("mexp")) {
-        static const char* msubs[] = {"Call", "Patch", "Trace",
-                                      "Hook"};
+        static const char* msubs[] = {"Call", "Patch", "Trace"};
         char tlbl[40];
-        for (int t = 0; t < 4; t++) {
+        for (int t = 0; t < 3; t++) {
             snprintf(tlbl, sizeof(tlbl), "%s##mexp%d", msubs[t], t);
             if (ImGui::BeginTabItem(tlbl)) {
                 c.msub = t;
                 if      (t == 0) caller_tab(c, m);
                 else if (t == 1) patcher_tab(c, m);
-                else if (t == 2) tracer_tab(c, m);
-                else             hooker_tab(c, m);
+                else             trace_tab(c, m);
                 ImGui::EndTabItem();
             }
         }
@@ -2206,9 +2066,6 @@ static void method_body(ClassTab& c, const MethodSig& m) {
     }
     ImGui::Unindent();
 }
-
-/* ---- Methods list (tap = expand; right-click / "..." = context
-   menu per the field spec) ---- */
 static void methods_view(ClassTab& c) {
     MLK();
     ImGui::BeginChild("clsm", ImVec2(0, 0), true);
@@ -2218,24 +2075,41 @@ static void methods_view(ClassTab& c) {
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
             MethodSig& m = c.methods[i];
             ImGui::PushID(i);
-            /* r25: code-text hits are painted green (field spec:
-               "methods or fields that have this string should be
-               marked in green") */
             bool hitm = c.hit(c.hits_m, m.name);
-            if (hitm) ImGui::PushStyleColor(ImGuiCol_Text,
-                       ImVec4(0.25f, 0.95f, 0.35f, 1.f));
-            bool is_exp = (c.expanded == i);
-            char lbl[512];
-            snprintf(lbl, sizeof(lbl), "%s %s(%s) -> %s",
-                     is_exp ? "-" : "+", m.name.c_str(),
-                     m.params.c_str(), m.ret.c_str());
-            if (ImGui::Selectable(lbl, is_exp)) {
-                if (c.expanded == i) {
-                    c.expanded = -1;
-                } else {
+            std::string key = c.cname + "." + m.name;
+            long hits = 0;
+            auto hi = s_hits.find(key);
+            if (hi != s_hits.end()) hits = hi->second;
+            bool hooked = false;
+            for (auto& h : s_hooks) {
+                if (h.cls == c.cname && h.method == m.name) {
+                    hooked = true;
+                    break;
+                }
+            }
+            int pushed = 0;
+            if (hooked || hits > 0) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      IM_COL32(25, 255, 125, 255));
+                pushed++;
+            } else if (hitm) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(0.25f, 0.95f, 0.35f, 1.f));
+                pushed++;
+            }
+            char pre[64] = "";
+            if (hits > 0)
+                snprintf(pre, sizeof(pre), "Hit Count %ld | ", hits);
+            char lbl[600];
+            snprintf(lbl, sizeof(lbl), "%s%s(%s) -> %s###m%d", pre,
+                     m.name.c_str(), m.params.c_str(), m.ret.c_str(), i);
+            ImGui::SetNextItemOpen(c.expanded == i, ImGuiCond_Always);
+            bool open = ImGui::TreeNodeEx(lbl,
+                        ImGuiTreeNodeFlags_SpanAvailWidth);
+            if (open) {
+                if (c.expanded != i) {
                     c.expanded = i;
                     c.msub = 0;
-                    /* fresh Caller state when the method changes */
                     if (c.call_sig.name != m.name ||
                         c.call_sig.params != m.params) {
                         c.call_sig = m;
@@ -2245,59 +2119,55 @@ static void methods_view(ClassTab& c) {
                         for (int k = 0; k < 8; k++) c.call_args[k][0] = 0;
                     }
                 }
-            }
-            if (hitm) ImGui::PopStyleColor();
-            bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-            /* spec v2: a LONG PRESS on the row (>= 0.55 s, the mock's
-               IsMouseDownDuration pattern) opens the same context
-               menu on touch. Scroll guard: if a wheel event was
-               injected while this press is held (the overlay turns
-               drags inside lists into wheel events), the gesture is
-               a scroll, not a long press. */
-            static bool mctx_wheel_press = false;
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                mctx_wheel_press = false;
-            ImGuiIO& pio = ImGui::GetIO();
-            if (pio.MouseWheel != 0.f || pio.MouseWheelH != 0.f)
-                mctx_wheel_press = true;
-            bool lng = ImGui::IsItemHovered() &&
-                       ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
-                       !mctx_wheel_press &&
-                       !ImGui::IsMouseDragging(ImGuiMouseButton_Left,
-                                               10.f) &&
-                       pio.MouseDownDuration[ImGuiMouseButton_Left] >
-                           0.55f;
-            float bx = ImGui::GetCursorPosX() +
-                       ImGui::GetContentRegionAvail().x - 26.f;
-            ImGui::SameLine(bx);
-            bool dot = ImGui::SmallButton("...");
-            if (rclk || dot || lng) ImGui::OpenPopup("mctx");
-            if (ImGui::BeginPopup("mctx")) {
-                if (ImGui::MenuItem("Open in new window")) {
-                    /* deferred: pushing into s_classes here would
-                       reallocate the vector this loop is walking */
-                    MLK();
-                    s_dup_req = c.cname;
-                    MULK();
+                if (pushed) { ImGui::PopStyleColor(pushed); pushed = 0; }
+                bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                static bool mctx_wheel_press = false;
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                    mctx_wheel_press = false;
+                ImGuiIO& pio = ImGui::GetIO();
+                if (pio.MouseWheel != 0.f || pio.MouseWheelH != 0.f)
+                    mctx_wheel_press = true;
+                bool lng = ImGui::IsItemHovered() &&
+                           ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+                           !mctx_wheel_press &&
+                           !ImGui::IsMouseDragging(ImGuiMouseButton_Left,
+                                                   10.f) &&
+                           pio.MouseDownDuration[ImGuiMouseButton_Left] >
+                               0.55f;
+                float bx = ImGui::GetCursorPosX() +
+                           ImGui::GetContentRegionAvail().x - 26.f;
+                ImGui::SameLine(bx);
+                bool dot = ImGui::SmallButton("...");
+                if (rclk || dot || lng) ImGui::OpenPopup("mctx");
+                if (ImGui::BeginPopup("mctx")) {
+                    if (ImGui::MenuItem("Open in new tab")) {
+                        s_dup_req = c.cname;
+                    }
+                    if (ImGui::MenuItem("Full Method View")) {
+                        s_fm_cls  = c.cname;
+                        s_fm_mth  = m.name;
+                        s_fm_open = true;
+                        s_fm_have = false;
+                        s_open_fmview = true;   /* r28: deferred popup */
+                        snprintf(s_fm_note, sizeof(s_fm_note),
+                                 "disassembling...");
+                        std::string a = "{\"class\":\"" + jesc(c.cname)
+                                      + "\",\"method\":\"" + jesc(m.name)
+                                      + "\"}";
+                        post_rpc("getMethodSrc", a);
+                    }
+                    if (ImGui::MenuItem("Copy Method Name"))
+                        copy_text("method", m.name);
+                    if (ImGui::MenuItem("Copy Class Name"))
+                        copy_text("class", c.cname);
+                    ImGui::EndPopup();
                 }
-                if (ImGui::MenuItem("Full Method View")) {
-                    s_fm_cls  = c.cname;
-                    s_fm_mth  = m.name;
-                    s_fm_open = true;
-                    s_fm_have = false;
-                    snprintf(s_fm_note, sizeof(s_fm_note),
-                             "disassembling...");
-                    std::string a = "{\"class\":\"" + jesc(c.cname)
-                                  + "\",\"method\":\"" + jesc(m.name) + "\"}";
-                    post_rpc("getMethodSrc", a);
-                }
-                if (ImGui::MenuItem("Copy Method Name"))
-                    copy_text("method", m.name);
-                if (ImGui::MenuItem("Copy Class Name"))
-                    copy_text("class", c.cname);
-                ImGui::EndPopup();
+                method_body(c, m);
+                ImGui::TreePop();
+            } else if (c.expanded == i) {
+                c.expanded = -1;
             }
-            if (c.expanded == i) method_body(c, m);
+            if (pushed) ImGui::PopStyleColor(pushed);
             ImGui::PopID();
         }
     }
@@ -2305,392 +2175,170 @@ static void methods_view(ClassTab& c) {
     mark_scroll_item(s_lst_scroll);
     MULK();
 }
-
-static void tab_classes() {
-    /* r12: the full class list loads BY DEFAULT - no "+ search" gate.
-       The agent streams every loaded class in pages of 400; the
-       Explorer's Filter re-queries with a substring. */
+static void open_obj_tab(const std::string& cls, long handle,
+                         const std::string& str);
+static void explorer_body(ExplorerWin& e);
+static void class_tab_body(ClassTab& c);
+static void obj_tab_body(ObjTab& t) {
     MLK();
-    bool agent_ready = s_agent_ready;
-    bool need_auto   = !s_cls_auto_done && !s_search_wait &&
-                       s_search_res.empty();
-    int  qid         = 0;
-    if (agent_ready && need_auto) {
-        s_cls_auto_done = true;
-        s_search_wait   = true;
-        qid = ++s_search_seq;
-        s_search_qid   = qid;      /* r23: generation armed at SEND time */
-        s_search_page0 = false;
+    char ttl[80];
+    snprintf(ttl, sizeof(ttl), "[0x%lx]", t.handle);
+    ImGui::TextDisabled("%s", ttl);
+    ImGui::SameLine();
+    ImGui::PushTextWrapPos();
+    ImGui::TextUnformatted(t.cls.c_str());
+    ImGui::PopTextWrapPos();
+    if (!t.str.empty())
+        ImGui::TextDisabled("%s", t.str.c_str());
+    if (ImGui::SmallButton("Refresh##ot")) {
+        std::string a = "{\"class\":\"" + jesc(t.cls) + "\"}";
+        post_rpc("listInstances", a);
     }
-    /* r26: the first Explorer window opens by itself so the class
-       list is visible immediately (the r12 default-list behavior) */
-    bool want_expl = s_explorers.empty();
-    MULK();
-    if (want_expl) {
-        ExplorerWin e{};
-        e.id = ++s_expl_seq;
-        s_explorers.push_back(e);
-    }
-    /* r25: the AUTO default list is always a plain, sorted class
-       listing (mode 0) - a user who left the mode on Code text
-       would otherwise trigger a full dex scan just by opening the
-       tab. The System gate still applies. */
-    if (qid)
-        post_rpc("listLoadedClasses",
-                 "{\"filter\":\"\",\"qid\":" + std::to_string(qid)
-                 + ",\"mode\":0"
-                 + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}");
-
-    /* ---- secondary bar: opened classes + "+" (field spec) ---- */
-    MLK();
-    static int s_cls_cur_uid = -1;
-    int active_uid = -1;
-    float bh = ImGui::GetFrameHeight();
-    float avail = ImGui::GetContentRegionAvail().x;
-    ImGui::BeginChild("##clstabs", ImVec2(avail - 46.f, bh), false);
-    if (ImGui::BeginTabBar("clsTabs")) {
-        /* r13: unique tab-bar id kept; labels carry ##t<uid> so two
-           windows of the SAME class ("Open in new window") never
-           share an id */
-        for (int i = 0; i < (int)s_classes.size(); i++) {
-            std::string lbl = s_classes[i].cname + "##t"
-                            + std::to_string(s_classes[i].uid);
-            ImGuiTabItemFlags fl = 0;
-            if (s_classes[i].uid == s_cls_cur_uid)
-                fl |= ImGuiTabItemFlags_SetSelected;
-            if (ImGui::BeginTabItem(lbl.c_str(), nullptr, fl)) {
-                active_uid = s_classes[i].uid;
-                ImGui::EndTabItem();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Class##ot"))
+        open_inspector(t.cls, true);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Methods##ot"))
+        ImGui::OpenPopup("ObjMethodsPopup");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Dump to file##ot"))
+        ImGui::OpenPopup("ObjDumpPopup");
+    if (ImGui::BeginPopup("ObjMethodsPopup",
+                          ImGuiWindowFlags_HorizontalScrollbar)) {
+        const char* nm = t.cls.c_str();
+        float ww = ImGui::GetWindowSize().x;
+        float tw = ImGui::CalcTextSize(nm).x;
+        ImGui::SetCursorPosX((ww - tw) * 0.5f);
+        ImGui::Text("%s", nm);
+        ImGui::Separator();
+        ClassTab* c = find_tab(t.cls);
+        if (!c || c->methods.empty()) {
+            ImGui::TextDisabled("open the class tab once to load its "
+                                "method list");
+        } else {
+            int j = 0;
+            for (auto& m : c->methods) {
+                ImGui::PushID(9600 + j++);
+                char lbl[512];
+                snprintf(lbl, sizeof(lbl), "%s(%s) -> %s",
+                         m.name.c_str(), m.params.c_str(),
+                         m.ret.c_str());
+                if (ImGui::Button(lbl,
+                                  ImVec2(ImGui::GetContentRegionAvail().x,
+                                         0))) {
+                    for (int q = 0; q < (int)c->methods.size(); q++) {
+                        if (c->methods[q].name == m.name) {
+                            c->expanded = q;
+                            c->msub = 0;
+                            break;
+                        }
+                    }
+                    open_inspector(t.cls, true);
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::PopID();
             }
         }
-        ImGui::EndTabBar();
+        ImGui::EndPopup();
     }
-    ImGui::EndChild();
-    if (active_uid >= 0 && active_uid != s_cls_cur_uid) {
-        /* a tab was clicked -> raise its inspector window */
-        for (auto& c : s_classes)
-            if (c.uid == active_uid) { s_focus_win = win_title(c); break; }
-        s_cls_cur_uid = active_uid;
+    if (ImGui::BeginPopup("ObjDumpPopup")) {
+        char fn[128];
+        snprintf(fn, sizeof(fn), "dextool-object-0x%lx.json", t.handle);
+        ImGui::Text("File will be saved as %s", fn);
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 50, 255));
+        ImGui::Text("Note: This may take a while depending on the size "
+                    "of the object");
+        ImGui::Text("Do not touch the screen if it's freezing!");
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Proceed",
+                          ImVec2(ImGui::GetContentRegionAvail().x, 0))) {
+            std::string a = "{\"class\":\"" + jesc(t.cls)
+                          + "\",\"handle\":" + std::to_string(t.handle)
+                          + "}";
+            post_rpc("dumpObject", a);
+            snprintf(s_dobj_note, sizeof(s_dobj_note), "writing...");
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
-    MULK();
-    ImGui::SameLine(0, 6);
-    if (ImGui::Button("+##newexpl", ImVec2(40, bh))) s_expl_req = true;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("open a new Class Explorer window");
+    if (s_dobj_note[0])
+        ImGui::TextDisabled("%s", s_dobj_note);
     ImGui::Separator();
-    if (s_classes.empty())
-        ImGui::TextDisabled("no class windows - pick a class in the "
-                            "Class Explorer (the + button)");
-    /* r26: the "+" opens a NEW Explorer window (field spec) */
-    if (s_expl_req) {
-        s_expl_req = false;
-        if (s_explorers.size() < 4) {
-            ExplorerWin e{};
-            e.id = ++s_expl_seq;
-            s_explorers.push_back(e);
-            s_focus_expl = e.id;
-        }
-    }
-}
-
-/* ===================== Class Explorer windows (r26) ===================== */
-static void draw_explorer_windows(ImVec2 ds) {
-    for (int i = 0; i < (int)s_explorers.size(); ) {
-        ExplorerWin& e = s_explorers[i];
-        bool open = e.open;
-        std::string title = "Class Explorer##" + std::to_string(e.id);
-        if (s_focus_expl == e.id) {
-            ImGui::SetNextWindowFocus();
-            s_focus_expl = 0;
-        }
-        ImGui::SetNextWindowPos(ImVec2(70.f + 30.f * (e.id % 4),
-                                       50.f + 30.f * (e.id % 4)),
-                                ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(320, 240),
-            ImVec2(ds.x * .96f, ds.y * .96f));
-        ImGui::SetNextWindowSize(ImVec2(ds.x * .62f, ds.y * .72f),
-                                 ImGuiCond_Once);
-        bool body = ImGui::Begin(title.c_str(), &open,
-                                 ImGuiWindowFlags_NoSavedSettings);
-        ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-        bool do_search = false;
-        /* r26: the mutex is HELD across the body - the GumJS callback
-           thread can rebuild s_families / s_search_res at ANY moment,
-           and the family dropdown caches const char* INTO those
-           strings (r25 drew its lists under the lock for the same
-           reason). run_search/open_inspector re-lock recursively. */
-        MLK();
-        if (body) {
-            /* the dropdown can be opened before the agent finished
-               streaming - fill families from whatever is buffered */
-            if (s_families.empty() && !s_search_res.empty() &&
-                !s_search_wait) {
-                for (auto& n : s_search_res) {
-                    std::string f = family_of(n);
-                    if (!f.empty() &&
-                        std::find(s_families.begin(), s_families.end(), f)
-                            == s_families.end())
-                        s_families.push_back(f);
-                }
-                std::sort(s_families.begin(), s_families.end());
+    if (t.sel >= (int)t.fields.size()) t.sel = -1;
+    for (int f = 0; f < (int)t.fields.size(); f++) {
+        FieldInfo& fi = t.fields[f];
+        ImGui::PushID(9000 + f);
+        if (t.sel != f) {
+            ImGui::BulletText("%s (%s) = %s", fi.name.c_str(),
+                              fi.type.c_str(), fi.value.c_str());
+            if (ImGui::IsItemClicked()) {
+                t.sel = f;
+                snprintf(t.edit, sizeof(t.edit), "%s",
+                         fi.value.c_str());
             }
-            std::vector<const char*> famc;
-            for (auto& f : s_families) famc.push_back(f.c_str());
-            int nf = (int)famc.size();
-            /* family row (spec: dropdown left + "All" checkbox) */
-            if (e.family >= nf || e.family < 0) e.family = 0;
-            ImGui::SetNextItemWidth(
-                ImGui::GetContentRegionAvail().x - 90.f);
-            const char* fprev = nf ? famc[e.family]
-                                    : "(no classes yet)";
-            if (ImGui::BeginCombo("##fam",
-                                  e.all_fam ? "(All families)" : fprev)) {
-                /* spec v2: the popup's FIRST widget is the
-                   "Search families..." box - it filters the PACKAGE
-                   names below in real time and NEVER touches the
-                   class list or the Filter search */
-                ImGui::SetNextItemWidth(-1.f);
-                ime_textfield("Search families...##fsearch",
-                              e.fam_search, sizeof(e.fam_search));
-                ImGui::Separator();
-                if (ImGui::Selectable("(All families)##fsearchall",
-                                      e.all_fam))
-                    e.all_fam = true;
-                ImGui::Separator();
-                for (int f = 0; f < nf; f++) {
-                    if (!contains_ci(s_families[f], e.fam_search))
-                        continue;
-                    bool sel = (!e.all_fam && e.family == f);
-                    if (ImGui::Selectable(famc[f], sel)) {
-                        e.family  = f;
-                        e.all_fam = false;
-                    }
-                }
-                ImGui::EndCombo();
+        } else {
+            ImGui::BulletText("%s (%s)", fi.name.c_str(),
+                              fi.type.c_str());
+            ImGui::SetNextItemWidth(200);
+            ime_textfield("##ov", t.edit, sizeof(t.edit));
+            ImGui::SameLine();
+            if (ImGui::Button("Set##os")) {
+                std::string a = "{\"class\":\"" + jesc(t.cls)
+                              + "\",\"handle\":"
+                              + std::to_string(t.handle)
+                              + ",\"index\":0"
+                              + ",\"field\":\"" + jesc(fi.name)
+                              + "\",\"value\":\"" + jesc(t.edit) + "\"}";
+                post_rpc("setInstanceField", a);
+                t.sel = -1;
             }
             ImGui::SameLine();
-            ImGui::Checkbox("All", &e.all_fam);
-            /* search row (spec: text input + Filter button). r23:
-               search on Enter / button ONLY - every keystroke used
-               to re-run enumerateLoadedClasses on the agent. */
-            ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 84.f);
-            do_search |= ime_textfield("##esearch", e.search,
-                                       sizeof(e.search),
-                                       ImGuiInputTextFlags_EnterReturnsTrue);
-            ImGui::PopItemWidth();
-            ImGui::SameLine();
-            if (ImGui::Button("Filter")) do_search = true;
-            /* options row (spec: pink Options button) */
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                                  ImVec4(0.94f, 0.44f, 0.66f, 1.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                  ImVec4(0.98f, 0.55f, 0.74f, 1.f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                                  ImVec4(0.88f, 0.34f, 0.58f, 1.f));
-            if (ImGui::Button("Options")) ImGui::OpenPopup("explOpts");
-            ImGui::PopStyleColor(3);
-            ImGui::SameLine();
-            if (s_search_wait) ImGui::TextDisabled("(listing...)");
-            else ImGui::TextDisabled("%ld of %ld loaded classes",
-                                     (long)s_search_shown,
-                                     (long)s_search_total);
-            if (ImGui::BeginPopup("explOpts")) {
-                ImGui::Checkbox("Case sensitive", &e.case_sensitive);
-                ImGui::TextDisabled("Filter by:");
-                int fb = e.advanced ? 3 : e.filter_by;
-                if (ImGui::RadioButton("Class",  fb == 0)) {
-                    e.filter_by = 0; e.advanced = false; }
-                if (ImGui::RadioButton("Method", fb == 1)) {
-                    e.filter_by = 1; e.advanced = false; }
-                if (ImGui::RadioButton("Field",  fb == 2)) {
-                    e.filter_by = 2; e.advanced = false; }
-                if (ImGui::RadioButton(
-                        "Code text (advanced: string inside class code)",
-                        fb == 3))
-                    e.advanced = true;
-                bool sys = s_search_sys;
-                if (ImGui::Checkbox("System classes", &sys))
-                    s_search_sys = sys;
-                ImGui::EndPopup();
-            }
-            ImGui::Separator();
-            /* filtered class list */
-            ImGui::BeginChild("explst", ImVec2(0, 0), true);
-            ImGuiListClipper clip;
-            clip.Begin((int)s_search_res.size());
-            while (clip.Step()) {
-                for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) {
-                    const std::string& nm = s_search_res[k];
-                    if (!e.all_fam && e.family < (int)s_families.size() &&
-                        family_of(nm) != s_families[e.family]) continue;
-                    ImGui::PushID(k);
-                    if (ImGui::Selectable(nm.c_str()))
-                        open_inspector(nm, false);
-                    ImGui::PopID();
-                }
-            }
-            ImGui::EndChild();
-            mark_scroll_item(s_lst_scroll);
+            if (ImGui::SmallButton("Cancel##oc")) t.sel = -1;
         }
-        MULK();
-        ImGui::End();
-        mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
-        if (do_search)
-            run_search(e.search, e.advanced ? 3 : e.filter_by,
-                       e.case_sensitive);
-        if (!open) {
-            s_explorers.erase(s_explorers.begin() + i);
-            continue;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Track##otf")) {
+            std::string a = "{\"class\":\"" + jesc(t.cls)
+                          + "\",\"field\":\"" + jesc(fi.name) + "\"}";
+            post_rpc("trackField", a);
+            s_trackers.push_back({t.cls + "." + fi.name, true, {}});
         }
-        i++;
+        ImGui::PopID();
     }
-}
-
-/* ===================== floating Inspector windows (r26) =====================
-   One per opened class; the secondary bar raises them, "-" collapses,
-   "X" closes. s_dup_req (declared at the top of this section) defers
-   the "Open in new window" duplicate to after the loop. */
-
-static void draw_class_windows(ImVec2 ds) {
-    for (int i = 0; i < (int)s_classes.size(); i++) {
-        MLK();
-        ClassTab& c = s_classes[i];
-        std::string title = win_title(c);
-        bool open = true;
-        if (s_focus_win == title) {
-            ImGui::SetNextWindowFocus();
-            s_focus_win.clear();
-        }
-        ImGui::SetNextWindowPos(ImVec2(40.f + 24.f * (c.uid % 6),
-                                       60.f + 24.f * (c.uid % 5)),
-                                ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSizeConstraints(ImVec2(320, 220),
-            ImVec2(ds.x * .96f, ds.y * .96f));
-        ImGui::SetNextWindowSize(ImVec2(ds.x * .70f, ds.y * .60f),
-                                 ImGuiCond_Once);
-        /* r13 comment kept: the sub-tab bar id is unique per scope */
-        bool body = ImGui::Begin(title.c_str(), &open,
-                                 ImGuiWindowFlags_NoSavedSettings);
-        ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-        if (body) {
-            if (ImGui::SmallButton("Inspector")) {
-                snprintf(s_of.cls, sizeof(s_of.cls), "%s", c.cname.c_str());
-                snprintf(s_of.typ, sizeof(s_of.typ), "%s", "this");
-                s_of.ctx_uid = c.uid;
-                s_of.ctx_arg = -1;
-                s_of.open    = true;
-                s_of.results.clear();
-                s_of.waiting  = false;
-                s_of.creating = false;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("find / create objects of this class");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("-##min")) {
-                ImGui::SetWindowCollapsed(true);   /* restore: title [+] */
-            }
-            float xr = ImGui::GetWindowWidth() - 34.f;
-            ImGui::SameLine(xr);
-            if (ImGui::SmallButton("X")) { c.win_close = true; open = false; }
-            /* spec v2: the class name is the window's title line and
-               WRAPS to the window width (long package paths stay
-               readable when the menu is small) */
-            ImGui::PushTextWrapPos();
-            ImGui::TextUnformatted(c.cname.c_str());
-            ImGui::PopTextWrapPos();
-            if (!c.got_info)
-                ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
-                                              : "(no data - tap Refresh)");
-            if (ImGui::Button("Refresh"))
-                open_inspector(c.cname, false);
-            ImGui::Separator();
-            if (c.of_handle >= 0)
-                ImGui::TextColored(ImVec4(0, 1, 0, 1), "%s",
-                                   c.of_note.c_str());
-            static const char* subs[] = {"Instances", "Static Fields",
-                                         "Methods", "Fields"};
-            char sl[40];
-            if (ImGui::BeginTabBar("clssub")) {
-                for (int si = 0; si < 4; si++) {
-                    snprintf(sl, sizeof(sl), "%s##cs%d", subs[si], si);
-                    if (ImGui::BeginTabItem(sl)) {
-                        c.sub = si;
-                        if      (si == 0) inst_view(c);
-                        else if (si == 1) static_fields_view(c);
-                        else if (si == 2) methods_view(c);
-                        else              fields_view(c);
-                        ImGui::EndTabItem();
-                    }
-                }
-                ImGui::EndTabBar();
-            }
-        }
-        ImGui::End();
-        MULK();
-        mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
-        if (!open || c.win_close) {
-            MLK();
-            s_classes.erase(s_classes.begin() + i);
-            MULK();
-            i--;   /* the next entry shifted into this slot */
-        }
-    }
-    /* deferred "Open in new window": duplicate AFTER all references
-       are gone */
-    if (!s_dup_req.empty()) {
-        MLK();
-        ClassTab nt{};
-        nt.cname   = s_dup_req;
-        nt.uid     = ++s_tab_uid_seq;
-        nt.waiting = true;
-        s_classes.push_back(nt);
-        s_focus_win = win_title(s_classes.back());
-        MULK();
-        std::string a = "{\"class\":\"" + jesc(s_dup_req) + "\"}";
-        post_rpc("openClass", a);
-        s_dup_req.clear();
-    }
-}
-
-/* ===================== Full Method View window (r26) ===================== */
-static void draw_fm_window(ImVec2 ds) {
-    if (!s_fm_open) return;
-    ImGui::SetNextWindowPos(ImVec2(90.f, 80.f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(300, 200),
-        ImVec2(ds.x * .96f, ds.y * .96f));
-    ImGui::SetNextWindowSize(ImVec2(ds.x * .58f, ds.y * .52f),
-                             ImGuiCond_Once);
-    bool open = s_fm_open;
-    ImGui::Begin("Method view##fm", &open,
-                 ImGuiWindowFlags_NoSavedSettings);
-    ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-    MLK();   /* s_fm_* are written by the GumJS callback thread too */
-    ImGui::Text("%s.%s", s_fm_cls.c_str(), s_fm_mth.c_str());
-    if (ImGui::SmallButton("Load source")) {
-        std::string a = "{\"class\":\"" + jesc(s_fm_cls)
-                      + "\",\"method\":\"" + jesc(s_fm_mth) + "\"}";
-        post_rpc("getMethodSrc", a);
-        snprintf(s_fm_note, sizeof(s_fm_note), "disassembling...");
-        s_fm_have = false;
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Copy source") && s_fm_have)
-        copy_text("source", s_fm_src);
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", s_fm_note);
-    if (s_fm_have) {
-        ImGui::BeginChild("fmsrc", ImVec2(0, 0), true);
-        ImGui::TextUnformatted(s_fm_src);
-        ImGui::EndChild();
-        mark_scroll_item(s_lst_scroll);
-    }
-    if (!open) s_fm_open = false;
+    if (t.fields.empty())
+        ImGui::TextDisabled("no fields yet - open the class tab once, "
+                            "then Refresh");
     MULK();
-    ImGui::End();
-    mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
 }
-
-/* ===================== Object Finder window (r26) ===================== */
+static void open_obj_tab(const std::string& cls, long handle,
+                         const std::string& str) {
+    MLK();
+    for (auto& t : s_objtabs) {
+        if (t.handle == handle) {
+            s_objfocus = handle;
+            if (!str.empty()) t.str = str;
+            MULK();
+            return;
+        }
+    }
+    ObjTab t;
+    t.handle = handle;
+    t.cls    = cls;
+    t.str    = str;
+    for (auto& c : s_classes) {
+        if (c.cname != cls) continue;
+        for (auto& in : c.instances) {
+            if (in.handle == handle) {
+                t.fields = in.fields;
+                if (t.str.empty()) t.str = in.str;
+                break;
+            }
+        }
+        break;
+    }
+    s_objtabs.push_back(t);
+    s_objfocus = handle;
+    MULK();
+}
 static void of_deliver(long handle, const std::string& str) {
     MLK();
     if (s_of.ctx_arg >= 0) {
@@ -2723,17 +2371,15 @@ static void of_deliver(long handle, const std::string& str) {
     MULK();
     s_of.open = false;
 }
-
-static void draw_object_finder(ImVec2 ds) {
+static void objfinder_popup() {
     if (!s_of.open) return;
-    ImGui::SetNextWindowPos(ImVec2(110.f, 100.f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(320, 220),
-        ImVec2(ds.x * .96f, ds.y * .96f));
-    ImGui::SetNextWindowSize(ImVec2(460, 380), ImGuiCond_Once);
-    bool open = s_of.open;
-    ImGui::Begin("Object Finder", &open,
-                 ImGuiWindowFlags_NoSavedSettings);
-    ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(io.DisplaySize.x * 0.6f, 0),
+        ImVec2(io.DisplaySize.x * 0.6f, io.DisplaySize.y / 1.5f));
+    if (!ImGui::BeginPopup("ObjFinderPopup",
+                           ImGuiWindowFlags_HorizontalScrollbar))
+        return;
     MLK();   /* s_of.results is written by the GumJS callback thread */
     ImGui::Text("class: %s", s_of.cls);
     if (s_of.ctx_arg >= 0)
@@ -2742,28 +2388,21 @@ static void draw_object_finder(ImVec2 ds) {
     else
         ImGui::TextDisabled("selecting for the Inspector");
     if (ImGui::Button("Find Objects")) {
-        /* the spec's Java.choose */
         s_of.results.clear();
         s_of.waiting = true;
         post_rpc("listInstances", "{\"class\":\"" + jesc(s_of.cls) + "\"}");
     }
     ImGui::SameLine();
     if (ImGui::Button("Create Object")) {
-        /* the spec's $new() through the constructor */
         s_of.creating = true;
         post_rpc("createInstance", "{\"class\":\"" + jesc(s_of.cls) + "\"}");
     }
     ImGui::SameLine();
-    if (ImGui::Button("Clear##ofc")) {
-        s_of.results.clear();
-        s_of.waiting  = false;
-        s_of.creating = false;
-    }
+    if (ImGui::SmallButton("Close##ofx")) s_of.open = false;
     ImGui::SetNextItemWidth(180);
     ime_textfield("##ofman", s_of.manual, sizeof(s_of.manual));
     ImGui::SameLine();
     if (ImGui::Button("Use##ofman") && s_of.manual[0]) {
-        MLK();
         if (s_of.ctx_arg >= 0) {
             for (auto& c : s_classes)
                 if (c.uid == s_of.ctx_uid && s_of.ctx_arg < 8) {
@@ -2778,22 +2417,27 @@ static void draw_object_finder(ImVec2 ds) {
                     break;
                 }
         }
-        MULK();
         s_of.open = false;
     }
     ImGui::Separator();
-    MLK();
     ImGui::BeginChild("oflst", ImVec2(0, 0), true);
     int N = (int)s_of.results.size();
     for (int k = 0; k < N; k++) {
         ImGui::PushID(k);
         InstInfo& in = s_of.results[k];
-        /* the spec's row format: "GameComputer (0/0)" */
         char lbl[220];
         snprintf(lbl, sizeof(lbl), "%s (%d/%d)",
                  short_name(s_of.cls).c_str(), k, N);
         if (ImGui::Selectable(lbl))
             of_deliver(in.handle, in.str);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Save##ofsv")) {
+            bool have = false;
+            for (auto& sv : s_saved)
+                if (sv.handle == in.handle) { have = true; break; }
+            if (!have)
+                s_saved.push_back({s_of.cls, in.str, in.handle});
+        }
         ImGui::TextDisabled("    %s", in.str.c_str());
         ImGui::PopID();
     }
@@ -2801,24 +2445,364 @@ static void draw_object_finder(ImVec2 ds) {
     if (s_of.creating) ImGui::TextDisabled("(constructing...)");
     if (N == 0 && !s_of.waiting && !s_of.creating)
         ImGui::TextDisabled("no results yet - tap Find Objects");
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Saved Objects")) {
+        for (int k = 0; k < (int)s_saved.size(); ) {
+            ImGui::PushID(9500 + k);
+            SavedObj& sv = s_saved[k];
+            char lbl[280];
+            snprintf(lbl, sizeof(lbl), "%s [0x%lx]",
+                     short_name(sv.cls).c_str(), sv.handle);
+            if (ImGui::Button(lbl, ImVec2(
+                    ImGui::GetContentRegionAvail().x - 70.f, 0)))
+                of_deliver(sv.handle, sv.str);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove")) {
+                s_saved.erase(s_saved.begin() + k);
+                ImGui::PopID();
+                continue;
+            }
+            ImGui::PopID();
+            k++;
+        }
+        if (s_saved.empty())
+            ImGui::TextDisabled("Nothing...");
+    }
     ImGui::EndChild();
     mark_scroll_item(s_lst_scroll);
-    if (!open) s_of.open = false;
     MULK();
-    ImGui::End();
-    mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
+    ImGui::EndPopup();
 }
-
-
-/* ===================== floating toggle button =====================
-   Always available (unless disabled in Settings), draggable, and a
-   plain tap toggles the menu - r7 only showed it while the menu was
-   hidden and it could not be moved. */
+static void fm_popup() {
+    if (!s_fm_open) return;
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(io.DisplaySize.x / 1.2f, 0),
+        ImVec2(io.DisplaySize.x / 1.2f, io.DisplaySize.y / 2));
+    if (!ImGui::BeginPopup("fmPopup",
+                           ImGuiWindowFlags_HorizontalScrollbar)) {
+        s_fm_open = false;   /* clicked away: do not force-reopen */
+        return;
+    }
+    MLK();   /* s_fm_* are written by the GumJS callback thread too */
+    ImGui::Text("%s.%s", s_fm_cls.c_str(), s_fm_mth.c_str());
+    if (ImGui::SmallButton("Load source")) {
+        std::string a = "{\"class\":\"" + jesc(s_fm_cls)
+                      + "\",\"method\":\"" + jesc(s_fm_mth) + "\"}";
+        post_rpc("getMethodSrc", a);
+        snprintf(s_fm_note, sizeof(s_fm_note), "disassembling...");
+        s_fm_have = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy source") && s_fm_have)
+        copy_text("source", s_fm_src);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Close##fmx")) s_fm_open = false;
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", s_fm_note);
+    if (s_fm_have) {
+        ImGui::BeginChild("fmsrc", ImVec2(0, 0), true);
+        ImGui::TextUnformatted(s_fm_src);
+        ImGui::EndChild();
+        mark_scroll_item(s_lst_scroll);
+    }
+    MULK();
+    ImGui::EndPopup();
+}
+static void explorer_body(ExplorerWin& e) {
+    bool do_search = false;
+    if (s_families.empty() && !s_search_res.empty() && !s_search_wait) {
+        for (auto& n : s_search_res) {
+            std::string f = family_of(n);
+            if (!f.empty() &&
+                std::find(s_families.begin(), s_families.end(), f)
+                    == s_families.end())
+                s_families.push_back(f);
+        }
+        std::sort(s_families.begin(), s_families.end());
+    }
+    std::vector<const char*> famc;
+    for (auto& f : s_families) famc.push_back(f.c_str());
+    int nf = (int)famc.size();
+    if (e.family >= nf || e.family < 0) e.family = 0;
+    ImGui::SetNextItemWidth(
+        ImGui::GetContentRegionAvail().x - 90.f);
+    const char* fprev = nf ? famc[e.family]
+                            : "(no classes yet)";
+    if (ImGui::BeginCombo("##fam",
+                          e.all_fam ? "(All families)" : fprev)) {
+        ImGui::SetNextItemWidth(-1.f);
+        ime_textfield("Search families...##fsearch",
+                      e.fam_search, sizeof(e.fam_search));
+        ImGui::Separator();
+        if (ImGui::Selectable("(All families)##fsearchall",
+                              e.all_fam))
+            e.all_fam = true;
+        ImGui::Separator();
+        for (int f = 0; f < nf; f++) {
+            if (!contains_ci(s_families[f], e.fam_search))
+                continue;
+            bool sel = (!e.all_fam && e.family == f);
+            if (ImGui::Selectable(famc[f], sel)) {
+                e.family  = f;
+                e.all_fam = false;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("All", &e.all_fam);
+    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 84.f);
+    do_search |= ime_textfield("##esearch", e.search,
+                               sizeof(e.search),
+                               ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    if (ImGui::Button("Filter")) do_search = true;
+    ImGui::PushStyleColor(ImGuiCol_Button,
+                          ImVec4(0.94f, 0.44f, 0.66f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                          ImVec4(0.98f, 0.55f, 0.74f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                          ImVec4(0.88f, 0.34f, 0.58f, 1.f));
+    if (ImGui::Button("Options")) ImGui::OpenPopup("explOpts");
+    ImGui::PopStyleColor(3);
+    ImGui::SameLine();
+    if (s_search_wait) ImGui::TextDisabled("(listing...)");
+    else ImGui::TextDisabled("%ld of %ld loaded classes",
+                             (long)s_search_shown,
+                             (long)s_search_total);
+    if (ImGui::BeginPopup("explOpts")) {
+        ImGui::Checkbox("Case sensitive", &e.case_sensitive);
+        ImGui::TextDisabled("Filter by:");
+        int fb = e.advanced ? 3 : e.filter_by;
+        if (ImGui::RadioButton("Class",  fb == 0)) {
+            e.filter_by = 0; e.advanced = false; }
+        if (ImGui::RadioButton("Method", fb == 1)) {
+            e.filter_by = 1; e.advanced = false; }
+        if (ImGui::RadioButton("Field",  fb == 2)) {
+            e.filter_by = 2; e.advanced = false; }
+        if (ImGui::RadioButton(
+                "Code text (advanced: string inside class code)",
+                fb == 3))
+            e.advanced = true;
+        bool sys = s_search_sys;
+        if (ImGui::Checkbox("System classes", &sys))
+            s_search_sys = sys;
+        ImGui::EndPopup();
+    }
+    ImGui::Separator();
+    ImGui::BeginChild("explst", ImVec2(0, 0), true);
+    ImGuiListClipper clip;
+    clip.Begin((int)s_search_res.size());
+    while (clip.Step()) {
+        for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) {
+            const std::string& nm = s_search_res[k];
+            if (!e.all_fam && e.family < (int)s_families.size() &&
+                family_of(nm) != s_families[e.family]) continue;
+            ImGui::PushID(k);
+            if (ImGui::Selectable(nm.c_str()))
+                open_inspector(nm, false);
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+    mark_scroll_item(s_lst_scroll);
+    if (do_search)
+        run_search(e.search, e.advanced ? 3 : e.filter_by,
+                   e.case_sensitive);
+}
+static void class_tab_body(ClassTab& c) {
+    ImGui::PushTextWrapPos();
+    ImGui::TextUnformatted(c.cname.c_str());
+    ImGui::PopTextWrapPos();
+    if (ImGui::SmallButton("Inspector##ct")) {
+        snprintf(s_of.cls, sizeof(s_of.cls), "%s", c.cname.c_str());
+        snprintf(s_of.typ, sizeof(s_of.typ), "%s", "this");
+        s_of.ctx_uid = c.uid;
+        s_of.ctx_arg = -1;
+        s_of.open    = true;
+        s_of.results.clear();
+        s_of.waiting  = false;
+        s_of.creating = false;
+        s_open_objfinder = true;   /* r28: popup instead of window */
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("find / create objects of this class");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh##ct"))
+        open_inspector(c.cname, false);
+    ImGui::SameLine();
+    if (c.of_handle >= 0)
+        ImGui::TextColored(ImVec4(0, 1, 0, 1), "%s",
+                           c.of_note.c_str());
+    if (!c.got_info)
+        ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
+                                      : "(no data - tap Refresh)");
+    ImGui::Separator();
+    static const char* subs[] = {"Instances", "Static Fields",
+                                 "Methods", "Fields"};
+    char sl[40];
+    if (ImGui::BeginTabBar("clssub")) {
+        for (int si = 0; si < 4; si++) {
+            snprintf(sl, sizeof(sl), "%s##cs%d", subs[si], si);
+            if (ImGui::BeginTabItem(sl)) {
+                c.sub = si;
+                if      (si == 0) inst_view(c);
+                else if (si == 1) static_fields_view(c);
+                else if (si == 2) methods_view(c);
+                else              fields_view(c);
+                ImGui::EndTabItem();
+            }
+        }
+        ImGui::EndTabBar();
+    }
+}
+static void tab_tools() {
+    MLK();
+    bool agent_ready = s_agent_ready;
+    bool need_auto   = !s_cls_auto_done && !s_search_wait &&
+                       s_search_res.empty();
+    int  qid         = 0;
+    if (agent_ready && need_auto) {
+        s_cls_auto_done = true;
+        s_search_wait   = true;
+        qid = ++s_search_seq;
+        s_search_qid   = qid;      /* r23: generation armed at SEND time */
+        s_search_page0 = false;
+    }
+    bool want_expl = s_explorers.empty();
+    MULK();
+    if (want_expl) {
+        ExplorerWin e{};
+        e.id = ++s_expl_seq;
+        MLK();
+        s_explorers.push_back(e);
+        MULK();
+    }
+    if (qid)
+        post_rpc("listLoadedClasses",
+                 "{\"filter\":\"\",\"qid\":" + std::to_string(qid)
+                 + ",\"mode\":0"
+                 + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}");
+    if (ImGui::Checkbox("Fullscreen", &s_fullscreen)) {
+        if (s_fullscreen) {
+            s_fs_last_pos  = ImGui::GetWindowPos();
+            s_fs_last_size = ImGui::GetWindowSize();
+        } else {
+            s_fs_restore = true;
+        }
+        s_conf_dirty = true;
+    }
+    MLK();
+    if (ImGui::BeginTabBar("tabber",
+                           ImGuiTabBarFlags_AutoSelectNewTabs |
+                           ImGuiTabBarFlags_FittingPolicyScroll |
+                           ImGuiTabBarFlags_TabListPopupButton)) {
+        if (ImGui::TabItemButton("+",
+                                 ImGuiTabItemFlags_NoTooltip |
+                                 ImGuiTabItemFlags_Leading))
+            s_expl_req = true;
+        if (s_expl_req) {
+            s_expl_req = false;
+            if (s_explorers.size() < 6) {
+                ExplorerWin e{};
+                e.id = ++s_expl_seq;
+                s_explorers.push_back(e);
+                s_focus_expl = e.id;
+            }
+        }
+        int exi = 0;
+        for (int i = 0; i < (int)s_explorers.size(); ) {
+            ExplorerWin& e = s_explorers[i];
+            bool open = true;
+            char lbl[192];
+            if (e.search[0])
+                snprintf(lbl, sizeof(lbl), "%s", e.search);
+            else if (exi == 0)
+                snprintf(lbl, sizeof(lbl), "Classes");
+            else
+                snprintf(lbl, sizeof(lbl), "Classes [%d]", e.id);
+            ImGuiTabItemFlags fl = 0;
+            if (s_focus_expl == e.id) {
+                fl |= ImGuiTabItemFlags_SetSelected;
+                s_focus_expl = 0;
+            }
+            if (ImGui::BeginTabItem(lbl, &open, fl)) {
+                explorer_body(e);
+                ImGui::EndTabItem();
+            }
+            if (!open) {
+                s_explorers.erase(s_explorers.begin() + i);
+                continue;   /* no i++ - the next tab shifted in */
+            }
+            exi++;
+            i++;
+        }
+        if (s_explorers.empty()) {
+            ExplorerWin e{};
+            e.id = ++s_expl_seq;
+            s_explorers.push_back(e);
+        }
+        for (int i = 0; i < (int)s_classes.size(); ) {
+            ClassTab& c = s_classes[i];
+            bool open = true;
+            std::string lbl = win_title(c);
+            ImGuiTabItemFlags fl = 0;
+            if (s_focus_win == lbl) {
+                fl |= ImGuiTabItemFlags_SetSelected;
+                s_focus_win.clear();
+            }
+            if (ImGui::BeginTabItem(lbl.c_str(), &open, fl)) {
+                class_tab_body(c);
+                ImGui::EndTabItem();
+            }
+            if (!open) {
+                s_classes.erase(s_classes.begin() + i);
+                continue;
+            }
+            i++;
+        }
+        if (!s_dup_req.empty()) {
+            ClassTab nt{};
+            nt.cname   = s_dup_req;
+            nt.uid     = ++s_tab_uid_seq;
+            nt.waiting = true;
+            s_classes.push_back(nt);
+            s_focus_win = win_title(s_classes.back());
+            std::string a = "{\"class\":\"" + jesc(s_dup_req) + "\"}";
+            post_rpc("openClass", a);
+            s_dup_req.clear();
+        }
+        for (int i = 0; i < (int)s_objtabs.size(); ) {
+            ObjTab& t = s_objtabs[i];
+            bool open = true;
+            char lbl[96];
+            snprintf(lbl, sizeof(lbl), "[0x%lx]##ot%ld",
+                     t.handle, t.handle);
+            ImGuiTabItemFlags fl = 0;
+            if (s_objfocus == t.handle) {
+                fl |= ImGuiTabItemFlags_SetSelected;
+                s_objfocus = -1;
+            }
+            if (ImGui::BeginTabItem(lbl, &open, fl)) {
+                obj_tab_body(t);
+                ImGui::EndTabItem();
+            }
+            if (!open) {
+                s_objtabs.erase(s_objtabs.begin() + i);
+                continue;
+            }
+            i++;
+        }
+        ImGui::EndTabBar();
+    }
+    MULK();
+}
 static ImVec2 s_fab_pos(-1, -1);
 static bool    s_fab_drag = false;
 static bool    s_fab_moved = false;
 static ImVec2  s_fab_grab(0, 0), s_fab_orig(0, 0);
-
 static void draw_fab(ImVec2 ds) {
     if (!s_show_fab) return;
     if (s_fab_pos.x < 0) s_fab_pos = ImVec2(ds.x - 90.f, ds.y - 110.f);
@@ -2836,7 +2820,6 @@ static void draw_fab(ImVec2 ds) {
                  ImGuiWindowFlags_AlwaysAutoResize |
                  ImGuiWindowFlags_NoFocusOnAppearing);
     if (ImGui::Button(s_visible ? "HIDE" : "MENU", ImVec2(64, 44))) {
-        /* click handled on release below for taps; drags reposition */
     }
     if (ImGui::IsItemActive()) {
         if (!s_fab_drag) {
@@ -2866,14 +2849,6 @@ static void draw_fab(ImVec2 ds) {
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
 }
-
-/* ===================== frame pump (r25) =====================
-   0/1/2 level for dextool_want_frames(); the agent postInvalidate()s
-   the host DecorView at this rate so render-on-demand hosts keep
-   producing frames while the menu is up. Without it the menu only
-   advanced when the host happened to swap ("menu hangs, lags and
-   freezes on other apps ... when I touch the app, the touch I had
-   previously made on the menu works"). */
 int menu_frame_pump_level() {
     MLK();
     bool vis = s_visible;
@@ -2881,17 +2856,13 @@ int menu_frame_pump_level() {
     if (vis) return 2;                    /* full rate */
     return overlay_ready() ? 1 : 0;       /* FAB-only slow pump  */
 }
-
-/* ===================== main window ===================== */
 void menu_draw() {
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 ds = io.DisplaySize;
     apply_theme();
-
     MLK();
     bool vis = s_visible;
     MULK();
-
     if (!vis) {
         draw_fab(ds);
         MLK();
@@ -2902,46 +2873,79 @@ void menu_draw() {
         MULK();
         if (ime_was) ime_hide();  /* menu hidden: close the phone kb */
         if (clear_req) ImGui::ClearActiveID();
-        /* publish empty region list: drags elsewhere must not scroll */
         overlay_publish_scroll_regions(s_regions);
         s_regions.clear();
         return;
     }
     draw_fab(ds);
     ime_frame_prelude();
-
-    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints(
-        ImVec2(420, 300), ImVec2(ds.x * .95f, ds.y * .95f));
-    ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f), ImGuiCond_Once);
-    /* r24: the r23 "style.Alpha is the single source" call was wrong -
-       style.Alpha faded EVERYTHING (text included) while the spec
-       wants only the window BACKGROUND transparent. apply_theme() no
-       longer touches style.Alpha; SetNextWindowBgAlpha(s_opacity)
-       here is the single opacity source. */
+    {
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        float dt = io.DeltaTime;
+        float lh = ImGui::CalcTextSize("X").y;
+        if (lh <= 0.f) lh = 18.f;
+        int maxline = (int)((ds.y - 150.f) / lh) - 5;
+        if (maxline > 10) maxline = 10;
+        int i = 0;
+        for (int k = 0; k < (int)s_flash.size(); ) {
+            HitFlash& f = s_flash[k];
+            f.time -= dt;
+            f.gone -= dt;
+            if (f.gone <= 0.f || f.name.empty()) {
+                s_flash.erase(s_flash.begin() + k);
+                continue;
+            }
+            if (i < maxline) {
+                char lbl[300];
+                snprintf(lbl, sizeof(lbl), "%s (%ldx)",
+                         f.name.c_str(), f.count);
+                ImVec2 pos(20.f, 150.f + lh * (float)i);
+                ImVec2 ts = ImGui::CalcTextSize(lbl);
+                float g = f.time > 0.f
+                              ? (f.time > 1.f ? 1.f : f.time) : 0.f;
+                ImVec4 col(1.f - g, 1.f, 1.f - g, 1.f);
+                if (f.gone < 1.f) col.w = f.gone;
+                dl->AddRectFilled(pos,
+                                  ImVec2(pos.x + ts.x, pos.y + ts.y),
+                                  IM_COL32(0, 0, 0, 100));
+                dl->AddText(pos, ImGui::GetColorU32(col), lbl);
+                i++;
+            }
+            k++;
+        }
+    }
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse;
+    if (s_fullscreen) {
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ds);
+        wflags |= ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+    } else {
+        if (s_fs_restore) {
+            s_fs_restore = false;
+            ImGui::SetNextWindowPos(s_fs_last_pos);
+            ImGui::SetNextWindowSize(s_fs_last_size);
+        }
+        ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
+        ImGui::SetNextWindowSizeConstraints(
+            ImVec2(420, 300), ImVec2(ds.x * .95f, ds.y * .95f));
+        ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f),
+                                 ImGuiCond_Once);
+    }
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r27)", &open,
-                 ImGuiWindowFlags_NoCollapse);
+    ImGui::Begin("Dex-tool v1.3 (r28)", &open, wflags);
     if (!open) {
         MLK();
         s_visible = false;
         s_conf_dirty = true;
-        /* r23 UI polish: pressing the window X with the toggle button
-           disabled stranded the menu (nothing could bring it back) -
-           the FAB force-returns, same policy as the Settings rescue */
         if (!s_show_fab) s_show_fab = true;
         MULK();
     }
-
-    if (ImGui::BeginTabBar("tb")) {
+    if (ImGui::BeginTabBar("mainTabber")) {
         struct TabDef { const char* name; void (*fn)(); };
-        /* r26: EXACT order + names of the field spec: Classes,
-           Patches, Trackers, Hooks, Recorder, Monitor, Script,
-           Settings */
         TabDef tabs[] = {
-            {"Classes",  tab_classes},  {"Patches",  tab_patches},
-            {"Trackers", tab_tracker},  {"Hooks",    tab_hooks},
+            {"Tools",    tab_tools},    {"Tracer",   tab_tracer},
+            {"Patches",  tab_patches},  {"Dumper",   tab_dumper},
             {"Recorder", tab_recorder}, {"Monitor",  tab_monitor},
             {"Script",   tab_script},   {"Settings", tab_settings},
         };
@@ -2959,24 +2963,23 @@ void menu_draw() {
         }
         ImGui::EndTabBar();
     }
-    /* r26: clipboard echo (Copy Method Name / Copy Class Name / the
-       source copy) - visible for 2.5 s under the tab bar */
     if (s_clip_msg[0] && conf_now_ms() - s_clip_ms < 2500)
         ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1), "%s", s_clip_msg);
+    if (s_open_objfinder) {
+        s_open_objfinder = false;
+        ImGui::OpenPopup("ObjFinderPopup");
+    }
+    if (s_open_fmview) {
+        s_open_fmview = false;
+        ImGui::OpenPopup("fmPopup");
+    }
+    objfinder_popup();
+    fm_popup();
     ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
     ImGui::End();
-    /* the whole window body pans at the overlay speed */
     mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
-    /* r26: the floating spec windows - Class Explorer(s), one
-       Inspector per opened class, Full Method View, Object Finder */
-    draw_explorer_windows(ds);
-    draw_class_windows(ds);
-    draw_fm_window(ds);
-    draw_object_finder(ds);
     overlay_publish_scroll_regions(s_regions);
     s_regions.clear();
-
-    /* debounce the conf write so sliders do not hit the disk 60x/s */
     if (s_conf_dirty && s_conf_path[0] &&
         conf_now_ms() - s_conf_last_ms > 700) {
         conf_save();

@@ -8,10 +8,6 @@ void logger_init(const char* base_dir);
 void log_info(const char* msg);
 void log_debug(const char* msg);
 void log_crash_raw(const char* msg);
-/* r11: base dir captured at init, for menu.cpp config IO */
 const char* logger_base_dir();
 void logger_install_abort_capture();
-/* r16: re-point the log files at the app's real private dir after
-   JNI_OnLoad (DexToolApp.nativeSetLogDir). Append-only: nothing
-   already written is lost. */
 void logger_retarget(const char* base_dir);

@@ -8,9 +8,7 @@
 #include <ctime>
 #include <cstdio>
 #include <sys/stat.h>
-
 JavaVM* g_jvm_global = nullptr;
-
 static void write_marker(const char* path, const char* msg) {
     int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
     if (fd < 0) return;
@@ -19,27 +17,12 @@ static void write_marker(const char* path, const char* msg) {
     write(fd, buf, (size_t)n);
     close(fd);
 }
-
 static void write_marker_in(const char* dir, const char* name,
                             const char* msg) {
     char p[600];
     snprintf(p, sizeof(p), "%s/%s", dir, name);
     write_marker(p, msg);
 }
-
-/* r15: the Java log copier (DexToolApp.copyLogs) reads
-   getFilesDir()/dextool-logs/ - but the native side logged to
-   /sdcard/Download, so the copier never saw the files (and the
-   /sdcard writes themselves fail silently under scoped storage on
-   newer devices). Resolve the app's private dir via JNI and log
-   THERE; /sdcard/Download stays as the fallback when the JVM or
-   the Application is not reachable.
-   r16: currentApplication() is frequently still NULL during
-   Application.onCreate (JNI_OnLoad runs inside
-   System.loadLibrary), so the fallback wins exactly when the
-   logs matter most. DexToolApp now calls nativeSetLogDir() right
-   after loadLibrary; this JNI resolution remains the safety net
-   for other entry points. */
 static void resolve_log_dir(char* out, size_t n) {
     snprintf(out, n, "/sdcard/Download");
     JNIEnv* env = nullptr;
@@ -77,11 +60,6 @@ static void resolve_log_dir(char* out, size_t n) {
     } while (0);
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
-
-/* r16: called by DexToolApp right after System.loadLibrary. That
-   is the one moment the Java side knows getFilesDir() for certain
-   and the native logger can still be re-pointed cheaply (see
-   logger_retarget). */
 extern "C" JNIEXPORT void JNICALL
 Java_com_dextool_app_DexToolApp_nativeSetLogDir(JNIEnv* env, jclass,
                                                 jstring path) {
@@ -91,7 +69,6 @@ Java_com_dextool_app_DexToolApp_nativeSetLogDir(JNIEnv* env, jclass,
     logger_retarget(p);
     env->ReleaseStringUTFChars(path, p);
 }
-
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void*) {
     g_jvm_global = vm;

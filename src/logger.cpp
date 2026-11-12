@@ -12,16 +12,13 @@
 #include <ucontext.h>
 #include <dlfcn.h>
 #include <pthread.h>
-
 static FILE* g_info_fp  = nullptr;
 static FILE* g_debug_fp = nullptr;
 static int   g_crash_fd = -1;
 static bool  g_stdio_redirected = false;   /* r22/audit: fds 1/2 point at the crash log */
 static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
-
 const char* logger_base_dir() { return g_base_dir; }
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-
 static void ts(char* buf, size_t n) {
     time_t t = time(nullptr);
     struct tm tm;
@@ -30,16 +27,9 @@ static void ts(char* buf, size_t n) {
              tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
-
-/* Fatal-signal capture. SA_SIGINFO logs signal/si_code/fault
-   addr/PC, then the PREVIOUS handler is restored and the signal
-   re-raised so debuggerd still writes its tombstone and the
-   "Fatal signal" backtrace to logcat (streamed to
-   dextool-logcat.txt by DexToolApp). */
 static struct sigaction g_prev_act[32];
 static bool             g_prev_set[32];
 static char             g_alt_stack[64 * 1024];
-
 static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
     uintptr_t pc = 0;
     ucontext_t* u = (ucontext_t*)uc;
@@ -71,7 +61,6 @@ static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
     }
     raise(sig);
 }
-
 static void install_crash_sig(int sig) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -80,7 +69,6 @@ static void install_crash_sig(int sig) {
     sigemptyset(&sa.sa_mask);
     g_prev_set[sig] = (sigaction(sig, &sa, &g_prev_act[sig]) == 0);
 }
-
 void logger_init(const char* base_dir) {
     mkdir(base_dir, 0755);
     snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
@@ -89,21 +77,12 @@ void logger_init(const char* base_dir) {
     g_info_fp  = fopen(p, "a");
     snprintf(p, sizeof(p), "%s/dextool-debug.log",  base_dir);
     g_debug_fp = fopen(p, "a");
-    /* keep last boot's crash log; start fresh for this boot so
-       entries map 1:1 to runs */
     char pprev[640];
     snprintf(pprev, sizeof(pprev), "%s/dextool-crash.prev.log", base_dir);
     snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
     rename(p, pprev);
-    /* r16: O_APPEND - every write lands atomically at EOF,
-       so concurrent appends (Java uncaught-exception handler,
-       copier) can never clobber an offset */
     g_crash_fd = open(p, O_WRONLY|O_CREAT|O_TRUNC|O_APPEND, 0644);
     {
-        /* r22/audit: the runtime installs its own alternate stack on
-           the main thread (stack-overflow handling); only add ours
-           when none is usable - replacing it broke the runtime's
-           own stack-overflow path */
         stack_t old;
         memset(&old, 0, sizeof(old));
         if (sigaltstack(NULL, &old) != 0 || (old.ss_flags & SS_DISABLE) ||
@@ -126,9 +105,6 @@ void logger_init(const char* base_dir) {
         snprintf(boot, sizeof(boot), "--- boot %ld ---\n", (long)time(nullptr));
         log_crash_raw(boot);
     }
-    /* r14: memory snapshot at boot. lmkd kills (the "crash when I
-       open any app" class) are invisible to signal handlers, so the
-       field report must show how much headroom the process had. */
     {
         char ln[256];
         long avail = -1, rss = -1;
@@ -149,21 +125,8 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r27: UI spec v2 integrated - family dropdown popup opens with a real-time Search families box (package names only), class windows wrap the full class name to the window width, methods answer long-press with the context menu (right-click and ... kept), method sub-tabs renamed Call/Patch/Trace/Hook, object parameters are dropdowns with auto instance scan + Find/Create entry (free-form value input kept), fields list under a Fields tree node, Call Count input and Call Results log, Manual Input in the Patch tab, r26 window restructure kept)");
+    log_info("logger_init done (build r28: the real IL2CPP Tool structure - one window, main tabs Tools/Tracer/Patches/Dumper/Recorder/Monitor/Script/Settings, Tools holds the inner tabber with the leading + button and closeable explorer tabs plus one tab per opened class and one [0x..] tab per object (the floating r26 windows are gone), methods are colored tree nodes with Call/Patch/Trace sub-tabs, Tracer tab lists traced methods with hit counts and a Quick Restore popup, hit flashes are painted on the background draw list from throttled hookHit events, Dumper tab writes dextool-classes.txt / object JSON via the agent, Settings uses the 7-step Scale combo and an Info section with the package name)");
 }
-
-/* r16: re-point the logs at the app's real private dir.
-   JNI_OnLoad runs inside System.loadLibrary from
-   Application.onCreate - before onCreate has finished - and on
-   many Android versions ActivityThread.currentApplication() is
-   still null there, so resolve_log_dir() fell back to
-   /sdcard/Download (unwritable under scoped storage on modern
-   devices) while the Java copier read
-   getFilesDir()/dextool-logs. DexToolApp knows its own dir with
-   certainty and hands it over right after loadLibrary. Files are
-   reopened APPEND-ONLY (no truncate, no rename) so everything
-   written to the fallback dir earlier stays intact and nothing
-   already logged is lost. */
 void logger_retarget(const char* base_dir) {
     if (!base_dir || !base_dir[0]) return;
     if (strcmp(base_dir, g_base_dir) == 0) return;
@@ -176,9 +139,6 @@ void logger_retarget(const char* base_dir) {
     g_info_fp = fopen(p, "a");
     snprintf(p, sizeof(p), "%s/dextool-debug.log", base_dir);
     g_debug_fp = fopen(p, "a");
-    /* r22/audit: the PRIVATE dir's crash log was never rotated here
-       (logger_init rotates the FALLBACK dir's) - without this it
-       grows across runs and dextool-crash.prev.log never exists */
     {
         char pprev[640];
         snprintf(pprev, sizeof(pprev), "%s/dextool-crash.prev.log", base_dir);
@@ -186,16 +146,10 @@ void logger_retarget(const char* base_dir) {
         rename(p, pprev);
     }
     if (g_crash_fd >= 0) {
-        /* r16: dup2 replaces the descriptor ATOMICALLY in the fd
-           table - a concurrent log_crash_raw() (no mutex: it runs
-           in signal handlers) hits either the old or the new file,
-           never a closed or recycled descriptor */
         snprintf(p, sizeof(p), "%s/dextool-crash.log", base_dir);
         int nfd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
         if (nfd >= 0) {
             dup2(nfd, g_crash_fd);
-            /* r22/audit: stdout/stderr were duplicated from the OLD
-               crash fd; they must follow it to the new file too */
             if (g_stdio_redirected) {
                 dup2(nfd, STDOUT_FILENO);
                 dup2(nfd, STDERR_FILENO);
@@ -213,10 +167,7 @@ void logger_retarget(const char* base_dir) {
         log_info(m);
     }
 }
-
 void log_info(const char* msg) {
-    /* r22/audit: the FILE* is tested UNDER the lock - retarget()
-       closes/reopens it and a check before the lock raced that */
     pthread_mutex_lock(&g_mtx);
     if (g_info_fp) {
         char t[32]; ts(t, sizeof(t));
@@ -225,9 +176,7 @@ void log_info(const char* msg) {
     }
     pthread_mutex_unlock(&g_mtx);
 }
-
 void log_debug(const char* msg) {
-    /* r22/audit: same race as log_info - check under the lock */
     pthread_mutex_lock(&g_mtx);
     if (g_debug_fp) {
         char t[32]; ts(t, sizeof(t));
@@ -236,11 +185,9 @@ void log_debug(const char* msg) {
     }
     pthread_mutex_unlock(&g_mtx);
 }
-
 void log_crash_raw(const char* msg) {
     if (g_crash_fd >= 0) write(g_crash_fd, msg, strlen(msg));
 }
-
 static void glib_log_capture(const gchar* domain, GLogLevelFlags level,
                              const gchar* message, gpointer) {
     const char* lv =
@@ -252,15 +199,11 @@ static void glib_log_capture(const gchar* domain, GLogLevelFlags level,
              domain ? domain : "GLib", lv, message ? message : "(null)");
     log_crash_raw(m);
     if (level & G_LOG_FLAG_FATAL) {
-        /* custom handler must abort fatal messages itself */
         abort();
     }
 }
-
 static void dt_terminate() {
     log_crash_raw("std::terminate called\n");
-    /* r22/audit: rethrowing a NULL exception_ptr is undefined -
-       terminate() can run with no active exception */
     std::exception_ptr ep = std::current_exception();
     if (ep) {
         try { std::rethrow_exception(ep); }
@@ -276,7 +219,6 @@ static void dt_terminate() {
     }
     abort();
 }
-
 void logger_install_abort_capture() {
     if (g_crash_fd >= 0) {
         dup2(g_crash_fd, STDOUT_FILENO);

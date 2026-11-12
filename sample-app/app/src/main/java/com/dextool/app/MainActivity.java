@@ -1,5 +1,4 @@
 package com.dextool.app;
-
 import android.app.Activity;
 import android.opengl.GLSurfaceView;
 import static android.opengl.GLES20.glClearColor;
@@ -9,10 +8,8 @@ import static android.opengl.GLES20.GL_COLOR_BUFFER_BIT;
 import android.os.Bundle;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
-
 public class MainActivity extends Activity {
     private GLSurfaceView mGLView;
-
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -31,7 +28,6 @@ public class MainActivity extends Activity {
         });
         setContentView(mGLView);
     }
-
     @Override protected void onResume() { super.onResume(); mGLView.onResume(); }
     @Override protected void onPause()  { super.onPause();  mGLView.onPause();  }
 }
