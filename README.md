@@ -1,7 +1,94 @@
 # Dex-tool
 
+
+## What this is
+
+Dex-tool is a runtime inspector for Android apps: a Frida-GumJS agent
+plus an ImGui overlay injected into the host process. It browses
+loaded classes, inspects and patches static/instance fields, traces
+method calls, calls methods, creates instances, hooks methods (Java
+source, smali skeleton or the one-tap Patch NOP), dumps classes and
+objects to file, and records/monitors network + Activity traffic.
+Touch-first menu: single-tap toggle button, drag-to-move, edge-drag
+resize, IME-aware text fields.
+
+## How to build
+
+The workflow `.github/workflows/build.yml` IS the source of truth: it
+writes `src/`, `agent/agent.js`, `sample-app/` and this README from
+inline heredocs, builds `libtool.so` + the sample APK with the NDK and
+commits the generated tree back. Hand edits under `src/` are
+overwritten by the next CI run - change the heredocs, not the tree.
+
+## Known limitations
+
+- The C-side JSON handling is a small hand-rolled scanner. The
+  current agent message set is safe; nested duplicate keys would need
+  a real parser (deferred, see the r30 notes).
+- One recursive mutex guards most shared UI state; the JS thread can
+  stall for the duration of a frame (deferred, r30 notes).
+- The overlay needs a GL context on the screen it draws on; on
+  context loss it parks itself without GL calls and re-inits on the
+  next one (r30).
+
+
+
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+## Fixes in this version (r30)
+
+Applied from the external code review (dex-tool-review.md); every
+finding was verified against the tree before patching.
+
+- **C1** the hit-flash overlay loop runs under the menu mutex now -
+  flash_hit() pushes from the JS thread and the loop iterated and
+  erased s_flash unlocked (use-after-free on realloc).
+- **C2** s_classes, s_objtabs, s_explorers, s_trackers, s_rec, s_mon
+  and s_cons moved to std::deque: opening a class tab from inside a
+  method-arg pick used to push_back into s_classes while the whole
+  call chain still held a ClassTab& (use-after-free). deque keeps
+  references stable across push_back.
+- **C3** the agent prefix-matches hook modes ("Nop (auto)" reached
+  do_addHook un-mapped and fell through silently) and do_addHook
+  reports hookFailed for unknown modes. The one-tap Nop itself
+  already existed ("Patch NOP" button) and keeps working.
+- **C4** dumpObject / dumpLoadedClasses are in FN_ARGS - the
+  per-object "Dump to file" used to call dumpObject(undefined,
+  undefined) and always report "handle gone (GC)".
+- **H3** the stale OpenPopup("fmPopup") trigger and its dead twin are
+  gone, together with the s_open_fmview flag; the context menu sets
+  s_fm_open directly.
+- **H4** a legacy font= value is honored again (the scale is derived
+  from it) instead of being parsed and then discarded.
+- **H5** touch-queue overflow clears the whole pending gesture (never
+  a lone DOWN) and MOVE events no longer fabricate a button press, so
+  the virtual mouse cannot get stuck down after a burst.
+- **H6** on context loss the overlay parks ImGui without issuing any
+  glDelete* - ForgetDeviceObjects against a foreign context was
+  deleting the host app's GL objects.
+- **M1** the tool no longer dup2()s the host app's stdout/stderr into
+  the crash log; the app keeps its console.
+- **M2** the crash signal handler is async-signal-safe: manual hex
+  formatting + write(), no snprintf and no dladdr (both can deadlock
+  on the stdio/loader locks during the very crash being reported).
+- **M5** logger_init / logger_retarget create the full directory
+  chain - a missing directory used to silence all logging.
+- **M7** setInstanceField without a valid handle now reports
+  "instance handle gone (GC)" instead of re-running Java.choose and
+  patching whatever object the old scan index resolved to.
+- **M9** apply_theme() runs only when the theme changes.
+- junesc() pairs UTF-16 surrogate escapes before encoding, so emoji
+  in agent output survive.
+- **Not applied, with reasons:** H1/M3/M6 cite src/smali_runtime.cpp
+  which does not exist in this project (the smali path is agent-side
+  JS); H2's malformed-JSON mechanism does not reproduce
+  (raw_json_string is escape-boundary correct and the raw form is
+  valid JSON when re-embedded); M4a (real JSON parser), M7a (retain
+  policy) and M8 (lock scope) are deferred as larger refactors; the
+  CI-regeneration structural change would break this project's
+  yml-heredoc delivery model and stays as documented above.
+
 
 ## Fixes in this version (r29)
 

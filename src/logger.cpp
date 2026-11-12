@@ -15,7 +15,6 @@
 static FILE* g_info_fp  = nullptr;
 static FILE* g_debug_fp = nullptr;
 static int   g_crash_fd = -1;
-static bool  g_stdio_redirected = false;   /* r22/audit: fds 1/2 point at the crash log */
 static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
 const char* logger_base_dir() { return g_base_dir; }
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -30,6 +29,21 @@ static void ts(char* buf, size_t n) {
 static struct sigaction g_prev_act[32];
 static bool             g_prev_set[32];
 static char             g_alt_stack[64 * 1024];
+static int crash_ux(char* dst, unsigned long v) {
+    /* r30 M2: async-signal-safe hex formatter (no stdio) */
+    int n = 0;
+    dst[n++] = '0';
+    dst[n++] = 'x';
+    char tmp[18];
+    int t = 0;
+    do {
+        int d = (int)(v & 15ul);
+        tmp[t++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        v >>= 4;
+    } while (v && t < 16);
+    while (t) dst[n++] = tmp[--t];
+    return n;
+}
 static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
     uintptr_t pc = 0;
     ucontext_t* u = (ucontext_t*)uc;
@@ -38,21 +52,28 @@ static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
 #elif defined(__arm__)
     if (u) pc = (uintptr_t)u->uc_mcontext.arm_pc;
 #endif
-    char m[160];
-    snprintf(m, sizeof(m), "CRASH signal=%d code=%d addr=%p pc=%p\n",
-   sig, si ? si->si_code : 0,
-             si ? si->si_addr : NULL, (void*)pc);
-    log_crash_raw(m);
     {
-        Dl_info di;
-        if (dladdr((const void*)pc, &di) && di.dli_fname) {
-            char lm[256];
-            snprintf(lm, sizeof(lm),
-                     "pc=%p in %s base=%p off=+%zx\n",
-                     (void*)pc, di.dli_fname, di.dli_fbase,
-                     (size_t)(pc - (uintptr_t)di.dli_fbase));
-            log_crash_raw(lm);
-        }
+        /* r30 M2: async-signal-safe only - no snprintf (stdio lock)
+           and no dladdr (loader lock): they can deadlock exactly on
+           the crash they are supposed to report. write() only. */
+        char m[160];
+        size_t n = 0;
+        const char* q = "CRASH signal=";
+        while (*q && n < sizeof(m) - 1) m[n++] = *q++;
+        n += (size_t)crash_ux(m + n, (unsigned long)sig);
+        q = " code=";
+        while (*q && n < sizeof(m) - 1) m[n++] = *q++;
+        n += (size_t)crash_ux(m + n, (unsigned long)(si ? si->si_code : 0));
+        q = " addr=";
+        while (*q && n < sizeof(m) - 1) m[n++] = *q++;
+        n += (size_t)crash_ux(m + n,
+                              (unsigned long)(si ? (uintptr_t)si->si_addr : 0));
+        q = " pc=";
+        while (*q && n < sizeof(m) - 1) m[n++] = *q++;
+        n += (size_t)crash_ux(m + n, (unsigned long)pc);
+        if (n < sizeof(m) - 1) m[n++] = '\n';
+        m[n] = 0;
+        log_crash_raw(m);
     }
     if (g_prev_set[sig]) {
         sigaction(sig, &g_prev_act[sig], NULL);
@@ -69,8 +90,24 @@ static void install_crash_sig(int sig) {
     sigemptyset(&sa.sa_mask);
     g_prev_set[sig] = (sigaction(sig, &sa, &g_prev_act[sig]) == 0);
 }
+static void mkdir_p(const char* path) {
+    /* r30 M5: create the whole base-dir chain - a missing directory
+       used to silence all logging (fopen just failed) */
+    char tmp[600];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t l = strlen(tmp);
+    while (l > 1 && tmp[l - 1] == '/') tmp[--l] = 0;
+    for (char* q = tmp + 1; *q; q++) {
+        if (*q == '/') {
+            *q = 0;
+            mkdir(tmp, 0755);
+            *q = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
 void logger_init(const char* base_dir) {
-    mkdir(base_dir, 0755);
+    mkdir_p(base_dir);
     snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
     char p[640];
     snprintf(p, sizeof(p), "%s/dextool.log",       base_dir);
@@ -125,7 +162,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r29: single-tap FAB toggle, the menu resizes by dragging its left/right/bottom edges, Class Families and Full Method View are movable windows, instance find/create/manual/Saved Objects merged into the Inspector Instances sub-tab and the Object Finder popup is gone, method-arg picking opens the class Instances tab with a picking banner, list heights follow the menu size via fit_h, duplicated forward declarations cleaned)");
+    log_info("logger_init done (build r30: review fixes - C1 flash loop locked, C2 tab containers on std::deque for stable references, C3 hook mode Nop (auto) prefix-matched and unknown modes report hookFailed, C4 dumpObject args wired in FN_ARGS, H3 dead fmPopup trigger removed, H4 legacy font= honored, H5 touch overflow drops whole gestures and MOVE no longer fabricates presses, H6 no GL deletes on foreign contexts, M1 host stdout/stderr left alone, M2 async-signal-safe crash handler, M5 logger dirs mkdir -p, M7 setInstanceField reports stale handles, M9 theme applied on change, junesc pairs surrogate escapes)");
 }
 void logger_retarget(const char* base_dir) {
     if (!base_dir || !base_dir[0]) return;
@@ -133,6 +170,7 @@ void logger_retarget(const char* base_dir) {
     pthread_mutex_lock(&g_mtx);
     if (g_info_fp)  { fclose(g_info_fp);  g_info_fp  = nullptr; }
     if (g_debug_fp) { fclose(g_debug_fp); g_debug_fp = nullptr; }
+    mkdir_p(base_dir);   /* r30 M5: retarget may hit a fresh dir */
     snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
     char p[640];
     snprintf(p, sizeof(p), "%s/dextool.log", base_dir);
@@ -150,10 +188,6 @@ void logger_retarget(const char* base_dir) {
         int nfd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
         if (nfd >= 0) {
             dup2(nfd, g_crash_fd);
-            if (g_stdio_redirected) {
-                dup2(nfd, STDOUT_FILENO);
-                dup2(nfd, STDERR_FILENO);
-            }
             close(nfd);
         }
     } else {
@@ -220,11 +254,8 @@ static void dt_terminate() {
     abort();
 }
 void logger_install_abort_capture() {
-    if (g_crash_fd >= 0) {
-        dup2(g_crash_fd, STDOUT_FILENO);
-        dup2(g_crash_fd, STDERR_FILENO);
-        g_stdio_redirected = true;
-    }
+    /* r30 M1: no longer hijack the host app's stdout/stderr - the
+       crash log keeps its own fd and the app keeps its console */
     g_log_set_default_handler(glib_log_capture, nullptr);
     std::set_terminate(dt_terminate);
     log_info("abort capture installed (glib+terminate+stderr -> crash log)");

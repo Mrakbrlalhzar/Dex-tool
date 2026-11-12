@@ -30,6 +30,15 @@ static fn_swap_dmg    g_orig_swap_dmg    = nullptr;
 static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
 static fn_terminate   g_orig_terminate   = nullptr;
 IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects();
+static void imgui_park_without_gl() {
+    /* r30 H6: ForgetDeviceObjects issues glDelete* against whatever
+       context is current - on a foreign context that destroys the
+       HOST's GL objects. Park ImGui without any GL call; the next
+       Init on a fresh context recreates everything. */
+    ImGuiIO& io = ImGui::GetIO();
+    io.BackendRendererName     = nullptr;
+    io.BackendRendererUserData = nullptr;
+}
 static std::atomic<bool> g_gum_inited {false};
 static JavaVM*           g_jvm        = nullptr;
 #define DT_ELECT_MIN_SWAPS 45
@@ -112,7 +121,9 @@ static void touch_push(float x, float y, int phase) {
         return;                          /* duplicate from the 2nd path */
     g_touch_last = {x, y, phase};
     g_touch_last_ms = now;
-    if (g_touch_q.size() > 96) g_touch_q.erase(g_touch_q.begin());
+    if (g_touch_q.size() > 96) g_touch_q.clear();   /* r30 H5: drop the
+        whole pending gesture - dropping the oldest single event could
+        separate a DOWN from its UP */
     g_touch_q.push_back({x, y, phase});
 }
 extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
@@ -280,7 +291,7 @@ static bool ensure_ownership(Slot* s, EGLContext ctx, EGLDisplay dpy,
                 g_orphan_dh = g_disp_h;
             }
             ImGui::SetCurrentContext(g_orphan_imgui);
-            ImGui_ImplOpenGL3_ForgetDeviceObjects();
+            imgui_park_without_gl();
             clear_window_rects();   /* nothing draws for this world
                                        until a context adopts it */
             LOGI("[overlay] owner migrated - old ImGui world parked "
@@ -394,7 +405,7 @@ static void slot_destroy(EGLContext ctx) {
                 ImGui_ImplOpenGL3_Shutdown();
             } else {
                 ImGui::SetCurrentContext(g_orphan_imgui);
-                ImGui_ImplOpenGL3_ForgetDeviceObjects();
+                imgui_park_without_gl();
             }
             clear_window_rects();   /* r23: this world draws nothing
                                        until a new context adopts it */
@@ -586,7 +597,9 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
             if (t.phase == 0) io.AddMouseButtonEvent(0, true);
             if (t.phase == 1) io.AddMouseButtonEvent(0, false);
             if (t.phase == 2) {
-                io.AddMouseButtonEvent(0, true);
+                /* r30 H5: MOVE no longer fabricates a button press -
+                   a queue-overflowed DOWN used to leave the virtual
+                   mouse stuck down forever */
                 if (have_prev) {
                     float sp = region_speed_at(prev.x, prev.y);
                     if (sp > 0.f) {
@@ -683,7 +696,7 @@ static EGLBoolean my_terminate(EGLDisplay dpy) {
                     g_orphan_dh = g_disp_h;
                 }
                 ImGui::SetCurrentContext(g_orphan_imgui);
-                ImGui_ImplOpenGL3_ForgetDeviceObjects();
+                imgui_park_without_gl();
                 clear_window_rects();
                 LOGI("[overlay] display terminated - ImGui parked, "
                      "waiting for the next GL context");

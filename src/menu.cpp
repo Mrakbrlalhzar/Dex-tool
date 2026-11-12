@@ -1,8 +1,8 @@
-/* Dex-tool menu (r29): single-tap FAB toggle, resize by dragging the
-   left/right/bottom edges, Class Families + Full Method View as
-   movable windows, instances (find/create/saved/arg-pick) merged
-   into the Inspector's Instances sub-tab, list heights follow the
-   menu size (fit_h). The Object Finder popup is gone. */
+/* Dex-tool menu (r30): review round - C1 flash loop locked, C2 tab
+   containers on std::deque (stable refs), H3 dead fmPopup trigger
+   removed, H4 legacy font= honored, M9 theme on change, junesc
+   surrogate pairs. r29: single-tap FAB, edge resize, movable
+   windows, instances merged into the Inspector. */
 #include "menu.h"
 #include "overlay.h"
 #include "frida_bridge.h"
@@ -10,6 +10,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include <string>
+#include <deque>   /* r30 C2: stable refs across push_back */
 #include <vector>
 #include <cstdio>
 #include <cstring>
@@ -122,7 +123,7 @@ struct ExplorerWin {
     int  filter_by = 0;           /* 0 Class 1 Method 2 Field        */
     bool advanced = false;        /* string search inside class code */
 };
-static std::vector<ExplorerWin> s_explorers;
+static std::deque<ExplorerWin> s_explorers;
 static std::vector<std::string> s_families;   /* com.game, com.android... */
 static bool s_expl_req = false;               /* "+" pressed               */
 static int  s_expl_seq = 0;
@@ -143,13 +144,13 @@ static char        s_fm_note[200] = "";
 static bool        s_fm_have = false;
 static char s_clip_msg[192] = "";
 static long s_clip_ms = 0;
-static std::vector<ClassTab>  s_classes;
+static std::deque<ClassTab>  s_classes;
 static std::vector<PatchRow>   s_patches;
 static std::vector<HookRow>    s_hooks;
-static std::vector<Tracker>    s_trackers;
-static std::vector<RecRow>     s_rec;
-static std::vector<MonRow>     s_mon;
-static std::vector<std::string> s_cons;      /* script console */
+static std::deque<Tracker>    s_trackers;
+static std::deque<RecRow>     s_rec;
+static std::deque<MonRow>     s_mon;
+static std::deque<std::string> s_cons;      /* script console */
 static bool  s_rec_on=false;  static char s_rec_stat[128]="idle";
 static int   s_rec_installed=0, s_rec_total=0;
 static char  s_rec_filter[120]="";           /* empty = host package */
@@ -209,7 +210,7 @@ struct ObjTab {
     int  sel = -1;               /* field row being edited            */
     char edit[256] = {};         /* its edit buffer                   */
 };
-static std::vector<ObjTab> s_objtabs;
+static std::deque<ObjTab> s_objtabs;
 static long s_objfocus = -1;     /* handle of the tab to select       */
 struct SavedObj { std::string cls, str; long handle = -1; };
 static std::vector<SavedObj> s_saved;
@@ -220,7 +221,6 @@ static char  s_dump_path[512] = "";
 static char  s_dump_note[192] = "";
 static char  s_dobj_note[192] = "";
 static std::string s_pkg = "(unknown)";
-static bool s_open_fmview    = false;
 /* r29: instances live in the Inspector's Instances sub-tab; these
    hold the "pick for method arg" target while a pick is active */
 static int  s_arg_uid = -1;      /* class tab owning the arg      */
@@ -277,6 +277,36 @@ static std::string junesc(const std::string& s) {
                         else { v = 0xFFFF; break; }
                     }
                     i += 4;
+                    if (v >= 0xD800 && v <= 0xDBFF &&
+                        i + 6 < s.size() &&
+                        s[i + 1] == '\\' && s[i + 2] == 'u') {
+                        /* r30: pair the high surrogate before
+                           encoding instead of emitting broken UTF-8 */
+                        unsigned lo = 0;
+                        int ok = 1;
+                        for (int k2 = 3; k2 <= 6; k2++) {
+                            char h = s[i + k2];
+                            lo <<= 4;
+                            if (h >= '0' && h <= '9')
+                                lo |= (unsigned)(h - '0');
+                            else if (h >= 'a' && h <= 'f')
+                                lo |= (unsigned)(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F')
+                                lo |= (unsigned)(h - 'A' + 10);
+                            else { ok = 0; break; }
+                        }
+                        if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            unsigned cp = 0x10000u
+                                        + ((v - 0xD800u) << 10)
+                                        + (lo - 0xDC00u);
+                            r += (char)(0xF0 | (cp >> 18));
+                            r += (char)(0x80 | ((cp >> 12) & 0x3F));
+                            r += (char)(0x80 | ((cp >> 6) & 0x3F));
+                            r += (char)(0x80 | (cp & 0x3F));
+                            i += 6;
+                            break;
+                        }
+                    }
                     if (v < 0x80) r += (char)v;
                     else if (v < 0x800) {
                         r += (char)(0xC0 | (v >> 6));
@@ -567,6 +597,7 @@ static void conf_load() {
     FILE* f = fopen(s_conf_path, "r");
     if (!f) return;
     char ln[128];
+    bool have_scale = false;   /* r30 H4: honor a legacy font= value */
     while (fgets(ln, sizeof(ln), f)) {
         char* eq = strchr(ln, '=');
         if (!eq) continue;
@@ -580,11 +611,13 @@ static void conf_load() {
         else if (!strcmp(k, "lst"))    s_lst_scroll = v;
         else if (!strcmp(k, "ybias"))  s_y_off    = v;   /* r15: key renamed from yoff so a stale saved -80 cannot fight the new mapping */
         else if (!strcmp(k, "fab"))    s_show_fab = v > 0.5f;
-        else if (!strcmp(k, "scale"))  s_scale    = (int)v;   /* r28 */
+        else if (!strcmp(k, "scale"))  { s_scale = (int)v; have_scale = true; }
     }
     fclose(f);
-    if (s_scale < 0 || s_scale > 6) {
-        s_scale = 3;
+    if (s_scale < 0 || s_scale > 6) s_scale = 3;
+    if (!have_scale) {
+        /* r30 H4: a legacy font= value was parsed then discarded -
+           derive the scale from it instead */
         float best = 1e9f;
         for (int i = 0; i < 7; i++) {
             float d = k_scale_px[i] - s_font_size;
@@ -618,10 +651,14 @@ static void copy_text(const std::string& what, const std::string& text) {
     s_clip_ms = conf_now_ms();
 }
 static void apply_theme() {
-    switch (s_theme) {
-        case 0: ImGui::StyleColorsDark();    break;
-        case 1: ImGui::StyleColorsLight();   break;
-        case 2: ImGui::StyleColorsClassic(); break;
+    static int applied = -1;
+    if (applied != s_theme) {   /* r30 M9: on change, not every frame */
+        applied = s_theme;
+        switch (s_theme) {
+            case 0: ImGui::StyleColorsDark();    break;
+            case 1: ImGui::StyleColorsLight();   break;
+            case 2: ImGui::StyleColorsClassic(); break;
+        }
     }
     ImGui::GetIO().FontGlobalScale = 1.0f;   /* real size comes from the
                                                atlas, not from scaling */
@@ -2227,7 +2264,6 @@ static void methods_view(ClassTab& c) {
                         s_fm_mth  = m.name;
                         s_fm_open = true;
                         s_fm_have = false;
-                        s_open_fmview = true;   /* r28: deferred popup */
                         snprintf(s_fm_note, sizeof(s_fm_note),
                                  "disassembling...");
                         std::string a = "{\"class\":\"" + jesc(c.cname)
@@ -2954,6 +2990,7 @@ void menu_draw() {
     }
     draw_fab(ds);
     ime_frame_prelude();
+    MLK();   /* r30 C1: s_flash is pushed from the JS thread */
     {
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
         float dt = io.DeltaTime;
@@ -2989,6 +3026,7 @@ void menu_draw() {
             k++;
         }
     }
+    MULK();
     ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse;
     if (s_fullscreen) {
         ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -3008,7 +3046,7 @@ void menu_draw() {
     }
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r29)", &open, wflags);
+    ImGui::Begin("Dex-tool v1.3 (r30)", &open, wflags);
     if (!open) {
         MLK();
         s_visible = false;
@@ -3040,15 +3078,6 @@ void menu_draw() {
     }
     if (s_clip_msg[0] && conf_now_ms() - s_clip_ms < 2500)
         ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1), "%s", s_clip_msg);
-    if (s_open_fmview) {
-        s_open_fmview = false;
-        ImGui::OpenPopup("fmPopup");
-    }
-    /* r29: full method view is a movable window now */
-    if (s_open_fmview) {
-        s_open_fmview = false;
-        s_fm_open = true;
-    }
     families_window();
     fm_window();
     if (!s_fullscreen) draw_resize_handles();

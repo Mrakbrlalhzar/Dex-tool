@@ -1,7 +1,7 @@
-/* Dex-tool agent (r29): no agent changes this round - the
-instance UI merged into the Inspector on the menu
-side. r28 added hookHit, dumpLoadedClasses /
-dumpObject and the package name in ready. */
+/* Dex-tool agent (r30): C3 hook-mode prefix match + unknown-mode
+   hookFailed report, C4 dumpObject / dumpLoadedClasses wired into
+   FN_ARGS, M7 setInstanceField reports stale handles instead of
+   patching by a stale scan index. r29: no agent change. */
 'use strict';
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
 var gAgentLog = null;
@@ -1422,6 +1422,10 @@ function do_addHook(cls, method, mode, code) {
         hooks[key] = st3;
         sendMsg('smaliReady', { name: key, ok: 1, error: '' });
         sendMsg('hookAdded', { name: key });
+    } else {
+        /* r30 C3: never fail silently on an unknown mode */
+        sendMsg('hookFailed',
+                { name: key, error: 'unknown hook mode: ' + mode });
     }
 }
 function do_addTracker(cls, method) {
@@ -1529,7 +1533,8 @@ rpc.exports = {
         var ml = String(mode).toLowerCase();
         if (ml.indexOf('java') === 0) mode = 'Java';
         else if (ml === 'smali') mode = 'Smali';
-        else if (ml === 'noop' || ml === 'nop') mode = 'noop';
+        else if (ml.indexOf('nop') === 0 || ml.indexOf('noop') === 0)
+            mode = 'noop';   /* r30 C3: the UI sends "Nop (auto)" */
         Java.perform(function () {
             if (!dt_is_loaded(cls)) {
                 defer_install('hook', cls, function () {
@@ -2017,29 +2022,12 @@ rpc.exports = {
                 }
                 return;
             }
-            try {
-                var found = [];
-                Java.choose(cls, {
-                    onMatch: function (inst) {
-                        found.push(inst);
-                        if (found.length > index + 1) return 'stop';
-                    },
-                    onComplete: function () {
-                        try {
-                            var inst = found[index];
-                            if (!inst) throw new Error('no instance #' + index);
-                            var jc = Java.use(cls);
-                            var f = jc.class.getDeclaredField(field);
-                            f.setAccessible(true);
-                            set_field_value(f, inst, value);
-                            sendMsg('patchApplied', { name: key });
-                        } catch (e2) {
-                            sendMsg('patchFailed', { name: key,
-                                                     error: String(e2.message || e2) });
-                        }
-                    }
-                });
-            } catch (e) {}
+            /* r30 M7: the old fallback re-ran Java.choose and
+               patched found[index] - that index came from an earlier
+               scan and could resolve to a DIFFERENT object. Report
+               instead of silently patching the wrong instance. */
+            sendMsg('patchFailed', { name: key,
+                error: 'instance handle gone (GC) - re-scan and pick again' });
         });
     },
     callMethod: function (cls, method, args, handle, count, main) {
@@ -2567,7 +2555,10 @@ var FN_ARGS = {
     listInstances:   ['class'],
     setInstanceField:['class', 'index', 'field', 'value', 'handle'],
     callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
-    createInstance:  ['class']
+    createInstance:  ['class'],
+    dumpLoadedClasses: [],              /* r30 C4 */
+    dumpObject:      ['cls', 'handle']  /* r30 C4: per-object dump
+                                           was dead (undefined args) */
 };
 agentLog('phase: deferred init scheduled');
 setTimeout(function () {
@@ -2591,6 +2582,6 @@ setTimeout(function () {
         var appR = ATr.currentApplication();
         if (appR) pkgR = String(appR.getPackageName());
     } catch (eP) {}
-    sendMsg('ready', { msg: 'Dex-tool agent r29 loaded', pkg: pkgR });
+    sendMsg('ready', { msg: 'Dex-tool agent r30 loaded', pkg: pkgR });
     agentLog('phase: ready sent');
 }, 0);
