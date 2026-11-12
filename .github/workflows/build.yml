@@ -338,7 +338,6 @@ jobs:
           static FILE* g_info_fp  = nullptr;
           static FILE* g_debug_fp = nullptr;
           static int   g_crash_fd = -1;
-          static bool  g_stdio_redirected = false;   /* r22/audit: fds 1/2 point at the crash log */
           static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
           const char* logger_base_dir() { return g_base_dir; }
           static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -353,6 +352,21 @@ jobs:
           static struct sigaction g_prev_act[32];
           static bool             g_prev_set[32];
           static char             g_alt_stack[64 * 1024];
+          static int crash_ux(char* dst, unsigned long v) {
+              /* r30 M2: async-signal-safe hex formatter (no stdio) */
+              int n = 0;
+              dst[n++] = '0';
+              dst[n++] = 'x';
+              char tmp[18];
+              int t = 0;
+              do {
+                  int d = (int)(v & 15ul);
+                  tmp[t++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+                  v >>= 4;
+              } while (v && t < 16);
+              while (t) dst[n++] = tmp[--t];
+              return n;
+          }
           static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
               uintptr_t pc = 0;
               ucontext_t* u = (ucontext_t*)uc;
@@ -361,21 +375,28 @@ jobs:
           #elif defined(__arm__)
               if (u) pc = (uintptr_t)u->uc_mcontext.arm_pc;
           #endif
-              char m[160];
-              snprintf(m, sizeof(m), "CRASH signal=%d code=%d addr=%p pc=%p\n",
-             sig, si ? si->si_code : 0,
-                       si ? si->si_addr : NULL, (void*)pc);
-              log_crash_raw(m);
               {
-                  Dl_info di;
-                  if (dladdr((const void*)pc, &di) && di.dli_fname) {
-                      char lm[256];
-                      snprintf(lm, sizeof(lm),
-                               "pc=%p in %s base=%p off=+%zx\n",
-                               (void*)pc, di.dli_fname, di.dli_fbase,
-                               (size_t)(pc - (uintptr_t)di.dli_fbase));
-                      log_crash_raw(lm);
-                  }
+                  /* r30 M2: async-signal-safe only - no snprintf (stdio lock)
+                     and no dladdr (loader lock): they can deadlock exactly on
+                     the crash they are supposed to report. write() only. */
+                  char m[160];
+                  size_t n = 0;
+                  const char* q = "CRASH signal=";
+                  while (*q && n < sizeof(m) - 1) m[n++] = *q++;
+                  n += (size_t)crash_ux(m + n, (unsigned long)sig);
+                  q = " code=";
+                  while (*q && n < sizeof(m) - 1) m[n++] = *q++;
+                  n += (size_t)crash_ux(m + n, (unsigned long)(si ? si->si_code : 0));
+                  q = " addr=";
+                  while (*q && n < sizeof(m) - 1) m[n++] = *q++;
+                  n += (size_t)crash_ux(m + n,
+                                        (unsigned long)(si ? (uintptr_t)si->si_addr : 0));
+                  q = " pc=";
+                  while (*q && n < sizeof(m) - 1) m[n++] = *q++;
+                  n += (size_t)crash_ux(m + n, (unsigned long)pc);
+                  if (n < sizeof(m) - 1) m[n++] = '\n';
+                  m[n] = 0;
+                  log_crash_raw(m);
               }
               if (g_prev_set[sig]) {
                   sigaction(sig, &g_prev_act[sig], NULL);
@@ -392,8 +413,24 @@ jobs:
               sigemptyset(&sa.sa_mask);
               g_prev_set[sig] = (sigaction(sig, &sa, &g_prev_act[sig]) == 0);
           }
+          static void mkdir_p(const char* path) {
+              /* r30 M5: create the whole base-dir chain - a missing directory
+                 used to silence all logging (fopen just failed) */
+              char tmp[600];
+              snprintf(tmp, sizeof(tmp), "%s", path);
+              size_t l = strlen(tmp);
+              while (l > 1 && tmp[l - 1] == '/') tmp[--l] = 0;
+              for (char* q = tmp + 1; *q; q++) {
+                  if (*q == '/') {
+                      *q = 0;
+                      mkdir(tmp, 0755);
+                      *q = '/';
+                  }
+              }
+              mkdir(tmp, 0755);
+          }
           void logger_init(const char* base_dir) {
-              mkdir(base_dir, 0755);
+              mkdir_p(base_dir);
               snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
               char p[640];
               snprintf(p, sizeof(p), "%s/dextool.log",       base_dir);
@@ -448,7 +485,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r29: single-tap FAB toggle, the menu resizes by dragging its left/right/bottom edges, Class Families and Full Method View are movable windows, instance find/create/manual/Saved Objects merged into the Inspector Instances sub-tab and the Object Finder popup is gone, method-arg picking opens the class Instances tab with a picking banner, list heights follow the menu size via fit_h, duplicated forward declarations cleaned)");
+              log_info("logger_init done (build r30: review fixes - C1 flash loop locked, C2 tab containers on std::deque for stable references, C3 hook mode Nop (auto) prefix-matched and unknown modes report hookFailed, C4 dumpObject args wired in FN_ARGS, H3 dead fmPopup trigger removed, H4 legacy font= honored, H5 touch overflow drops whole gestures and MOVE no longer fabricates presses, H6 no GL deletes on foreign contexts, M1 host stdout/stderr left alone, M2 async-signal-safe crash handler, M5 logger dirs mkdir -p, M7 setInstanceField reports stale handles, M9 theme applied on change, junesc pairs surrogate escapes)");
           }
           void logger_retarget(const char* base_dir) {
               if (!base_dir || !base_dir[0]) return;
@@ -456,6 +493,7 @@ jobs:
               pthread_mutex_lock(&g_mtx);
               if (g_info_fp)  { fclose(g_info_fp);  g_info_fp  = nullptr; }
               if (g_debug_fp) { fclose(g_debug_fp); g_debug_fp = nullptr; }
+              mkdir_p(base_dir);   /* r30 M5: retarget may hit a fresh dir */
               snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
               char p[640];
               snprintf(p, sizeof(p), "%s/dextool.log", base_dir);
@@ -473,10 +511,6 @@ jobs:
                   int nfd = open(p, O_WRONLY|O_CREAT|O_APPEND, 0644);
                   if (nfd >= 0) {
                       dup2(nfd, g_crash_fd);
-                      if (g_stdio_redirected) {
-                          dup2(nfd, STDOUT_FILENO);
-                          dup2(nfd, STDERR_FILENO);
-                      }
                       close(nfd);
                   }
               } else {
@@ -543,11 +577,8 @@ jobs:
               abort();
           }
           void logger_install_abort_capture() {
-              if (g_crash_fd >= 0) {
-                  dup2(g_crash_fd, STDOUT_FILENO);
-                  dup2(g_crash_fd, STDERR_FILENO);
-                  g_stdio_redirected = true;
-              }
+              /* r30 M1: no longer hijack the host app's stdout/stderr - the
+                 crash log keeps its own fd and the app keeps its console */
               g_log_set_default_handler(glib_log_capture, nullptr);
               std::set_terminate(dt_terminate);
               log_info("abort capture installed (glib+terminate+stderr -> crash log)");
@@ -623,6 +654,15 @@ jobs:
           static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
           static fn_terminate   g_orig_terminate   = nullptr;
           IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects();
+          static void imgui_park_without_gl() {
+              /* r30 H6: ForgetDeviceObjects issues glDelete* against whatever
+                 context is current - on a foreign context that destroys the
+                 HOST's GL objects. Park ImGui without any GL call; the next
+                 Init on a fresh context recreates everything. */
+              ImGuiIO& io = ImGui::GetIO();
+              io.BackendRendererName     = nullptr;
+              io.BackendRendererUserData = nullptr;
+          }
           static std::atomic<bool> g_gum_inited {false};
           static JavaVM*           g_jvm        = nullptr;
           #define DT_ELECT_MIN_SWAPS 45
@@ -705,7 +745,9 @@ jobs:
                   return;                          /* duplicate from the 2nd path */
               g_touch_last = {x, y, phase};
               g_touch_last_ms = now;
-              if (g_touch_q.size() > 96) g_touch_q.erase(g_touch_q.begin());
+              if (g_touch_q.size() > 96) g_touch_q.clear();   /* r30 H5: drop the
+                  whole pending gesture - dropping the oldest single event could
+                  separate a DOWN from its UP */
               g_touch_q.push_back({x, y, phase});
           }
           extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
@@ -873,7 +915,7 @@ jobs:
                           g_orphan_dh = g_disp_h;
                       }
                       ImGui::SetCurrentContext(g_orphan_imgui);
-                      ImGui_ImplOpenGL3_ForgetDeviceObjects();
+                      imgui_park_without_gl();
                       clear_window_rects();   /* nothing draws for this world
                                                  until a context adopts it */
                       LOGI("[overlay] owner migrated - old ImGui world parked "
@@ -987,7 +1029,7 @@ jobs:
                           ImGui_ImplOpenGL3_Shutdown();
                       } else {
                           ImGui::SetCurrentContext(g_orphan_imgui);
-                          ImGui_ImplOpenGL3_ForgetDeviceObjects();
+                          imgui_park_without_gl();
                       }
                       clear_window_rects();   /* r23: this world draws nothing
                                                  until a new context adopts it */
@@ -1179,7 +1221,9 @@ jobs:
                       if (t.phase == 0) io.AddMouseButtonEvent(0, true);
                       if (t.phase == 1) io.AddMouseButtonEvent(0, false);
                       if (t.phase == 2) {
-                          io.AddMouseButtonEvent(0, true);
+                          /* r30 H5: MOVE no longer fabricates a button press -
+                             a queue-overflowed DOWN used to leave the virtual
+                             mouse stuck down forever */
                           if (have_prev) {
                               float sp = region_speed_at(prev.x, prev.y);
                               if (sp > 0.f) {
@@ -1276,7 +1320,7 @@ jobs:
                               g_orphan_dh = g_disp_h;
                           }
                           ImGui::SetCurrentContext(g_orphan_imgui);
-                          ImGui_ImplOpenGL3_ForgetDeviceObjects();
+                          imgui_park_without_gl();
                           clear_window_rects();
                           LOGI("[overlay] display terminated - ImGui parked, "
                                "waiting for the next GL context");
@@ -1586,11 +1630,11 @@ jobs:
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
-          /* Dex-tool menu (r29): single-tap FAB toggle, resize by dragging the
-             left/right/bottom edges, Class Families + Full Method View as
-             movable windows, instances (find/create/saved/arg-pick) merged
-             into the Inspector's Instances sub-tab, list heights follow the
-             menu size (fit_h). The Object Finder popup is gone. */
+          /* Dex-tool menu (r30): review round - C1 flash loop locked, C2 tab
+             containers on std::deque (stable refs), H3 dead fmPopup trigger
+             removed, H4 legacy font= honored, M9 theme on change, junesc
+             surrogate pairs. r29: single-tap FAB, edge resize, movable
+             windows, instances merged into the Inspector. */
           #include "menu.h"
           #include "overlay.h"
           #include "frida_bridge.h"
@@ -1598,6 +1642,7 @@ jobs:
           #include "imgui.h"
           #include "imgui_internal.h"
           #include <string>
+          #include <deque>   /* r30 C2: stable refs across push_back */
           #include <vector>
           #include <cstdio>
           #include <cstring>
@@ -1710,7 +1755,7 @@ jobs:
               int  filter_by = 0;           /* 0 Class 1 Method 2 Field        */
               bool advanced = false;        /* string search inside class code */
           };
-          static std::vector<ExplorerWin> s_explorers;
+          static std::deque<ExplorerWin> s_explorers;
           static std::vector<std::string> s_families;   /* com.game, com.android... */
           static bool s_expl_req = false;               /* "+" pressed               */
           static int  s_expl_seq = 0;
@@ -1731,13 +1776,13 @@ jobs:
           static bool        s_fm_have = false;
           static char s_clip_msg[192] = "";
           static long s_clip_ms = 0;
-          static std::vector<ClassTab>  s_classes;
+          static std::deque<ClassTab>  s_classes;
           static std::vector<PatchRow>   s_patches;
           static std::vector<HookRow>    s_hooks;
-          static std::vector<Tracker>    s_trackers;
-          static std::vector<RecRow>     s_rec;
-          static std::vector<MonRow>     s_mon;
-          static std::vector<std::string> s_cons;      /* script console */
+          static std::deque<Tracker>    s_trackers;
+          static std::deque<RecRow>     s_rec;
+          static std::deque<MonRow>     s_mon;
+          static std::deque<std::string> s_cons;      /* script console */
           static bool  s_rec_on=false;  static char s_rec_stat[128]="idle";
           static int   s_rec_installed=0, s_rec_total=0;
           static char  s_rec_filter[120]="";           /* empty = host package */
@@ -1797,7 +1842,7 @@ jobs:
               int  sel = -1;               /* field row being edited            */
               char edit[256] = {};         /* its edit buffer                   */
           };
-          static std::vector<ObjTab> s_objtabs;
+          static std::deque<ObjTab> s_objtabs;
           static long s_objfocus = -1;     /* handle of the tab to select       */
           struct SavedObj { std::string cls, str; long handle = -1; };
           static std::vector<SavedObj> s_saved;
@@ -1808,7 +1853,6 @@ jobs:
           static char  s_dump_note[192] = "";
           static char  s_dobj_note[192] = "";
           static std::string s_pkg = "(unknown)";
-          static bool s_open_fmview    = false;
           /* r29: instances live in the Inspector's Instances sub-tab; these
              hold the "pick for method arg" target while a pick is active */
           static int  s_arg_uid = -1;      /* class tab owning the arg      */
@@ -1865,6 +1909,36 @@ jobs:
                                   else { v = 0xFFFF; break; }
                               }
                               i += 4;
+                              if (v >= 0xD800 && v <= 0xDBFF &&
+                                  i + 6 < s.size() &&
+                                  s[i + 1] == '\\' && s[i + 2] == 'u') {
+                                  /* r30: pair the high surrogate before
+                                     encoding instead of emitting broken UTF-8 */
+                                  unsigned lo = 0;
+                                  int ok = 1;
+                                  for (int k2 = 3; k2 <= 6; k2++) {
+                                      char h = s[i + k2];
+                                      lo <<= 4;
+                                      if (h >= '0' && h <= '9')
+                                          lo |= (unsigned)(h - '0');
+                                      else if (h >= 'a' && h <= 'f')
+                                          lo |= (unsigned)(h - 'a' + 10);
+                                      else if (h >= 'A' && h <= 'F')
+                                          lo |= (unsigned)(h - 'A' + 10);
+                                      else { ok = 0; break; }
+                                  }
+                                  if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                                      unsigned cp = 0x10000u
+                                                  + ((v - 0xD800u) << 10)
+                                                  + (lo - 0xDC00u);
+                                      r += (char)(0xF0 | (cp >> 18));
+                                      r += (char)(0x80 | ((cp >> 12) & 0x3F));
+                                      r += (char)(0x80 | ((cp >> 6) & 0x3F));
+                                      r += (char)(0x80 | (cp & 0x3F));
+                                      i += 6;
+                                      break;
+                                  }
+                              }
                               if (v < 0x80) r += (char)v;
                               else if (v < 0x800) {
                                   r += (char)(0xC0 | (v >> 6));
@@ -2155,6 +2229,7 @@ jobs:
               FILE* f = fopen(s_conf_path, "r");
               if (!f) return;
               char ln[128];
+              bool have_scale = false;   /* r30 H4: honor a legacy font= value */
               while (fgets(ln, sizeof(ln), f)) {
                   char* eq = strchr(ln, '=');
                   if (!eq) continue;
@@ -2168,11 +2243,13 @@ jobs:
                   else if (!strcmp(k, "lst"))    s_lst_scroll = v;
                   else if (!strcmp(k, "ybias"))  s_y_off    = v;   /* r15: key renamed from yoff so a stale saved -80 cannot fight the new mapping */
                   else if (!strcmp(k, "fab"))    s_show_fab = v > 0.5f;
-                  else if (!strcmp(k, "scale"))  s_scale    = (int)v;   /* r28 */
+                  else if (!strcmp(k, "scale"))  { s_scale = (int)v; have_scale = true; }
               }
               fclose(f);
-              if (s_scale < 0 || s_scale > 6) {
-                  s_scale = 3;
+              if (s_scale < 0 || s_scale > 6) s_scale = 3;
+              if (!have_scale) {
+                  /* r30 H4: a legacy font= value was parsed then discarded -
+                     derive the scale from it instead */
                   float best = 1e9f;
                   for (int i = 0; i < 7; i++) {
                       float d = k_scale_px[i] - s_font_size;
@@ -2206,10 +2283,14 @@ jobs:
               s_clip_ms = conf_now_ms();
           }
           static void apply_theme() {
-              switch (s_theme) {
-                  case 0: ImGui::StyleColorsDark();    break;
-                  case 1: ImGui::StyleColorsLight();   break;
-                  case 2: ImGui::StyleColorsClassic(); break;
+              static int applied = -1;
+              if (applied != s_theme) {   /* r30 M9: on change, not every frame */
+                  applied = s_theme;
+                  switch (s_theme) {
+                      case 0: ImGui::StyleColorsDark();    break;
+                      case 1: ImGui::StyleColorsLight();   break;
+                      case 2: ImGui::StyleColorsClassic(); break;
+                  }
               }
               ImGui::GetIO().FontGlobalScale = 1.0f;   /* real size comes from the
                                                          atlas, not from scaling */
@@ -3815,7 +3896,6 @@ jobs:
                                   s_fm_mth  = m.name;
                                   s_fm_open = true;
                                   s_fm_have = false;
-                                  s_open_fmview = true;   /* r28: deferred popup */
                                   snprintf(s_fm_note, sizeof(s_fm_note),
                                            "disassembling...");
                                   std::string a = "{\"class\":\"" + jesc(c.cname)
@@ -4542,6 +4622,7 @@ jobs:
               }
               draw_fab(ds);
               ime_frame_prelude();
+              MLK();   /* r30 C1: s_flash is pushed from the JS thread */
               {
                   ImDrawList* dl = ImGui::GetBackgroundDrawList();
                   float dt = io.DeltaTime;
@@ -4577,6 +4658,7 @@ jobs:
                       k++;
                   }
               }
+              MULK();
               ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse;
               if (s_fullscreen) {
                   ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -4596,7 +4678,7 @@ jobs:
               }
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.3 (r29)", &open, wflags);
+              ImGui::Begin("Dex-tool v1.3 (r30)", &open, wflags);
               if (!open) {
                   MLK();
                   s_visible = false;
@@ -4628,15 +4710,6 @@ jobs:
               }
               if (s_clip_msg[0] && conf_now_ms() - s_clip_ms < 2500)
                   ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1), "%s", s_clip_msg);
-              if (s_open_fmview) {
-                  s_open_fmview = false;
-                  ImGui::OpenPopup("fmPopup");
-              }
-              /* r29: full method view is a movable window now */
-              if (s_open_fmview) {
-                  s_open_fmview = false;
-                  s_fm_open = true;
-              }
               families_window();
               fm_window();
               if (!s_fullscreen) draw_resize_handles();
@@ -4760,10 +4833,10 @@ jobs:
       - name: Generate agent.js
         run: |
           cat > agent/agent.js << 'DXTAGNT'
-          /* Dex-tool agent (r29): no agent changes this round - the
-          instance UI merged into the Inspector on the menu
-          side. r28 added hookHit, dumpLoadedClasses /
-          dumpObject and the package name in ready. */
+          /* Dex-tool agent (r30): C3 hook-mode prefix match + unknown-mode
+             hookFailed report, C4 dumpObject / dumpLoadedClasses wired into
+             FN_ARGS, M7 setInstanceField reports stale handles instead of
+             patching by a stale scan index. r29: no agent change. */
           'use strict';
           function sendMsg(type, payload) { send({ type: type, payload: payload }); }
           var gAgentLog = null;
@@ -6184,6 +6257,10 @@ jobs:
                   hooks[key] = st3;
                   sendMsg('smaliReady', { name: key, ok: 1, error: '' });
                   sendMsg('hookAdded', { name: key });
+              } else {
+                  /* r30 C3: never fail silently on an unknown mode */
+                  sendMsg('hookFailed',
+                          { name: key, error: 'unknown hook mode: ' + mode });
               }
           }
           function do_addTracker(cls, method) {
@@ -6291,7 +6368,8 @@ jobs:
                   var ml = String(mode).toLowerCase();
                   if (ml.indexOf('java') === 0) mode = 'Java';
                   else if (ml === 'smali') mode = 'Smali';
-                  else if (ml === 'noop' || ml === 'nop') mode = 'noop';
+                  else if (ml.indexOf('nop') === 0 || ml.indexOf('noop') === 0)
+                      mode = 'noop';   /* r30 C3: the UI sends "Nop (auto)" */
                   Java.perform(function () {
                       if (!dt_is_loaded(cls)) {
                           defer_install('hook', cls, function () {
@@ -6779,29 +6857,12 @@ jobs:
                           }
                           return;
                       }
-                      try {
-                          var found = [];
-                          Java.choose(cls, {
-                              onMatch: function (inst) {
-                                  found.push(inst);
-                                  if (found.length > index + 1) return 'stop';
-                              },
-                              onComplete: function () {
-                                  try {
-                                      var inst = found[index];
-                                      if (!inst) throw new Error('no instance #' + index);
-                                      var jc = Java.use(cls);
-                                      var f = jc.class.getDeclaredField(field);
-                                      f.setAccessible(true);
-                                      set_field_value(f, inst, value);
-                                      sendMsg('patchApplied', { name: key });
-                                  } catch (e2) {
-                                      sendMsg('patchFailed', { name: key,
-                                                               error: String(e2.message || e2) });
-                                  }
-                              }
-                          });
-                      } catch (e) {}
+                      /* r30 M7: the old fallback re-ran Java.choose and
+                         patched found[index] - that index came from an earlier
+                         scan and could resolve to a DIFFERENT object. Report
+                         instead of silently patching the wrong instance. */
+                      sendMsg('patchFailed', { name: key,
+                          error: 'instance handle gone (GC) - re-scan and pick again' });
                   });
               },
               callMethod: function (cls, method, args, handle, count, main) {
@@ -7329,7 +7390,10 @@ jobs:
               listInstances:   ['class'],
               setInstanceField:['class', 'index', 'field', 'value', 'handle'],
               callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
-              createInstance:  ['class']
+              createInstance:  ['class'],
+              dumpLoadedClasses: [],              /* r30 C4 */
+              dumpObject:      ['cls', 'handle']  /* r30 C4: per-object dump
+                                                     was dead (undefined args) */
           };
           agentLog('phase: deferred init scheduled');
           setTimeout(function () {
@@ -7353,7 +7417,7 @@ jobs:
                   var appR = ATr.currentApplication();
                   if (appR) pkgR = String(appR.getPackageName());
               } catch (eP) {}
-              sendMsg('ready', { msg: 'Dex-tool agent r29 loaded', pkg: pkgR });
+              sendMsg('ready', { msg: 'Dex-tool agent r30 loaded', pkg: pkgR });
               agentLog('phase: ready sent');
           }, 0);
           DXTAGNT
@@ -7710,8 +7774,95 @@ jobs:
           cat > README.md << 'DXTRDME'
           # Dex-tool
 
+
+          ## What this is
+
+          Dex-tool is a runtime inspector for Android apps: a Frida-GumJS agent
+          plus an ImGui overlay injected into the host process. It browses
+          loaded classes, inspects and patches static/instance fields, traces
+          method calls, calls methods, creates instances, hooks methods (Java
+          source, smali skeleton or the one-tap Patch NOP), dumps classes and
+          objects to file, and records/monitors network + Activity traffic.
+          Touch-first menu: single-tap toggle button, drag-to-move, edge-drag
+          resize, IME-aware text fields.
+
+          ## How to build
+
+          The workflow `.github/workflows/build.yml` IS the source of truth: it
+          writes `src/`, `agent/agent.js`, `sample-app/` and this README from
+          inline heredocs, builds `libtool.so` + the sample APK with the NDK and
+          commits the generated tree back. Hand edits under `src/` are
+          overwritten by the next CI run - change the heredocs, not the tree.
+
+          ## Known limitations
+
+          - The C-side JSON handling is a small hand-rolled scanner. The
+            current agent message set is safe; nested duplicate keys would need
+            a real parser (deferred, see the r30 notes).
+          - One recursive mutex guards most shared UI state; the JS thread can
+            stall for the duration of a frame (deferred, r30 notes).
+          - The overlay needs a GL context on the screen it draws on; on
+            context loss it parks itself without GL calls and re-inits on the
+            next one (r30).
+
+
+
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+          ## Fixes in this version (r30)
+
+          Applied from the external code review (dex-tool-review.md); every
+          finding was verified against the tree before patching.
+
+          - **C1** the hit-flash overlay loop runs under the menu mutex now -
+            flash_hit() pushes from the JS thread and the loop iterated and
+            erased s_flash unlocked (use-after-free on realloc).
+          - **C2** s_classes, s_objtabs, s_explorers, s_trackers, s_rec, s_mon
+            and s_cons moved to std::deque: opening a class tab from inside a
+            method-arg pick used to push_back into s_classes while the whole
+            call chain still held a ClassTab& (use-after-free). deque keeps
+            references stable across push_back.
+          - **C3** the agent prefix-matches hook modes ("Nop (auto)" reached
+            do_addHook un-mapped and fell through silently) and do_addHook
+            reports hookFailed for unknown modes. The one-tap Nop itself
+            already existed ("Patch NOP" button) and keeps working.
+          - **C4** dumpObject / dumpLoadedClasses are in FN_ARGS - the
+            per-object "Dump to file" used to call dumpObject(undefined,
+            undefined) and always report "handle gone (GC)".
+          - **H3** the stale OpenPopup("fmPopup") trigger and its dead twin are
+            gone, together with the s_open_fmview flag; the context menu sets
+            s_fm_open directly.
+          - **H4** a legacy font= value is honored again (the scale is derived
+            from it) instead of being parsed and then discarded.
+          - **H5** touch-queue overflow clears the whole pending gesture (never
+            a lone DOWN) and MOVE events no longer fabricate a button press, so
+            the virtual mouse cannot get stuck down after a burst.
+          - **H6** on context loss the overlay parks ImGui without issuing any
+            glDelete* - ForgetDeviceObjects against a foreign context was
+            deleting the host app's GL objects.
+          - **M1** the tool no longer dup2()s the host app's stdout/stderr into
+            the crash log; the app keeps its console.
+          - **M2** the crash signal handler is async-signal-safe: manual hex
+            formatting + write(), no snprintf and no dladdr (both can deadlock
+            on the stdio/loader locks during the very crash being reported).
+          - **M5** logger_init / logger_retarget create the full directory
+            chain - a missing directory used to silence all logging.
+          - **M7** setInstanceField without a valid handle now reports
+            "instance handle gone (GC)" instead of re-running Java.choose and
+            patching whatever object the old scan index resolved to.
+          - **M9** apply_theme() runs only when the theme changes.
+          - junesc() pairs UTF-16 surrogate escapes before encoding, so emoji
+            in agent output survive.
+          - **Not applied, with reasons:** H1/M3/M6 cite src/smali_runtime.cpp
+            which does not exist in this project (the smali path is agent-side
+            JS); H2's malformed-JSON mechanism does not reproduce
+            (raw_json_string is escape-boundary correct and the raw form is
+            valid JSON when re-embedded); M4a (real JSON parser), M7a (retain
+            policy) and M8 (lock scope) are deferred as larger refactors; the
+            CI-regeneration structural change would break this project's
+            yml-heredoc delivery model and stays as documented above.
+
 
           ## Fixes in this version (r29)
 
@@ -8573,7 +8724,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r29: single-tap FAB toggle, menu resizes by dragging its edges, Class Families and Full Method View as movable windows, instance find/create/saved merged into the Inspector Instances sub-tab (Object Finder popup removed), adaptive list heights (fit_h), dead declarations cleaned [skip ci]"
+            git commit -m "fix r30: review fixes - C1 flash lock, C2 deque containers, C3 hook mode match+report, C4 dumpObject FN_ARGS, H3 dead trigger removed, H4 font= honored, H5 touch overflow safety, H6 no foreign-context GL deletes, M1 no stdio hijack, M2 signal-safe crash handler, M5 mkdir -p, M7 stale-instance report, M9 theme on change, junesc surrogates [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
