@@ -515,7 +515,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r25: frame pump keeps render-on-demand hosts redrawing so the menu no longer hangs/lags/freezes on other apps, method source view via bundled baksmali (smali, editable into Smali hooks), one-tap Nop button (auto return value by method logic), method input/output patching with live values and per-item enable, network monitor logs requests AND responses with a click-to-open detail window (payload preview + originating method), class list sorted alphabetically with Android/Google/kotlin system classes filtered by default, 4 search modes: class name, method name, field name, code-text (const-string + static String values, matched members marked green), r24 field-tracker throttles/dispatcher lazy-parse/UP-leak fix kept)");
+              log_info("logger_init done (build r26: menu restructured per the field spec - main tabs Classes/Patches/Trackers/Hooks/Recorder/Monitor/Script/Settings, secondary bar of opened classes with a + that opens Class Explorer windows (family dropdown + All, Filter, pink Options: case-sensitive / filter by class-method-field / advanced code-text search), floating Class Inspector windows with Inspector button, Static Fields, Methods expanding into Caller (per-param inputs, Object Finder for object params, call count, Call and Call in Main Thread, per-call results log) / Patcher (manual value, Patch NOP, Redirect, live IO probe) / Tracer / Hooker, right-click method context menu (open in new window, full method view, copy names), Object Finder window with Java.choose find, $new create and manual reference, r25 frame pump/source view/monitor fixes kept)");
           }
 
           /* r16: re-point the logs at the app's real private dir.
@@ -2125,21 +2125,41 @@ jobs:
           #include <ctime>
 
           /* =====================================================================
-             Dex-tool menu (r12)
-             - every tab of the spec: Settings, Patches, Hooks, Tracker, Recorder,
-               Monitor, Script, Classes
-             - Classes lists ALL loaded classes by default (the agent pages them
-               in); the filter row is optional
-             - text input via the PHONE's keyboard: focusing a field posts
-               showIme to the agent (hidden EditText + TextWatcher -> add_char/
-               backspace); the r11 drawn keyboard is gone
+             Dex-tool menu (r26)
+             - UI RESTRUCTURE per the field spec:
+               * topmost main tabs, exact order: Classes, Patches, Trackers,
+                 Hooks, Recorder, Monitor, Script, Settings
+               * secondary tab bar: the OPENED classes, with a "+" button on the
+                 far right that opens a new Class Explorer WINDOW
+               * Class Explorer windows: family dropdown + All checkbox, search
+                 field + Filter button, pink Options popup (Case Sensitive,
+                 Filter by Class/Method/Field, Advanced code-text search, System
+                 classes gate) and the filtered class list
+               * Class Inspector windows (one per opened class): Inspector button
+                 (Object Finder), Static Fields, Methods list (tap = expand into
+                 Caller / Patcher / Tracer / Hooker sub-tabs; right-click or the
+                 "..." button = context menu: Open in new window / Full Method
+                 View / Copy Method Name / Copy Class Name), Fields list;
+                 minimize "-" and close "X" buttons in the window
+               * Caller tab: one input per parameter (primitives = text, objects
+                 = Find button -> Object Finder), Call Count, Call + Call in
+                 Main Thread buttons, per-call results log
+               * Patcher tab: manual value + Patch NOP + Redirect (the r25 live
+                 IO-probe editor kept inside it)
+               * Tracer tab: track this method + live event log
+               * Hooker tab: Java/Smali/Nop hook editor for this method
+               * Object Finder window: Find Objects (Java.choose), Create Object
+                 ($new), manual reference, results list; a click fills the
+                 caller parameter or the inspector's selected instance
+             - every tab of the spec; text input via the PHONE's keyboard (system
+               IME; focusing a field posts showIme to the agent)
              - DEADLOCK FIX ("open a class and the app freezes"): g_mtx is a
                RECURSIVE mutex now. tab_classes() used to lock it a second time
                while already holding it, and class_tab_content() nested again -
                the render thread self-deadlocked inside the eglSwapBuffers hook,
                which froze the host's GL thread: the whole app hung.
              - cross-linking: clicking a row in Tracker / Recorder / Monitor opens
-               that class in the Classes tab (menu_open_class)
+               that class in an inspector window (menu_open_class)
              - the recorder/monitor lists are fed by the agent in throttled
                batches; the recorder is scoped (package filter + method cap)
              - scrollable areas are published to the overlay, which converts
@@ -2147,7 +2167,7 @@ jobs:
              - UI state persists to <logdir>/dextool-ui.conf
              ===================================================================== */
 
-          /* recursive: tab_classes / class_tab_content / menu_open_class nest */
+          /* recursive: tab_classes / the class views / menu_open_class nest */
           static pthread_mutex_t g_mtx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
           #define MLK()   pthread_mutex_lock(&g_mtx)
           #define MULK()  pthread_mutex_unlock(&g_mtx)
@@ -2191,18 +2211,34 @@ jobs:
                              std::vector<FieldInfo> fields; };
           struct ClassTab {
               std::string cname;
+              int  uid = 0;                       /* r26: stable window/tab id */
+              bool win_close = false;             /* r26: X pressed -> erase */
               bool got_info = false, waiting = false;
               std::vector<MethodSig> methods;
               std::vector<FieldInfo> fields;
               std::vector<InstInfo>  instances;
               int  sel_inst = -1;
               int  gen = -1;                      /* r23: instance-list generation; part of the editor buffer key */
-              int  sub = 0;                       /* 0 Instances 1 Methods 2 Fields */
-              /* inline method-call editor */
-              bool call_open = false;
+              int  sub = 0;                       /* 0 Instances 1 Static Fields 2 Methods 3 Fields */
+              /* r26 method expansion: which method row is open + its sub-tab */
+              int  expanded = -1;                 /* index into methods, -1 none   */
+              int  msub = 0;                      /* 0 Caller 1 Patcher 2 Tracer 3 Hooker */
+              /* inline method-call editor (r26 Caller tab) */
               MethodSig call_sig;
               char call_args[8][128] = {};
-              std::string call_result;
+              char call_typ[8][64]   = {};        /* r26: parameter types          */
+              int  call_nargs = 0;
+              int  call_count = 1;                /* r26: Call Count input         */
+              std::vector<std::string> call_log;  /* r26: per-call results         */
+              /* r26 Patcher tab */
+              char patch_val[256] = {};           /* manual value                  */
+              std::string patch_note;
+              /* r26 Hooker tab */
+              int  hook_mode = 0;
+              char hook_code[4096] = {};
+              /* r26 Object Finder selection (Inspector button) */
+              long of_handle = -1;
+              std::string of_note;
               /* r25: method input/output patch editor. The agent probes ONE
                  call of the method (ioprobe layer), reports the captured
                  current values, and only the rows the user P-marked are
@@ -2242,6 +2278,51 @@ jobs:
              window (request body, response body peek, stream note) */
           struct MonRow   { std::string kind, url, method, origin, note, detail; };
 
+          /* r26: Class Explorer windows - the "+" button opens one; each has
+             its own search structure (field spec) while the agent result page
+             stream stays global (one qid at a time, like r25) */
+          struct ExplorerWin {
+              int  id = 0;
+              bool open = true;
+              char search[160] = {};
+              int  family = 0;              /* index into s_families           */
+              bool all_fam = true;          /* "All" checkbox = every family   */
+              bool case_sensitive = false;
+              int  filter_by = 0;           /* 0 Class 1 Method 2 Field        */
+              bool advanced = false;        /* string search inside class code */
+          };
+          /* r26: Object Finder window state (opened from a Caller object
+             parameter or the Inspector button of an inspector window) */
+          struct ObjFinder {
+              bool open = false;
+              char cls[200] = {};
+              char typ[96]  = {};
+              char manual[128] = {};
+              std::vector<InstInfo> results;
+              bool waiting  = false;        /* Java.choose scan in flight      */
+              bool creating = false;        /* $new in flight                  */
+              int  ctx_uid  = -1;           /* inspector that opened it        */
+              int  ctx_arg  = -1;           /* >=0: fill caller arg N; -1: the inspector */
+          };
+          static ObjFinder s_of;
+          static std::vector<ExplorerWin> s_explorers;
+          static std::vector<std::string> s_families;   /* com.game, com.android... */
+          static bool s_expl_req = false;               /* "+" pressed               */
+          static int  s_expl_seq = 0;
+          static int  s_tab_uid_seq = 0;
+          static int  s_focus_expl = 0;                 /* explorer id to raise     */
+          static std::string s_focus_win;               /* inspector title to raise */
+          /* r26: Full Method View window (method context menu) */
+          static bool        s_fm_open = false;
+          static std::string s_fm_cls, s_fm_mth;
+          static char        s_fm_src[16384] = "";
+          static char        s_fm_note[200] = "";
+          static bool        s_fm_have = false;
+          /* r26: clipboard echo - ImGui::SetClipboardText needs a backend the
+             touch bridge does not provide, so the toast IS the user feedback */
+          static char s_clip_msg[192] = "";
+          static long s_clip_ms = 0;
+
           static std::vector<ClassTab>  s_classes;
           static std::vector<PatchRow>   s_patches;
           static std::vector<HookRow>    s_hooks;
@@ -2266,9 +2347,11 @@ jobs:
           /* r25: 0 class name, 1 method name, 2 field name, 3 code text.
              s_search_sys=false hides android/androidx/com.android/com.google/
              java/javax/dalvik/kotlin packages (the field report asked for
-             "no Android and Google classes"); the checkbox brings them back. */
+             "no Android and Google classes"); the checkbox brings them back.
+             r26: s_search_cs = case-sensitive compare (Explorer Options). */
           static int  s_search_mode = 0;
           static bool s_search_sys  = false;
+          static bool s_search_cs   = false;
           /* r25: read-only source panel of the Hooks tab (real smali via the
              bundled baksmali; Java decompilation is NOT bundled) */
           static char s_hsrc[16384] = "";
@@ -2286,7 +2369,6 @@ jobs:
                                                   the first page OF THAT QID clears
                                                   the list - stale pages of an older
                                                   qid are dropped, not mixed in */
-          static std::string s_focus_cls;          /* class tab to select */
           static std::string s_next_tab;           /* top tab to select */
 
           /* ---------------- JSON helpers ---------------- */
@@ -2494,25 +2576,43 @@ jobs:
               if (s_cons.size() > 400) s_cons.erase(s_cons.begin());
           }
 
-          /* ---------------- cross-linking ---------------- */
-          void menu_open_class(const std::string& name) {
-              if (name.empty()) return;
+          /* ---------------- cross-linking ----------------
+             r26: class windows carry a STABLE uid so titles/ids survive
+             insertion of further windows ("Open in new window"). */
+          static std::string short_name(const std::string& cls) {
+              auto d = cls.rfind('.');
+              return (d == std::string::npos) ? cls : cls.substr(d + 1);
+          }
+          static std::string win_title(const ClassTab& c) {
+              return short_name(c.cname) + "##t" + std::to_string(c.uid);
+          }
+          /* open (or refresh) a class inspector window; r26: switch_tab=false
+             from the Explorer / secondary bar (the Classes main tab is already
+             up, the inspector window must not fight the tab selection) */
+          static ClassTab* open_inspector(const std::string& name, bool switch_tab) {
+              if (name.empty()) return nullptr;
+              ClassTab* out = nullptr;
               MLK();
-              bool have = false;
               for (auto& c : s_classes)
-                  if (c.cname == name) { have = true; c.waiting = true; break; }
-              if (!have) {
+                  if (c.cname == name) { c.waiting = true; out = &c; break; }
+              if (!out) {
                   ClassTab nt{};
-                  nt.cname = name;
+                  nt.cname   = name;
+                  nt.uid     = ++s_tab_uid_seq;
                   nt.waiting = true;
                   s_classes.push_back(nt);
+                  out = &s_classes.back();
               }
-              s_focus_cls = name;
-              s_next_tab  = "Classes";
+              s_focus_win = win_title(*out);
+              if (switch_tab) s_next_tab = "Classes";
               MULK();
               /* refresh from the agent (methods/fields); reply fills the tab */
               std::string a = "{\"class\":\"" + jesc(name) + "\"}";
               post_rpc("openClass", a);
+              return out;
+          }
+          void menu_open_class(const std::string& name) {
+              (void)open_inspector(name, true);
           }
 
           static ClassTab* find_tab(const std::string& n) {
@@ -2601,6 +2701,47 @@ jobs:
               return s.substr(0, d);
           }
 
+          /* r26: family of a class = first two package components (com.game).
+             The Explorer family dropdown is built from these. */
+          static std::string family_of(const std::string& cls) {
+              auto d1 = cls.find('.');
+              if (d1 == std::string::npos) return cls;
+              auto d2 = cls.find('.', d1 + 1);
+              if (d2 == std::string::npos) return cls;
+              return cls.substr(0, d2);
+          }
+          /* r26: split a parameter list on TOP-LEVEL commas only - generic
+             depth (Map<String,Integer>) and array brackets must not split */
+          static std::vector<std::string> split_params(const std::string& p) {
+              std::vector<std::string> ps;
+              std::string cur;
+              int depth = 0;
+              for (char ch : p) {
+                  if (ch == '<' || ch == '[') depth++;
+                  else if (ch == '>' || ch == ']') { if (depth > 0) depth--; }
+                  if (ch == ',' && depth == 0) { ps.push_back(cur); cur.clear(); continue; }
+                  cur += ch;
+              }
+              ps.push_back(cur);
+              if (ps.size() == 1 && ps[0].empty()) ps.clear();
+              for (auto& s : ps) {
+                  while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+                  while (!s.empty() && s.back() == ' ')  s.pop_back();
+              }
+              return ps;
+          }
+          /* r26: primitive parameter types get plain text inputs (field spec);
+             everything else is an object with a Find button (Object Finder) */
+          static bool is_prim_type(const std::string& t) {
+              std::string s = t;
+              if (s == "int32")   s = "int";
+              if (s == "int64")   s = "long";
+              if (s == "string" || s == "String") s = "java.lang.String";
+              return s == "int" || s == "long" || s == "short" || s == "byte" ||
+                     s == "char" || s == "float" || s == "double" ||
+                     s == "boolean" || s == "java.lang.String";
+          }
+
           /* ---------------- UI persistence ---------------- */
           static char  s_conf_path[512] = "";
           static bool  s_conf_dirty = false;
@@ -2648,6 +2789,18 @@ jobs:
               fclose(f);
               s_conf_dirty = false;
               s_conf_last_ms = conf_now_ms();
+          }
+
+          /* r26: copy text - ImGui::SetClipboardText plus an on-screen echo;
+             the touch bridge provides no system-clipboard backend, so the
+             toast below the tabs is the feedback the user actually sees */
+          static void copy_text(const std::string& what, const std::string& text) {
+              ImGui::SetClipboardText(text.c_str());
+              std::string t = text;
+              if (t.size() > 140) t = t.substr(0, 137) + "...";
+              snprintf(s_clip_msg, sizeof(s_clip_msg), "copied %s: %s",
+                       what.c_str(), t.c_str());
+              s_clip_ms = conf_now_ms();
           }
 
           /* ---------------- theme ---------------- */
@@ -2828,9 +2981,26 @@ jobs:
                       }
                   } else if (ty == "methodSrc") {
                       /* r25: real smali of one method (bundled baksmali) for
-                         the read-only source panel of the Hooks tab */
-                      if (jstr(j, "class") == s_hcls &&
-                          jstr(j, "method") == s_hmth) {
+                         the read-only source panel of the Hooks tab.
+                         r26: the Full Method View window gets the reply first
+                         when it is the one that asked. */
+                      if (s_fm_open && jstr(j, "class") == s_fm_cls &&
+                          jstr(j, "method") == s_fm_mth) {
+                          if (jnum(j, "ok")) {
+                              std::string src = jstr(j, "src");
+                              snprintf(s_fm_src, sizeof(s_fm_src), "%s", src.c_str());
+                              snprintf(s_fm_note, sizeof(s_fm_note),
+                                       "smali (bytecode) of %s.%s",
+                                       s_fm_cls.c_str(), s_fm_mth.c_str());
+                              s_fm_have = true;
+                          } else {
+                              s_fm_src[0] = 0;
+                              s_fm_have = false;
+                              snprintf(s_fm_note, sizeof(s_fm_note),
+                                       "source: %s", jstr(j, "error").c_str());
+                          }
+                      } else if (jstr(j, "class") == s_hcls &&
+                                 jstr(j, "method") == s_hmth) {
                           if (jnum(j, "ok")) {
                               std::string src = jstr(j, "src");
                               snprintf(s_hsrc, sizeof(s_hsrc), "%s", src.c_str());
@@ -2899,7 +3069,21 @@ jobs:
                           for (auto& c : jarr(j, "classes")) s_search_res.push_back(c);
                           s_search_total = (int)jnum(j, "total");
                           s_search_shown = (int)jnum(j, "shown");
-                          if (page + 1 >= jnum(j, "pages")) s_search_wait = false;
+                          if (page + 1 >= jnum(j, "pages")) {
+                              s_search_wait = false;
+                              /* r26: rebuild the Explorer family dropdown from
+                                 the COMPLETE list (partial pages would leave
+                                 families out) */
+                              s_families.clear();
+                              for (auto& n : s_search_res) {
+                                  std::string f = family_of(n);
+                                  if (!f.empty() &&
+                                      std::find(s_families.begin(), s_families.end(),
+                                                f) == s_families.end())
+                                      s_families.push_back(f);
+                              }
+                              std::sort(s_families.begin(), s_families.end());
+                          }
                       }
                   } else if (ty == "instanceList") {
                       /* r23: structured instances - {str, handle, fields:[{n,t,v}]}.
@@ -2907,32 +3091,60 @@ jobs:
                          containing | # or ;, and index-only addressing gave
                          setInstanceField/callMethod NO receiver at all. gen keys
                          the editor buffers; handle addresses the retained
-                         instance on the agent side. */
+                         instance on the agent side.
+                         r26: the SAME scan feeds the Object Finder when it is
+                         open for this class (its own copy, independent of any
+                         inspector tab). */
+                      std::vector<InstInfo> list;
+                      for (auto& o : jobjarr(j, "instances")) {
+                          InstInfo in;
+                          in.str    = jstr(o, "str");
+                          in.handle = jnum(o, "handle", -1);
+                          for (auto& fo : jobjarr(o, "fields")) {
+                              FieldInfo fi;
+                              fi.name  = jstr(fo, "n");
+                              fi.type  = jstr(fo, "t");
+                              fi.value = jstr(fo, "v");
+                              in.fields.push_back(std::move(fi));
+                          }
+                          list.push_back(std::move(in));
+                      }
                       ClassTab* c = find_tab(jstr(j, "class"));
                       if (c) {
-                          c->instances.clear();
+                          c->instances = list;
                           c->gen = (int)jnum(j, "gen");
-                          for (auto& o : jobjarr(j, "instances")) {
-                              InstInfo in;
-                              in.str    = jstr(o, "str");
-                              in.handle = jnum(o, "handle", -1);
-                              for (auto& fo : jobjarr(o, "fields")) {
-                                  FieldInfo fi;
-                                  fi.name  = jstr(fo, "n");
-                                  fi.type  = jstr(fo, "t");
-                                  fi.value = jstr(fo, "v");
-                                  in.fields.push_back(std::move(fi));
-                              }
-                              c->instances.push_back(std::move(in));
-                          }
                           c->sel_inst = -1;
                       }
+                      if (s_of.open && s_of.cls == jstr(j, "class")) {
+                          s_of.results = list;
+                          s_of.waiting = false;
+                      }
+                  } else if (ty == "instanceCreated") {
+                      /* r26: Object Finder "Create Object" result */
+                      InstInfo in;
+                      in.str    = jstr(j, "str");
+                      in.handle = jnum(j, "handle", -1);
+                      if (s_of.open && s_of.cls == jstr(j, "class")) {
+                          s_of.results.push_back(in);
+                          s_of.creating = false;
+                          s_of.waiting  = false;
+                      }
+                      push_console("[finder]", "created " + jstr(j, "class") +
+                                   " -> handle " + std::to_string(in.handle));
                   } else if (ty == "callResult") {
+                      /* r26: per-call results (Caller tab log); callMethod with
+                         count > 1 sends one message PER call (idx/of) */
                       ClassTab* c = find_tab(jstr(j, "class"));
                       if (c) {
-                          c->call_result = jhas(j, "ok") && jnum(j, "ok") ?
-                              jstr(j, "result") :
-                              ("ERR: " + jstr(j, "error"));
+                          long idx = jnum(j, "idx", 0), of = jnum(j, "of", 0);
+                          std::string body = jhas(j, "ok") && jnum(j, "ok") ?
+                              jstr(j, "result") : ("ERR: " + jstr(j, "error"));
+                          char hdr[32] = "";
+                          if (of > 1) snprintf(hdr, sizeof(hdr), "call %ld/%ld: ",
+                                               idx + 1, of);
+                          c->call_log.push_back(std::string(hdr) + body);
+                          if (c->call_log.size() > 200)
+                              c->call_log.erase(c->call_log.begin());
                       }
                   } else if (ty == "trackerEvent") {
                       std::string n = jstr(j, "name");
@@ -3505,163 +3717,356 @@ jobs:
               MULK();
           }
 
-          /* ===================== Classes ===================== */
-          static void class_tab_content(ClassTab& c) {
-              const char* subs[] = {"Instances", "Fields", "Methods"};
-              /* r13: unique tab-bar id - it used to be "cls", the same id as
-                 the outer class-tab bar of tab_classes(); the two bars shared
-                 one ImGuiTabBar state and the selection oscillated every frame
-                 (lists flashed and disappeared). */
-              if (ImGui::BeginTabBar("clssub")) {
-                  for (int si = 0; si < 3; si++) {
-                      if (ImGui::BeginTabItem(subs[si], nullptr, 0)) {
-                          c.sub = si;
-                          ImGui::EndTabItem();
+          /* ===================== Classes =====================
+             r26 restructure: the Classes MAIN tab hosts the secondary bar
+             (opened-class tabs + the "+" button); search moved into the Class
+             Explorer windows; class content moved into floating Inspector
+             windows. */
+          /* deferred "Open in new window": pushing into s_classes while the
+             window loop holds references would REALLOCATE the vector under
+             them - the duplicate is created after the loop instead */
+          static std::string s_dup_req;
+
+          static void run_search(const char* text, int mode, bool cs) {
+              MLK();
+              snprintf(s_search, sizeof(s_search), "%s", text);
+              s_search_mode = mode;
+              s_search_cs   = cs;
+              s_search_wait = true;
+              int sqid = ++s_search_seq;
+              s_search_qid   = sqid;     /* r23: generation armed at SEND time */
+              s_search_page0 = false;
+              MULK();
+              std::string a = "{\"filter\":\"" + jesc(s_search)
+                             + "\",\"qid\":" + std::to_string(sqid)
+                             + ",\"mode\":" + std::to_string(mode)
+                             + ",\"sys\":" + (s_search_sys ? "true" : "false")
+                             + ",\"cs\":" + (cs ? "true" : "false") + "}";
+              post_rpc("listLoadedClasses", a);
+          }
+
+          /* ---- Instances (receiver picker + live field editor) ---- */
+          static void inst_view(ClassTab& c) {
+              if (ImGui::Button("Find instances##fi")) {
+                  std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
+                  post_rpc("listInstances", a);
+              }
+              if (c.instances.empty()) {
+                  ImGui::TextDisabled("no instances loaded - tap Find instances");
+              }
+              for (int i = 0; i < (int)c.instances.size(); i++) {
+                  ImGui::PushID(i);
+                  bool sel = (c.sel_inst == i);
+                  char lbl[256];
+                  snprintf(lbl, sizeof(lbl), "#%d %s", i,
+                           c.instances[i].str.c_str());
+                  if (ImGui::Selectable(lbl, sel)) c.sel_inst = i;
+                  ImGui::PopID();
+              }
+              if (c.sel_inst >= 0 && c.sel_inst < (int)c.instances.size()) {
+                  InstInfo& in = c.instances[c.sel_inst];
+                  ImGui::Separator();
+                  ImGui::Text("fields of #%d:", c.sel_inst);
+                  /* edit buffers are (re)filled only when a different instance
+                     is picked, not every frame - otherwise the user's typing
+                     would be overwritten before it ever reaches the agent.
+                     r23: the key used to be the BARE index - picking instance
+                     0 of another class kept the stale text of the previous
+                     class (nv_for still matched). The key is class + list
+                     generation + index now. */
+                  static char        nv[32][128];
+                  static std::string nv_key;
+                  static int         nv_idx = -1;
+                  {
+                      std::string key = c.cname + "#" + std::to_string(c.gen);
+                      if (key != nv_key || nv_idx != c.sel_inst) {
+                          nv_key = key;
+                          nv_idx = c.sel_inst;
+                          for (int f = 0; f < 32; f++) {
+                              nv[f][0] = 0;
+                              if (f < (int)in.fields.size())
+                                  snprintf(nv[f], sizeof(nv[f]), "%s",
+                                           in.fields[f].value.c_str());
+                          }
                       }
                   }
-                  ImGui::EndTabBar();
-              }
-              if (!c.got_info)
-                  ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
-                                                : "(no data - tap Refresh)");
-
-              if (ImGui::Button("Refresh"))
-                  menu_open_class(c.cname);
-              ImGui::Separator();
-
-              if (c.sub == 0) {                        /* ---- Instances ---- */
-                  if (ImGui::Button("Find instances##fi")) {
-                      std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
-                      post_rpc("listInstances", a);
-                  }
-                  if (c.instances.empty()) {
-                      ImGui::TextDisabled("no instances loaded - tap Find instances");
-                  }
-                  for (int i = 0; i < (int)c.instances.size(); i++) {
-                      ImGui::PushID(i);
-                      bool sel = (c.sel_inst == i);
-                      char lbl[256];
-                      snprintf(lbl, sizeof(lbl), "#%d %s", i,
-                               c.instances[i].str.c_str());
-                      if (ImGui::Selectable(lbl, sel)) c.sel_inst = i;
+                  for (int f = 0; f < (int)in.fields.size() && f < 32; f++) {
+                      FieldInfo& fi = in.fields[f];
+                      ImGui::PushID(1000 + f);
+                      ImGui::Text("%s (%s)", fi.name.c_str(), fi.type.c_str());
+                      ImGui::SameLine();
+                      if (ImGui::SmallButton("Track##ft")) {
+                          std::string a = "{\"class\":\"" + jesc(c.cname)
+                                        + "\",\"field\":\"" + jesc(fi.name) + "\"}";
+                          post_rpc("trackField", a);
+                          MLK();
+                          s_trackers.push_back({c.cname + "." + fi.name, true, {}});
+                          MULK();
+                      }
+                      ImGui::Text("  value:");
+                      ImGui::SameLine();
+                      ImGui::SetNextItemWidth(140);
+                      ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper */
+                      ImGui::SameLine();
+                      if (ImGui::Button("Set##fs")) {
+                          /* r23: address the instance by the agent's retained
+                             handle when one exists - the index-only request
+                             had NO receiver, so f.set() failed on every
+                             instance field (same fix as callMethod below) */
+                          long h = in.handle;
+                          std::string a = "{\"class\":\"" + jesc(c.cname)
+                                        + "\",\"handle\":" + std::to_string(h)
+                                        + ",\"index\":" + std::to_string(c.sel_inst)
+                                        + ",\"field\":\"" + jesc(fi.name)
+                                        + "\",\"value\":\"" + jesc(nv[f]) + "\"}";
+                          post_rpc("setInstanceField", a);
+                      }
                       ImGui::PopID();
                   }
-                  if (c.sel_inst >= 0 && c.sel_inst < (int)c.instances.size()) {
-                      InstInfo& in = c.instances[c.sel_inst];
-                      ImGui::Separator();
-                      ImGui::Text("fields of #%d:", c.sel_inst);
-                      /* edit buffers are (re)filled only when a different instance
-                         is picked, not every frame - otherwise the user's typing
-                         would be overwritten before it ever reaches the agent.
-                         r23: the key used to be the BARE index - picking instance
-                         0 of another class kept the stale text of the previous
-                         class (nv_for still matched). The key is class + list
-                         generation + index now. */
-                      static char        nv[32][128];
-                      static std::string nv_key;
-                      static int         nv_idx = -1;
-                      {
-                          std::string key = c.cname + "#" + std::to_string(c.gen);
-                          if (key != nv_key || nv_idx != c.sel_inst) {
-                              nv_key = key;
-                              nv_idx = c.sel_inst;
-                              for (int f = 0; f < 32; f++) {
-                                  nv[f][0] = 0;
-                                  if (f < (int)in.fields.size())
-                                      snprintf(nv[f], sizeof(nv[f]), "%s",
-                                               in.fields[f].value.c_str());
-                              }
-                          }
-                      }
-                      for (int f = 0; f < (int)in.fields.size() && f < 32; f++) {
-                          FieldInfo& fi = in.fields[f];
-                          ImGui::PushID(1000 + f);
-                          ImGui::Text("%s (%s)", fi.name.c_str(), fi.type.c_str());
-                          ImGui::SameLine();
-                          if (ImGui::SmallButton("Track##ft")) {
-                              std::string a = "{\"class\":\"" + jesc(c.cname)
-                                            + "\",\"field\":\"" + jesc(fi.name) + "\"}";
-                              post_rpc("trackField", a);
-                              MLK();
-                              s_trackers.push_back({c.cname + "." + fi.name,
-                                                    true, {}});
-                              MULK();
-                          }
-                          ImGui::Text("  value:");
-                          ImGui::SameLine();
-                          ImGui::SetNextItemWidth(140);
-                          ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper - raw InputText never opened the keyboard */
-                          ImGui::SameLine();
-                          if (ImGui::Button("Set##fs")) {
-                              /* r23: address the instance by the agent's retained
-                                 handle when one exists - the index-only request
-                                 had NO receiver, so f.set() failed on every
-                                 instance field (same fix as callMethod below) */
-                              long h = in.handle;
-                              std::string a = "{\"class\":\"" + jesc(c.cname)
-                                            + "\",\"handle\":" + std::to_string(h)
-                                            + ",\"index\":" + std::to_string(c.sel_inst)
-                                            + ",\"field\":\"" + jesc(fi.name)
-                                            + "\",\"value\":\"" + jesc(nv[f]) + "\"}";
-                              post_rpc("setInstanceField", a);
-                          }
-                          ImGui::PopID();
-                      }
+              }
+          }
+
+          /* ---- Static Fields (field spec: its own section) ----
+             The agent marks every field "(static)"/"(instance)" until the
+             values are read on demand, so the split is client-side. */
+          static void static_fields_view(ClassTab& c) {
+              MLK();
+              if (ImGui::SmallButton("Read static values"))
+                  post_rpc("readStaticFields",
+                           "{\"class\":\"" + jesc(c.cname) + "\"}");
+              ImGui::SameLine();
+              int nst = 0;
+              for (auto& f : c.fields)
+                  if (f.value != "(instance)") nst++;
+              ImGui::TextDisabled("%d static fields", nst);
+              ImGui::Separator();
+              for (int i = 0; i < (int)c.fields.size(); i++) {
+                  FieldInfo& f = c.fields[i];
+                  if (f.value == "(instance)") continue;
+                  ImGui::PushID(5000 + i);
+                  bool hitf = c.hit(c.hits_f, f.name);
+                  if (hitf) ImGui::PushStyleColor(ImGuiCol_Text,
+                             ImVec4(0.25f, 0.95f, 0.35f, 1.f));
+                  ImGui::BulletText("%s : %s = %s", f.name.c_str(),
+                                    f.type.c_str(), f.value.c_str());
+                  if (hitf) ImGui::PopStyleColor();
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Patch##fp")) {
+                      snprintf(s_pcls, sizeof(s_pcls), "%s", c.cname.c_str());
+                      snprintf(s_pfld, sizeof(s_pfld), "%s", f.name.c_str());
+                      snprintf(s_pval, sizeof(s_pval), "%s", f.value.c_str());
+                      s_next_tab = "Patches";
                   }
-              } else if (c.sub == 2) {                 /* ---- Methods ---- */
-                  if (c.call_open) {
-                      ImGui::TextColored(ImVec4(0, 1, 0, 1), "call %s.%s",
-                                         c.cname.c_str(), c.call_sig.name.c_str());
-                      int na = 0;
-                      {   /* one input per parameter, parsed from the signature */
-                          std::vector<std::string> ps;
-                          std::string p = c.call_sig.params, cur;
-                          int depth = 0;
-                          for (char ch : p) {
-                              if (ch == ',' && depth == 0) { ps.push_back(cur); cur.clear(); continue; }
-                              cur += ch;
-                          }
-                          ps.push_back(cur);
-                          if (ps.size() == 1 && ps[0].empty()) ps.clear();
-                          for (int k = 0; k < (int)ps.size() && k < 8; k++) {
-                              char lb[64];
-                              snprintf(lb, sizeof(lb), "arg%d (%s)", k, ps[k].c_str());
-                              ime_textfield(lb, c.call_args[k], sizeof(c.call_args[k]));   /* r15: IME-aware wrapper */
-                              na++;
-                          }
-                      }
-                      if (ImGui::Button("Invoke")) {
-                          /* r23: instance methods need a RECEIVER - when an
-                             instance is selected its retained handle rides along
-                             (Java.retain-ed on the agent side), otherwise the
-                             agent refuses a non-static call with a hint instead
-                             of the old silent ov.apply(null) failure */
-                          long h = (c.sel_inst >= 0 &&
-                                    c.sel_inst < (int)c.instances.size())
-                                       ? c.instances[c.sel_inst].handle : -1;
-                          std::string a = "{\"class\":\"" + jesc(c.cname)
-                                        + "\",\"method\":\"" + jesc(c.call_sig.name)
-                                        + "\",\"handle\":" + std::to_string(h)
-                                        + ",\"args\":[";
-                          for (int k = 0; k < na; k++) {
-                              if (k) a += ",";
-                              a += "\"" + jesc(c.call_args[k]) + "\"";
-                          }
-                          a += "]}";
-                          post_rpc("callMethod", a);
-                          c.call_result = "...";
-                      }
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Track##ftf")) {
+                      std::string a = "{\"class\":\"" + jesc(c.cname)
+                                    + "\",\"field\":\"" + jesc(f.name) + "\"}";
+                      post_rpc("trackField", a);
+                      s_trackers.push_back({c.cname + "." + f.name, true, {}});
+                  }
+                  ImGui::PopID();
+              }
+              MULK();
+          }
+
+          /* ---- Fields (all fields, the spec's plain "Fields List") ---- */
+          static void fields_view(ClassTab& c) {
+              MLK();
+              ImGui::TextDisabled("%lu fields (static values: Static Fields tab)",
+                                  (unsigned long)c.fields.size());
+              for (int i = 0; i < (int)c.fields.size(); i++) {
+                  FieldInfo& f = c.fields[i];
+                  ImGui::PushID(6000 + i);
+                  bool hitf = c.hit(c.hits_f, f.name);
+                  if (hitf) ImGui::PushStyleColor(ImGuiCol_Text,
+                             ImVec4(0.25f, 0.95f, 0.35f, 1.f));
+                  ImGui::BulletText("%s : %s", f.name.c_str(), f.type.c_str());
+                  if (hitf) ImGui::PopStyleColor();
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Patch##fp2")) {
+                      snprintf(s_pcls, sizeof(s_pcls), "%s", c.cname.c_str());
+                      snprintf(s_pfld, sizeof(s_pfld), "%s", f.name.c_str());
+                      snprintf(s_pval, sizeof(s_pval), "%s", f.value.c_str());
+                      s_next_tab = "Patches";
+                  }
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Track##ftf2")) {
+                      std::string a = "{\"class\":\"" + jesc(c.cname)
+                                    + "\",\"field\":\"" + jesc(f.name) + "\"}";
+                      post_rpc("trackField", a);
+                      s_trackers.push_back({c.cname + "." + f.name, true, {}});
+                  }
+                  ImGui::PopID();
+              }
+              MULK();
+          }
+
+          /* ---- expanded-method sub-tabs (field spec: Caller / Patcher /
+             Tracer / Hooker) ---- */
+          static void caller_tab(ClassTab& c, const MethodSig& m) {
+              std::vector<std::string> ps = split_params(m.params);
+              int na = (int)ps.size();
+              if (na > 8) na = 8;
+              for (int k = 0; k < na; k++) {
+                  ImGui::PushID(2000 + k);
+                  bool prim = is_prim_type(ps[k]);
+                  char lb[96];
+                  snprintf(lb, sizeof(lb), "arg%d (%s)", k, ps[k].c_str());
+                  if (prim) {
+                      ImGui::SetNextItemWidth(210);
+                      ime_textfield(lb, c.call_args[k], sizeof(c.call_args[k]));
+                  } else {
+                      /* field spec: object parameters get a dropdown that opens
+                         the Object Finder for the PARAMETER's class */
+                      ImGui::Text("%s", lb);
+                      ImGui::SetNextItemWidth(-52.f);
+                      ime_textfield("##co", c.call_args[k], sizeof(c.call_args[k]));
                       ImGui::SameLine();
-                      if (ImGui::Button("Close")) c.call_open = false;
-                      if (!c.call_result.empty()) {
-                          ImGui::TextWrapped("%s", c.call_result.c_str());
+                      if (ImGui::SmallButton("Find...")) {
+                          snprintf(s_of.cls, sizeof(s_of.cls), "%s", ps[k].c_str());
+                          snprintf(s_of.typ, sizeof(s_of.typ), "%s", ps[k].c_str());
+                          s_of.ctx_uid = c.uid;
+                          s_of.ctx_arg = k;
+                          s_of.open    = true;
+                          s_of.results.clear();
+                          s_of.waiting  = false;
+                          s_of.creating = false;
                       }
-                      ImGui::Separator();
                   }
-                  /* r25: method INPUT/OUTPUT patch editor - the agent probes
-                     one call (ioprobe), the captured values are shown, only
-                     the P-marked rows are patched from then on. */
-                  if (c.io_open) {
+                  ImGui::PopID();
+              }
+              if (c.sel_inst >= 0 && c.sel_inst < (int)c.instances.size())
+                  ImGui::TextDisabled("receiver: instance #%d", c.sel_inst);
+              else
+                  ImGui::TextDisabled("instance methods need a receiver - pick "
+                                      "one on the Instances tab or via Inspector");
+              ImGui::SetNextItemWidth(130);
+              if (ImGui::InputInt("Call count", &c.call_count)) {
+                  if (c.call_count < 1)    c.call_count = 1;
+                  if (c.call_count > 50)   c.call_count = 50;
+              }
+              if (ImGui::IsItemHovered())
+                  ImGui::SetTooltip("how many times to call with these args; "
+                                    "every call is logged below");
+              if (ImGui::Button("Call")) {
+                  long h = (c.sel_inst >= 0 && c.sel_inst < (int)c.instances.size())
+                               ? c.instances[c.sel_inst].handle : -1;
+                  std::string a = "{\"class\":\"" + jesc(c.cname)
+                                + "\",\"method\":\"" + jesc(m.name)
+                                + "\",\"handle\":" + std::to_string(h)
+                                + ",\"args\":[";
+                  for (int k = 0; k < na; k++) {
+                      if (k) a += ",";
+                      std::string v = c.call_args[k];
+                      if (v.rfind("@handle:", 0) == 0) {
+                          long oh = strtol(v.c_str() + 8, nullptr, 10);
+                          if (oh > 0) a += "{\"handle\":" + std::to_string(oh) + "}";
+                          else        a += "\"" + jesc(v) + "\"";
+                      } else {
+                          a += "\"" + jesc(v) + "\"";
+                      }
+                  }
+                  a += "],\"count\":" + std::to_string(c.call_count)
+                     + ",\"main\":false}";
+                  post_rpc("callMethod", a);
+                  char note[80];
+                  snprintf(note, sizeof(note), "sent %d call(s)...", c.call_count);
+                  c.call_log.push_back(note);
+              }
+              ImGui::SameLine();
+              if (ImGui::Button("Call in Main Thread")) {
+                  long h = (c.sel_inst >= 0 && c.sel_inst < (int)c.instances.size())
+                               ? c.instances[c.sel_inst].handle : -1;
+                  std::string a = "{\"class\":\"" + jesc(c.cname)
+                                + "\",\"method\":\"" + jesc(m.name)
+                                + "\",\"handle\":" + std::to_string(h)
+                                + ",\"args\":[";
+                  for (int k = 0; k < na; k++) {
+                      if (k) a += ",";
+                      std::string v = c.call_args[k];
+                      if (v.rfind("@handle:", 0) == 0) {
+                          long oh = strtol(v.c_str() + 8, nullptr, 10);
+                          if (oh > 0) a += "{\"handle\":" + std::to_string(oh) + "}";
+                          else        a += "\"" + jesc(v) + "\"";
+                      } else {
+                          a += "\"" + jesc(v) + "\"";
+                      }
+                  }
+                  a += "],\"count\":" + std::to_string(c.call_count)
+                     + ",\"main\":true}";
+                  post_rpc("callMethod", a);
+                  char note[96];
+                  snprintf(note, sizeof(note), "sent %d call(s) on the main thread...",
+                           c.call_count);
+                  c.call_log.push_back(note);
+              }
+              if (!c.call_log.empty()) {
+                  ImGui::TextDisabled("call results:");
+                  ImGui::SameLine();
+                  if (ImGui::SmallButton("Clear##clg")) c.call_log.clear();
+                  ImGui::BeginChild("calllog", ImVec2(0, 150), true);
+                  for (auto& l : c.call_log)
+                      ImGui::TextWrapped("%s", l.c_str());
+                  /* r24 pattern: auto-scroll INSIDE the child */
+                  if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40)
+                      ImGui::SetScrollHereY(1.f);
+                  ImGui::EndChild();
+                  mark_scroll_item(s_lst_scroll);
+              }
+          }
+
+          static void patcher_tab(ClassTab& c, const MethodSig& m) {
+              ImGui::TextDisabled("Patch NOP: skip the body (auto return value by "
+                                  "return type). Redirect: force the return value "
+                                  "below on every subsequent call.");
+              ImGui::SetNextItemWidth(220);
+              ime_textfield("Value##pv26", c.patch_val, sizeof(c.patch_val));
+              if (ImGui::Button("Patch NOP")) {
+                  std::string a = "{\"class\":\"" + jesc(c.cname)
+                                + "\",\"method\":\"" + jesc(m.name)
+                                + "\",\"mode\":\"noop\",\"code\":\"\"}";
+                  post_rpc("addHook", a);
+                  MLK();
+                  s_hooks.push_back({c.cname, m.name, 2, "", true, "..."});
+                  MULK();
+                  c.patch_note = "NOP armed on " + m.name;
+              }
+              ImGui::SameLine();
+              if (ImGui::Button("Redirect") && c.patch_val[0]) {
+                  std::string a = "{\"class\":\"" + jesc(c.cname)
+                                + "\",\"method\":\"" + jesc(m.name)
+                                + "\",\"args\":[],\"ret\":{\"on\":true,\"v\":\""
+                                + jesc(c.patch_val) + "\"}}";
+                  post_rpc("setMethodIO", a);
+                  c.patch_note = "redirect armed -> " + std::string(c.patch_val);
+              }
+              if (!c.patch_val[0]) {
+                  ImGui::SameLine();
+                  ImGui::TextDisabled("(enter a value first)");
+              }
+              ImGui::SameLine();
+              if (ImGui::Button("Stop redirect")) {
+                  std::string a = "{\"class\":\"" + jesc(c.cname)
+                                + "\",\"method\":\"" + jesc(m.name)
+                                + "\",\"args\":[],\"ret\":{\"on\":false,\"v\":\"\"}}";
+                  post_rpc("setMethodIO", a);
+                  c.patch_note = "redirect removed";
+              }
+              if (!c.patch_note.empty())
+                  ImGui::TextColored(ImVec4(0, 1, 0, 1), "%s", c.patch_note.c_str());
+              /* r25 live IO editor kept: probe one call, patch the marked rows */
+              if (ImGui::CollapsingHeader("Live IO patch (probe)##ioh")) {
+                  if (!c.io_open) {
+                      if (ImGui::SmallButton("Probe next call values")) {
+                          c.io_sig    = m;
+                          c.io_wait   = true;
+                          c.io_nargs  = 0;
+                          c.io_result = "waiting for the next call...";
+                          std::string a = "{\"class\":\"" + jesc(c.cname)
+                                        + "\",\"method\":\"" + jesc(m.name) + "\"}";
+                          post_rpc("getMethodIO", a);
+                      }
+                  } else {
                       ImGui::TextColored(ImVec4(0, 1, 0, 1), "patch IO %s.%s",
                                          c.cname.c_str(), c.io_sig.name.c_str());
                       ImGui::TextDisabled("P = patch this item; only marked "
@@ -3719,136 +4124,190 @@ jobs:
                       if (ImGui::Button("Close##ioc")) c.io_open = false;
                       if (!c.io_result.empty())
                           ImGui::TextWrapped("%s", c.io_result.c_str());
-                      ImGui::Separator();
                   }
-                  ImGui::BeginChild("clsm", ImVec2(0, 0), true);
-                  ImGuiListClipper clip;
-                  clip.Begin((int)c.methods.size());
-                  while (clip.Step()) {
-                      for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
-                          MethodSig& m = c.methods[i];
-                          ImGui::PushID(i);
-                          /* r25: code-text hits are painted green (field spec:
-                             "methods or fields that have this string should be
-                             marked in green") */
-                          bool hitm = c.hit(c.hits_m, m.name);
-                          if (hitm) ImGui::PushStyleColor(ImGuiCol_Text,
-                                     ImVec4(0.25f, 0.95f, 0.35f, 1.f));
-                          ImGui::BulletText("%s(%s) -> %s",
-                                            m.name.c_str(), m.params.c_str(),
-                                            m.ret.c_str());
-                          if (hitm) ImGui::PopStyleColor();
-                          if (ImGui::SmallButton("Call##mc")) {
-                              c.call_open  = true;
-                              c.call_sig   = m;
-                              c.call_result.clear();
-                              for (int k = 0; k < 8; k++) c.call_args[k][0] = 0;
-                          }
-                          ImGui::SameLine();
-                          if (ImGui::SmallButton("Track##mt")) {
-                              std::string a = "{\"class\":\"" + jesc(c.cname)
-                                            + "\",\"method\":\"" + jesc(m.name) + "\"}";
-                              post_rpc("addTracker", a);
-                              MLK();
-                              s_trackers.push_back({c.cname + "." + m.name, false, {}});
-                              MULK();
-                          }
-                          ImGui::SameLine();
-                          if (ImGui::SmallButton("Hook##mh")) {
-                              /* prefill the Hooks form and jump there */
-                              snprintf(s_hcls, sizeof(s_hcls), "%s", c.cname.c_str());
-                              snprintf(s_hmth, sizeof(s_hmth), "%s", m.name.c_str());
-                              s_hcode[0] = 0;
-                              s_next_tab = "Hooks";
-                          }
-                          ImGui::SameLine();
-                          /* r25: one-tap Nop - auto return value by the method's
-                             return type (void -> return, numeric -> 0, boolean
-                             -> false, object/array -> null), no code needed */
-                          if (ImGui::SmallButton("Nop##mn")) {
-                              std::string a = "{\"class\":\"" + jesc(c.cname)
-                                            + "\",\"method\":\"" + jesc(m.name)
-                                            + "\",\"mode\":\"noop\",\"code\":\"\"}";
-                              post_rpc("addHook", a);
-                              MLK();
-                              s_hooks.push_back({c.cname, m.name, 2, "", true, "..."});
-                              MULK();
-                          }
-                          ImGui::SameLine();
-                          if (ImGui::SmallButton("Src##ms")) {
-                              /* load the real method body (baksmali) and jump to
-                                 the Hooks tab source panel */
-                              snprintf(s_hcls, sizeof(s_hcls), "%s", c.cname.c_str());
-                              snprintf(s_hmth, sizeof(s_hmth), "%s", m.name.c_str());
-                              std::string a = "{\"class\":\"" + jesc(c.cname)
-                                            + "\",\"method\":\"" + jesc(m.name) + "\"}";
-                              post_rpc("getMethodSrc", a);
-                              snprintf(s_hsrc_note, sizeof(s_hsrc_note),
-                                       "disassembling...");
-                              s_hsrc_have = false;
-                              s_next_tab = "Hooks";
-                          }
-                          ImGui::SameLine();
-                          if (ImGui::SmallButton("IO##mi")) {
-                              /* probe one call and open the IO patch editor */
-                              c.io_sig   = m;
-                              c.io_wait  = true;
-                              c.io_open  = true;
-                              c.io_nargs = 0;
-                              c.io_result = "waiting for the next call...";
-                              std::string a = "{\"class\":\"" + jesc(c.cname)
-                                            + "\",\"method\":\"" + jesc(m.name) + "\"}";
-                              post_rpc("getMethodIO", a);
-                          }
-                          ImGui::PopID();
+              }
+          }
+
+          static void tracer_tab(ClassTab& c, const MethodSig& m) {
+              std::string tname = c.cname + "." + m.name;
+              int ti = find_tracker(tname);
+              if (ti < 0) {
+                  if (ImGui::Button("Track this method")) {
+                      std::string a = "{\"class\":\"" + jesc(c.cname)
+                                    + "\",\"method\":\"" + jesc(m.name) + "\"}";
+                      post_rpc("addTracker", a);
+                      MLK();
+                      s_trackers.push_back({tname, false, {}});
+                      MULK();
+                  }
+                  ImGui::SameLine();
+                  ImGui::TextDisabled("not tracking yet");
+              } else {
+                  Tracker& t = s_trackers[ti];
+                  ImGui::TextDisabled("tracking - %lu events (full log: Trackers)",
+                                      (unsigned long)t.log.size());
+                  ImGui::BeginChild("texp", ImVec2(0, 160), true);
+                  for (auto& r : t.log) {
+                      for (auto& cl : r.callers) {
+                          if (ImGui::SmallButton(("@ " + cl).c_str()))
+                              menu_open_class(cls_of_member(cl));
                       }
+                      ImGui::BulletText("args=%s ret=%s%s%s",
+                                        r.args.c_str(), r.ret.c_str(),
+                                        r.err.empty() ? "" : " ERR=",
+                                        r.err.c_str());
+                      ImGui::Separator();
                   }
                   ImGui::EndChild();
                   mark_scroll_item(s_lst_scroll);
-              } else if (c.sub == 1) {                 /* ---- Fields ---- */
-                  MLK();
-                  /* r12: values are NOT read while opening the class anymore
-                     (reading a static can run the class's <clinit> and hang
-                     the agent - the "open a class and the app freezes" bug).
-                     This button reads them on demand, for this class only. */
-                  if (ImGui::SmallButton("Read static values"))
-                      post_rpc("readStaticFields",
-                               "{\"class\":\"" + jesc(c.cname) + "\"}");
-                  ImGui::SameLine();
-                  ImGui::TextDisabled("%lu fields", (unsigned long)c.fields.size());
-                  for (int i = 0; i < (int)c.fields.size(); i++) {
-                      FieldInfo& f = c.fields[i];
-                      ImGui::PushID(i);
-                      /* r25: code-text hits are painted green */
-                      bool hitf = c.hit(c.hits_f, f.name);
-                      if (hitf) ImGui::PushStyleColor(ImGuiCol_Text,
-                                 ImVec4(0.25f, 0.95f, 0.35f, 1.f));
-                      ImGui::BulletText("%s : %s = %s", f.name.c_str(),
-                                        f.type.c_str(), f.value.c_str());
-                      if (hitf) ImGui::PopStyleColor();
-                      if (ImGui::SmallButton("Patch##fp")) {
-                          snprintf(s_pcls, sizeof(s_pcls), "%s", c.cname.c_str());
-                          snprintf(s_pfld, sizeof(s_pfld), "%s", f.name.c_str());
-                          snprintf(s_pval, sizeof(s_pval), "%s", f.value.c_str());
-                          s_next_tab = "Patches";
-                      }
-                      ImGui::SameLine();
-                      if (ImGui::SmallButton("Track##ftf")) {
-                          std::string a = "{\"class\":\"" + jesc(c.cname)
-                                        + "\",\"field\":\"" + jesc(f.name) + "\"}";
-                          post_rpc("trackField", a);
-                          s_trackers.push_back({c.cname + "." + f.name, true, {}});
-                      }
-                      ImGui::PopID();
+                  if (ImGui::SmallButton("Remove tracker")) {
+                      std::string a = "{\"name\":\"" + jesc(tname) + "\"}";
+                      post_rpc("removeTracker", a);
+                      s_trackers.erase(s_trackers.begin() + ti);
                   }
+              }
+          }
+
+          static void hooker_tab(ClassTab& c, const MethodSig& m) {
+              const char* modes[] = {"Java(JS)", "Smali", "Nop (auto)"};
+              ImGui::Combo("Mode##hx26", &c.hook_mode, modes, 3);
+              ime_multiline("Code##hx26", c.hook_code, sizeof(c.hook_code),
+                            ImVec2(-1, 90));
+              ImGui::TextDisabled("Java: fn(Java,send,console,thiz,args,orig). "
+                                  "Smali: body of static hook(Object thiz, Object[] args); "
+                                  "p0=thiz p1=args, must return an Object.");
+              if (ImGui::Button("Add Hook")) {
+                  std::string a = "{\"class\":\"" + jesc(c.cname)
+                                + "\",\"method\":\"" + jesc(m.name)
+                                + "\",\"mode\":\"" + modes[c.hook_mode]
+                                + "\",\"code\":\"" + jesc(c.hook_code) + "\"}";
+                  post_rpc("addHook", a);
+                  MLK();
+                  s_hooks.push_back({c.cname, m.name, c.hook_mode, c.hook_code,
+                                     true, "..."});
                   MULK();
               }
+              ImGui::SameLine();
+              if (ImGui::SmallButton("Method source")) {
+                  /* r25 pipeline: the real bytecode into the Hooks tab panel */
+                  snprintf(s_hcls, sizeof(s_hcls), "%s", c.cname.c_str());
+                  snprintf(s_hmth, sizeof(s_hmth), "%s", m.name.c_str());
+                  std::string a = "{\"class\":\"" + jesc(c.cname)
+                                + "\",\"method\":\"" + jesc(m.name) + "\"}";
+                  post_rpc("getMethodSrc", a);
+                  snprintf(s_hsrc_note, sizeof(s_hsrc_note), "disassembling...");
+                  s_hsrc_have = false;
+                  s_next_tab = "Hooks";
+              }
+          }
+
+          /* the expanded method body: exactly the 4 sub-tabs of the spec */
+          static void method_body(ClassTab& c, const MethodSig& m) {
+              ImGui::Indent();
+              if (ImGui::BeginTabBar("mexp")) {
+                  static const char* msubs[] = {"Caller", "Patcher", "Tracer",
+                                                "Hooker"};
+                  char tlbl[40];
+                  for (int t = 0; t < 4; t++) {
+                      snprintf(tlbl, sizeof(tlbl), "%s##mexp%d", msubs[t], t);
+                      if (ImGui::BeginTabItem(tlbl)) {
+                          c.msub = t;
+                          if      (t == 0) caller_tab(c, m);
+                          else if (t == 1) patcher_tab(c, m);
+                          else if (t == 2) tracer_tab(c, m);
+                          else             hooker_tab(c, m);
+                          ImGui::EndTabItem();
+                      }
+                  }
+                  ImGui::EndTabBar();
+              }
+              ImGui::Unindent();
+          }
+
+          /* ---- Methods list (tap = expand; right-click / "..." = context
+             menu per the field spec) ---- */
+          static void methods_view(ClassTab& c) {
+              MLK();
+              ImGui::BeginChild("clsm", ImVec2(0, 0), true);
+              ImGuiListClipper clip;
+              clip.Begin((int)c.methods.size());
+              while (clip.Step()) {
+                  for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                      MethodSig& m = c.methods[i];
+                      ImGui::PushID(i);
+                      /* r25: code-text hits are painted green (field spec:
+                         "methods or fields that have this string should be
+                         marked in green") */
+                      bool hitm = c.hit(c.hits_m, m.name);
+                      if (hitm) ImGui::PushStyleColor(ImGuiCol_Text,
+                                 ImVec4(0.25f, 0.95f, 0.35f, 1.f));
+                      bool is_exp = (c.expanded == i);
+                      char lbl[512];
+                      snprintf(lbl, sizeof(lbl), "%s %s(%s) -> %s",
+                               is_exp ? "-" : "+", m.name.c_str(),
+                               m.params.c_str(), m.ret.c_str());
+                      if (ImGui::Selectable(lbl, is_exp)) {
+                          if (c.expanded == i) {
+                              c.expanded = -1;
+                          } else {
+                              c.expanded = i;
+                              c.msub = 0;
+                              /* fresh Caller state when the method changes */
+                              if (c.call_sig.name != m.name ||
+                                  c.call_sig.params != m.params) {
+                                  c.call_sig = m;
+                                  c.call_nargs = 0;
+                                  c.call_count = 1;
+                                  c.call_log.clear();
+                                  for (int k = 0; k < 8; k++) c.call_args[k][0] = 0;
+                              }
+                          }
+                      }
+                      if (hitm) ImGui::PopStyleColor();
+                      bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                      float bx = ImGui::GetCursorPosX() +
+                                 ImGui::GetContentRegionAvail().x - 26.f;
+                      ImGui::SameLine(bx);
+                      bool dot = ImGui::SmallButton("...");
+                      if (rclk || dot) ImGui::OpenPopup("mctx");
+                      if (ImGui::BeginPopup("mctx")) {
+                          if (ImGui::MenuItem("Open in new window")) {
+                              /* deferred: pushing into s_classes here would
+                                 reallocate the vector this loop is walking */
+                              MLK();
+                              s_dup_req = c.cname;
+                              MULK();
+                          }
+                          if (ImGui::MenuItem("Full Method View")) {
+                              s_fm_cls  = c.cname;
+                              s_fm_mth  = m.name;
+                              s_fm_open = true;
+                              s_fm_have = false;
+                              snprintf(s_fm_note, sizeof(s_fm_note),
+                                       "disassembling...");
+                              std::string a = "{\"class\":\"" + jesc(c.cname)
+                                            + "\",\"method\":\"" + jesc(m.name) + "\"}";
+                              post_rpc("getMethodSrc", a);
+                          }
+                          if (ImGui::MenuItem("Copy Method Name"))
+                              copy_text("method", m.name);
+                          if (ImGui::MenuItem("Copy Class Name"))
+                              copy_text("class", c.cname);
+                          ImGui::EndPopup();
+                      }
+                      if (c.expanded == i) method_body(c, m);
+                      ImGui::PopID();
+                  }
+              }
+              ImGui::EndChild();
+              mark_scroll_item(s_lst_scroll);
+              MULK();
           }
 
           static void tab_classes() {
               /* r12: the full class list loads BY DEFAULT - no "+ search" gate.
                  The agent streams every loaded class in pages of 400; the
-                 filter row just re-queries with a substring. */
+                 Explorer's Filter re-queries with a substring. */
               MLK();
               bool agent_ready = s_agent_ready;
               bool need_auto   = !s_cls_auto_done && !s_search_wait &&
@@ -3861,7 +4320,15 @@ jobs:
                   s_search_qid   = qid;      /* r23: generation armed at SEND time */
                   s_search_page0 = false;
               }
+              /* r26: the first Explorer window opens by itself so the class
+                 list is visible immediately (the r12 default-list behavior) */
+              bool want_expl = s_explorers.empty();
               MULK();
+              if (want_expl) {
+                  ExplorerWin e{};
+                  e.id = ++s_expl_seq;
+                  s_explorers.push_back(e);
+              }
               /* r25: the AUTO default list is always a plain, sorted class
                  listing (mode 0) - a user who left the mode on Code text
                  would otherwise trigger a full dex scan just by opening the
@@ -3872,107 +4339,453 @@ jobs:
                            + ",\"mode\":0"
                            + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}");
 
-              bool do_search = false;
+              /* ---- secondary bar: opened classes + "+" (field spec) ---- */
               MLK();
-              /* r25: 4 search modes + the system-class gate. Mode 3 (code
-                 text) runs the dexlib2/baksmali scan on the agent; modes 0-2
-                 are name matches. Search fires on Enter / button only. */
-              const char* smodes[] = {"Class name", "Method name",
-                                      "Field name", "Code text"};
-              ImGui::SetNextItemWidth(150.f);
-              if (ImGui::Combo("Mode##smode", &s_search_mode, smodes, 4))
-                  do_search = !s_search_wait;      /* re-run with the new mode */
-              ImGui::SameLine();
-              if (ImGui::Checkbox("System", &s_search_sys))
-                  do_search = !s_search_wait;      /* re-run with the new gate */
-              if (ImGui::IsItemHovered())
-                  ImGui::SetTooltip("show android/androidx/com.android/com.google/"
-                                    "java/javax/dalvik/kotlin classes too (off by "
-                                    "default - the field spec asked them hidden)");
-              ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 150.f);
-              /* r23: search on Enter / button ONLY - every keystroke used to
-                 re-run enumerateLoadedClasses on the agent (30k+ names per
-                 letter, flooding the bridge while typing). */
-              do_search |= ime_textfield("Filter##sf", s_search, sizeof(s_search),
-                                         ImGuiInputTextFlags_EnterReturnsTrue);
-              ImGui::PopItemWidth();
-              ImGui::SameLine();
-              if (ImGui::Button("Search##cls")) do_search = true;
-              ImGui::SameLine();
-              if (s_search_wait) ImGui::TextDisabled("(listing...)");
-              else ImGui::TextDisabled("%ld of %ld loaded classes",
-                                       (long)s_search_shown, (long)s_search_total);
-              ImGui::BeginChild("srch", ImVec2(0, 220), true);
-              ImGuiListClipper clip;
-              clip.Begin((int)s_search_res.size());
-              while (clip.Step()) {
-                  for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
-                      ImGui::PushID(i);
-                      if (ImGui::Selectable(s_search_res[i].c_str()))
-                          menu_open_class(s_search_res[i]);
-                      ImGui::PopID();
+              static int s_cls_cur_uid = -1;
+              int active_uid = -1;
+              float bh = ImGui::GetFrameHeight();
+              float avail = ImGui::GetContentRegionAvail().x;
+              ImGui::BeginChild("##clstabs", ImVec2(avail - 46.f, bh), false);
+              if (ImGui::BeginTabBar("clsTabs")) {
+                  /* r13: unique tab-bar id kept; labels carry ##t<uid> so two
+                     windows of the SAME class ("Open in new window") never
+                     share an id */
+                  for (int i = 0; i < (int)s_classes.size(); i++) {
+                      std::string lbl = s_classes[i].cname + "##t"
+                                      + std::to_string(s_classes[i].uid);
+                      ImGuiTabItemFlags fl = 0;
+                      if (s_classes[i].uid == s_cls_cur_uid)
+                          fl |= ImGuiTabItemFlags_SetSelected;
+                      if (ImGui::BeginTabItem(lbl.c_str(), nullptr, fl)) {
+                          active_uid = s_classes[i].uid;
+                          ImGui::EndTabItem();
+                      }
                   }
+                  ImGui::EndTabBar();
               }
               ImGui::EndChild();
-              mark_scroll_item(s_lst_scroll);
-              MULK();
-              if (do_search) {
-                  MLK();
-                  s_search_wait = true;
-                  int sqid = ++s_search_seq;
-                  s_search_qid   = sqid;     /* r23: generation armed at SEND time */
-                  s_search_page0 = false;
-                  MULK();
-                  std::string a = "{\"filter\":\"" + jesc(s_search)
-                                 + "\",\"qid\":" + std::to_string(sqid)
-                                 + ",\"mode\":" + std::to_string(s_search_mode)
-                                 + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}";
-                  post_rpc("listLoadedClasses", a);
+              if (active_uid >= 0 && active_uid != s_cls_cur_uid) {
+                  /* a tab was clicked -> raise its inspector window */
+                  for (auto& c : s_classes)
+                      if (c.uid == active_uid) { s_focus_win = win_title(c); break; }
+                  s_cls_cur_uid = active_uid;
               }
+              MULK();
+              ImGui::SameLine(0, 6);
+              if (ImGui::Button("+##newexpl", ImVec2(40, bh))) s_expl_req = true;
+              if (ImGui::IsItemHovered())
+                  ImGui::SetTooltip("open a new Class Explorer window");
               ImGui::Separator();
+              if (s_classes.empty())
+                  ImGui::TextDisabled("no class windows - pick a class in the "
+                                      "Class Explorer (the + button)");
+              /* r26: the "+" opens a NEW Explorer window (field spec) */
+              if (s_expl_req) {
+                  s_expl_req = false;
+                  if (s_explorers.size() < 4) {
+                      ExplorerWin e{};
+                      e.id = ++s_expl_seq;
+                      s_explorers.push_back(e);
+                      s_focus_expl = e.id;
+                  }
+              }
+          }
 
-              MLK();
-              if (!s_classes.empty()) {
-                  /* which open class is visible? ImGui has no query for "current
-                     tab", so remember the last one the user clicked */
-                  static int s_cls_cur = 0;
-                  if (ImGui::BeginTabBar("clsTabs")) {
-                      for (int i = 0; i < (int)s_classes.size(); i++) {
-                          bool open = true;
-                          ImGuiTabItemFlags fl = 0;
-                          if (s_focus_cls == s_classes[i].cname)
-                              fl |= ImGuiTabItemFlags_SetSelected;
-                          if (ImGui::BeginTabItem(s_classes[i].cname.c_str(), &open,
-                                                  fl)) {
-                              s_cls_cur = i;
-                              if (s_focus_cls == s_classes[i].cname)
-                                  s_focus_cls.clear();
-                              ImGui::EndTabItem();
+          /* ===================== Class Explorer windows (r26) ===================== */
+          static void draw_explorer_windows(ImVec2 ds) {
+              for (int i = 0; i < (int)s_explorers.size(); ) {
+                  ExplorerWin& e = s_explorers[i];
+                  bool open = e.open;
+                  std::string title = "Class Explorer##" + std::to_string(e.id);
+                  if (s_focus_expl == e.id) {
+                      ImGui::SetNextWindowFocus();
+                      s_focus_expl = 0;
+                  }
+                  ImGui::SetNextWindowPos(ImVec2(70.f + 30.f * (e.id % 4),
+                                                 50.f + 30.f * (e.id % 4)),
+                                          ImGuiCond_FirstUseEver);
+                  ImGui::SetNextWindowSizeConstraints(ImVec2(320, 240),
+                      ImVec2(ds.x * .96f, ds.y * .96f));
+                  ImGui::SetNextWindowSize(ImVec2(ds.x * .62f, ds.y * .72f),
+                                           ImGuiCond_Once);
+                  bool body = ImGui::Begin(title.c_str(), &open,
+                                           ImGuiWindowFlags_NoSavedSettings);
+                  ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+                  bool do_search = false;
+                  /* r26: the mutex is HELD across the body - the GumJS callback
+                     thread can rebuild s_families / s_search_res at ANY moment,
+                     and the family dropdown caches const char* INTO those
+                     strings (r25 drew its lists under the lock for the same
+                     reason). run_search/open_inspector re-lock recursively. */
+                  MLK();
+                  if (body) {
+                      /* the dropdown can be opened before the agent finished
+                         streaming - fill families from whatever is buffered */
+                      if (s_families.empty() && !s_search_res.empty() &&
+                          !s_search_wait) {
+                          for (auto& n : s_search_res) {
+                              std::string f = family_of(n);
+                              if (!f.empty() &&
+                                  std::find(s_families.begin(), s_families.end(), f)
+                                      == s_families.end())
+                                  s_families.push_back(f);
                           }
-                          if (!open) {
-                              s_classes.erase(s_classes.begin() + i);
-                              if (s_cls_cur >= (int)s_classes.size())
-                                  s_cls_cur = (int)s_classes.size() - 1;
-                              ImGui::EndTabBar();
-                              MULK();
-                              return;
+                          std::sort(s_families.begin(), s_families.end());
+                      }
+                      std::vector<const char*> famc;
+                      for (auto& f : s_families) famc.push_back(f.c_str());
+                      int nf = (int)famc.size();
+                      /* family row (spec: dropdown left + "All" checkbox) */
+                      if (e.family >= nf || e.family < 0) e.family = 0;
+                      ImGui::SetNextItemWidth(
+                          ImGui::GetContentRegionAvail().x - 90.f);
+                      const char* fprev = nf ? famc[e.family]
+                                              : "(no classes yet)";
+                      if (ImGui::BeginCombo("##fam",
+                                            e.all_fam ? "(All families)" : fprev)) {
+                          for (int f = 0; f < nf; f++) {
+                              bool sel = (!e.all_fam && e.family == f);
+                              if (ImGui::Selectable(famc[f], sel)) {
+                                  e.family  = f;
+                                  e.all_fam = false;
+                              }
+                          }
+                          ImGui::EndCombo();
+                      }
+                      ImGui::SameLine();
+                      ImGui::Checkbox("All", &e.all_fam);
+                      /* search row (spec: text input + Filter button). r23:
+                         search on Enter / button ONLY - every keystroke used
+                         to re-run enumerateLoadedClasses on the agent. */
+                      ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 84.f);
+                      do_search |= ime_textfield("##esearch", e.search,
+                                                 sizeof(e.search),
+                                                 ImGuiInputTextFlags_EnterReturnsTrue);
+                      ImGui::PopItemWidth();
+                      ImGui::SameLine();
+                      if (ImGui::Button("Filter")) do_search = true;
+                      /* options row (spec: pink Options button) */
+                      ImGui::PushStyleColor(ImGuiCol_Button,
+                                            ImVec4(0.94f, 0.44f, 0.66f, 1.f));
+                      ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                            ImVec4(0.98f, 0.55f, 0.74f, 1.f));
+                      ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                                            ImVec4(0.88f, 0.34f, 0.58f, 1.f));
+                      if (ImGui::Button("Options")) ImGui::OpenPopup("explOpts");
+                      ImGui::PopStyleColor(3);
+                      ImGui::SameLine();
+                      if (s_search_wait) ImGui::TextDisabled("(listing...)");
+                      else ImGui::TextDisabled("%ld of %ld loaded classes",
+                                               (long)s_search_shown,
+                                               (long)s_search_total);
+                      if (ImGui::BeginPopup("explOpts")) {
+                          ImGui::Checkbox("Case sensitive", &e.case_sensitive);
+                          ImGui::TextDisabled("Filter by:");
+                          int fb = e.advanced ? 3 : e.filter_by;
+                          if (ImGui::RadioButton("Class",  fb == 0)) {
+                              e.filter_by = 0; e.advanced = false; }
+                          if (ImGui::RadioButton("Method", fb == 1)) {
+                              e.filter_by = 1; e.advanced = false; }
+                          if (ImGui::RadioButton("Field",  fb == 2)) {
+                              e.filter_by = 2; e.advanced = false; }
+                          if (ImGui::RadioButton(
+                                  "Code text (advanced: string inside class code)",
+                                  fb == 3))
+                              e.advanced = true;
+                          bool sys = s_search_sys;
+                          if (ImGui::Checkbox("System classes", &sys))
+                              s_search_sys = sys;
+                          ImGui::EndPopup();
+                      }
+                      ImGui::Separator();
+                      /* filtered class list */
+                      ImGui::BeginChild("explst", ImVec2(0, 0), true);
+                      ImGuiListClipper clip;
+                      clip.Begin((int)s_search_res.size());
+                      while (clip.Step()) {
+                          for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) {
+                              const std::string& nm = s_search_res[k];
+                              if (!e.all_fam && e.family < (int)s_families.size() &&
+                                  family_of(nm) != s_families[e.family]) continue;
+                              ImGui::PushID(k);
+                              if (ImGui::Selectable(nm.c_str()))
+                                  open_inspector(nm, false);
+                              ImGui::PopID();
                           }
                       }
-                      ImGui::EndTabBar();
+                      ImGui::EndChild();
+                      mark_scroll_item(s_lst_scroll);
                   }
-                  int cur = s_cls_cur;
-                  /* r12 deadlock fix: the r11 code locked g_mtx a SECOND time
-                     right here (and class_tab_content locks again inside) -
-                     with the plain mutex that self-deadlocked the render
-                     thread on the first tap on a class. g_mtx is recursive
-                     now and this stray lock is gone. */
-                  if (cur >= 0 && cur < (int)s_classes.size())
-                      class_tab_content(s_classes[cur]);
                   MULK();
-              } else {
-                  ImGui::TextDisabled("no class tabs - tap a class above");
-                  MULK();
+                  ImGui::End();
+                  mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
+                  if (do_search)
+                      run_search(e.search, e.advanced ? 3 : e.filter_by,
+                                 e.case_sensitive);
+                  if (!open) {
+                      s_explorers.erase(s_explorers.begin() + i);
+                      continue;
+                  }
+                  i++;
               }
+          }
+
+          /* ===================== floating Inspector windows (r26) =====================
+             One per opened class; the secondary bar raises them, "-" collapses,
+             "X" closes. s_dup_req (declared at the top of this section) defers
+             the "Open in new window" duplicate to after the loop. */
+
+          static void draw_class_windows(ImVec2 ds) {
+              for (int i = 0; i < (int)s_classes.size(); i++) {
+                  MLK();
+                  ClassTab& c = s_classes[i];
+                  std::string title = win_title(c);
+                  bool open = true;
+                  if (s_focus_win == title) {
+                      ImGui::SetNextWindowFocus();
+                      s_focus_win.clear();
+                  }
+                  ImGui::SetNextWindowPos(ImVec2(40.f + 24.f * (c.uid % 6),
+                                                 60.f + 24.f * (c.uid % 5)),
+                                          ImGuiCond_FirstUseEver);
+                  ImGui::SetNextWindowSizeConstraints(ImVec2(320, 220),
+                      ImVec2(ds.x * .96f, ds.y * .96f));
+                  ImGui::SetNextWindowSize(ImVec2(ds.x * .70f, ds.y * .60f),
+                                           ImGuiCond_Once);
+                  /* r13 comment kept: the sub-tab bar id is unique per scope */
+                  bool body = ImGui::Begin(title.c_str(), &open,
+                                           ImGuiWindowFlags_NoSavedSettings);
+                  ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+                  if (body) {
+                      if (ImGui::SmallButton("Inspector")) {
+                          snprintf(s_of.cls, sizeof(s_of.cls), "%s", c.cname.c_str());
+                          snprintf(s_of.typ, sizeof(s_of.typ), "%s", "this");
+                          s_of.ctx_uid = c.uid;
+                          s_of.ctx_arg = -1;
+                          s_of.open    = true;
+                          s_of.results.clear();
+                          s_of.waiting  = false;
+                          s_of.creating = false;
+                      }
+                      if (ImGui::IsItemHovered())
+                          ImGui::SetTooltip("find / create objects of this class");
+                      ImGui::SameLine();
+                      if (ImGui::SmallButton("-##min")) {
+                          ImGui::SetWindowCollapsed(true);   /* restore: title [+] */
+                      }
+                      float xr = ImGui::GetWindowWidth() - 34.f;
+                      ImGui::SameLine(xr);
+                      if (ImGui::SmallButton("X")) { c.win_close = true; open = false; }
+                      ImGui::TextDisabled("%s", c.cname.c_str());
+                      if (!c.got_info)
+                          ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
+                                                        : "(no data - tap Refresh)");
+                      if (ImGui::Button("Refresh"))
+                          open_inspector(c.cname, false);
+                      ImGui::Separator();
+                      if (c.of_handle >= 0)
+                          ImGui::TextColored(ImVec4(0, 1, 0, 1), "%s",
+                                             c.of_note.c_str());
+                      static const char* subs[] = {"Instances", "Static Fields",
+                                                   "Methods", "Fields"};
+                      char sl[40];
+                      if (ImGui::BeginTabBar("clssub")) {
+                          for (int si = 0; si < 4; si++) {
+                              snprintf(sl, sizeof(sl), "%s##cs%d", subs[si], si);
+                              if (ImGui::BeginTabItem(sl)) {
+                                  c.sub = si;
+                                  if      (si == 0) inst_view(c);
+                                  else if (si == 1) static_fields_view(c);
+                                  else if (si == 2) methods_view(c);
+                                  else              fields_view(c);
+                                  ImGui::EndTabItem();
+                              }
+                          }
+                          ImGui::EndTabBar();
+                      }
+                  }
+                  ImGui::End();
+                  MULK();
+                  mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
+                  if (!open || c.win_close) {
+                      MLK();
+                      s_classes.erase(s_classes.begin() + i);
+                      MULK();
+                      i--;   /* the next entry shifted into this slot */
+                  }
+              }
+              /* deferred "Open in new window": duplicate AFTER all references
+                 are gone */
+              if (!s_dup_req.empty()) {
+                  MLK();
+                  ClassTab nt{};
+                  nt.cname   = s_dup_req;
+                  nt.uid     = ++s_tab_uid_seq;
+                  nt.waiting = true;
+                  s_classes.push_back(nt);
+                  s_focus_win = win_title(s_classes.back());
+                  MULK();
+                  std::string a = "{\"class\":\"" + jesc(s_dup_req) + "\"}";
+                  post_rpc("openClass", a);
+                  s_dup_req.clear();
+              }
+          }
+
+          /* ===================== Full Method View window (r26) ===================== */
+          static void draw_fm_window(ImVec2 ds) {
+              if (!s_fm_open) return;
+              ImGui::SetNextWindowPos(ImVec2(90.f, 80.f), ImGuiCond_FirstUseEver);
+              ImGui::SetNextWindowSizeConstraints(ImVec2(300, 200),
+                  ImVec2(ds.x * .96f, ds.y * .96f));
+              ImGui::SetNextWindowSize(ImVec2(ds.x * .58f, ds.y * .52f),
+                                       ImGuiCond_Once);
+              bool open = s_fm_open;
+              ImGui::Begin("Method view##fm", &open,
+                           ImGuiWindowFlags_NoSavedSettings);
+              ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+              MLK();   /* s_fm_* are written by the GumJS callback thread too */
+              ImGui::Text("%s.%s", s_fm_cls.c_str(), s_fm_mth.c_str());
+              if (ImGui::SmallButton("Load source")) {
+                  std::string a = "{\"class\":\"" + jesc(s_fm_cls)
+                                + "\",\"method\":\"" + jesc(s_fm_mth) + "\"}";
+                  post_rpc("getMethodSrc", a);
+                  snprintf(s_fm_note, sizeof(s_fm_note), "disassembling...");
+                  s_fm_have = false;
+              }
+              ImGui::SameLine();
+              if (ImGui::SmallButton("Copy source") && s_fm_have)
+                  copy_text("source", s_fm_src);
+              ImGui::SameLine();
+              ImGui::TextDisabled("%s", s_fm_note);
+              if (s_fm_have) {
+                  ImGui::BeginChild("fmsrc", ImVec2(0, 0), true);
+                  ImGui::TextUnformatted(s_fm_src);
+                  ImGui::EndChild();
+                  mark_scroll_item(s_lst_scroll);
+              }
+              if (!open) s_fm_open = false;
+              MULK();
+              ImGui::End();
+              mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
+          }
+
+          /* ===================== Object Finder window (r26) ===================== */
+          static void of_deliver(long handle, const std::string& str) {
+              MLK();
+              if (s_of.ctx_arg >= 0) {
+                  for (auto& c : s_classes) {
+                      if (c.uid == s_of.ctx_uid) {
+                          char tok[40];
+                          snprintf(tok, sizeof(tok), "@handle:%ld", handle);
+                          if (s_of.ctx_arg < 8)
+                              snprintf(c.call_args[s_of.ctx_arg],
+                                       sizeof(c.call_args[0]), "%s", tok);
+                          break;
+                      }
+                  }
+              } else {
+                  for (auto& c : s_classes) {
+                      if (c.uid == s_of.ctx_uid) {
+                          c.of_handle = handle;
+                          std::string t = str;
+                          if (t.size() > 120) t = t.substr(0, 117) + "...";
+                          c.of_note = "selected: " + t;
+                          for (int k = 0; k < (int)c.instances.size(); k++)
+                              if (c.instances[k].handle == handle) {
+                                  c.sel_inst = k;
+                                  break;
+                              }
+                          break;
+                      }
+                  }
+              }
+              MULK();
+              s_of.open = false;
+          }
+
+          static void draw_object_finder(ImVec2 ds) {
+              if (!s_of.open) return;
+              ImGui::SetNextWindowPos(ImVec2(110.f, 100.f), ImGuiCond_FirstUseEver);
+              ImGui::SetNextWindowSizeConstraints(ImVec2(320, 220),
+                  ImVec2(ds.x * .96f, ds.y * .96f));
+              ImGui::SetNextWindowSize(ImVec2(460, 380), ImGuiCond_Once);
+              bool open = s_of.open;
+              ImGui::Begin("Object Finder", &open,
+                           ImGuiWindowFlags_NoSavedSettings);
+              ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+              MLK();   /* s_of.results is written by the GumJS callback thread */
+              ImGui::Text("class: %s", s_of.cls);
+              if (s_of.ctx_arg >= 0)
+                  ImGui::TextDisabled("selecting for arg%d (%s)",
+                                      s_of.ctx_arg, s_of.typ);
+              else
+                  ImGui::TextDisabled("selecting for the Inspector");
+              if (ImGui::Button("Find Objects")) {
+                  /* the spec's Java.choose */
+                  s_of.results.clear();
+                  s_of.waiting = true;
+                  post_rpc("listInstances", "{\"class\":\"" + jesc(s_of.cls) + "\"}");
+              }
+              ImGui::SameLine();
+              if (ImGui::Button("Create Object")) {
+                  /* the spec's $new() through the constructor */
+                  s_of.creating = true;
+                  post_rpc("createInstance", "{\"class\":\"" + jesc(s_of.cls) + "\"}");
+              }
+              ImGui::SameLine();
+              if (ImGui::Button("Clear##ofc")) {
+                  s_of.results.clear();
+                  s_of.waiting  = false;
+                  s_of.creating = false;
+              }
+              ImGui::SetNextItemWidth(180);
+              ime_textfield("##ofman", s_of.manual, sizeof(s_of.manual));
+              ImGui::SameLine();
+              if (ImGui::Button("Use##ofman") && s_of.manual[0]) {
+                  MLK();
+                  if (s_of.ctx_arg >= 0) {
+                      for (auto& c : s_classes)
+                          if (c.uid == s_of.ctx_uid && s_of.ctx_arg < 8) {
+                              snprintf(c.call_args[s_of.ctx_arg],
+                                       sizeof(c.call_args[0]), "%s", s_of.manual);
+                              break;
+                          }
+                  } else {
+                      for (auto& c : s_classes)
+                          if (c.uid == s_of.ctx_uid) {
+                              c.of_note = std::string("manual: ") + s_of.manual;
+                              break;
+                          }
+                  }
+                  MULK();
+                  s_of.open = false;
+              }
+              ImGui::Separator();
+              MLK();
+              ImGui::BeginChild("oflst", ImVec2(0, 0), true);
+              int N = (int)s_of.results.size();
+              for (int k = 0; k < N; k++) {
+                  ImGui::PushID(k);
+                  InstInfo& in = s_of.results[k];
+                  /* the spec's row format: "GameComputer (0/0)" */
+                  char lbl[220];
+                  snprintf(lbl, sizeof(lbl), "%s (%d/%d)",
+                           short_name(s_of.cls).c_str(), k, N);
+                  if (ImGui::Selectable(lbl))
+                      of_deliver(in.handle, in.str);
+                  ImGui::TextDisabled("    %s", in.str.c_str());
+                  ImGui::PopID();
+              }
+              if (s_of.waiting)  ImGui::TextDisabled("(scanning the heap...)");
+              if (s_of.creating) ImGui::TextDisabled("(constructing...)");
+              if (N == 0 && !s_of.waiting && !s_of.creating)
+                  ImGui::TextDisabled("no results yet - tap Find Objects");
+              ImGui::EndChild();
+              mark_scroll_item(s_lst_scroll);
+              if (!open) s_of.open = false;
+              MULK();
+              ImGui::End();
+              mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
           }
 
 
@@ -4087,7 +4900,7 @@ jobs:
                  here is the single opacity source. */
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.2 (r25)", &open,
+              ImGui::Begin("Dex-tool v1.3 (r26)", &open,
                            ImGuiWindowFlags_NoCollapse);
               if (!open) {
                   MLK();
@@ -4102,11 +4915,14 @@ jobs:
 
               if (ImGui::BeginTabBar("tb")) {
                   struct TabDef { const char* name; void (*fn)(); };
+                  /* r26: EXACT order + names of the field spec: Classes,
+                     Patches, Trackers, Hooks, Recorder, Monitor, Script,
+                     Settings */
                   TabDef tabs[] = {
-                      {"Settings", tab_settings}, {"Patches", tab_patches},
-                      {"Hooks",    tab_hooks},    {"Tracker", tab_tracker},
-                      {"Recorder", tab_recorder}, {"Monitor", tab_monitor},
-                      {"Script",   tab_script},   {"Classes", tab_classes},
+                      {"Classes",  tab_classes},  {"Patches",  tab_patches},
+                      {"Trackers", tab_tracker},  {"Hooks",    tab_hooks},
+                      {"Recorder", tab_recorder}, {"Monitor",  tab_monitor},
+                      {"Script",   tab_script},   {"Settings", tab_settings},
                   };
                   MLK();
                   std::string want = s_next_tab;
@@ -4122,10 +4938,20 @@ jobs:
                   }
                   ImGui::EndTabBar();
               }
+              /* r26: clipboard echo (Copy Method Name / Copy Class Name / the
+                 source copy) - visible for 2.5 s under the tab bar */
+              if (s_clip_msg[0] && conf_now_ms() - s_clip_ms < 2500)
+                  ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1), "%s", s_clip_msg);
               ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
               ImGui::End();
               /* the whole window body pans at the overlay speed */
               mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
+              /* r26: the floating spec windows - Class Explorer(s), one
+                 Inspector per opened class, Full Method View, Object Finder */
+              draw_explorer_windows(ds);
+              draw_class_windows(ds);
+              draw_fm_window(ds);
+              draw_object_finder(ds);
               overlay_publish_scroll_regions(s_regions);
               s_regions.clear();
 
@@ -4269,11 +5095,24 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r25). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r26). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
 
-             r25 changes (field report: menu hangs/lags/freezes on OTHER apps +
+             r26 changes (menu restructure per the field spec - Class Explorer
+             windows, Inspector windows, Caller/Patcher/Tracer/Hooker sub-tabs,
+             Object Finder):
+             - callMethod gained count (N calls, per-call callResult with
+               idx/of) and main (Java.scheduleOnMainThread - the spec's "Call
+               in Main Thread" button).
+             - Object args travel as {"handle":N} - call_with_args resolves the
+               retained instance, so the Object Finder can feed an actual object
+               into any parameter (the old text-only args could not).
+             - createInstance: the Object Finder's "Create Object" - $new() via
+               the no-arg constructor, retained like a Java.choose match.
+             - listLoadedClasses gained cs (case-sensitive compare for mode 0
+               and the dex scan; the Explorer Options popup checkbox).
+             - r25 changes (field report: menu hangs/lags/freezes on OTHER apps +
              feature requests for the Hooks/Monitor/Classes sections):
              - FRAME PUMP (the freeze fix): the menu is drawn inside the
                eglSwapBuffers hook, so a host that renders on demand (most
@@ -6105,13 +6944,31 @@ jobs:
               /* map the text args onto the overload's parameter types.
                  r23: `recv` is the retained-instance receiver for instance
                  methods (the old call was ov.apply(null, ...) - no receiver,
-                 so instance methods could never be invoked). */
+                 so instance methods could never be invoked).
+                 r26: an arg may be {"handle":N} - a retained instance picked
+                 in the Object Finder is passed as the ACTUAL object (the old
+                 text-only args could only ever send strings/null). */
               var params = ov.argumentTypes;
               var real = [];
               for (var i = 0; i < params.length; i++) {
-                  real.push(coerce_arg(params[i].name, argStrings[i]));
+                  var a = argStrings[i];
+                  if (a && typeof a === 'object' && typeof a.handle === 'number') {
+                      var inst = inst_get(a.handle);
+                      if (!inst)
+                          throw new Error('object #' + a.handle +
+                              ' expired - Find Objects again');
+                      real.push(inst);
+                      continue;
+                  }
+                  real.push(coerce_arg(params[i].name, a));
               }
               return ov.apply(recv || null, real);
+          }
+
+          /* r26: case-sensitivity for the dex scan matches (Explorer Options) */
+          function scan_hit(s) {
+              if (SCAN.cs) return s.indexOf(SCAN.fRaw) !== -1;
+              return s.toLowerCase().indexOf(SCAN.f) !== -1;
           }
 
           var gModCls = null;
@@ -6898,14 +7755,17 @@ jobs:
               },
 
               /* ---- classes ---- */
-              listLoadedClasses: function (filter, qid, mode, sys) {
+              listLoadedClasses: function (filter, qid, mode, sys, cs) {
                   Java.perform(function () {
                       try {
                           var all = Java.enumerateLoadedClassesSync();
-                          var f = (filter || '').toLowerCase();
+                          var fRaw = String(filter || '');
+                          var f = fRaw.toLowerCase();
                           var md = (typeof mode === 'number') ? mode : 0;
                           var includeSys = (sys === true || sys === 1);
-                          gLastSearch = { f: f, mode: md };   /* r25: green marks */
+                          /* r26: Case sensitive (Explorer Options popup) */
+                          var csm = (cs === true || cs === 1);
+                          gLastSearch = { f: f, fRaw: fRaw, mode: md, cs: csm };
                           if (!includeSys) {
                               all = all.filter(function (n) {
                                   return !is_system_cls(n);
@@ -6913,9 +7773,10 @@ jobs:
                           }
                           /* r25: alphabetical order (field spec) */
                           all.sort();
-                          if (!f || md === 0) {
-                              var out0 = f ? all.filter(function (n) {
-                                  return n.toLowerCase().indexOf(f) !== -1;
+                          if (!fRaw || md === 0) {
+                              var out0 = fRaw ? all.filter(function (n) {
+                                  return csm ? n.indexOf(fRaw) !== -1
+                                             : n.toLowerCase().indexOf(f) !== -1;
                               }) : all;
                               page_out(out0, qid, all.length);
                               return;
@@ -6929,6 +7790,8 @@ jobs:
                           SCAN.on = true;
                           SCAN.qid = (typeof qid === 'number') ? qid : 0;
                           SCAN.f = f;
+                          SCAN.fRaw = fRaw;
+                          SCAN.cs = csm;
                           SCAN.md = md;
                           SCAN.want = want;
                           SCAN.matches = [];
@@ -6968,7 +7831,9 @@ jobs:
                                       var nm;
                                       try { nm = String(ms[i].getName()); }
                                       catch (eN) { continue; }
-                                      if (nm.toLowerCase().indexOf(fl) !== -1 &&
+                                      if ((gLastSearch.cs ?
+                                               nm.indexOf(gLastSearch.fRaw) !== -1 :
+                                               nm.toLowerCase().indexOf(fl) !== -1) &&
                                           hm.indexOf(nm) === -1) hm.push(nm);
                                   }
                               } else if (gLastSearch.mode === 2) {
@@ -6977,7 +7842,9 @@ jobs:
                                       var fn;
                                       try { fn = String(fs[j].getName()); }
                                       catch (eF) { continue; }
-                                      if (fn.toLowerCase().indexOf(fl) !== -1 &&
+                                      if ((gLastSearch.cs ?
+                                               fn.indexOf(gLastSearch.fRaw) !== -1 :
+                                               fn.toLowerCase().indexOf(fl) !== -1) &&
                                           hf.indexOf(fn) === -1) hf.push(fn);
                                   }
                               } else if (gLastSearch.mode === 3) {
@@ -7225,50 +8092,91 @@ jobs:
                       } catch (e) {}
                   });
               },
-              callMethod: function (cls, method, args, handle) {
+              /* r26: count = call N times with the same args (the Caller tab's
+                 Call Count input; every call reports its own callResult with
+                 idx/of), main = run each call on the app's MAIN thread via
+                 Java.scheduleOnMainThread (the spec's "Call in Main Thread"). */
+              callMethod: function (cls, method, args, handle, count, main) {
+                  var n = 1;
+                  if (typeof count === 'number' && count > 0) n = Math.min(count, 50);
+                  var onMain = (main === true || main === 1);
+                  var done = 0;
+                  var once = function () {
+                      Java.perform(function () {
+                          try {
+                              /* r23: use_loaded - no forced <clinit> on unloaded
+                                 classes */
+                              var jc = use_loaded(cls);
+                              var recv = inst_get(handle);
+                              var node = null;
+                              try { node = jc[method]; } catch (e0) {}
+                              if (!node || !node.overloads || !node.overloads.length)
+                                  throw new Error('method not found: ' + method);
+                              var ovs = node.overloads;
+                              var want = args ? args.length : 0;
+                              var best = null;
+                              for (var i = 0; i < ovs.length; i++) {
+                                  if (ovs[i].argumentTypes.length === want) {
+                                      best = ovs[i];
+                                      break;
+                                  }
+                              }
+                              if (!best) best = ovs[0];
+                              var r;
+                              if (recv) {
+                                  /* r23: instance-method call WITH a receiver */
+                                  r = call_with_args(best, args || [], false, recv);
+                              } else {
+                                  if (!is_static_method(jc, method))
+                                      throw new Error('instance method - Find ' +
+                                          'instances, pick one (or use the Object ' +
+                                          'Finder), then Call (a retained handle is ' +
+                                          'required as the receiver)');
+                                  r = call_with_args(best, args || [], false, null);
+                              }
+                              sendMsg('callResult', {
+                                  class: cls, ok: 1, result: jstr(r), error: '',
+                                  idx: done, of: n
+                              });
+                          } catch (e) {
+                              sendMsg('callResult', {
+                                  class: cls, ok: 0, result: '',
+                                  error: String(e.message || e), idx: done, of: n
+                              });
+                          }
+                          done++;
+                          if (done < n) {
+                              setTimeout(function () {
+                                  if (onMain) Java.scheduleOnMainThread(once);
+                                  else once();
+                              }, 30);
+                          }
+                      });
+                  };
+                  if (onMain) Java.scheduleOnMainThread(once);
+                  else once();
+              },
+
+              /* r26: Object Finder "Create Object" - $new() through the no-arg
+                 constructor, retained like a Java.choose match. Creating an
+                 instance REQUIRES the class, so the <clinit> cost of Java.use
+                 is accepted here (use_loaded would refuse to ever create one). */
+              createInstance: function (cls) {
                   Java.perform(function () {
                       try {
-                          /* r23: use_loaded - no forced <clinit> on unloaded
-                             classes */
-                          var jc = use_loaded(cls);
-                          var recv = inst_get(handle);
-                          var node = null;
-                          try { node = jc[method]; } catch (e0) {}
-                          if (!node || !node.overloads || !node.overloads.length)
-                              throw new Error('method not found: ' + method);
-                          var ovs = node.overloads;
-                          var want = args ? args.length : 0;
-                          var best = null;
-                          for (var i = 0; i < ovs.length; i++) {
-                              if (ovs[i].argumentTypes.length === want) {
-                                  best = ovs[i];
-                                  break;
-                              }
-                          }
-                          if (!best) best = ovs[0];
-                          if (recv) {
-                              /* r23: instance-method call WITH a receiver (the
-                                 audit's "callMethod fails because it has no
-                                 receiver") */
-                              var r = call_with_args(best, args || [], false, recv);
-                              sendMsg('callResult', {
-                                  class: cls, ok: 1, result: jstr(r), error: ''
-                              });
-                              return;
-                          }
-                          if (!is_static_method(jc, method))
-                              throw new Error('instance method - Find instances, ' +
-                                  'pick one, then Call (a retained handle is ' +
-                                  'required as the receiver)');
-                          var r2 = call_with_args(best, args || [], false, null);
-                          sendMsg('callResult', {
-                              class: cls, ok: 1, result: jstr(r2), error: ''
-                          });
+                          var jc = Java.use(cls);
+                          var inst = jc.$new();
+                          var h = inst_put(inst);
+                          var lbl = '';
+                          try { lbl = String(inst); }
+                          catch (eL) { lbl = '(toString failed)'; }
+                          if (lbl.length > 160) lbl = lbl.substring(0, 157) + '...';
+                          sendMsg('instanceCreated', { class: cls, str: lbl,
+                                                       handle: h });
                       } catch (e) {
-                          sendMsg('callResult', {
-                              class: cls, ok: 0, result: '',
-                              error: String(e.message || e)
-                          });
+                          sendMsg('error', { fn: 'createInstance',
+                              msg: String(e.message || e) +
+                                   ' (needs a no-arg constructor)' });
                       }
                   });
               }
@@ -7616,7 +8524,7 @@ jobs:
                           while (mit.hasNext()) {
                               var mm = mit.next();
                               var mn = String(mm.getName());
-                              if (mn.toLowerCase().indexOf(SCAN.f) !== -1) {
+                              if (scan_hit(mn)) {
                                   matched = true;
                                   mh = [mn];
                                   break;
@@ -7627,7 +8535,7 @@ jobs:
                           while (fit.hasNext()) {
                               var ff = fit.next();
                               var fn = String(ff.getName());
-                              if (fn.toLowerCase().indexOf(SCAN.f) !== -1) {
+                              if (scan_hit(fn)) {
                                   matched = true;
                                   fh = [fn];
                                   break;
@@ -7643,7 +8551,7 @@ jobs:
                               var iit = impl.getInstructions().iterator();
                               while (iit.hasNext()) {
                                   var s = ins_const_string(L, iit.next());
-                                  if (s && s.toLowerCase().indexOf(SCAN.f) !== -1) {
+                                  if (s && scan_hit(s)) {
                                       matched = true;
                                       var nm = String(m3.getName());
                                       if (!mh) mh = [];
@@ -7669,8 +8577,7 @@ jobs:
                                       var ev = sf.getInitialValue();
                                       if (ev) {
                                           var sv = Java.cast(ev, L.StrVal).getValue();
-                                          if (sv && String(sv).toLowerCase()
-                                                    .indexOf(SCAN.f) !== -1) {
+                                          if (sv && scan_hit(String(sv))) {
                                               matched = true;
                                               if (fh.indexOf(sfn) === -1 && fh.length < 40)
                                                   fh.push(sfn);
@@ -7779,7 +8686,7 @@ jobs:
               startMonitor:    [],
               stopMonitor:     [],
               evalScript:      ['src'],
-              listLoadedClasses: ['filter', 'qid', 'mode', 'sys'],
+              listLoadedClasses: ['filter', 'qid', 'mode', 'sys', 'cs'],
               getMethodSrc:    ['class', 'method'],
               getMethodIO:     ['class', 'method'],
               setMethodIO:     ['class', 'method', 'args', 'ret'],
@@ -7789,7 +8696,8 @@ jobs:
               hideIme:         [],
               listInstances:   ['class'],
               setInstanceField:['class', 'index', 'field', 'value', 'handle'],
-              callMethod:      ['class', 'method', 'args', 'handle']
+              callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
+              createInstance:  ['class']
           };
 
           /* r14: phased startup. gum_script_load_sync must ALWAYS return:
@@ -7814,7 +8722,7 @@ jobs:
                   sendMsg('error', { fn: 'touchhook',
                                      msg: String(eT && eT.message || eT) });
               }
-              sendMsg('ready', { msg: 'Dex-tool agent r25 loaded' });
+              sendMsg('ready', { msg: 'Dex-tool agent r26 loaded' });
               agentLog('phase: ready sent');
           }, 0);
           DXTAGNT
@@ -8239,6 +9147,65 @@ jobs:
 
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+          ## Fixes in this version (r26)
+
+          Field spec: a full menu RESTRUCTURE. Same engine and RPCs - the
+          UI is reorganized around windows and the exact tab set the spec
+          names.
+
+          - **Main tabs, exact order:** Classes, Patches, Trackers, Hooks,
+            Recorder, Monitor, Script, Settings (was Settings-first with
+            "Tracker").
+          - **Secondary bar:** the opened classes are tabs under the main
+            bar; the far-right **+** button opens a NEW Class Explorer
+            window. Tapping a class tab raises that class's window.
+          - **Class Explorer windows:** package/family dropdown (com.game,
+            com.android, ... derived from the loaded list) with an **All**
+            checkbox, the search field + **Filter** button, and a pink
+            **Options** button whose popup holds **Case sensitive**,
+            **Filter by Class / Method / Field**, the advanced **code-text**
+            search (same baksmali const-string scan as r25) and the System
+            classes gate. The filtered class list fills the window; tapping
+            a class opens its Inspector. Case sensitivity now reaches the
+            agent (listLoadedClasses gained a `cs` argument - mode 0 AND
+            the dex scan honor it).
+          - **Class Inspector windows** (one per opened class, floating,
+            movable): **Inspector** button (opens the Object Finder for the
+            class), **Static Fields** section (values read on demand), the
+            Methods list and the full Fields list. **-** collapses the
+            window, **X** closes it.
+          - **Method expansion:** tapping a method opens the 4 spec
+            sub-tabs in place:
+            - **Caller** - one input per parameter (primitives int32/
+              int64/float/double/string/boolean/byte are plain text;
+              OBJECT parameters get a **Find...** button that opens the
+              Object Finder for the parameter's class), the **Call count**
+              input, **Call** and **Call in Main Thread** buttons (the
+              agent loops and runs each call via
+              Java.scheduleOnMainThread), and a per-call results log
+              ("call 3/10: ..."). Object args travel as {"handle":N} and
+              callMethod passes the retained instance as the REAL object
+              - text-only args could never do that.
+            - **Patcher** - manual value, **Patch NOP** (auto return by
+              method logic) and **Redirect** (forces the return value on
+              every subsequent call), plus the r25 live IO-probe editor.
+            - **Tracer** - track this method + live event log.
+            - **Hooker** - Java/Smali/Nop hook editor for the method.
+          - **Method context menu:** right-click (or the "..." button on
+            touch) offers Open in new window (duplicate Inspector), Full
+            Method View (real smali in its own window), Copy Method Name
+            and Copy Class Name (clipboard + an on-screen echo - the touch
+            bridge has no system clipboard backend).
+          - **Object Finder window:** **Find Objects** (Java.choose),
+            **Create Object** ($new() through the no-arg constructor,
+            retained like a scan match), a manual reference field and a
+            results list in the spec's "Name (i/N)" shape. A click fills
+            the caller parameter that opened it or selects the object for
+            the Inspector/Instances view.
+          - r25 kept: frame pump, method source view, one-tap Nop, IO
+            patching, network monitor detail window, green code-text marks,
+            sorted filtered class list.
 
           ## Fixes in this version (r25)
 
@@ -8969,7 +9936,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r25: frame pump (menu freeze/lag on render-on-demand hosts - agent postInvalidate()s the host DecorView while dextool_want_frames is up), method source view via bundled org.smali 2.5.2 baksmali (real smali per method, copy-to-editor for Smali hooks), one-tap Nop button (auto default return value by method logic), method input/output patching (one-shot probe, live current values, only marked rows patched), network monitor logs requests AND responses with click-to-open detail window (payload preview + originating method), class list sorted alphabetically with android/google/kotlin classes hidden by default (System checkbox), 4 search modes incl. code-text scan of const-strings and static String values with green member marks, r24 throttles/layering/IME fixes kept [skip ci]"
+            git commit -m "fix r26: menu restructure per the field spec - main tabs Classes/Patches/Trackers/Hooks/Recorder/Monitor/Script/Settings, secondary bar of opened classes with + opening Class Explorer windows (family dropdown + All, Filter button, pink Options popup: case sensitive / filter by class-method-field / advanced code-text, System gate; cs reaches the agent for mode 0 and the dex scan), floating Class Inspector windows (Inspector button, Static Fields, Methods, Fields, - and X), methods expand into Caller (per-param inputs, Object Finder for object params, call count, Call + Call in Main Thread via scheduleOnMainThread, per-call results log) / Patcher (manual value, Patch NOP, Redirect, r25 live IO probe) / Tracer / Hooker, method context menu (open in new window, full method view with smali, copy method/class name with toast), Object Finder window (Java.choose, createInstance via no-arg ctor, manual reference, results as Name (i/N)), callMethod gained count/main and object args as retained handles, r25 fixes kept [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
