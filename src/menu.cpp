@@ -1,8 +1,7 @@
-/* Dex-tool menu (r30): review round - C1 flash loop locked, C2 tab
-   containers on std::deque (stable refs), H3 dead fmPopup trigger
-   removed, H4 legacy font= honored, M9 theme on change, junesc
-   surrogate pairs. r29: single-tap FAB, edge resize, movable
-   windows, instances merged into the Inspector. */
+/* Dex-tool menu (r31): M4 real JSON tree parser (shallowest-match
+   lookup, surrogate pairs, depth cap), M7 releaseHandle on object
+   tab close, M8 lock-free frame pump via atomic mirror. r30:
+   flash-loop lock, deque tab containers, dead trigger removed. */
 #include "menu.h"
 #include "overlay.h"
 #include "frida_bridge.h"
@@ -11,6 +10,7 @@
 #include "imgui_internal.h"
 #include <string>
 #include <deque>   /* r30 C2: stable refs across push_back */
+#include <atomic>  /* r31 M8: lock-free frame-pump mirror */
 #include <vector>
 #include <cstdio>
 #include <cstring>
@@ -30,6 +30,7 @@ static int   s_theme      = 0;
 static float s_ovl_scroll = 1.5f;   /* whole-menu drag speed */
 static float s_lst_scroll = 1.2f;   /* inner list drag speed */
 static bool  s_visible    = true;
+static std::atomic<bool> s_visible_pub{ true };  /* r31 M8 */
 static bool  s_show_fab   = true;
 static float s_y_off      = 0.0f;   /* manual touch Y bias (px); r15: default 0 - the screen-space touch map is mathematically exact, the slider stays for exotic hosts */
 static bool  s_agent_ready = false;
@@ -250,179 +251,276 @@ static std::string jesc(const std::string& s) {
     }
     return r;
 }
-static std::string junesc(const std::string& s) {
-    std::string r;
-    r.reserve(s.size());
-    for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] != '\\' || i + 1 >= s.size()) { r += s[i]; continue; }
-        char n = s[++i];
-        switch (n) {
-            case 'n': r += '\n'; break;
-            case 't': r += '\t'; break;
-            case 'r': r += '\r'; break;
-            case 'b': r += '\b'; break;
-            case 'f': r += '\f'; break;
-            case '"': r += '"';  break;
-            case '\\':r += '\\'; break;
-            case '/': r += '/';  break;
-            case 'u':
-                if (i + 4 < s.size()) {
-                    unsigned v = 0;
-                    for (int k = 1; k <= 4; k++) {
+/* ---- r31 M4: minimal scoped JSON tree --------------------------
+   Replaces the old substring scans (jstr / jnum / jhas / jarr /
+   jtype / jobjarr / junesc): keys resolve to the SHALLOWEST match,
+   so nested duplicate keys can no longer return the wrong value;
+   escapes are handled once, with UTF-16 surrogate pairs encoded as
+   real UTF-8; parse depth is capped so hostile input cannot blow
+   the stack. ---- */
+struct JVal {
+    int kind = 0;   /* 0=undef 1=obj 2=arr 3=str 4=num 5=bool 6=null */
+    std::vector<std::pair<std::string, JVal>> obj;
+    std::vector<JVal> arr;
+    std::string str;
+    double num = 0;
+    bool b = false;
+};
+static void jws(const std::string& s, size_t& i) {
+    while (i < s.size() &&
+           (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r'))
+        i++;
+}
+static bool jparse_str(const std::string& s, size_t& i, std::string& out) {
+    if (i >= s.size() || s[i] != '"') return false;
+    i++;
+    out.clear();
+    while (i < s.size()) {
+        char c = s[i];
+        if (c == '"') { i++; return true; }
+        if (c != '\\') { out += c; i++; continue; }
+        i++;
+        if (i >= s.size()) return false;
+        char e = s[i++];
+        switch (e) {
+            case 'n': out += '\n'; break;
+            case 't': out += '\t'; break;
+            case 'r': out += '\r'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case '"': out += '"';  break;
+            case '\\': out += '\\'; break;
+            case '/': out += '/';  break;
+            case 'u': {
+                if (i + 4 > s.size()) return false;
+                unsigned v = 0;
+                for (int k = 0; k < 4; k++) {
+                    char h = s[i + k];
+                    v <<= 4;
+                    if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f')
+                        v |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F')
+                        v |= (unsigned)(h - 'A' + 10);
+                    else return false;
+                }
+                i += 4;
+                if (v >= 0xD800 && v <= 0xDBFF &&
+                    i + 6 <= s.size() &&
+                    s[i] == '\\' && s[i + 1] == 'u') {
+                    /* r31: pair the high surrogate before encoding */
+                    unsigned lo = 0;
+                    int ok = 1;
+                    for (int k = 2; k < 6; k++) {
                         char h = s[i + k];
-                        v <<= 4;
-                        if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
-                        else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
-                        else if (h >= 'A' && h <= 'F') v |= (unsigned)(h - 'A' + 10);
-                        else { v = 0xFFFF; break; }
+                        lo <<= 4;
+                        if (h >= '0' && h <= '9')
+                            lo |= (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f')
+                            lo |= (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F')
+                            lo |= (unsigned)(h - 'A' + 10);
+                        else { ok = 0; break; }
                     }
-                    i += 4;
-                    if (v >= 0xD800 && v <= 0xDBFF &&
-                        i + 6 < s.size() &&
-                        s[i + 1] == '\\' && s[i + 2] == 'u') {
-                        /* r30: pair the high surrogate before
-                           encoding instead of emitting broken UTF-8 */
-                        unsigned lo = 0;
-                        int ok = 1;
-                        for (int k2 = 3; k2 <= 6; k2++) {
-                            char h = s[i + k2];
-                            lo <<= 4;
-                            if (h >= '0' && h <= '9')
-                                lo |= (unsigned)(h - '0');
-                            else if (h >= 'a' && h <= 'f')
-                                lo |= (unsigned)(h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F')
-                                lo |= (unsigned)(h - 'A' + 10);
-                            else { ok = 0; break; }
-                        }
-                        if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
-                            unsigned cp = 0x10000u
-                                        + ((v - 0xD800u) << 10)
-                                        + (lo - 0xDC00u);
-                            r += (char)(0xF0 | (cp >> 18));
-                            r += (char)(0x80 | ((cp >> 12) & 0x3F));
-                            r += (char)(0x80 | ((cp >> 6) & 0x3F));
-                            r += (char)(0x80 | (cp & 0x3F));
-                            i += 6;
-                            break;
-                        }
+                    if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                        v = 0x10000u + ((v - 0xD800u) << 10)
+                          + (lo - 0xDC00u);
+                        i += 6;
                     }
-                    if (v < 0x80) r += (char)v;
-                    else if (v < 0x800) {
-                        r += (char)(0xC0 | (v >> 6));
-                        r += (char)(0x80 | (v & 0x3F));
-                    } else {
-                        r += (char)(0xE0 | (v >> 12));
-                        r += (char)(0x80 | ((v >> 6) & 0x3F));
-                        r += (char)(0x80 | (v & 0x3F));
-                    }
-                } else r += n;
+                }
+                if (v < 0x80) out += (char)v;
+                else if (v < 0x800) {
+                    out += (char)(0xC0 | (v >> 6));
+                    out += (char)(0x80 | (v & 0x3F));
+                } else if (v < 0x10000) {
+                    out += (char)(0xE0 | (v >> 12));
+                    out += (char)(0x80 | ((v >> 6) & 0x3F));
+                    out += (char)(0x80 | (v & 0x3F));
+                } else {
+                    out += (char)(0xF0 | (v >> 18));
+                    out += (char)(0x80 | ((v >> 12) & 0x3F));
+                    out += (char)(0x80 | ((v >> 6) & 0x3F));
+                    out += (char)(0x80 | (v & 0x3F));
+                }
                 break;
-            default: r += n; break;
+            }
+            default: return false;
         }
+    }
+    return false;
+}
+static bool jparse_val(const std::string& s, size_t& i, int depth,
+                       JVal& out) {
+    if (depth > 64) return false;   /* r31: stack guard */
+    jws(s, i);
+    if (i >= s.size()) return false;
+    char c = s[i];
+    if (c == '{') {
+        out.kind = 1;
+        i++;
+        jws(s, i);
+        if (i < s.size() && s[i] == '}') { i++; return true; }
+        for (;;) {
+            jws(s, i);
+            std::string k;
+            if (!jparse_str(s, i, k)) return false;
+            jws(s, i);
+            if (i >= s.size() || s[i] != ':') return false;
+            i++;
+            JVal v;
+            if (!jparse_val(s, i, depth + 1, v)) return false;
+            out.obj.push_back({k, std::move(v)});
+            jws(s, i);
+            if (i < s.size() && s[i] == ',') { i++; continue; }
+            if (i < s.size() && s[i] == '}') { i++; return true; }
+            return false;
+        }
+    }
+    if (c == '[') {
+        out.kind = 2;
+        i++;
+        jws(s, i);
+        if (i < s.size() && s[i] == ']') { i++; return true; }
+        for (;;) {
+            JVal v;
+            if (!jparse_val(s, i, depth + 1, v)) return false;
+            out.arr.push_back(std::move(v));
+            jws(s, i);
+            if (i < s.size() && s[i] == ',') { i++; continue; }
+            if (i < s.size() && s[i] == ']') { i++; return true; }
+            return false;
+        }
+    }
+    if (c == '"') { out.kind = 3; return jparse_str(s, i, out.str); }
+    if (c == 't' && s.compare(i, 4, "true") == 0) {
+        i += 4; out.kind = 5; out.b = true; return true;
+    }
+    if (c == 'f' && s.compare(i, 5, "false") == 0) {
+        i += 5; out.kind = 5; return true;
+    }
+    if (c == 'n' && s.compare(i, 4, "null") == 0) {
+        i += 4; out.kind = 6; return true;
+    }
+    size_t st = i;
+    if (c == '-' || c == '+') i++;
+    while (i < s.size() &&
+           ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' ||
+            s[i] == 'e' || s[i] == 'E' || s[i] == '-' || s[i] == '+'))
+        i++;
+    if (i == st) return false;
+    out.kind = 4;
+    out.num = strtod(s.c_str() + st, nullptr);
+    return true;
+}
+static const JVal* jfind_bfs(const JVal& root, const char* key) {
+    /* breadth-first: the shallowest occurrence of key wins */
+    std::vector<const JVal*> level;
+    level.push_back(&root);
+    while (!level.empty()) {
+        std::vector<const JVal*> next;
+        for (const JVal* n : level) {
+            if (n->kind == 1) {
+                for (auto& kv : n->obj) {
+                    if (kv.first == key) return &kv.second;
+                    if (kv.second.kind == 1 || kv.second.kind == 2)
+                        next.push_back(&kv.second);
+                }
+            } else if (n->kind == 2) {
+                for (auto& v : n->arr)
+                    if (v.kind == 1 || v.kind == 2) next.push_back(&v);
+            }
+        }
+        level.swap(next);
+    }
+    return nullptr;
+}
+static bool jparse_root(const std::string& j, JVal& root) {
+    size_t i = 0;
+    if (!jparse_val(j, i, 0, root)) return false;
+    jws(j, i);
+    return true;
+}
+static std::string jdump(const JVal& v) {
+    /* re-serialise a parsed value (jobjarr returns object strings) */
+    std::string r;
+    if (v.kind == 1) {
+        r += '{';
+        bool first = true;
+        for (auto& kv : v.obj) {
+            if (!first) r += ',';
+            first = false;
+            r += '"'; r += jesc(kv.first); r += "\":";
+            r += jdump(kv.second);
+        }
+        r += '}';
+    } else if (v.kind == 2) {
+        r += '[';
+        bool first = true;
+        for (auto& e : v.arr) {
+            if (!first) r += ',';
+            first = false;
+            r += jdump(e);
+        }
+        r += ']';
+    } else if (v.kind == 3) {
+        r += '"'; r += jesc(v.str); r += '"';
+    } else if (v.kind == 4) {
+        char b[40];
+        if (v.num == (double)(long long)v.num &&
+            v.num > -1e15 && v.num < 1e15)
+            snprintf(b, sizeof(b), "%lld", (long long)v.num);
+        else
+            snprintf(b, sizeof(b), "%.9g", v.num);
+        r += b;
+    } else if (v.kind == 5) {
+        r += v.b ? "true" : "false";
+    } else {
+        r += "null";
     }
     return r;
 }
 static std::vector<std::string> jarr(const std::string& j, const char* key) {
     std::vector<std::string> r;
-    std::string k = std::string("\"")+key+"\":";
-    auto p = j.find(k);
-    if (p == std::string::npos) return r;
-    p = j.find('[', p + k.size());
-    if (p == std::string::npos) return r;
-    size_t i = p + 1;
-    while (i < j.size()) {
-        while (i < j.size() && (j[i]==' '||j[i]==','||j[i]=='\n')) i++;
-        if (i >= j.size() || j[i] != '"') break;
-        size_t s = ++i;
-        std::string val;
-        while (i < j.size()) {
-            if (j[i] == '\\' && i + 1 < j.size()) { i += 2; continue; }
-            if (j[i] == '"') break;
-            i++;
-        }
-        if (i > s) val = j.substr(s, i - s);
-        r.push_back(junesc(val));
-        i++;                      /* closing quote */
-    }
+    JVal root;
+    if (!jparse_root(j, root)) return r;
+    const JVal* v = jfind_bfs(root, key);
+    if (!v || v->kind != 2) return r;
+    for (auto& e : v->arr)
+        if (e.kind == 3) r.push_back(e.str);
     return r;
 }
 static std::string jstr(const std::string& j, const char* key) {
-    std::string k = std::string("\"")+key+"\":\"";
-    auto p = j.find(k);
-    if (p == std::string::npos) return "";
-    p += k.size();
-    std::string val;
-    size_t i = p;
-    while (i < j.size()) {
-        if (j[i] == '\\' && i + 1 < j.size()) { i += 2; continue; }
-        if (j[i] == '"') break;
-        i++;
-    }
-    if (i > p) val = j.substr(p, i - p);
-    return junesc(val);
+    JVal root;
+    if (!jparse_root(j, root)) return "";
+    const JVal* v = jfind_bfs(root, key);
+    return (v && v->kind == 3) ? v->str : "";
 }
-static long jnum(const std::string& j, const char* key, long dflt=0) {
-    std::string k = std::string("\"")+key+"\":";
-    auto p = j.find(k);
-    if (p == std::string::npos) return dflt;
-    p += k.size();
-    while (p < j.size() && j[p]==' ') p++;
-    bool neg = false;
-    if (p < j.size() && j[p]=='-') { neg = true; p++; }
-    long v = 0; bool any=false;
-    while (p < j.size() && j[p] >= '0' && j[p] <= '9') {
-        v = v*10 + (j[p]-'0'); p++; any=true;
-    }
-    return any ? (neg ? -v : v) : dflt;
+static long jnum(const std::string& j, const char* key, long dflt = 0) {
+    JVal root;
+    if (!jparse_root(j, root)) return dflt;
+    const JVal* v = jfind_bfs(root, key);
+    return (v && v->kind == 4) ? (long)v->num : dflt;
 }
 static bool jhas(const std::string& j, const char* key) {
-    return j.find(std::string("\"") + key + "\":") != std::string::npos;
+    JVal root;
+    if (!jparse_root(j, root)) return false;
+    return jfind_bfs(root, key) != nullptr;
 }
 static std::string jtype(const std::string& j) {
-    const std::string k = "\"type\":\"";
-    auto p = j.find(k);
-    if (p == std::string::npos) return "";
-    p += k.size();
-    size_t i = p;
-    while (i < j.size() && j[i] != '"') {
-        if (j[i] == '\\' && i + 1 < j.size()) i++;
-        i++;
-    }
-    return j.substr(p, i - p);
+    return jstr(j, "type");
 }
 static std::vector<std::string> jobjarr(const std::string& j,
                                         const char* key) {
     std::vector<std::string> r;
-    std::string k = std::string("\"") + key + "\":[";
-    auto p = j.find(k);
-    if (p == std::string::npos) return r;
-    p += k.size();
-    while (p < j.size()) {
-        while (p < j.size() && (j[p] == ' ' || j[p] == ',')) p++;
-        if (p >= j.size() || j[p] != '{') break;
-        size_t s = p;
-        int depth = 0;
-        bool instr = false;
-        while (p < j.size()) {
-            char c = j[p];
-            if (instr) {
-                if (c == '\\') p++;
-                else if (c == '"') instr = false;
-            } else {
-                if (c == '"') instr = true;
-                else if (c == '{') depth++;
-                else if (c == '}') {
-                    depth--;
-                    if (depth == 0) { p++; break; }
-                }
-            }
-            p++;
-        }
-        r.push_back(j.substr(s, p - s));
-    }
+    JVal root;
+    if (!jparse_root(j, root)) return r;
+    const JVal* v = jfind_bfs(root, key);
+    if (!v || v->kind != 2) return r;
+    for (auto& e : v->arr)
+        if (e.kind == 1) r.push_back(jdump(e));
     return r;
 }
+/* ---- end r31 JSON tree ---- */
 static void post_rpc(const char* fn, const std::string& args) {
     std::string m = "{\"type\":\"rpc\",\"fn\":\"";
     m += fn; m += "\",\"args\":"; m += args; m += "}";
@@ -2825,6 +2923,11 @@ static void tab_tools() {
                 ImGui::EndTabItem();
             }
             if (!open) {
+                /* r31 M7: free the retained instance - it used to
+                   stay pinned until the 200-entry LRU evicted it */
+                std::string a = "{\"handle\":" +
+                                std::to_string(t.handle) + "}";
+                post_rpc("releaseHandle", a);
                 s_objtabs.erase(s_objtabs.begin() + i);
                 continue;
             }
@@ -2880,11 +2983,13 @@ static void draw_fab(ImVec2 ds) {
         if (!s_fab_moved && !fab_press) {
             /* tap released just off the button: still a tap */
             s_visible = !s_visible;
+            s_visible_pub.store(s_visible);
             s_conf_dirty = true;
         }
     }
     if (fab_press && !s_fab_moved) {  /* r29: single tap toggles */
         s_visible = !s_visible;
+        s_visible_pub.store(s_visible);
         s_conf_dirty = true;
     }
     ImGui::End();
@@ -2961,19 +3066,17 @@ static void draw_resize_handles() {
     }
 }
 int menu_frame_pump_level() {
-    MLK();
-    bool vis = s_visible;
-    MULK();
-    if (vis) return 2;                    /* full rate */
+    /* r31 M8: no mutex - s_visible is mirrored into an atomic, so
+       the JS thread's frame pump can no longer stall behind a
+       whole-frame render lock */
+    if (s_visible_pub.load(std::memory_order_relaxed)) return 2;
     return overlay_ready() ? 1 : 0;       /* FAB-only slow pump  */
 }
 void menu_draw() {
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 ds = io.DisplaySize;
     apply_theme();
-    MLK();
-    bool vis = s_visible;
-    MULK();
+    bool vis = s_visible_pub.load(std::memory_order_relaxed);  /* r31 M8 */
     if (!vis) {
         draw_fab(ds);
         MLK();
@@ -3046,10 +3149,11 @@ void menu_draw() {
     }
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r30)", &open, wflags);
+    ImGui::Begin("Dex-tool v1.3 (r31)", &open, wflags);
     if (!open) {
         MLK();
         s_visible = false;
+        s_visible_pub.store(false);
         s_conf_dirty = true;
         if (!s_show_fab) s_show_fab = true;
         MULK();

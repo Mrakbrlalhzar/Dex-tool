@@ -162,7 +162,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r30: review fixes - C1 flash loop locked, C2 tab containers on std::deque for stable references, C3 hook mode Nop (auto) prefix-matched and unknown modes report hookFailed, C4 dumpObject args wired in FN_ARGS, H3 dead fmPopup trigger removed, H4 legacy font= honored, H5 touch overflow drops whole gestures and MOVE no longer fabricates presses, H6 no GL deletes on foreign contexts, M1 host stdout/stderr left alone, M2 async-signal-safe crash handler, M5 logger dirs mkdir -p, M7 setInstanceField reports stale handles, M9 theme applied on change, junesc pairs surrogate escapes)");
+    log_info("logger_init done (build r31: M4 real JSON tree parser with shallowest-match key lookup, surrogate pairs and a depth cap, M7 releaseHandle frees retained instances on object tab close, M8 lock-free frame pump via atomic mirror, CI warns on hand edits to generated files. r30: flash-loop lock, deque containers, hook-mode fix, dumpObject args, touch/GL/logger fixes, signal-safe crash handler)");
 }
 void logger_retarget(const char* base_dir) {
     if (!base_dir || !base_dir[0]) return;

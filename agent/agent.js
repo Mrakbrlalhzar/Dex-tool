@@ -1,7 +1,7 @@
-/* Dex-tool agent (r30): C3 hook-mode prefix match + unknown-mode
-   hookFailed report, C4 dumpObject / dumpLoadedClasses wired into
-   FN_ARGS, M7 setInstanceField reports stale handles instead of
-   patching by a stale scan index. r29: no agent change. */
+/* Dex-tool agent (r31): M7 releaseHandle export - the menu frees
+   retained instances when their object tab closes. r30: hook-mode
+   prefix match + unknown-mode report, dumpObject FN_ARGS, stale
+   handle reporting. */
 'use strict';
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
 var gAgentLog = null;
@@ -1684,6 +1684,17 @@ rpc.exports = {
             sendMsg('scriptError', { msg: String(e && e.stack ? e.stack : e) });
         }
     },
+    releaseHandle: function (handle) {
+        /* r31 M7: the menu posts this when an object tab closes -
+           free the retained instance now instead of waiting for the
+           200-entry LRU to evict it */
+        var k = String(handle);
+        var w = gInstHandles[k];
+        if (w) {
+            try { ime_release_act(w); } catch (e0) {}
+            delete gInstHandles[k];
+        }
+    },
     dumpLoadedClasses: function () {
         Java.perform(function () {
             var path = '', n = 0, err = '';
@@ -2557,8 +2568,9 @@ var FN_ARGS = {
     callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
     createInstance:  ['class'],
     dumpLoadedClasses: [],              /* r30 C4 */
-    dumpObject:      ['cls', 'handle']  /* r30 C4: per-object dump
+    dumpObject:      ['cls', 'handle'],/* r30 C4: per-object dump
                                            was dead (undefined args) */
+    releaseHandle:   ['handle']         /* r31 M7 */
 };
 agentLog('phase: deferred init scheduled');
 setTimeout(function () {
@@ -2582,6 +2594,6 @@ setTimeout(function () {
         var appR = ATr.currentApplication();
         if (appR) pkgR = String(appR.getPackageName());
     } catch (eP) {}
-    sendMsg('ready', { msg: 'Dex-tool agent r30 loaded', pkg: pkgR });
+    sendMsg('ready', { msg: 'Dex-tool agent r31 loaded', pkg: pkgR });
     agentLog('phase: ready sent');
 }, 0);

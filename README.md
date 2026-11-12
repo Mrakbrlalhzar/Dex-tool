@@ -22,11 +22,10 @@ overwritten by the next CI run - change the heredocs, not the tree.
 
 ## Known limitations
 
-- The C-side JSON handling is a small hand-rolled scanner. The
-  current agent message set is safe; nested duplicate keys would need
-  a real parser (deferred, see the r30 notes).
 - One recursive mutex guards most shared UI state; the JS thread can
-  stall for the duration of a frame (deferred, r30 notes).
+  still stall for the duration of a frame (r31 removed the frame-pump
+  stall via an atomic mirror; full per-container ownership remains
+  future work).
 - The overlay needs a GL context on the screen it draws on; on
   context loss it parks itself without GL calls and re-inits on the
   next one (r30).
@@ -35,6 +34,30 @@ overwritten by the next CI run - change the heredocs, not the tree.
 
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+## Fixes in this version (r31)
+
+- **M4** the menu's substring JSON helpers (jstr, jnum, jhas, jarr,
+  jtype, jobjarr, junesc) are replaced by a real minimal JSON tree
+  parser: keys resolve to the SHALLOWEST match, so a payload like
+  {"inner":{"class":"B"},"class":"A"} can no longer return "B";
+  escapes are handled once, UTF-16 surrogate pairs encode as real
+  emoji, and parse depth is capped at 64 against hostile input.
+  Verified by a standalone harness covering the review's cases,
+  emoji, depth bombs and malformed input.
+- **M7** closing an object tab now posts releaseHandle - the agent
+  Java.release()s / $dispose()s the retained instance instead of
+  pinning it until the 200-entry LRU evicts it.
+- **M8 (partial)** menu_frame_pump_level() no longer takes the menu
+  mutex: s_visible is mirrored into a std::atomic<bool>, so the JS
+  thread's frame pump can never stall behind a whole-frame render
+  lock. Full per-container ownership remains future work.
+- **Structural** the workflow now warns when a push modifies files
+  under the generated paths (src/, agent/, sample-app/, README.md) -
+  the heredocs overwrite those edits in the same run. It is a
+  warning, not a failure: a yml-only update (the normal flow) passes
+  silently, and the initial all-zeros push is skipped.
+
 
 ## Fixes in this version (r30)
 
