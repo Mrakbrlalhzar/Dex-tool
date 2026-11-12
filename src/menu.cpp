@@ -10,13 +10,29 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <cctype>
 #include <algorithm>
 #include <pthread.h>
 #include <ctime>
 
 /* =====================================================================
-   Dex-tool menu (r26)
-   - UI RESTRUCTURE per the field spec:
+   Dex-tool menu (r27)
+   - r27 = UI spec v2 integrated (the runtime_tool_imgui_mock design):
+     * family dropdown popup: a "Search families..." input at the
+       very top filters the PACKAGE list in real time (package names
+       only - it never touches the class search)
+     * class windows: the full class name is the title line and
+       wraps to the window width
+     * methods: LONG PRESS (>= 0.55 s) opens the context menu, next
+       to right-click and the "..." button
+     * method sub-tabs renamed: Call / Patch / Trace / Hook
+     * object parameters: a real DROPDOWN (auto instance scan of the
+       parameter's class + "Find / Create Object..." entry; the
+       free-form value input is kept below)
+     * the fields list lives under a "Fields" tree node
+     * "Call Count" input and "Call Results:" log per spec,
+       "Manual Input" in the Patch tab (NOP = void methods)
+   - r26 UI RESTRUCTURE per the field spec:
      * topmost main tabs, exact order: Classes, Patches, Trackers,
        Hooks, Recorder, Monitor, Script, Settings
      * secondary tab bar: the OPENED classes, with a "+" button on the
@@ -112,7 +128,7 @@ struct ClassTab {
     int  sub = 0;                       /* 0 Instances 1 Static Fields 2 Methods 3 Fields */
     /* r26 method expansion: which method row is open + its sub-tab */
     int  expanded = -1;                 /* index into methods, -1 none   */
-    int  msub = 0;                      /* 0 Caller 1 Patcher 2 Tracer 3 Hooker */
+    int  msub = 0;                      /* 0 Call 1 Patch 2 Trace 3 Hook */
     /* inline method-call editor (r26 Caller tab) */
     MethodSig call_sig;
     char call_args[8][128] = {};
@@ -175,6 +191,7 @@ struct ExplorerWin {
     int  id = 0;
     bool open = true;
     char search[160] = {};
+    char fam_search[96] = {};     /* r27: "Search families..." filter */
     int  family = 0;              /* index into s_families           */
     bool all_fam = true;          /* "All" checkbox = every family   */
     bool case_sensitive = false;
@@ -199,6 +216,16 @@ static std::vector<ExplorerWin> s_explorers;
 static std::vector<std::string> s_families;   /* com.game, com.android... */
 static bool s_expl_req = false;               /* "+" pressed               */
 static int  s_expl_seq = 0;
+/* r27: object-parameter dropdowns auto-scan the parameter's class
+   (listInstances) when their combo opens for the first time; the
+   instanceList reply fills this per-dropdown buffer. */
+static struct ParamScan {
+    int uid = -1;                 /* inspector window the dropdown is in */
+    int arg = -1;                 /* parameter index                     */
+    std::string cls;              /* parameter type                      */
+    std::vector<InstInfo> list;
+    bool waiting = false;
+} s_pscan;
 static int  s_tab_uid_seq = 0;
 static int  s_focus_expl = 0;                 /* explorer id to raise     */
 static std::string s_focus_win;               /* inspector title to raise */
@@ -599,6 +626,16 @@ static std::string family_of(const std::string& cls) {
     auto d2 = cls.find('.', d1 + 1);
     if (d2 == std::string::npos) return cls;
     return cls.substr(0, d2);
+}
+/* r27: case-insensitive substring (the mock's Contains(hay, nd,
+   false)); used by the family popup's "Search families..." filter */
+static bool contains_ci(const std::string& hay, const char* nd) {
+    if (!nd || !nd[0]) return true;
+    std::string a, b = nd;
+    a.reserve(hay.size());
+    for (char ch : hay) a += (char)tolower((unsigned char)ch);
+    for (char& ch : b)  ch = (char)tolower((unsigned char)ch);
+    return a.find(b) != std::string::npos;
 }
 /* r26: split a parameter list on TOP-LEVEL commas only - generic
    depth (Map<String,Integer>) and array brackets must not split */
@@ -1008,6 +1045,11 @@ void menu_init() {
             if (s_of.open && s_of.cls == jstr(j, "class")) {
                 s_of.results = list;
                 s_of.waiting = false;
+            }
+            /* r27: the object-parameter dropdown scan */
+            if (s_pscan.cls == jstr(j, "class")) {
+                s_pscan.list = list;
+                s_pscan.waiting = false;
             }
         } else if (ty == "instanceCreated") {
             /* r26: Object Finder "Create Object" result */
@@ -1759,11 +1801,13 @@ static void static_fields_view(ClassTab& c) {
     MULK();
 }
 
-/* ---- Fields (all fields, the spec's plain "Fields List") ---- */
+/* ---- Fields (all fields, the spec's plain "Fields List") ----
+   spec v2: the list renders under a "Fields" TREE NODE */
 static void fields_view(ClassTab& c) {
     MLK();
     ImGui::TextDisabled("%lu fields (static values: Static Fields tab)",
                         (unsigned long)c.fields.size());
+    if (!ImGui::TreeNode("Fields##ftn")) { MULK(); return; }
     for (int i = 0; i < (int)c.fields.size(); i++) {
         FieldInfo& f = c.fields[i];
         ImGui::PushID(6000 + i);
@@ -1788,6 +1832,7 @@ static void fields_view(ClassTab& c) {
         }
         ImGui::PopID();
     }
+    ImGui::TreePop();
     MULK();
 }
 
@@ -1806,22 +1851,68 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
             ImGui::SetNextItemWidth(210);
             ime_textfield(lb, c.call_args[k], sizeof(c.call_args[k]));
         } else {
-            /* field spec: object parameters get a dropdown that opens
-               the Object Finder for the PARAMETER's class */
+            /* spec v2: object parameters are a DROPDOWN. First open
+               auto-scans the parameter's class (listInstances) and
+               the popup lists the found instances (tap = fill the
+               retained @handle); "Find / Create Object..." opens the
+               full Object Finder (Java.choose / $new / manual). The
+               free-form value input is kept below. */
             ImGui::Text("%s", lb);
             ImGui::SetNextItemWidth(-52.f);
-            ime_textfield("##co", c.call_args[k], sizeof(c.call_args[k]));
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Find...")) {
-                snprintf(s_of.cls, sizeof(s_of.cls), "%s", ps[k].c_str());
-                snprintf(s_of.typ, sizeof(s_of.typ), "%s", ps[k].c_str());
-                s_of.ctx_uid = c.uid;
-                s_of.ctx_arg = k;
-                s_of.open    = true;
-                s_of.results.clear();
-                s_of.waiting  = false;
-                s_of.creating = false;
+            std::string prev = c.call_args[k][0] ?
+                std::string(c.call_args[k]) : "(pick instance)";
+            if (ImGui::BeginCombo("##co", prev.c_str())) {
+                if (ImGui::Selectable(
+                        "Find / Create Object (Object Finder)...")) {
+                    snprintf(s_of.cls, sizeof(s_of.cls), "%s",
+                             ps[k].c_str());
+                    snprintf(s_of.typ, sizeof(s_of.typ), "%s",
+                             ps[k].c_str());
+                    s_of.ctx_uid = c.uid;
+                    s_of.ctx_arg = k;
+                    s_of.open    = true;
+                    s_of.results.clear();
+                    s_of.waiting  = false;
+                    s_of.creating = false;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::Separator();
+                if (s_pscan.uid != c.uid || s_pscan.arg != k ||
+                    s_pscan.cls != ps[k]) {
+                    s_pscan.uid = c.uid;
+                    s_pscan.arg = k;
+                    s_pscan.cls = ps[k];
+                    s_pscan.list.clear();
+                    s_pscan.waiting = true;
+                    post_rpc("listInstances",
+                             "{\"class\":\"" + jesc(ps[k]) + "\"}");
+                }
+                if (s_pscan.waiting)
+                    ImGui::TextDisabled("(scanning instances...)");
+                int pn = (int)s_pscan.list.size();
+                for (int q = 0; q < pn; q++) {
+                    ImGui::PushID(q);
+                    char pl[220];
+                    snprintf(pl, sizeof(pl), "%s (%d/%d)",
+                             short_name(ps[k]).c_str(), q, pn);
+                    if (ImGui::Selectable(pl)) {
+                        char tok[40];
+                        snprintf(tok, sizeof(tok), "@handle:%ld",
+                                 s_pscan.list[q].handle);
+                        snprintf(c.call_args[k], sizeof(c.call_args[0]),
+                                 "%s", tok);
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::TextDisabled("    %s",
+                                        s_pscan.list[q].str.c_str());
+                    ImGui::PopID();
+                }
+                if (pn == 0 && !s_pscan.waiting)
+                    ImGui::TextDisabled("no instances - use Find / Create");
+                ImGui::EndCombo();
             }
+            ImGui::SetNextItemWidth(-52.f);
+            ime_textfield("##cov", c.call_args[k], sizeof(c.call_args[k]));
         }
         ImGui::PopID();
     }
@@ -1831,7 +1922,7 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
         ImGui::TextDisabled("instance methods need a receiver - pick "
                             "one on the Instances tab or via Inspector");
     ImGui::SetNextItemWidth(130);
-    if (ImGui::InputInt("Call count", &c.call_count)) {
+    if (ImGui::InputInt("Call Count", &c.call_count)) {
         if (c.call_count < 1)    c.call_count = 1;
         if (c.call_count > 50)   c.call_count = 50;
     }
@@ -1891,7 +1982,7 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
         c.call_log.push_back(note);
     }
     if (!c.call_log.empty()) {
-        ImGui::TextDisabled("call results:");
+        ImGui::TextDisabled("Call Results:");
         ImGui::SameLine();
         if (ImGui::SmallButton("Clear##clg")) c.call_log.clear();
         ImGui::BeginChild("calllog", ImVec2(0, 150), true);
@@ -1906,11 +1997,12 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
 }
 
 static void patcher_tab(ClassTab& c, const MethodSig& m) {
-    ImGui::TextDisabled("Patch NOP: skip the body (auto return value by "
-                        "return type). Redirect: force the return value "
+    ImGui::TextDisabled("Patch NOP: skip the body (void methods return "
+                        "immediately; others return the default for "
+                        "their type). Redirect: force the return value "
                         "below on every subsequent call.");
     ImGui::SetNextItemWidth(220);
-    ime_textfield("Value##pv26", c.patch_val, sizeof(c.patch_val));
+    ime_textfield("Manual Input##pv26", c.patch_val, sizeof(c.patch_val));
     if (ImGui::Button("Patch NOP")) {
         std::string a = "{\"class\":\"" + jesc(c.cname)
                       + "\",\"method\":\"" + jesc(m.name)
@@ -2091,12 +2183,13 @@ static void hooker_tab(ClassTab& c, const MethodSig& m) {
     }
 }
 
-/* the expanded method body: exactly the 4 sub-tabs of the spec */
+/* the expanded method body: exactly the 4 sub-tabs of the spec
+   (v2 naming: Call / Patch / Trace / Hook) */
 static void method_body(ClassTab& c, const MethodSig& m) {
     ImGui::Indent();
     if (ImGui::BeginTabBar("mexp")) {
-        static const char* msubs[] = {"Caller", "Patcher", "Tracer",
-                                      "Hooker"};
+        static const char* msubs[] = {"Call", "Patch", "Trace",
+                                      "Hook"};
         char tlbl[40];
         for (int t = 0; t < 4; t++) {
             snprintf(tlbl, sizeof(tlbl), "%s##mexp%d", msubs[t], t);
@@ -2155,11 +2248,30 @@ static void methods_view(ClassTab& c) {
             }
             if (hitm) ImGui::PopStyleColor();
             bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            /* spec v2: a LONG PRESS on the row (>= 0.55 s, the mock's
+               IsMouseDownDuration pattern) opens the same context
+               menu on touch. Scroll guard: if a wheel event was
+               injected while this press is held (the overlay turns
+               drags inside lists into wheel events), the gesture is
+               a scroll, not a long press. */
+            static bool mctx_wheel_press = false;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                mctx_wheel_press = false;
+            ImGuiIO& pio = ImGui::GetIO();
+            if (pio.MouseWheel != 0.f || pio.MouseWheelH != 0.f)
+                mctx_wheel_press = true;
+            bool lng = ImGui::IsItemHovered() &&
+                       ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+                       !mctx_wheel_press &&
+                       !ImGui::IsMouseDragging(ImGuiMouseButton_Left,
+                                               10.f) &&
+                       pio.MouseDownDuration[ImGuiMouseButton_Left] >
+                           0.55f;
             float bx = ImGui::GetCursorPosX() +
                        ImGui::GetContentRegionAvail().x - 26.f;
             ImGui::SameLine(bx);
             bool dot = ImGui::SmallButton("...");
-            if (rclk || dot) ImGui::OpenPopup("mctx");
+            if (rclk || dot || lng) ImGui::OpenPopup("mctx");
             if (ImGui::BeginPopup("mctx")) {
                 if (ImGui::MenuItem("Open in new window")) {
                     /* deferred: pushing into s_classes here would
@@ -2333,7 +2445,21 @@ static void draw_explorer_windows(ImVec2 ds) {
                                     : "(no classes yet)";
             if (ImGui::BeginCombo("##fam",
                                   e.all_fam ? "(All families)" : fprev)) {
+                /* spec v2: the popup's FIRST widget is the
+                   "Search families..." box - it filters the PACKAGE
+                   names below in real time and NEVER touches the
+                   class list or the Filter search */
+                ImGui::SetNextItemWidth(-1.f);
+                ime_textfield("Search families...##fsearch",
+                              e.fam_search, sizeof(e.fam_search));
+                ImGui::Separator();
+                if (ImGui::Selectable("(All families)##fsearchall",
+                                      e.all_fam))
+                    e.all_fam = true;
+                ImGui::Separator();
                 for (int f = 0; f < nf; f++) {
+                    if (!contains_ci(s_families[f], e.fam_search))
+                        continue;
                     bool sel = (!e.all_fam && e.family == f);
                     if (ImGui::Selectable(famc[f], sel)) {
                         e.family  = f;
@@ -2466,7 +2592,12 @@ static void draw_class_windows(ImVec2 ds) {
             float xr = ImGui::GetWindowWidth() - 34.f;
             ImGui::SameLine(xr);
             if (ImGui::SmallButton("X")) { c.win_close = true; open = false; }
-            ImGui::TextDisabled("%s", c.cname.c_str());
+            /* spec v2: the class name is the window's title line and
+               WRAPS to the window width (long package paths stay
+               readable when the menu is small) */
+            ImGui::PushTextWrapPos();
+            ImGui::TextUnformatted(c.cname.c_str());
+            ImGui::PopTextWrapPos();
             if (!c.got_info)
                 ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
                                               : "(no data - tap Refresh)");
@@ -2790,7 +2921,7 @@ void menu_draw() {
        here is the single opacity source. */
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r26)", &open,
+    ImGui::Begin("Dex-tool v1.3 (r27)", &open,
                  ImGuiWindowFlags_NoCollapse);
     if (!open) {
         MLK();

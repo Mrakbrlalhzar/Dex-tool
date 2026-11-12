@@ -3,64 +3,37 @@
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
-## Fixes in this version (r26)
+## Fixes in this version (r27)
 
-Field spec: a full menu RESTRUCTURE. Same engine and RPCs - the
-UI is reorganized around windows and the exact tab set the spec
-names.
+UI spec v2 (the runtime_tool_imgui_mock design) integrated into the
+real menu. Same engine, RPCs and agent - menu.cpp carries the
+changes; the object-parameter dropdowns reuse listInstances.
 
-- **Main tabs, exact order:** Classes, Patches, Trackers, Hooks,
-  Recorder, Monitor, Script, Settings (was Settings-first with
-  "Tracker").
-- **Secondary bar:** the opened classes are tabs under the main
-  bar; the far-right **+** button opens a NEW Class Explorer
-  window. Tapping a class tab raises that class's window.
-- **Class Explorer windows:** package/family dropdown (com.game,
-  com.android, ... derived from the loaded list) with an **All**
-  checkbox, the search field + **Filter** button, and a pink
-  **Options** button whose popup holds **Case sensitive**,
-  **Filter by Class / Method / Field**, the advanced **code-text**
-  search (same baksmali const-string scan as r25) and the System
-  classes gate. The filtered class list fills the window; tapping
-  a class opens its Inspector. Case sensitivity now reaches the
-  agent (listLoadedClasses gained a `cs` argument - mode 0 AND
-  the dex scan honor it).
-- **Class Inspector windows** (one per opened class, floating,
-  movable): **Inspector** button (opens the Object Finder for the
-  class), **Static Fields** section (values read on demand), the
-  Methods list and the full Fields list. **-** collapses the
-  window, **X** closes it.
-- **Method expansion:** tapping a method opens the 4 spec
-  sub-tabs in place:
-  - **Caller** - one input per parameter (primitives int32/
-    int64/float/double/string/boolean/byte are plain text;
-    OBJECT parameters get a **Find...** button that opens the
-    Object Finder for the parameter's class), the **Call count**
-    input, **Call** and **Call in Main Thread** buttons (the
-    agent loops and runs each call via
-    Java.scheduleOnMainThread), and a per-call results log
-    ("call 3/10: ..."). Object args travel as {"handle":N} and
-    callMethod passes the retained instance as the REAL object
-    - text-only args could never do that.
-  - **Patcher** - manual value, **Patch NOP** (auto return by
-    method logic) and **Redirect** (forces the return value on
-    every subsequent call), plus the r25 live IO-probe editor.
-  - **Tracer** - track this method + live event log.
-  - **Hooker** - Java/Smali/Nop hook editor for the method.
-- **Method context menu:** right-click (or the "..." button on
-  touch) offers Open in new window (duplicate Inspector), Full
-  Method View (real smali in its own window), Copy Method Name
-  and Copy Class Name (clipboard + an on-screen echo - the touch
-  bridge has no system clipboard backend).
-- **Object Finder window:** **Find Objects** (Java.choose),
-  **Create Object** ($new() through the no-arg constructor,
-  retained like a scan match), a manual reference field and a
-  results list in the spec's "Name (i/N)" shape. A click fills
-  the caller parameter that opened it or selects the object for
-  the Inspector/Instances view.
-- r25 kept: frame pump, method source view, one-tap Nop, IO
-  patching, network monitor detail window, green code-text marks,
-  sorted filtered class list.
+- **Family dropdown popup:** the FIRST widget inside the popup is a
+  "Search families..." input that filters the PACKAGE list in real
+  time as you type (package names only - it never touches the class
+  search). "(All families)" sits right under it; the "All" checkbox
+  stays next to the dropdown.
+- **Class window title:** the full class name is the title line and
+  WRAPS to the window width (long package paths stay readable when
+  the menu is small).
+- **Method long press:** pressing a method row for >= 0.55 s opens
+  the same context menu as right-click / "...": Copy Method Name,
+  Copy Class Name, Open in new window, Full Method View.
+- **Method sub-tabs renamed:** Call / Patch / Trace / Hook (were
+  Caller / Patcher / Tracer / Hooker).
+- **Object parameters are dropdowns:** first open auto-scans the
+  parameter's class (listInstances) and lists found instances in
+  the popup; a tap fills the argument with the retained handle.
+  "Find / Create Object..." opens the Object Finder (Java.choose,
+  $new, manual reference) and the free-form value input stays.
+- **Fields tree node:** the Fields list renders under a "Fields"
+  tree node.
+- **Labels per spec:** "Call Count" input, "Call Results:" log,
+  "Manual Input" in the Patch tab; the Patch NOP hint spells out
+  that void methods return immediately.
+- The floating Toggle button and the whole r26 restructure are
+  unchanged.
 
 ## Usage
 

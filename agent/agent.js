@@ -1,8 +1,12 @@
 'use strict';
-/* Dex-tool agent (r26). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r27). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
 
+   r27 changes (UI spec v2 - menu.cpp only, the agent is UNCHANGED:
+   the object-parameter dropdowns reuse listInstances): family popup
+   "Search families..." filter, wrapped class-name title, long-press
+   method menu, Call/Patch/Trace/Hook sub-tabs, Fields tree node.
    r26 changes (menu restructure per the field spec - Class Explorer
    windows, Inspector windows, Caller/Patcher/Tracer/Hooker sub-tabs,
    Object Finder):
@@ -3626,6 +3630,6 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r26 loaded' });
+    sendMsg('ready', { msg: 'Dex-tool agent r27 loaded' });
     agentLog('phase: ready sent');
 }, 0);

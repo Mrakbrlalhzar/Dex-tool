@@ -149,7 +149,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r26: menu restructured per the field spec - main tabs Classes/Patches/Trackers/Hooks/Recorder/Monitor/Script/Settings, secondary bar of opened classes with a + that opens Class Explorer windows (family dropdown + All, Filter, pink Options: case-sensitive / filter by class-method-field / advanced code-text search), floating Class Inspector windows with Inspector button, Static Fields, Methods expanding into Caller (per-param inputs, Object Finder for object params, call count, Call and Call in Main Thread, per-call results log) / Patcher (manual value, Patch NOP, Redirect, live IO probe) / Tracer / Hooker, right-click method context menu (open in new window, full method view, copy names), Object Finder window with Java.choose find, $new create and manual reference, r25 frame pump/source view/monitor fixes kept)");
+    log_info("logger_init done (build r27: UI spec v2 integrated - family dropdown popup opens with a real-time Search families box (package names only), class windows wrap the full class name to the window width, methods answer long-press with the context menu (right-click and ... kept), method sub-tabs renamed Call/Patch/Trace/Hook, object parameters are dropdowns with auto instance scan + Find/Create entry (free-form value input kept), fields list under a Fields tree node, Call Count input and Call Results log, Manual Input in the Patch tab, r26 window restructure kept)");
 }
 
 /* r16: re-point the logs at the app's real private dir.
