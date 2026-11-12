@@ -515,7 +515,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r26: menu restructured per the field spec - main tabs Classes/Patches/Trackers/Hooks/Recorder/Monitor/Script/Settings, secondary bar of opened classes with a + that opens Class Explorer windows (family dropdown + All, Filter, pink Options: case-sensitive / filter by class-method-field / advanced code-text search), floating Class Inspector windows with Inspector button, Static Fields, Methods expanding into Caller (per-param inputs, Object Finder for object params, call count, Call and Call in Main Thread, per-call results log) / Patcher (manual value, Patch NOP, Redirect, live IO probe) / Tracer / Hooker, right-click method context menu (open in new window, full method view, copy names), Object Finder window with Java.choose find, $new create and manual reference, r25 frame pump/source view/monitor fixes kept)");
+              log_info("logger_init done (build r27: UI spec v2 integrated - family dropdown popup opens with a real-time Search families box (package names only), class windows wrap the full class name to the window width, methods answer long-press with the context menu (right-click and ... kept), method sub-tabs renamed Call/Patch/Trace/Hook, object parameters are dropdowns with auto instance scan + Find/Create entry (free-form value input kept), fields list under a Fields tree node, Call Count input and Call Results log, Manual Input in the Patch tab, r26 window restructure kept)");
           }
 
           /* r16: re-point the logs at the app's real private dir.
@@ -2120,13 +2120,29 @@ jobs:
           #include <cstring>
           #include <cmath>
           #include <cstdlib>
+          #include <cctype>
           #include <algorithm>
           #include <pthread.h>
           #include <ctime>
 
           /* =====================================================================
-             Dex-tool menu (r26)
-             - UI RESTRUCTURE per the field spec:
+             Dex-tool menu (r27)
+             - r27 = UI spec v2 integrated (the runtime_tool_imgui_mock design):
+               * family dropdown popup: a "Search families..." input at the
+                 very top filters the PACKAGE list in real time (package names
+                 only - it never touches the class search)
+               * class windows: the full class name is the title line and
+                 wraps to the window width
+               * methods: LONG PRESS (>= 0.55 s) opens the context menu, next
+                 to right-click and the "..." button
+               * method sub-tabs renamed: Call / Patch / Trace / Hook
+               * object parameters: a real DROPDOWN (auto instance scan of the
+                 parameter's class + "Find / Create Object..." entry; the
+                 free-form value input is kept below)
+               * the fields list lives under a "Fields" tree node
+               * "Call Count" input and "Call Results:" log per spec,
+                 "Manual Input" in the Patch tab (NOP = void methods)
+             - r26 UI RESTRUCTURE per the field spec:
                * topmost main tabs, exact order: Classes, Patches, Trackers,
                  Hooks, Recorder, Monitor, Script, Settings
                * secondary tab bar: the OPENED classes, with a "+" button on the
@@ -2222,7 +2238,7 @@ jobs:
               int  sub = 0;                       /* 0 Instances 1 Static Fields 2 Methods 3 Fields */
               /* r26 method expansion: which method row is open + its sub-tab */
               int  expanded = -1;                 /* index into methods, -1 none   */
-              int  msub = 0;                      /* 0 Caller 1 Patcher 2 Tracer 3 Hooker */
+              int  msub = 0;                      /* 0 Call 1 Patch 2 Trace 3 Hook */
               /* inline method-call editor (r26 Caller tab) */
               MethodSig call_sig;
               char call_args[8][128] = {};
@@ -2285,6 +2301,7 @@ jobs:
               int  id = 0;
               bool open = true;
               char search[160] = {};
+              char fam_search[96] = {};     /* r27: "Search families..." filter */
               int  family = 0;              /* index into s_families           */
               bool all_fam = true;          /* "All" checkbox = every family   */
               bool case_sensitive = false;
@@ -2309,6 +2326,16 @@ jobs:
           static std::vector<std::string> s_families;   /* com.game, com.android... */
           static bool s_expl_req = false;               /* "+" pressed               */
           static int  s_expl_seq = 0;
+          /* r27: object-parameter dropdowns auto-scan the parameter's class
+             (listInstances) when their combo opens for the first time; the
+             instanceList reply fills this per-dropdown buffer. */
+          static struct ParamScan {
+              int uid = -1;                 /* inspector window the dropdown is in */
+              int arg = -1;                 /* parameter index                     */
+              std::string cls;              /* parameter type                      */
+              std::vector<InstInfo> list;
+              bool waiting = false;
+          } s_pscan;
           static int  s_tab_uid_seq = 0;
           static int  s_focus_expl = 0;                 /* explorer id to raise     */
           static std::string s_focus_win;               /* inspector title to raise */
@@ -2709,6 +2736,16 @@ jobs:
               auto d2 = cls.find('.', d1 + 1);
               if (d2 == std::string::npos) return cls;
               return cls.substr(0, d2);
+          }
+          /* r27: case-insensitive substring (the mock's Contains(hay, nd,
+             false)); used by the family popup's "Search families..." filter */
+          static bool contains_ci(const std::string& hay, const char* nd) {
+              if (!nd || !nd[0]) return true;
+              std::string a, b = nd;
+              a.reserve(hay.size());
+              for (char ch : hay) a += (char)tolower((unsigned char)ch);
+              for (char& ch : b)  ch = (char)tolower((unsigned char)ch);
+              return a.find(b) != std::string::npos;
           }
           /* r26: split a parameter list on TOP-LEVEL commas only - generic
              depth (Map<String,Integer>) and array brackets must not split */
@@ -3118,6 +3155,11 @@ jobs:
                       if (s_of.open && s_of.cls == jstr(j, "class")) {
                           s_of.results = list;
                           s_of.waiting = false;
+                      }
+                      /* r27: the object-parameter dropdown scan */
+                      if (s_pscan.cls == jstr(j, "class")) {
+                          s_pscan.list = list;
+                          s_pscan.waiting = false;
                       }
                   } else if (ty == "instanceCreated") {
                       /* r26: Object Finder "Create Object" result */
@@ -3869,11 +3911,13 @@ jobs:
               MULK();
           }
 
-          /* ---- Fields (all fields, the spec's plain "Fields List") ---- */
+          /* ---- Fields (all fields, the spec's plain "Fields List") ----
+             spec v2: the list renders under a "Fields" TREE NODE */
           static void fields_view(ClassTab& c) {
               MLK();
               ImGui::TextDisabled("%lu fields (static values: Static Fields tab)",
                                   (unsigned long)c.fields.size());
+              if (!ImGui::TreeNode("Fields##ftn")) { MULK(); return; }
               for (int i = 0; i < (int)c.fields.size(); i++) {
                   FieldInfo& f = c.fields[i];
                   ImGui::PushID(6000 + i);
@@ -3898,6 +3942,7 @@ jobs:
                   }
                   ImGui::PopID();
               }
+              ImGui::TreePop();
               MULK();
           }
 
@@ -3916,22 +3961,68 @@ jobs:
                       ImGui::SetNextItemWidth(210);
                       ime_textfield(lb, c.call_args[k], sizeof(c.call_args[k]));
                   } else {
-                      /* field spec: object parameters get a dropdown that opens
-                         the Object Finder for the PARAMETER's class */
+                      /* spec v2: object parameters are a DROPDOWN. First open
+                         auto-scans the parameter's class (listInstances) and
+                         the popup lists the found instances (tap = fill the
+                         retained @handle); "Find / Create Object..." opens the
+                         full Object Finder (Java.choose / $new / manual). The
+                         free-form value input is kept below. */
                       ImGui::Text("%s", lb);
                       ImGui::SetNextItemWidth(-52.f);
-                      ime_textfield("##co", c.call_args[k], sizeof(c.call_args[k]));
-                      ImGui::SameLine();
-                      if (ImGui::SmallButton("Find...")) {
-                          snprintf(s_of.cls, sizeof(s_of.cls), "%s", ps[k].c_str());
-                          snprintf(s_of.typ, sizeof(s_of.typ), "%s", ps[k].c_str());
-                          s_of.ctx_uid = c.uid;
-                          s_of.ctx_arg = k;
-                          s_of.open    = true;
-                          s_of.results.clear();
-                          s_of.waiting  = false;
-                          s_of.creating = false;
+                      std::string prev = c.call_args[k][0] ?
+                          std::string(c.call_args[k]) : "(pick instance)";
+                      if (ImGui::BeginCombo("##co", prev.c_str())) {
+                          if (ImGui::Selectable(
+                                  "Find / Create Object (Object Finder)...")) {
+                              snprintf(s_of.cls, sizeof(s_of.cls), "%s",
+                                       ps[k].c_str());
+                              snprintf(s_of.typ, sizeof(s_of.typ), "%s",
+                                       ps[k].c_str());
+                              s_of.ctx_uid = c.uid;
+                              s_of.ctx_arg = k;
+                              s_of.open    = true;
+                              s_of.results.clear();
+                              s_of.waiting  = false;
+                              s_of.creating = false;
+                              ImGui::CloseCurrentPopup();
+                          }
+                          ImGui::Separator();
+                          if (s_pscan.uid != c.uid || s_pscan.arg != k ||
+                              s_pscan.cls != ps[k]) {
+                              s_pscan.uid = c.uid;
+                              s_pscan.arg = k;
+                              s_pscan.cls = ps[k];
+                              s_pscan.list.clear();
+                              s_pscan.waiting = true;
+                              post_rpc("listInstances",
+                                       "{\"class\":\"" + jesc(ps[k]) + "\"}");
+                          }
+                          if (s_pscan.waiting)
+                              ImGui::TextDisabled("(scanning instances...)");
+                          int pn = (int)s_pscan.list.size();
+                          for (int q = 0; q < pn; q++) {
+                              ImGui::PushID(q);
+                              char pl[220];
+                              snprintf(pl, sizeof(pl), "%s (%d/%d)",
+                                       short_name(ps[k]).c_str(), q, pn);
+                              if (ImGui::Selectable(pl)) {
+                                  char tok[40];
+                                  snprintf(tok, sizeof(tok), "@handle:%ld",
+                                           s_pscan.list[q].handle);
+                                  snprintf(c.call_args[k], sizeof(c.call_args[0]),
+                                           "%s", tok);
+                                  ImGui::CloseCurrentPopup();
+                              }
+                              ImGui::TextDisabled("    %s",
+                                                  s_pscan.list[q].str.c_str());
+                              ImGui::PopID();
+                          }
+                          if (pn == 0 && !s_pscan.waiting)
+                              ImGui::TextDisabled("no instances - use Find / Create");
+                          ImGui::EndCombo();
                       }
+                      ImGui::SetNextItemWidth(-52.f);
+                      ime_textfield("##cov", c.call_args[k], sizeof(c.call_args[k]));
                   }
                   ImGui::PopID();
               }
@@ -3941,7 +4032,7 @@ jobs:
                   ImGui::TextDisabled("instance methods need a receiver - pick "
                                       "one on the Instances tab or via Inspector");
               ImGui::SetNextItemWidth(130);
-              if (ImGui::InputInt("Call count", &c.call_count)) {
+              if (ImGui::InputInt("Call Count", &c.call_count)) {
                   if (c.call_count < 1)    c.call_count = 1;
                   if (c.call_count > 50)   c.call_count = 50;
               }
@@ -4001,7 +4092,7 @@ jobs:
                   c.call_log.push_back(note);
               }
               if (!c.call_log.empty()) {
-                  ImGui::TextDisabled("call results:");
+                  ImGui::TextDisabled("Call Results:");
                   ImGui::SameLine();
                   if (ImGui::SmallButton("Clear##clg")) c.call_log.clear();
                   ImGui::BeginChild("calllog", ImVec2(0, 150), true);
@@ -4016,11 +4107,12 @@ jobs:
           }
 
           static void patcher_tab(ClassTab& c, const MethodSig& m) {
-              ImGui::TextDisabled("Patch NOP: skip the body (auto return value by "
-                                  "return type). Redirect: force the return value "
+              ImGui::TextDisabled("Patch NOP: skip the body (void methods return "
+                                  "immediately; others return the default for "
+                                  "their type). Redirect: force the return value "
                                   "below on every subsequent call.");
               ImGui::SetNextItemWidth(220);
-              ime_textfield("Value##pv26", c.patch_val, sizeof(c.patch_val));
+              ime_textfield("Manual Input##pv26", c.patch_val, sizeof(c.patch_val));
               if (ImGui::Button("Patch NOP")) {
                   std::string a = "{\"class\":\"" + jesc(c.cname)
                                 + "\",\"method\":\"" + jesc(m.name)
@@ -4201,12 +4293,13 @@ jobs:
               }
           }
 
-          /* the expanded method body: exactly the 4 sub-tabs of the spec */
+          /* the expanded method body: exactly the 4 sub-tabs of the spec
+             (v2 naming: Call / Patch / Trace / Hook) */
           static void method_body(ClassTab& c, const MethodSig& m) {
               ImGui::Indent();
               if (ImGui::BeginTabBar("mexp")) {
-                  static const char* msubs[] = {"Caller", "Patcher", "Tracer",
-                                                "Hooker"};
+                  static const char* msubs[] = {"Call", "Patch", "Trace",
+                                                "Hook"};
                   char tlbl[40];
                   for (int t = 0; t < 4; t++) {
                       snprintf(tlbl, sizeof(tlbl), "%s##mexp%d", msubs[t], t);
@@ -4265,11 +4358,30 @@ jobs:
                       }
                       if (hitm) ImGui::PopStyleColor();
                       bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                      /* spec v2: a LONG PRESS on the row (>= 0.55 s, the mock's
+                         IsMouseDownDuration pattern) opens the same context
+                         menu on touch. Scroll guard: if a wheel event was
+                         injected while this press is held (the overlay turns
+                         drags inside lists into wheel events), the gesture is
+                         a scroll, not a long press. */
+                      static bool mctx_wheel_press = false;
+                      if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                          mctx_wheel_press = false;
+                      ImGuiIO& pio = ImGui::GetIO();
+                      if (pio.MouseWheel != 0.f || pio.MouseWheelH != 0.f)
+                          mctx_wheel_press = true;
+                      bool lng = ImGui::IsItemHovered() &&
+                                 ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+                                 !mctx_wheel_press &&
+                                 !ImGui::IsMouseDragging(ImGuiMouseButton_Left,
+                                                         10.f) &&
+                                 pio.MouseDownDuration[ImGuiMouseButton_Left] >
+                                     0.55f;
                       float bx = ImGui::GetCursorPosX() +
                                  ImGui::GetContentRegionAvail().x - 26.f;
                       ImGui::SameLine(bx);
                       bool dot = ImGui::SmallButton("...");
-                      if (rclk || dot) ImGui::OpenPopup("mctx");
+                      if (rclk || dot || lng) ImGui::OpenPopup("mctx");
                       if (ImGui::BeginPopup("mctx")) {
                           if (ImGui::MenuItem("Open in new window")) {
                               /* deferred: pushing into s_classes here would
@@ -4443,7 +4555,21 @@ jobs:
                                               : "(no classes yet)";
                       if (ImGui::BeginCombo("##fam",
                                             e.all_fam ? "(All families)" : fprev)) {
+                          /* spec v2: the popup's FIRST widget is the
+                             "Search families..." box - it filters the PACKAGE
+                             names below in real time and NEVER touches the
+                             class list or the Filter search */
+                          ImGui::SetNextItemWidth(-1.f);
+                          ime_textfield("Search families...##fsearch",
+                                        e.fam_search, sizeof(e.fam_search));
+                          ImGui::Separator();
+                          if (ImGui::Selectable("(All families)##fsearchall",
+                                                e.all_fam))
+                              e.all_fam = true;
+                          ImGui::Separator();
                           for (int f = 0; f < nf; f++) {
+                              if (!contains_ci(s_families[f], e.fam_search))
+                                  continue;
                               bool sel = (!e.all_fam && e.family == f);
                               if (ImGui::Selectable(famc[f], sel)) {
                                   e.family  = f;
@@ -4576,7 +4702,12 @@ jobs:
                       float xr = ImGui::GetWindowWidth() - 34.f;
                       ImGui::SameLine(xr);
                       if (ImGui::SmallButton("X")) { c.win_close = true; open = false; }
-                      ImGui::TextDisabled("%s", c.cname.c_str());
+                      /* spec v2: the class name is the window's title line and
+                         WRAPS to the window width (long package paths stay
+                         readable when the menu is small) */
+                      ImGui::PushTextWrapPos();
+                      ImGui::TextUnformatted(c.cname.c_str());
+                      ImGui::PopTextWrapPos();
                       if (!c.got_info)
                           ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
                                                         : "(no data - tap Refresh)");
@@ -4900,7 +5031,7 @@ jobs:
                  here is the single opacity source. */
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.3 (r26)", &open,
+              ImGui::Begin("Dex-tool v1.3 (r27)", &open,
                            ImGuiWindowFlags_NoCollapse);
               if (!open) {
                   MLK();
@@ -5095,10 +5226,14 @@ jobs:
         run: |
           cat > agent/agent.js << 'DXTAGNT'
           'use strict';
-          /* Dex-tool agent (r26). All Java logic lives here (frida-java-bridge);
+          /* Dex-tool agent (r27). All Java logic lives here (frida-java-bridge);
              libtool.so only feeds input/GL. Messages both ways are JSON via
              send()/recv(); the C++ menu decodes them in menu.cpp.
 
+             r27 changes (UI spec v2 - menu.cpp only, the agent is UNCHANGED:
+             the object-parameter dropdowns reuse listInstances): family popup
+             "Search families..." filter, wrapped class-name title, long-press
+             method menu, Call/Patch/Trace/Hook sub-tabs, Fields tree node.
              r26 changes (menu restructure per the field spec - Class Explorer
              windows, Inspector windows, Caller/Patcher/Tracer/Hooker sub-tabs,
              Object Finder):
@@ -8722,7 +8857,7 @@ jobs:
                   sendMsg('error', { fn: 'touchhook',
                                      msg: String(eT && eT.message || eT) });
               }
-              sendMsg('ready', { msg: 'Dex-tool agent r26 loaded' });
+              sendMsg('ready', { msg: 'Dex-tool agent r27 loaded' });
               agentLog('phase: ready sent');
           }, 0);
           DXTAGNT
@@ -9148,64 +9283,37 @@ jobs:
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
-          ## Fixes in this version (r26)
+          ## Fixes in this version (r27)
 
-          Field spec: a full menu RESTRUCTURE. Same engine and RPCs - the
-          UI is reorganized around windows and the exact tab set the spec
-          names.
+          UI spec v2 (the runtime_tool_imgui_mock design) integrated into the
+          real menu. Same engine, RPCs and agent - menu.cpp carries the
+          changes; the object-parameter dropdowns reuse listInstances.
 
-          - **Main tabs, exact order:** Classes, Patches, Trackers, Hooks,
-            Recorder, Monitor, Script, Settings (was Settings-first with
-            "Tracker").
-          - **Secondary bar:** the opened classes are tabs under the main
-            bar; the far-right **+** button opens a NEW Class Explorer
-            window. Tapping a class tab raises that class's window.
-          - **Class Explorer windows:** package/family dropdown (com.game,
-            com.android, ... derived from the loaded list) with an **All**
-            checkbox, the search field + **Filter** button, and a pink
-            **Options** button whose popup holds **Case sensitive**,
-            **Filter by Class / Method / Field**, the advanced **code-text**
-            search (same baksmali const-string scan as r25) and the System
-            classes gate. The filtered class list fills the window; tapping
-            a class opens its Inspector. Case sensitivity now reaches the
-            agent (listLoadedClasses gained a `cs` argument - mode 0 AND
-            the dex scan honor it).
-          - **Class Inspector windows** (one per opened class, floating,
-            movable): **Inspector** button (opens the Object Finder for the
-            class), **Static Fields** section (values read on demand), the
-            Methods list and the full Fields list. **-** collapses the
-            window, **X** closes it.
-          - **Method expansion:** tapping a method opens the 4 spec
-            sub-tabs in place:
-            - **Caller** - one input per parameter (primitives int32/
-              int64/float/double/string/boolean/byte are plain text;
-              OBJECT parameters get a **Find...** button that opens the
-              Object Finder for the parameter's class), the **Call count**
-              input, **Call** and **Call in Main Thread** buttons (the
-              agent loops and runs each call via
-              Java.scheduleOnMainThread), and a per-call results log
-              ("call 3/10: ..."). Object args travel as {"handle":N} and
-              callMethod passes the retained instance as the REAL object
-              - text-only args could never do that.
-            - **Patcher** - manual value, **Patch NOP** (auto return by
-              method logic) and **Redirect** (forces the return value on
-              every subsequent call), plus the r25 live IO-probe editor.
-            - **Tracer** - track this method + live event log.
-            - **Hooker** - Java/Smali/Nop hook editor for the method.
-          - **Method context menu:** right-click (or the "..." button on
-            touch) offers Open in new window (duplicate Inspector), Full
-            Method View (real smali in its own window), Copy Method Name
-            and Copy Class Name (clipboard + an on-screen echo - the touch
-            bridge has no system clipboard backend).
-          - **Object Finder window:** **Find Objects** (Java.choose),
-            **Create Object** ($new() through the no-arg constructor,
-            retained like a scan match), a manual reference field and a
-            results list in the spec's "Name (i/N)" shape. A click fills
-            the caller parameter that opened it or selects the object for
-            the Inspector/Instances view.
-          - r25 kept: frame pump, method source view, one-tap Nop, IO
-            patching, network monitor detail window, green code-text marks,
-            sorted filtered class list.
+          - **Family dropdown popup:** the FIRST widget inside the popup is a
+            "Search families..." input that filters the PACKAGE list in real
+            time as you type (package names only - it never touches the class
+            search). "(All families)" sits right under it; the "All" checkbox
+            stays next to the dropdown.
+          - **Class window title:** the full class name is the title line and
+            WRAPS to the window width (long package paths stay readable when
+            the menu is small).
+          - **Method long press:** pressing a method row for >= 0.55 s opens
+            the same context menu as right-click / "...": Copy Method Name,
+            Copy Class Name, Open in new window, Full Method View.
+          - **Method sub-tabs renamed:** Call / Patch / Trace / Hook (were
+            Caller / Patcher / Tracer / Hooker).
+          - **Object parameters are dropdowns:** first open auto-scans the
+            parameter's class (listInstances) and lists found instances in
+            the popup; a tap fills the argument with the retained handle.
+            "Find / Create Object..." opens the Object Finder (Java.choose,
+            $new, manual reference) and the free-form value input stays.
+          - **Fields tree node:** the Fields list renders under a "Fields"
+            tree node.
+          - **Labels per spec:** "Call Count" input, "Call Results:" log,
+            "Manual Input" in the Patch tab; the Patch NOP hint spells out
+            that void methods return immediately.
+          - The floating Toggle button and the whole r26 restructure are
+            unchanged.
 
           ## Usage
 
@@ -9297,7 +9405,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r26: menu restructure per the field spec - main tabs Classes/Patches/Trackers/Hooks/Recorder/Monitor/Script/Settings, secondary bar of opened classes with + opening Class Explorer windows (family dropdown + All, Filter button, pink Options popup: case sensitive / filter by class-method-field / advanced code-text, System gate; cs reaches the agent for mode 0 and the dex scan), floating Class Inspector windows (Inspector button, Static Fields, Methods, Fields, - and X), methods expand into Caller (per-param inputs, Object Finder for object params, call count, Call + Call in Main Thread via scheduleOnMainThread, per-call results log) / Patcher (manual value, Patch NOP, Redirect, r25 live IO probe) / Tracer / Hooker, method context menu (open in new window, full method view with smali, copy method/class name with toast), Object Finder window (Java.choose, createInstance via no-arg ctor, manual reference, results as Name (i/N)), callMethod gained count/main and object args as retained handles, r25 fixes kept [skip ci]"
+            git commit -m "fix r27: UI spec v2 integrated - family dropdown popup gained the real-time Search families box (package names only), class windows wrap the full class name to the window width, methods answer long-press with the context menu, method sub-tabs renamed Call/Patch/Trace/Hook, object parameters are dropdowns with auto listInstances scan + Find/Create entry (free-form value input kept), fields list under a Fields tree node, Call Count input + Call Results log + Manual Input labels per spec, r26 window restructure kept [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
