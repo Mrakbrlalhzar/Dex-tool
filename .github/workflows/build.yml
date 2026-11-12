@@ -187,6 +187,11 @@ jobs:
             https://github.com/ocornut/imgui.git imgui
           ls imgui/backends/imgui_impl_opengl3.cpp
           cat >> imgui/backends/imgui_impl_opengl3.cpp << 'DXTIMGI'
+
+          /* --- DexTool r23: forget stored GL names without GL calls ---
+             Zeroes the guarded handles so DestroyDeviceObjects /
+             DestroyFontsTexture become no-ops; the next Init rebuilds
+             everything on the live context. */
           IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects()
           {
               ImGui_ImplOpenGL3_Data* bd =
@@ -249,24 +254,20 @@ jobs:
           project(dextool CXX C)
           set(CMAKE_CXX_STANDARD 17)
           set(CMAKE_C_STANDARD 11)
-
           set(FRIDA_GUM_DIR "${CMAKE_SOURCE_DIR}/deps/frida-gum/${ANDROID_ABI}")
           add_library(frida-gumjs STATIC IMPORTED)
           set_target_properties(frida-gumjs PROPERTIES
               IMPORTED_LOCATION "${FRIDA_GUM_DIR}/libfrida-gumjs.a")
-
           set(DOBBY_DIR "${CMAKE_SOURCE_DIR}/deps/dobby")
           add_library(dobby_static STATIC IMPORTED)
           set_target_properties(dobby_static PROPERTIES
               IMPORTED_LOCATION "${DOBBY_DIR}/${ANDROID_ABI}/libdobby.a")
-
           find_library(lib_egl     EGL)
           find_library(lib_gles2   GLESv2)
           find_library(lib_gles3   GLESv3)
           find_library(lib_log     log)
           find_library(lib_dl      dl)
           find_library(lib_android android)
-
           set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/imgui")
           set(IMGUI_SRC
               ${IMGUI_DIR}/imgui.cpp
@@ -274,7 +275,6 @@ jobs:
               ${IMGUI_DIR}/imgui_tables.cpp
               ${IMGUI_DIR}/imgui_widgets.cpp
               ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp)
-
           add_library(tool SHARED
               src/main.cpp
               src/logger.cpp
@@ -283,20 +283,16 @@ jobs:
               src/frida_bridge.cpp
               src/menu.cpp
               ${IMGUI_SRC})
-
           target_include_directories(tool PRIVATE
               src/
               ${FRIDA_GUM_DIR}/
               ${DOBBY_DIR}/include/
               ${IMGUI_DIR}/
               ${IMGUI_DIR}/backends/)
-
           target_compile_definitions(tool PRIVATE IMGUI_IMPL_OPENGL_ES2=1)
-
           target_compile_options(tool PRIVATE
               -fvisibility=hidden -ffunction-sections -fdata-sections -O2
               -Wno-unused-variable -Wno-unused-function)
-
           target_link_libraries(tool
               frida-gumjs dobby_static
               ${lib_egl} ${lib_gles2} ${lib_gles3} ${lib_log} ${lib_dl} ${lib_android}
@@ -339,12 +335,11 @@ jobs:
           #include <ucontext.h>
           #include <dlfcn.h>
           #include <pthread.h>
-
           static FILE* g_info_fp  = nullptr;
           static FILE* g_debug_fp = nullptr;
           static int   g_crash_fd = -1;
-          static bool  g_stdio_redirected = false;   
-          static char  g_base_dir[512] = "";
+          static bool  g_stdio_redirected = false;   /* r22/audit: fds 1/2 point at the crash log */
+          static char  g_base_dir[512] = "";      /* r11: for menu.cpp config IO */
           const char* logger_base_dir() { return g_base_dir; }
           static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
           static void ts(char* buf, size_t n) {
@@ -389,7 +384,6 @@ jobs:
               }
               raise(sig);
           }
-
           static void install_crash_sig(int sig) {
               struct sigaction sa;
               memset(&sa, 0, sizeof(sa));
@@ -398,7 +392,6 @@ jobs:
               sigemptyset(&sa.sa_mask);
               g_prev_set[sig] = (sigaction(sig, &sa, &g_prev_act[sig]) == 0);
           }
-
           void logger_init(const char* base_dir) {
               mkdir(base_dir, 0755);
               snprintf(g_base_dir, sizeof(g_base_dir), "%s", base_dir);
@@ -497,7 +490,6 @@ jobs:
                   log_info(m);
               }
           }
-
           void log_info(const char* msg) {
               pthread_mutex_lock(&g_mtx);
               if (g_info_fp) {
@@ -507,7 +499,6 @@ jobs:
               }
               pthread_mutex_unlock(&g_mtx);
           }
-
           void log_debug(const char* msg) {
               pthread_mutex_lock(&g_mtx);
               if (g_debug_fp) {
@@ -517,11 +508,9 @@ jobs:
               }
               pthread_mutex_unlock(&g_mtx);
           }
-
           void log_crash_raw(const char* msg) {
               if (g_crash_fd >= 0) write(g_crash_fd, msg, strlen(msg));
           }
-
           static void glib_log_capture(const gchar* domain, GLogLevelFlags level,
                                        const gchar* message, gpointer) {
               const char* lv =
@@ -536,7 +525,6 @@ jobs:
                   abort();
               }
           }
-
           static void dt_terminate() {
               log_crash_raw("std::terminate called\n");
               std::exception_ptr ep = std::current_exception();
@@ -554,7 +542,6 @@ jobs:
               }
               abort();
           }
-
           void logger_install_abort_capture() {
               if (g_crash_fd >= 0) {
                   dup2(g_crash_fd, STDOUT_FILENO);
@@ -575,25 +562,27 @@ jobs:
           #include <jni.h>
           #include <string>
           #include <vector>
-
           bool install_swap_hook();
           void overlay_set_java_vm(JavaVM* vm);
           void overlay_start(JavaVM* vm);
-          bool overlay_ready();          void overlay_get_display_size(float* w, float* h);          void overlay_request_font_rebuild(float size);
+          bool overlay_ready();
+          void overlay_get_display_size(float* w, float* h);
+          void overlay_request_font_rebuild(float size);
           void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed);
-          void overlay_set_touch_bias(float dy);          void overlay_touch_map_desc(char* buf, int n);
-
+          void overlay_set_touch_bias(float dy);
+          void overlay_touch_map_desc(char* buf, int n);
           #ifdef __cplusplus
           extern "C" {
-          #endif          JNIEXPORT void dextool_on_touch(float x, float y, int action);      
-          JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h);   
+          #endif
+          JNIEXPORT void dextool_on_touch(float x, float y, int action);      /* raw screen coords (getRawX/getRawY) */
+          JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h);   /* overlay view rect ON SCREEN (getLocationOnScreen) */
           JNIEXPORT void dextool_add_char(int codepoint);
           JNIEXPORT void dextool_backspace();
           JNIEXPORT bool dextool_want_mouse();
           JNIEXPORT bool dextool_hit_test(float x, float y);
-          JNIEXPORT int  dextool_display_size();
+          JNIEXPORT int  dextool_display_size();  /* (w<<16)|h, 0 until the overlay is up */
           JNIEXPORT int  dextool_want_frames();
-          JNIEXPORT void dextool_agent_log(const char* msg);
+          JNIEXPORT void dextool_agent_log(const char* msg); /* r14: agent phase markers -> logs */
           #ifdef __cplusplus
           }
           #endif
@@ -608,7 +597,7 @@ jobs:
           #include "frida_bridge.h"
           #include "touch.h"
           #include "imgui.h"
-          #include "imgui_internal.h"   
+          #include "imgui_internal.h"   /* r23: live window list for the hit test */
           #include "imgui_impl_opengl3.h"
           #include "dobby.h"
           #include "frida-gumjs.h"
@@ -625,12 +614,10 @@ jobs:
           #include <vector>
           #include <mutex>
           #include <unordered_map>
-
           typedef EGLBoolean (*fn_swap)(EGLDisplay, EGLSurface);
           typedef EGLBoolean (*fn_swap_dmg)(EGLDisplay, EGLSurface, EGLint*, EGLint);
           typedef EGLBoolean (*fn_destroy_ctx)(EGLDisplay, EGLContext);
           typedef EGLBoolean (*fn_terminate)(EGLDisplay);
-
           static fn_swap        g_orig_swap        = nullptr;
           static fn_swap_dmg    g_orig_swap_dmg    = nullptr;
           static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
@@ -638,15 +625,13 @@ jobs:
           IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects();
           static std::atomic<bool> g_gum_inited {false};
           static JavaVM*           g_jvm        = nullptr;
-
           #define DT_ELECT_MIN_SWAPS 45
           #define DT_ADOPT_MIN_SWAPS  8
           #define DT_OWNER_STALE_MS  1500
-
           struct GlState {
               GLint program = 0;
               GLint vao = 0, ab = 0, eb = 0;
-              GLint fb = 0;                     
+              GLint fb = 0;                     /* r9: app FBO restored too */
               GLint active_tex = GL_TEXTURE0, tex2d = 0;
               GLboolean attrib_en[8] = {GL_FALSE};
               GLint viewport[4]    = {0, 0, 0, 0};
@@ -661,26 +646,28 @@ jobs:
               ImGuiContext* imgui = nullptr;
               bool  failed = false;
               bool  es3 = false;
-              bool  dead = false;         
-              bool  reject_logged = false;  
-              long  swaps = 0;            
-              long  last_swap_ms = 0;     
-              long  last_frame_ms = 0;    
-              EGLDisplay dpy = nullptr;   
+              bool  dead = false;         /* under g_slots_mtx */
+              bool  reject_logged = false;  /* r14: one log per rejection */
+              long  swaps = 0;            /* under g_slots_mtx */
+              long  last_swap_ms = 0;     /* under g_slots_mtx */
+              long  last_frame_ms = 0;    /* owner thread only */
+              EGLDisplay dpy = nullptr;   /* r23: which display this context belongs to - eglTerminate(dpy) may only retire THESE slots */
               GlState gl;
           };
           static std::mutex g_slots_mtx;
           static std::unordered_map<EGLContext, Slot*> g_slots;
-          static std::vector<Slot*> g_graveyard;  
-          static EGLContext g_owner = nullptr;    
-          static ImGuiContext* g_orphan_imgui = nullptr;  
+          static std::vector<Slot*> g_graveyard;  /* never freed: no dangling */
+          static EGLContext g_owner = nullptr;    /* under g_slots_mtx */
+          static ImGuiContext* g_orphan_imgui = nullptr;  /* g_tick_mtx only */
           static float g_orphan_dw = 0.f, g_orphan_dh = 0.f;
-          static std::mutex g_tick_mtx;
+          static std::mutex g_tick_mtx;  /* one ImGui drawer at a time; also
+                                            serializes ownership changes, adoption
+                                            and slot teardown against frames */
           static std::atomic<bool> g_ready {false};
           struct TouchMap { float x=0, y=0, w=0, h=0; bool ok=false; bool est=false; };
           static std::mutex g_map_mtx;
           static TouchMap   g_map;
-          static float      g_bias_y = 0.f;
+          static float      g_bias_y = 0.f;      /* manual nudge (Settings), under g_map_mtx; r15: default 0 - the screen-space map is exact, the slider is only for exotic hosts */
           struct TouchEvent { float x, y; int phase; };
           static std::mutex              g_touch_mtx;
           static std::vector<TouchEvent> g_touch_q;
@@ -692,7 +679,7 @@ jobs:
           static std::vector<InEv>      g_pending_in;
           static std::vector<float> g_scroll_regions;
           static std::mutex           g_win_mtx;
-          static std::vector<float>   g_window_rects;   
+          static std::vector<float>   g_window_rects;   /* x,y,w,h quads */
           static void clear_window_rects() {
               std::lock_guard<std::mutex> lk(g_win_mtx);
               g_window_rects.clear();
@@ -702,14 +689,12 @@ jobs:
           static char  g_font_path[128] = "";
           static std::mutex g_disp_mtx;
           static float g_disp_w = 0.f, g_disp_h = 0.f;
-          static float g_max_surf_w = 0.f, g_max_surf_h = 0.f;   
-
+          static float g_max_surf_w = 0.f, g_max_surf_h = 0.f;   /* seen on ANY ctx */
           static long now_ms() {
               timespec ts;
               clock_gettime(CLOCK_MONOTONIC, &ts);
               return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
           }
-
           static void touch_push(float x, float y, int phase) {
               std::lock_guard<std::mutex> lk(g_touch_mtx);
               long now = now_ms();
@@ -717,21 +702,19 @@ jobs:
                   fabsf(x - g_touch_last.x) < 0.01f &&
                   fabsf(y - g_touch_last.y) < 0.01f &&
                   (now - g_touch_last_ms) < 40)
-                  return;                          
+                  return;                          /* duplicate from the 2nd path */
               g_touch_last = {x, y, phase};
               g_touch_last_ms = now;
               if (g_touch_q.size() > 96) g_touch_q.erase(g_touch_q.begin());
               g_touch_q.push_back({x, y, phase});
           }
-
           extern "C" JNIEXPORT void dextool_on_touch(float x, float y, int action) {
               int a = action & 0xff;
-              if      (a == 0)            touch_push(x, y, 0);  
-              else if (a == 1 || a == 3)  touch_push(x, y, 1);  
-              else if (a == 2)            touch_push(x, y, 2);  
-              else if (a == 5 || a == 6)  touch_push(x, y, 2);  
+              if      (a == 0)            touch_push(x, y, 0);  /* DOWN */
+              else if (a == 1 || a == 3)  touch_push(x, y, 1);  /* UP/CANCEL */
+              else if (a == 2)            touch_push(x, y, 2);  /* MOVE */
+              else if (a == 5 || a == 6)  touch_push(x, y, 2);  /* PTR up/dn */
           }
-
           extern "C" JNIEXPORT void dextool_set_touch_map(int x, int y, int w, int h) {
               if (w <= 0 || h <= 0) return;
               std::lock_guard<std::mutex> lk(g_map_mtx);
@@ -741,14 +724,12 @@ jobs:
                   LOGI("[overlay] touch map: view rect on screen = (%d,%d %dx%d)",
                        x, y, w, h);
           }
-
           void overlay_set_touch_bias(float dy) {
               if (dy < -100.f) dy = -100.f;
               if (dy >  100.f) dy =  100.f;
               std::lock_guard<std::mutex> lk(g_map_mtx);
               g_bias_y = dy;
           }
-
           void overlay_touch_map_desc(char* buf, int n) {
               if (!buf || n <= 0) return;
               std::lock_guard<std::mutex> lk(g_map_mtx);
@@ -761,7 +742,7 @@ jobs:
           }
           static void maybe_estimate_map() {
               std::lock_guard<std::mutex> lk(g_map_mtx);
-              if (g_map.ok) return;                      
+              if (g_map.ok) return;                      /* real map present */
               float w = 0.f, h = 0.f;
               {
                   std::lock_guard<std::mutex> lk2(g_disp_mtx);
@@ -772,11 +753,9 @@ jobs:
               LOGI("[overlay] touch map: estimate 0,0 %.0fx%.0f (max surface)", w, h);
           }
           static ImVec2 map_touch(float x, float y, const ImVec2& ds);
-
           extern "C" JNIEXPORT bool dextool_want_mouse() {
               return g_want_mouse.load();
           }
-
           extern "C" JNIEXPORT int dextool_display_size() {
               std::lock_guard<std::mutex> lk(g_disp_mtx);
               if (g_disp_w <= 0 || g_disp_h <= 0) return 0;
@@ -785,12 +764,10 @@ jobs:
           extern "C" JNIEXPORT int dextool_want_frames() {
               return menu_frame_pump_level();
           }
-
           extern "C" JNIEXPORT void dextool_add_char(int cp) {
               std::lock_guard<std::mutex> lk(g_char_mtx);
               if (g_pending_in.size() < 8192) g_pending_in.push_back(InEv{(unsigned)cp, false});
           }
-
           extern "C" JNIEXPORT void dextool_backspace() {
               std::lock_guard<std::mutex> lk(g_char_mtx);
               if (g_pending_in.size() < 8192) g_pending_in.push_back(InEv{0, true});
@@ -804,32 +781,26 @@ jobs:
               snprintf(m, sizeof(m), "%s\n", d);
               log_crash_raw(m);
           }
-
           bool overlay_ready() { return g_ready.load(); }
-
           void overlay_get_display_size(float* w, float* h) {
               std::lock_guard<std::mutex> lk(g_disp_mtx);
               if (w) *w = g_disp_w;
               if (h) *h = g_disp_h;
           }
-
           void overlay_request_font_rebuild(float size) {
               if (size < 10.f) size = 10.f;
               if (size > 40.f) size = 40.f;
               g_font_size  = size;
               g_font_dirty = true;
           }
-
           void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed) {
               g_scroll_regions = xywh_speed;
           }
-
           static void* frida_thread(void*) {
               frida_bridge_start(g_jvm);
               return nullptr;
           }
           void overlay_set_java_vm(JavaVM* vm) { g_jvm = vm; }
-
           void overlay_start(JavaVM*) {
               if (g_gum_inited.exchange(true)) return;
               gum_init_embedded();
@@ -844,12 +815,10 @@ jobs:
               touch_install_hooks();
               log_info("[overlay] touch hooks installed, frida thread started");
           }
-
           static void menu_init_once() {
               static bool done = false;
               if (!done) { done = true; menu_init(); }
           }
-
           static Slot* slot_for(EGLContext ctx) {
               std::lock_guard<std::mutex> lk(g_slots_mtx);
               Slot*& s = g_slots[ctx];
@@ -860,7 +829,7 @@ jobs:
                                        float sw, float sh) {
               std::lock_guard<std::mutex> lk(g_slots_mtx);
               if (s->dead) return false;
-              s->dpy = dpy;              
+              s->dpy = dpy;              /* r23: recorded for my_terminate */
               s->swaps++;
               long now = now_ms();
               long prev_swap = s->last_swap_ms;
@@ -894,7 +863,7 @@ jobs:
               if (ow) {
                   bool stale = (now - ow->last_swap_ms) > DT_OWNER_STALE_MS &&
                                (now - prev_swap)        < 600;
-                  if (!stale) return false;
+                  if (!stale) return false;     /* healthy owner elsewhere */
                   if (ow->imgui && !g_orphan_imgui) {
                       g_orphan_imgui = ow->imgui;
                       ow->imgui = nullptr;
@@ -905,7 +874,8 @@ jobs:
                       }
                       ImGui::SetCurrentContext(g_orphan_imgui);
                       ImGui_ImplOpenGL3_ForgetDeviceObjects();
-                      clear_window_rects();
+                      clear_window_rects();   /* nothing draws for this world
+                                                 until a context adopts it */
                       LOGI("[overlay] owner migrated - old ImGui world parked "
                            "(not leaked)");
                   }
@@ -923,7 +893,6 @@ jobs:
               }
               return false;
           }
-
           static void resolve_font_path() {
               if (g_font_path[0]) return;
               const char* cands[] = {
@@ -938,7 +907,6 @@ jobs:
                       return;
                   }
           }
-
           static void build_fonts(ImGuiIO& io) {
               resolve_font_path();
               io.Fonts->Clear();
@@ -955,7 +923,6 @@ jobs:
               EGLint w = 1080, h = 1920;
               eglQuerySurface(dpy, surf, EGL_WIDTH,  &w);
               eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-
               const GLubyte* ver = glGetString(GL_VERSION);
               if (!ver || !strstr((const char*)ver, "OpenGL ES")) {
                   LOGE("[overlay] not OpenGL ES: %s", ver ? (const char*)ver : "null");
@@ -981,7 +948,7 @@ jobs:
               io.DeltaTime   = 1.0f / 60.0f;
               io.IniFilename = nullptr;
               io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-              io.ConfigWindowsMoveFromTitleBarOnly = true;  
+              io.ConfigWindowsMoveFromTitleBarOnly = true;  /* touch friendly */
               ImGui::StyleColorsDark();
               ImGui::GetStyle().WindowRounding = 6.0f;
               if (io.Fonts->Fonts.empty() || g_font_dirty) build_fonts(io);
@@ -1007,7 +974,7 @@ jobs:
                   g_ready.store(false);
                   if (s->imgui) {
                       if (g_orphan_imgui)
-                          ImGui::DestroyContext(g_orphan_imgui);  
+                          ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
                       g_orphan_imgui = s->imgui;
                       s->imgui = nullptr;
                       {
@@ -1022,7 +989,8 @@ jobs:
                           ImGui::SetCurrentContext(g_orphan_imgui);
                           ImGui_ImplOpenGL3_ForgetDeviceObjects();
                       }
-                      clear_window_rects();
+                      clear_window_rects();   /* r23: this world draws nothing
+                                                 until a new context adopts it */
                       LOGI("[overlay] owner context destroyed - ImGui parked, "
                            "waiting for the next GL context");
                   }
@@ -1068,7 +1036,6 @@ jobs:
               if (first != GL_NO_ERROR)
                   LOGD("[overlay] drained GL error 0x%04x after draw", first);
           }
-
           static void gl_state_restore(Slot* s) {
               GlState& g = s->gl;
               if (s->es3) glBindVertexArray(g.vao);
@@ -1157,14 +1124,12 @@ jobs:
               }
               return false;
           }
-
           static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
               static thread_local bool in_tick = false;
-              if (in_tick) return;   
+              if (in_tick) return;   /* driver re-entry (swap->swapWithDamage) */
               in_tick = true;
               struct TickReset { bool& b; ~TickReset() { b = false; } }
                   tick_reset{in_tick};
-
               EGLContext ctx = eglGetCurrentContext();
               if (ctx == EGL_NO_CONTEXT) return;
               EGLint sw = 0, sh = 0;
@@ -1177,11 +1142,9 @@ jobs:
                   if (g_disp_w <= 0.f) { g_disp_w = (float)sw; g_disp_h = (float)sh; }
               }
               std::lock_guard<std::mutex> lk(g_tick_mtx);
-
               Slot* s = slot_for(ctx);
               if (!ensure_ownership(s, ctx, dpy, (float)sw, (float)sh)) return;
               if (s->dead || s->failed) return;
-
               if (!s->imgui) slot_init(dpy, surf, s);
               if (!s->imgui) return;
               ImGui::SetCurrentContext(s->imgui);
@@ -1231,7 +1194,6 @@ jobs:
                       have_prev = true;
                   }
               }
-
               {
                   std::lock_guard<std::mutex> lk2(g_char_mtx);
                   for (const InEv& ev : g_pending_in) {
@@ -1246,33 +1208,29 @@ jobs:
                   }
                   g_pending_in.clear();
               }
-
               menu_init_once();
-              maybe_estimate_map();     
+              maybe_estimate_map();     /* native fallback until the agent measures */
               if (g_font_dirty) {
                   build_fonts(io);
                   ImGui_ImplOpenGL3_DestroyDeviceObjects();
               }
-
               gl_state_save(s);
               glBindFramebuffer(GL_FRAMEBUFFER, 0);
               glEnable(GL_SCISSOR_TEST);
               ImGui_ImplOpenGL3_NewFrame();
               ImGui::NewFrame();
               menu_draw();
-              collect_window_rects();   
+              collect_window_rects();   /* r23: snapshot for the hit test */
               g_want_mouse.store(io.WantCaptureMouse);
               ImGui::Render();
               ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
               gl_state_restore(s);
               g_ready.store(true);
           }
-
           static EGLBoolean my_destroy_ctx(EGLDisplay dpy, EGLContext ctx) {
               slot_destroy(ctx);
               return g_orig_destroy_ctx ? g_orig_destroy_ctx(dpy, ctx) : EGL_TRUE;
           }
-
           static EGLBoolean my_terminate(EGLDisplay dpy) {
               {
                   std::lock_guard<std::mutex> lk(g_tick_mtx);
@@ -1283,7 +1241,7 @@ jobs:
                   for (auto& kv : g_slots) {
                       Slot* s = kv.second;
                       if (s->dpy != nullptr && s->dpy != dpy)
-                          continue;               
+                          continue;               /* another display - still live */
                       s->dead = true;
                       retired_any = true;
                       g_graveyard.push_back(s);
@@ -1310,7 +1268,7 @@ jobs:
                       g_ready.store(false);
                       if (park) {
                           if (g_orphan_imgui)
-                              ImGui::DestroyContext(g_orphan_imgui);  
+                              ImGui::DestroyContext(g_orphan_imgui);  /* keep newest */
                           g_orphan_imgui = park;
                           {
                               std::lock_guard<std::mutex> lk3(g_disp_mtx);
@@ -1328,7 +1286,6 @@ jobs:
               return g_orig_terminate ? g_orig_terminate(dpy) : EGL_TRUE;
           }
           static thread_local bool t_in_swap = false;
-
           static EGLBoolean my_swap(EGLDisplay dpy, EGLSurface surf) {
               if (t_in_swap) return g_orig_swap ? g_orig_swap(dpy, surf) : EGL_FALSE;
               t_in_swap = true;
@@ -1337,7 +1294,6 @@ jobs:
               t_in_swap = false;
               return r;
           }
-
           static EGLBoolean my_swap_dmg(EGLDisplay dpy, EGLSurface surf,
                                         EGLint* rects, EGLint n) {
               if (t_in_swap)
@@ -1350,7 +1306,6 @@ jobs:
               t_in_swap = false;
               return r;
           }
-
           bool install_swap_hook() {
               void* egl = dlopen("libEGL.so", RTLD_NOW);
               if (!egl) { LOGE("dlopen libEGL.so: %s", dlerror()); return false; }
@@ -1417,7 +1372,6 @@ jobs:
           #include "dobby.h"
           #include <dlfcn.h>
           #include <android/input.h>
-
           typedef int32_t (*fn_getEvent)(AInputQueue*, AInputEvent**);
           static fn_getEvent g_orig_get = nullptr;
           static int32_t my_getEvent(AInputQueue* q, AInputEvent** ev) {
@@ -1427,16 +1381,15 @@ jobs:
                       int32_t act = AMotionEvent_getAction(*ev) & AMOTION_EVENT_ACTION_MASK;
                       float x = AMotionEvent_getX(*ev, 0);
                       float y = AMotionEvent_getY(*ev, 0);
-                      int a = 2;                       
-                      if      (act == 0)           a = 0;  
-                      else if (act == 1 || act == 3) a = 1; 
-                      else if (act == 5 || act == 6) a = 2; 
+                      int a = 2;                       /* move */
+                      if      (act == 0)           a = 0;  /* DOWN */
+                      else if (act == 1 || act == 3) a = 1; /* UP / CANCEL */
+                      else if (act == 5 || act == 6) a = 2; /* pointer up/down */
                       dextool_on_touch(x, y, a);
                   }
               }
               return rc;
           }
-
           void touch_install_hooks() {
               void* lib = dlopen("libandroid.so", RTLD_NOW);
               if (!lib) { LOGD("touch: libandroid not found (OK for Java apps)"); return; }
@@ -1475,7 +1428,6 @@ jobs:
           #include <string>
           #include <cstdio>
           #include <cstring>
-
           static GumScriptBackend* g_backend = nullptr;
           static GumScript*        g_script  = nullptr;
           static GMainLoop*        g_loop    = nullptr;
@@ -1488,7 +1440,7 @@ jobs:
               std::string m(msg);
               size_t p = m.find("\"payload\":");
               if (p == std::string::npos) return "";
-              p += 10;   
+              p += 10;   /* "payload": is 10 chars incl. quotes+colon */
               while (p < m.size() && m[p] == ' ') p++;
               size_t e = m.rfind('}');
               if (e == std::string::npos || e < p) return "";
@@ -1519,21 +1471,19 @@ jobs:
               }
               return o;
           }
-
           static const char kErrEnvelope[] = "{\"type\":\"error\"";
           static void deliver(const std::string& pl) {
               MsgCallback local;
               {
                   std::lock_guard<std::mutex> lk(g_pmtx);
                   local = g_cb;
-                  if (!local && !pl.empty()) {       
+                  if (!local && !pl.empty()) {       /* menu not up yet: keep for it */
                       if (g_backlog.size() < 256) g_backlog.push_back(pl);
                       return;
                   }
               }
               if (local && !pl.empty()) local(pl);
           }
-
           static void on_message(const gchar* msg, GBytes*, gpointer) {
               if (!msg) return;
               std::string pl = extract_payload(msg);
@@ -1603,7 +1553,6 @@ jobs:
               g_main_loop_run(g_loop);
               log_info("[frida_bridge] loop exited");
           }
-
           void frida_post(const std::string& json) {
               if (!g_script) {
                   log_debug("[frida_post] dropped: agent not loaded yet");
@@ -1612,7 +1561,6 @@ jobs:
               std::lock_guard<std::mutex> lk(g_pmtx);
               gum_script_post(g_script, json.c_str(), nullptr);
           }
-
           void frida_set_message_callback(MsgCallback cb) {
               std::deque<std::string> pending;
               {
@@ -1620,7 +1568,7 @@ jobs:
                   g_cb = cb;
                   if (cb) pending.swap(g_backlog);
               }
-              if (cb) for (const std::string& m : pending) cb(m);   
+              if (cb) for (const std::string& m : pending) cb(m);   /* replay early ones */
           }
           DXTFBC
 
@@ -1655,18 +1603,17 @@ jobs:
           #include <unordered_map>
           #include <pthread.h>
           #include <ctime>
-
           static pthread_mutex_t g_mtx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
           #define MLK()   pthread_mutex_lock(&g_mtx)
           #define MULK()  pthread_mutex_unlock(&g_mtx)
           static float s_font_size  = 18.0f;
           static float s_opacity    = 0.92f;
           static int   s_theme      = 0;
-          static float s_ovl_scroll = 1.5f;   
-          static float s_lst_scroll = 1.2f;   
+          static float s_ovl_scroll = 1.5f;   /* whole-menu drag speed */
+          static float s_lst_scroll = 1.2f;   /* inner list drag speed */
           static bool  s_visible    = true;
           static bool  s_show_fab   = true;
-          static float s_y_off      = 0.0f;   
+          static float s_y_off      = 0.0f;   /* manual touch Y bias (px); r15: default 0 - the screen-space touch map is mathematically exact, the slider stays for exotic hosts */
           static bool  s_agent_ready = false;
           static char  s_agent_note[160] = "";
           static bool  s_ovl_ready   = false;
@@ -1676,7 +1623,8 @@ jobs:
               s_regions.push_back(x); s_regions.push_back(y);
               s_regions.push_back(w); s_regions.push_back(h);
               s_regions.push_back(speed);
-          }          static void mark_scroll_item(float speed) {
+          }
+          static void mark_scroll_item(float speed) {
               ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
               mark_rect(a.x, a.y, b.x - a.x, b.y - a.y, speed);
           }
@@ -1686,37 +1634,37 @@ jobs:
                              std::vector<FieldInfo> fields; };
           struct ClassTab {
               std::string cname;
-              int  uid = 0;                       
-              bool win_close = false;             
+              int  uid = 0;                       /* r26: stable window/tab id */
+              bool win_close = false;             /* r26: X pressed -> erase */
               bool got_info = false, waiting = false;
               std::vector<MethodSig> methods;
               std::vector<FieldInfo> fields;
               std::vector<InstInfo>  instances;
               int  sel_inst = -1;
-              int  gen = -1;                      
-              int  sub = 0;                       
-              int  expanded = -1;                 
-              int  msub = 0;                      
+              int  gen = -1;                      /* r23: instance-list generation; part of the editor buffer key */
+              int  sub = 0;                       /* 0 Instances 1 Static Fields 2 Methods 3 Fields */
+              int  expanded = -1;                 /* index into methods, -1 none   */
+              int  msub = 0;                      /* 0 Call 1 Patch 2 Trace 3 Hook */
               MethodSig call_sig;
               char call_args[8][128] = {};
-              char call_typ[8][64]   = {};        
+              char call_typ[8][64]   = {};        /* r26: parameter types          */
               int  call_nargs = 0;
-              int  call_count = 1;                
-              std::vector<std::string> call_log;  
-              char patch_val[256] = {};           
+              int  call_count = 1;                /* r26: Call Count input         */
+              std::vector<std::string> call_log;  /* r26: per-call results         */
+              char patch_val[256] = {};           /* manual value                  */
               std::string patch_note;
               int  hook_mode = 0;
               char hook_code[4096] = {};
               long of_handle = -1;
               std::string of_note;
-              bool io_open  = false;              
-              bool io_wait  = false;              
-              MethodSig io_sig;                   
+              bool io_open  = false;              /* editor visible            */
+              bool io_wait  = false;              /* probe in flight           */
+              MethodSig io_sig;                   /* which method is edited    */
               int  io_nargs = 0;
-              char io_arg_typ[8][64]  = {};       
-              char io_arg_cur[8][128] = {};       
-              char io_arg[8][128]     = {};       
-              bool io_arg_on[8]       = {};       
+              char io_arg_typ[8][64]  = {};       /* parameter types           */
+              char io_arg_cur[8][128] = {};       /* captured current values   */
+              char io_arg[8][128]     = {};       /* patch values (editable)   */
+              bool io_arg_on[8]       = {};       /* patch this argument       */
               char io_ret_typ[64]     = {};
               char io_ret_cur[128]    = {};
               char io_ret[128]        = {};
@@ -1734,7 +1682,7 @@ jobs:
                             bool enabled=true; std::string note; };
           struct TrackRow { std::vector<std::string> callers; std::string ret,
                             args, err; };
-          struct Tracker  { std::string name;              
+          struct Tracker  { std::string name;              /* full Class.member */
                             bool is_field=false;
                             std::vector<TrackRow> log; };
           struct RecRow   { std::string cls, method, args, ret, extra; };
@@ -1743,12 +1691,12 @@ jobs:
               int  id = 0;
               bool open = true;
               char search[160] = {};
-              char fam_search[96] = {};     
-              int  family = 0;              
-              bool all_fam = true;          
+              char fam_search[96] = {};     /* r27: "Search families..." filter */
+              int  family = 0;              /* index into s_families           */
+              bool all_fam = true;          /* "All" checkbox = every family   */
               bool case_sensitive = false;
-              int  filter_by = 0;           
-              bool advanced = false;        
+              int  filter_by = 0;           /* 0 Class 1 Method 2 Field        */
+              bool advanced = false;        /* string search inside class code */
           };
           struct ObjFinder {
               bool open = false;
@@ -1756,47 +1704,45 @@ jobs:
               char typ[96]  = {};
               char manual[128] = {};
               std::vector<InstInfo> results;
-              bool waiting  = false;        
-              bool creating = false;        
-              int  ctx_uid  = -1;           
-              int  ctx_arg  = -1;           
+              bool waiting  = false;        /* Java.choose scan in flight      */
+              bool creating = false;        /* $new in flight                  */
+              int  ctx_uid  = -1;           /* inspector that opened it        */
+              int  ctx_arg  = -1;           /* >=0: fill caller arg N; -1: the inspector */
           };
           static ObjFinder s_of;
           static std::vector<ExplorerWin> s_explorers;
-          static std::vector<std::string> s_families;   
-          static bool s_expl_req = false;               
+          static std::vector<std::string> s_families;   /* com.game, com.android... */
+          static bool s_expl_req = false;               /* "+" pressed               */
           static int  s_expl_seq = 0;
           static struct ParamScan {
-              int uid = -1;                 
-              int arg = -1;                 
-              std::string cls;              
+              int uid = -1;                 /* inspector window the dropdown is in */
+              int arg = -1;                 /* parameter index                     */
+              std::string cls;              /* parameter type                      */
               std::vector<InstInfo> list;
               bool waiting = false;
           } s_pscan;
           static int  s_tab_uid_seq = 0;
-          static int  s_focus_expl = 0;                 
-          static std::string s_focus_win;                         static bool        s_fm_open = false;
+          static int  s_focus_expl = 0;                 /* explorer id to raise     */
+          static std::string s_focus_win;               /* inspector title to raise */
+          static bool        s_fm_open = false;
           static std::string s_fm_cls, s_fm_mth;
           static char        s_fm_src[16384] = "";
           static char        s_fm_note[200] = "";
           static bool        s_fm_have = false;
           static char s_clip_msg[192] = "";
           static long s_clip_ms = 0;
-
           static std::vector<ClassTab>  s_classes;
           static std::vector<PatchRow>   s_patches;
           static std::vector<HookRow>    s_hooks;
           static std::vector<Tracker>    s_trackers;
           static std::vector<RecRow>     s_rec;
           static std::vector<MonRow>     s_mon;
-          static std::vector<std::string> s_cons;      
-
+          static std::vector<std::string> s_cons;      /* script console */
           static bool  s_rec_on=false;  static char s_rec_stat[128]="idle";
           static int   s_rec_installed=0, s_rec_total=0;
-          static char  s_rec_filter[120]="";           
-          static int   s_rec_cap=1500;                 
+          static char  s_rec_filter[120]="";           /* empty = host package */
+          static int   s_rec_cap=1500;                 /* method cap */
           static bool  s_mon_on=false;  static char s_mon_stat[160]="off";
-
           static char s_pcls[200]={}, s_pfld[128]={}, s_pval[256]={};
           static int  s_pedit=-1;
           static char s_hcls[200]={}, s_hmth[128]={}, s_hcode[4096]={};
@@ -1809,14 +1755,19 @@ jobs:
           static bool s_search_cs   = false;
           static char s_hsrc[16384] = "";
           static char s_hsrc_note[200] = "";
-          static bool s_hsrc_have = false;          static int  s_mon_sel = -1;
+          static bool s_hsrc_have = false;
+          static int  s_mon_sel = -1;
           static std::vector<std::string> s_search_res;
-          static bool s_cls_auto_done=false;
+          static bool s_cls_auto_done=false;   /* full class list requested once
+                                                  per agent session */
           static int  s_search_total=0, s_search_shown=0;
           static bool s_search_wait=false;
           static int  s_search_seq=0, s_search_qid=-1;
-          static bool s_search_page0=false;
-          static std::string s_next_tab;
+          static bool s_search_page0=false;    /* r23: set when a NEW qid is sent;
+                                                  the first page OF THAT QID clears
+                                                  the list - stale pages of an older
+                                                  qid are dropped, not mixed in */
+          static std::string s_next_tab;           /* top tab to select */
           static bool    s_fullscreen = false;
           static ImVec2  s_fs_last_pos(0, 0), s_fs_last_size(0, 0);
           static bool    s_fs_restore = false;
@@ -1843,22 +1794,22 @@ jobs:
               long handle = -1;
               std::string cls, str;
               std::vector<FieldInfo> fields;
-              int  sel = -1;               
-              char edit[256] = {};         
+              int  sel = -1;               /* field row being edited            */
+              char edit[256] = {};         /* its edit buffer                   */
           };
           static std::vector<ObjTab> s_objtabs;
-          static long s_objfocus = -1;
+          static long s_objfocus = -1;     /* handle of the tab to select       */
           struct SavedObj { std::string cls, str; long handle = -1; };
           static std::vector<SavedObj> s_saved;
           static bool  s_dump_wait = false;
           static bool  s_dump_done = false;
           static long  s_dump_count = 0;
           static char  s_dump_path[512] = "";
-          static char  s_dump_note[192] = "";          static char  s_dobj_note[192] = "";
+          static char  s_dump_note[192] = "";
+          static char  s_dobj_note[192] = "";
           static std::string s_pkg = "(unknown)";
           static bool s_open_objfinder = false;
           static bool s_open_fmview    = false;
-
           static std::string jesc(const std::string& s) {
               std::string r;
               r.reserve(s.size() + 8);
@@ -1943,11 +1894,10 @@ jobs:
                   }
                   if (i > s) val = j.substr(s, i - s);
                   r.push_back(junesc(val));
-                  i++;                      
+                  i++;                      /* closing quote */
               }
               return r;
           }
-
           static std::string jstr(const std::string& j, const char* key) {
               std::string k = std::string("\"")+key+"\":\"";
               auto p = j.find(k);
@@ -1963,7 +1913,6 @@ jobs:
               if (i > p) val = j.substr(p, i - p);
               return junesc(val);
           }
-
           static long jnum(const std::string& j, const char* key, long dflt=0) {
               std::string k = std::string("\"")+key+"\":";
               auto p = j.find(k);
@@ -1978,7 +1927,6 @@ jobs:
               }
               return any ? (neg ? -v : v) : dflt;
           }
-
           static bool jhas(const std::string& j, const char* key) {
               return j.find(std::string("\"") + key + "\":") != std::string::npos;
           }
@@ -2026,13 +1974,11 @@ jobs:
               }
               return r;
           }
-
           static void post_rpc(const char* fn, const std::string& args) {
               std::string m = "{\"type\":\"rpc\",\"fn\":\"";
               m += fn; m += "\",\"args\":"; m += args; m += "}";
               frida_post(m);
           }
-
           static void push_console(const char* tag, const std::string& line) {
               char b[256];
               snprintf(b, sizeof(b), "%s %s", tag, line.c_str());
@@ -2061,7 +2007,7 @@ jobs:
                   out = &s_classes.back();
               }
               s_focus_win = win_title(*out);
-              if (switch_tab) s_next_tab = "Tools";   
+              if (switch_tab) s_next_tab = "Tools";   /* r28 */
               MULK();
               std::string a = "{\"class\":\"" + jesc(name) + "\"}";
               post_rpc("openClass", a);
@@ -2070,12 +2016,10 @@ jobs:
           void menu_open_class(const std::string& name) {
               (void)open_inspector(name, true);
           }
-
           static ClassTab* find_tab(const std::string& n) {
               for (auto& c : s_classes) if (c.cname == n) return &c;
               return nullptr;
           }
-
           static int find_tracker(const std::string& n) {
               for (size_t i = 0; i < s_trackers.size(); i++)
                   if (s_trackers[i].name == n) return (int)i;
@@ -2108,7 +2052,8 @@ jobs:
               f.type  = s.substr(c1 + 1, e - c1 - 1);
               f.value = s.substr(e + 1);
               return f;
-          }          static RecRow parse_rec(const std::string& s) {
+          }
+          static RecRow parse_rec(const std::string& s) {
               RecRow r;
               auto p1 = s.find('|');
               if (p1 == std::string::npos) { r.method = s; return r; }
@@ -2124,7 +2069,8 @@ jobs:
               r.ret   = s.substr(p2 + 1, p3 - p2 - 1);
               r.extra = s.substr(p3 + 1);
               return r;
-          }          static MonRow parse_mon(const std::string& s) {
+          }
+          static MonRow parse_mon(const std::string& s) {
               MonRow m;
               auto p1 = s.find('|'); if (p1 == std::string::npos) { m.note=s; return m; }
               m.kind = s.substr(0, p1);
@@ -2191,13 +2137,11 @@ jobs:
           static char  s_conf_path[512] = "";
           static bool  s_conf_dirty = false;
           static long  s_conf_last_ms = 0;
-
           static long conf_now_ms() {
               timespec ts;
               clock_gettime(CLOCK_MONOTONIC, &ts);
               return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
           }
-
           static void conf_load() {
               snprintf(s_conf_path, sizeof(s_conf_path), "%s/dextool-ui.conf",
                        logger_base_dir());
@@ -2215,9 +2159,9 @@ jobs:
                   else if (!strcmp(k, "theme"))  s_theme    = (int)v;
                   else if (!strcmp(k, "ovl"))    s_ovl_scroll = v;
                   else if (!strcmp(k, "lst"))    s_lst_scroll = v;
-                  else if (!strcmp(k, "ybias"))  s_y_off    = v;   
+                  else if (!strcmp(k, "ybias"))  s_y_off    = v;   /* r15: key renamed from yoff so a stale saved -80 cannot fight the new mapping */
                   else if (!strcmp(k, "fab"))    s_show_fab = v > 0.5f;
-                  else if (!strcmp(k, "scale"))  s_scale    = (int)v;   
+                  else if (!strcmp(k, "scale"))  s_scale    = (int)v;   /* r28 */
               }
               fclose(f);
               if (s_scale < 0 || s_scale > 6) {
@@ -2231,7 +2175,6 @@ jobs:
               }
               s_font_size = k_scale_px[s_scale];
           }
-
           static void conf_save() {
               FILE* f = fopen(s_conf_path, "w");
               if (!f) return;
@@ -2242,7 +2185,7 @@ jobs:
               fprintf(f, "lst=%g\n",    s_lst_scroll);
               fprintf(f, "ybias=%g\n",  s_y_off);
               fprintf(f, "fab=%d\n",   s_show_fab ? 1 : 0);
-              fprintf(f, "scale=%d\n", s_scale);              
+              fprintf(f, "scale=%d\n", s_scale);              /* r28 */
               fclose(f);
               s_conf_dirty = false;
               s_conf_last_ms = conf_now_ms();
@@ -2261,17 +2204,16 @@ jobs:
                   case 1: ImGui::StyleColorsLight();   break;
                   case 2: ImGui::StyleColorsClassic(); break;
               }
-              ImGui::GetIO().FontGlobalScale = 1.0f;
+              ImGui::GetIO().FontGlobalScale = 1.0f;   /* real size comes from the
+                                                         atlas, not from scaling */
           }
-          static bool s_ime_active = false;   
-          static bool s_ime_clear  = false;   
-          static ImGuiID s_ime_owner = 0;     
-          static int  s_ime_enter = 0;        
-          static bool s_ime_enter_rel = false; 
-
+          static bool s_ime_active = false;   /* a text field owns ImGui focus */
+          static bool s_ime_clear  = false;   /* drop active id next frame      */
+          static ImGuiID s_ime_owner = 0;     /* r23: WHICH field owns the IME */
+          static int  s_ime_enter = 0;        /* r24: 2 = inject Enter DOWN, 1 = UP */
+          static bool s_ime_enter_rel = false; /* r24: release the field after the key */
           static void ime_show() { post_rpc("showIme", "{}"); }
           static void ime_hide() { post_rpc("hideIme", "{}"); }
-
           static void ime_close_if_active() {
               if (s_ime_active) { s_ime_active = false; ime_hide(); }
           }
@@ -2311,7 +2253,7 @@ jobs:
                   }
               } else if (s_ime_active && ImGui::GetItemID() == s_ime_owner &&
                          ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
-                  ime_show();     
+                  ime_show();     /* re-tap while active: keyboard was closed */
               }
               return used;
           }
@@ -2333,7 +2275,6 @@ jobs:
               }
               return used;
           }
-
           void menu_init() {
               apply_theme();
               conf_load();
@@ -2344,7 +2285,7 @@ jobs:
                   std::string ty = jtype(j);
                   if (ty == "ready") {
                       s_agent_ready = true;
-                      s_cls_auto_done = false;  
+                      s_cls_auto_done = false;  /* new agent: re-list classes */
                       snprintf(s_agent_note, sizeof(s_agent_note), "%s",
                                jstr(j, "msg").c_str());
                       s_pkg = jstr(j, "pkg");
@@ -2445,7 +2386,7 @@ jobs:
                                            "%s", v.c_str());
                                   snprintf(c->io_arg[idx], sizeof(c->io_arg[idx]),
                                            "%s", v.c_str());
-                                  c->io_arg_on[idx] = false;   
+                                  c->io_arg_on[idx] = false;   /* only edited+P rows patch */
                                   idx++;
                               }
                               c->io_nargs = idx;
@@ -2685,7 +2626,6 @@ jobs:
                   ImGui::TextColored(ImVec4(1, .6f, 0, 1),
                       "Menu hidden with no toggle button - it was re-enabled.");
               if (!s_show_fab && !s_visible) { s_show_fab = true; s_conf_dirty = true; }
-
               ImGui::Separator();
               ImGui::Text("Info");
               ImGui::Text("Package: %s", s_pkg.c_str());
@@ -2739,7 +2679,6 @@ jobs:
               ImGui::SameLine();
               if (ImGui::Button("Clear")) s_pcls[0]=s_pfld[0]=s_pval[0]=0;
               ImGui::Separator();
-
               MLK();
               for (int i = 0; i < (int)s_patches.size(); i++) {
                   ImGui::PushID(i);
@@ -3058,7 +2997,7 @@ jobs:
                                r.cls.c_str(), r.method.c_str(), r.args.c_str(),
                                r.ret.c_str(), ext.c_str());
                       if (ImGui::Selectable(lbl))
-                          menu_open_class(r.cls);          
+                          menu_open_class(r.cls);          /* cross-link */
                       ImGui::PopID();
                   }
               }
@@ -3176,7 +3115,6 @@ jobs:
           static void explorer_body(ExplorerWin& e);
           static void class_tab_body(ClassTab& c);
           static std::string s_dup_req;
-
           static void run_search(const char* text, int mode, bool cs) {
               MLK();
               snprintf(s_search, sizeof(s_search), "%s", text);
@@ -3184,7 +3122,7 @@ jobs:
               s_search_cs   = cs;
               s_search_wait = true;
               int sqid = ++s_search_seq;
-              s_search_qid   = sqid;     
+              s_search_qid   = sqid;     /* r23: generation armed at SEND time */
               s_search_page0 = false;
               MULK();
               std::string a = "{\"filter\":\"" + jesc(s_search)
@@ -3253,7 +3191,7 @@ jobs:
                       ImGui::Text("  value:");
                       ImGui::SameLine();
                       ImGui::SetNextItemWidth(140);
-                      ime_textfield("##fv", nv[f], sizeof(nv[f]));   
+                      ime_textfield("##fv", nv[f], sizeof(nv[f]));   /* r15: IME-aware wrapper */
                       ImGui::SameLine();
                       if (ImGui::Button("Set##fs")) {
                           long h = in.handle;
@@ -3369,7 +3307,7 @@ jobs:
                               s_of.results.clear();
                               s_of.waiting  = false;
                               s_of.creating = false;
-                              s_open_objfinder = true;   
+                              s_open_objfinder = true;   /* r28: deferred popup */
                               ImGui::CloseCurrentPopup();
                           }
                           ImGui::Separator();
@@ -3490,7 +3428,6 @@ jobs:
                   mark_scroll_item(s_lst_scroll);
               }
           }
-
           static void patcher_tab(ClassTab& c, const MethodSig& m) {
               ImGui::TextDisabled("Patch NOP: skip the body (void methods return "
                                   "immediately; others return the default for "
@@ -3799,7 +3736,7 @@ jobs:
                                   s_fm_mth  = m.name;
                                   s_fm_open = true;
                                   s_fm_have = false;
-                                  s_open_fmview = true;   
+                                  s_open_fmview = true;   /* r28: deferred popup */
                                   snprintf(s_fm_note, sizeof(s_fm_note),
                                            "disassembling...");
                                   std::string a = "{\"class\":\"" + jesc(c.cname)
@@ -3960,7 +3897,6 @@ jobs:
                                       "then Refresh");
               MULK();
           }
-
           static void open_obj_tab(const std::string& cls, long handle,
                                    const std::string& str) {
               MLK();
@@ -4023,7 +3959,6 @@ jobs:
               MULK();
               s_of.open = false;
           }
-
           static void objfinder_popup() {
               if (!s_of.open) return;
               ImGuiIO& io = ImGui::GetIO();
@@ -4033,7 +3968,7 @@ jobs:
               if (!ImGui::BeginPopup("ObjFinderPopup",
                                      ImGuiWindowFlags_HorizontalScrollbar))
                   return;
-              MLK();   
+              MLK();   /* s_of.results is written by the GumJS callback thread */
               ImGui::Text("class: %s", s_of.cls);
               if (s_of.ctx_arg >= 0)
                   ImGui::TextDisabled("selecting for arg%d (%s)",
@@ -4134,10 +4069,10 @@ jobs:
                   ImVec2(io.DisplaySize.x / 1.2f, io.DisplaySize.y / 2));
               if (!ImGui::BeginPopup("fmPopup",
                                      ImGuiWindowFlags_HorizontalScrollbar)) {
-                  s_fm_open = false;   
+                  s_fm_open = false;   /* clicked away: do not force-reopen */
                   return;
               }
-              MLK();   
+              MLK();   /* s_fm_* are written by the GumJS callback thread too */
               ImGui::Text("%s.%s", s_fm_cls.c_str(), s_fm_mth.c_str());
               if (ImGui::SmallButton("Load source")) {
                   std::string a = "{\"class\":\"" + jesc(s_fm_cls)
@@ -4278,7 +4213,7 @@ jobs:
                   s_of.results.clear();
                   s_of.waiting  = false;
                   s_of.creating = false;
-                  s_open_objfinder = true;   
+                  s_open_objfinder = true;   /* r28: popup instead of window */
               }
               if (ImGui::IsItemHovered())
                   ImGui::SetTooltip("find / create objects of this class");
@@ -4321,7 +4256,7 @@ jobs:
                   s_cls_auto_done = true;
                   s_search_wait   = true;
                   qid = ++s_search_seq;
-                  s_search_qid   = qid;      
+                  s_search_qid   = qid;      /* r23: generation armed at SEND time */
                   s_search_page0 = false;
               }
               bool want_expl = s_explorers.empty();
@@ -4387,7 +4322,7 @@ jobs:
                       }
                       if (!open) {
                           s_explorers.erase(s_explorers.begin() + i);
-                          continue;   
+                          continue;   /* no i++ - the next tab shifted in */
                       }
                       exi++;
                       i++;
@@ -4456,7 +4391,6 @@ jobs:
           static bool    s_fab_drag = false;
           static bool    s_fab_moved = false;
           static ImVec2  s_fab_grab(0, 0), s_fab_orig(0, 0);
-
           static void draw_fab(ImVec2 ds) {
               if (!s_show_fab) return;
               if (s_fab_pos.x < 0) s_fab_pos = ImVec2(ds.x - 90.f, ds.y - 110.f);
@@ -4494,7 +4428,7 @@ jobs:
                   }
               } else if (s_fab_drag) {
                   s_fab_drag = false;
-                  if (!s_fab_moved) {           
+                  if (!s_fab_moved) {           /* it was a tap, not a drag */
                       s_visible = !s_visible;
                       s_conf_dirty = true;
                   }
@@ -4507,18 +4441,16 @@ jobs:
               MLK();
               bool vis = s_visible;
               MULK();
-              if (vis) return 2;                    
-              return overlay_ready() ? 1 : 0;       
+              if (vis) return 2;                    /* full rate */
+              return overlay_ready() ? 1 : 0;       /* FAB-only slow pump  */
           }
           void menu_draw() {
               ImGuiIO& io = ImGui::GetIO();
               ImVec2 ds = io.DisplaySize;
               apply_theme();
-
               MLK();
               bool vis = s_visible;
               MULK();
-
               if (!vis) {
                   draw_fab(ds);
                   MLK();
@@ -4527,7 +4459,7 @@ jobs:
                   bool clear_req  = s_ime_clear;
                   s_ime_clear     = false;
                   MULK();
-                  if (ime_was) ime_hide();  
+                  if (ime_was) ime_hide();  /* menu hidden: close the phone kb */
                   if (clear_req) ImGui::ClearActiveID();
                   overlay_publish_scroll_regions(s_regions);
                   s_regions.clear();
@@ -4613,7 +4545,7 @@ jobs:
                       ImGuiTabItemFlags fl = 0;
                       if (want == t.name) fl |= ImGuiTabItemFlags_SetSelected;
                       if (ImGui::BeginTabItem(t.name, nullptr, fl)) {
-                          t.fn();          
+                          t.fn();          /* the body was missing: tabs drew empty */
                           ImGui::EndTabItem();
                       }
                   }
@@ -4631,14 +4563,11 @@ jobs:
               }
               objfinder_popup();
               fm_popup();
-
               ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
               ImGui::End();
               mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
-
               overlay_publish_scroll_regions(s_regions);
               s_regions.clear();
-
               if (s_conf_dirty && s_conf_path[0] &&
                   conf_now_ms() - s_conf_last_ms > 700) {
                   conf_save();
@@ -4662,9 +4591,7 @@ jobs:
           #include <ctime>
           #include <cstdio>
           #include <sys/stat.h>
-
           JavaVM* g_jvm_global = nullptr;
-
           static void write_marker(const char* path, const char* msg) {
               int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
               if (fd < 0) return;
@@ -4673,7 +4600,6 @@ jobs:
               write(fd, buf, (size_t)n);
               close(fd);
           }
-
           static void write_marker_in(const char* dir, const char* name,
                                       const char* msg) {
               char p[600];
@@ -4726,15 +4652,15 @@ jobs:
               logger_retarget(p);
               env->ReleaseStringUTFChars(path, p);
           }
-
           extern "C" JNIEXPORT jint JNICALL
           JNI_OnLoad(JavaVM* vm, void*) {
               g_jvm_global = vm;
               char base[512];
               resolve_log_dir(base, sizeof(base));
-              mkdir(base, 0755); 
+              mkdir(base, 0755);       /* entry marker + logs land even on the
+                                          very first boot */
               write_marker_in(base, "dextool-jni.marker", "checkpoint=entry");
-              logger_init(base);        
+              logger_init(base);        /* mkdir()s <filesDir>/dextool-logs */
               logger_install_abort_capture();
               {
                   char m[600];
@@ -4815,7 +4741,7 @@ jobs:
                       cn === 'java.lang.Short'   || cn === 'java.lang.Byte' ||
                       cn === 'java.lang.Float'   || cn === 'java.lang.Double' ||
                       cn === 'java.lang.Character')
-                      return String(v).substring(0, 160);   
+                      return String(v).substring(0, 160);   /* boxes: toString is safe */
                   if (cn) {
                       var id = '?';
                       try {
@@ -4824,15 +4750,13 @@ jobs:
                       } catch (e1) {}
                       return '@' + cn + '#' + id;
                   }
-                  return String(v).substring(0, 160);   
+                  return String(v).substring(0, 160);   /* plain JS values */
               } catch (e) { return '?'; }
           }
-
           var gAddChar = null, gBackspace = null, gWantMouse = null;
           var gNativeTouch = null, gSetMap = null;
-          var gHitTest = null, gDisplaySize = null;   
-          var gWantFrames = null;                     
-
+          var gHitTest = null, gDisplaySize = null;   /* r23 */
+          var gWantFrames = null;                     /* r25 frame pump */
           function ensure_native_fns() {
               if (gNativeTouch) return true;
               try {
@@ -4856,10 +4780,9 @@ jobs:
                   return true;
               } catch (e) { return false; }
           }
-
           var gMapSent = { w: -1, h: -1, x: -9999, y: -9999 };
           var gMapLastTouch = 0;
-          var gTouchEat = false;   
+          var gTouchEat = false;   /* r23: the current gesture started on the menu */
           var gPumpTick = 0, gPumpLogged = 0, gPumpMissLogged = 0;
           function pump_frames() {
               try {
@@ -4967,10 +4890,10 @@ jobs:
           }
           var IME = { act: null, edit: null, actHash: 0, prev: '',
                       silent: false, cnt: 0, everLogged: false,
-                      mapProbed: false,                   
-                      restore: null,                      
-                      showSeq: 0,                         
-                      upLogged: false };                  
+                      mapProbed: false,                   /* r20: one-shot view-map probe */
+                      restore: null,                      /* r23: app view whose focus we borrowed */
+                      showSeq: 0,                         /* r24: show-request session token */
+                      upLogged: false };                  /* r24: "already up" logged once per session */
           function ime_release_act(obj) {
               try {
                   if (!obj) return;
@@ -5001,15 +4924,15 @@ jobs:
                   if (IME.act) {
                       var same = false;
                       try { same = IME.act.equals(obj); } catch (eQ) { same = false; }
-                      if (same) return false;   
+                      if (same) return false;   /* already tracked - reuse */
                       ime_release_act(IME.act);
                       if (IME.restore) { ime_release_act(IME.restore); IME.restore = null; }
                   }
                   var kept = null;
                   try {
-                      kept = Java.retain(obj);   
+                      kept = Java.retain(obj);   /* promote to GLOBAL ref */
                   } catch (eT) {
-                      kept = obj;                
+                      kept = obj;                /* ancient bridge fallback */
                   }
                   try {
                       if (typeof kept.getWindow !== 'function') {
@@ -5062,14 +4985,13 @@ jobs:
               }
               return null;
           }
-
           function ime_on_text(ed) {
               try {
                   if (!ensure_native_fns()) return;
                   var cur = ime_read_text(ed);
                   if (cur === null) return;
                   cur = String(cur);
-                  if (IME.silent) { IME.prev = cur; return; }   
+                  if (IME.silent) { IME.prev = cur; return; }   /* programmatic */
                   var prev = IME.prev;
                   if (cur === prev) return;
                   var s = 0;
@@ -5080,7 +5002,7 @@ jobs:
                   var gone = prev.substring(s, prev.length - e), delN = 0;
                   for (var gi = 0; gi < gone.length; gi++) {
                       var gc = gone.charCodeAt(gi);
-                      if (gc < 0xDC00 || gc > 0xDFFF) delN++;   
+                      if (gc < 0xDC00 || gc > 0xDFFF) delN++;   /* skip low surrogates */
                   }
                   for (var d = 0; d < delN; d++) gBackspace();
                   var ins = cur.substring(s, cur.length - e);
@@ -5088,7 +5010,6 @@ jobs:
                   IME.prev = cur;
               } catch (e) {}
           }
-
           function ime_reset_text() {
               try {
                   IME.silent = true;
@@ -5117,7 +5038,7 @@ jobs:
                               (typeof act.addContentView) });
                       return null;
                   }
-                  IME.edit = null;               
+                  IME.edit = null;               /* activity switched */
                   IME.prev = '';
                   var edit = ime_stage('EditText.$new', function () {
                       var ET = Java.use('android.widget.EditText');
@@ -5128,7 +5049,7 @@ jobs:
                   });
                   ime_stage('clear background', function () {
                       if (typeof edit.setBackgroundDrawable === 'function')
-                          edit.setBackgroundDrawable(null);   
+                          edit.setBackgroundDrawable(null);   /* 1x1, transparent */
                       else if (typeof edit.setBackground === 'function')
                           edit.setBackground(null);
                       else
@@ -5178,7 +5099,7 @@ jobs:
                           implements: [Java.use('android.widget.TextView$OnEditorActionListener')],
                           methods: {
                               onEditorAction: function (v, actionId, ev) {
-                                  IME.showSeq++;            
+                                  IME.showSeq++;            /* keyboard closing: ladder stops */
                                   sendMsg('imeEnter', {});
                                   sendMsg('imeHidden', {});
                                   ime_reset_text();
@@ -5209,7 +5130,6 @@ jobs:
           function ime_ensure(act) {
               return ime_create_edit(act);
           }
-
           function ime_try_show(reset) {
               try {
                   if (!IME.act) {
@@ -5264,17 +5184,16 @@ jobs:
                   } catch (e2) {}
               });
           }
-
           function ime_show() {
               var seq = ++IME.showSeq;
               IME.upLogged = false;
               Java.perform(function () {
                   Java.scheduleOnMainThread(function () {
                       try {
-                          var walkErr = null;   
+                          var walkErr = null;   /* r17: warn payload, belt+braces */
                           if (!IME.act) {
                               try { ime_set_act(find_current_activity_sync(),
-                                                'sync walk'); }   
+                                                'sync walk'); }   /* r18: retained */
                               catch (e0) {
                                   walkErr = String(e0.message || e0);
                                   agentLog('ime: findAct failed: ' + walkErr);
@@ -5290,7 +5209,7 @@ jobs:
                                   ime_act_resolved(a, 'async');
                               });
                           }
-                          ime_try_show(true);
+                          ime_try_show(true);   /* r16: only the first attempt resets */
                           [150, 450, 900, 1500].forEach(function (delay) {
                               setTimeout(function () {
                                   Java.scheduleOnMainThread(function () {
@@ -5380,7 +5299,6 @@ jobs:
               find_current_activity_sync.lastDiag = diag;
               return best;
           }
-
           function resolve_current_activity(cb) {
               var a = null;
               try { a = find_current_activity_sync(); } catch (e0) {}
@@ -5391,8 +5309,8 @@ jobs:
                           var dead = false;
                           try { dead = act.isFinishing() || act.isDestroyed(); }
                           catch (eX) {}
-                          if (dead) return;   
-                          ime_set_act(act, 'heap scan');   
+                          if (dead) return;   /* keep scanning */
+                          ime_set_act(act, 'heap scan');   /* r18: retained */
                           try { cb(act); } catch (e3) {}
                           return 'stop';
                       },
@@ -5432,9 +5350,8 @@ jobs:
                   }
               });
           }
-
           function ime_hide() {
-              IME.showSeq++;            
+              IME.showSeq++;            /* r24: keyboard closing - ladder stops */
               Java.perform(function () {
                   Java.scheduleOnMainThread(function () {
                       try {
@@ -5448,7 +5365,6 @@ jobs:
                   });
               });
           }
-
           function installTouchHook() {
               if (!ensure_native_fns()) {
                   sendMsg('error', { fn: 'installTouchHook', msg: 'libtool.so natives missing' });
@@ -5495,8 +5411,9 @@ jobs:
                               try { gTouchEat = !!gHitTest(rx, ry); } catch (eH) {}
                           }
                           var eat = gTouchEat;
-                          if (act === 1 || act === 3) gTouchEat = false;  
-                          if (act === 0 || act === 2) {
+                          if (act === 1 || act === 3) gTouchEat = false;  /* UP/CANCEL */
+                          if (act === 0 || act === 2) {   /* r22/audit: throttled map
+                                                             refresh on DOWN + MOVE */
                               var now = Date.now();
                               if (now - gMapLastTouch > 2000) {
                                   gMapLastTouch = now;
@@ -5504,10 +5421,10 @@ jobs:
                               }
                           }
                           if (eat) {
-                              return true;                     
+                              return true;                     /* consume */
                           }
                       } catch (e) {}
-                      return this.dispatchTouchEvent(ev);         
+                      return this.dispatchTouchEvent(ev);         /* original call */
                   };
                   agentLog('phase: dispatchTouchEvent hook ok');
                   sendMsg('info', { msg: 'touch hook installed (r25, screen coords + hit-test click-through + UP-leak fix + IME activity capture + map refresh on DOWN + frame pump)' });
@@ -5560,8 +5477,8 @@ jobs:
           var REC = { on: false, busy: false, ring: [], installed: 0, flushBusy: false,
                       lastProg: 0 };
           function rec_wanted(name, filter) {
-              if (filter === '.') return true;                 
-              if (!filter) return true;                        
+              if (filter === '.') return true;                 /* everything */
+              if (!filter) return true;                        /* agent default */
               return name.indexOf(filter) === 0;
           }
           function rec_flush() {
@@ -5575,7 +5492,6 @@ jobs:
               }) });
           }
           setInterval(rec_flush, 500);
-
           function rec_install_chunk(list, batch) {
               if (!REC.on) {
                   REC.busy = false;
@@ -5659,7 +5575,6 @@ jobs:
               }) });
           }
           setInterval(function () { if (MON.on) mon_flush(); }, 600);
-
           function mon_install() {
               Java.perform(function () {
                   function req_body_repr(req) {
@@ -5721,7 +5636,6 @@ jobs:
                           okhttpOk = true;
                       }
                   } catch (e) { okhttpOk = false; }
-
                   try {
                       install_layer('java.net.URL', 'openConnection', 'mon', {
                           fn: function (self, a, out) {
@@ -5752,7 +5666,6 @@ jobs:
                       mon_push('ssl', 'engine', 'note',
                                '', 'SSLSocket reachable', '');
                   } catch (e) {}
-
                   sendMsg('monitorInfo', {
                       note: 'okhttp ' + (okhttpOk ? 'hooked' : 'absent') +
                              ', urlconn hooked'
@@ -5777,7 +5690,6 @@ jobs:
               if (s === 'null') return null;
               return s;
           }
-
           function call_with_args(ov, argStrings, isCtor, recv) {
               var params = ov.argumentTypes;
               var real = [];
@@ -5799,7 +5711,6 @@ jobs:
               if (SCAN.cs) return s.indexOf(SCAN.fRaw) !== -1;
               return s.toLowerCase().indexOf(SCAN.f) !== -1;
           }
-
           var gModCls = null;
           function is_static_method(jc, method) {
               try {
@@ -5826,7 +5737,7 @@ jobs:
                   return s;
               } catch (e) { return '?'; }
           }
-          var gInstHandles = {};     
+          var gInstHandles = {};     /* id -> retained wrapper */
           var INST_ID = 0, INST_GEN = 0;
           var INST_LIMIT = 200;
           function inst_put(inst) {
@@ -5850,7 +5761,6 @@ jobs:
               if (typeof handle !== 'number' || handle <= 0) return null;
               return gInstHandles[handle] || null;
           }
-
           function set_field_value(f, recv, value) {
               var t = String(f.getType().getName());
               if (t === 'int' || t === 'long' || t === 'short' || t === 'byte')
@@ -5862,7 +5772,7 @@ jobs:
                   f.set(recv, (value || 'a').charCodeAt(0));
               else f.set(recv, value);
           }
-          var LAYERS = {};
+          var LAYERS = {};   /* 'cls!method' -> { ovs: [overloads], parts: {kind: state} } */
           function noop_ret(ov) {
               var rt = ov.returnType.name;
               if (rt === 'int' || rt === 'long' || rt === 'short' || rt === 'byte')
@@ -5928,7 +5838,7 @@ jobs:
               } catch (e2) {
                   try {
                       if (p.rec && REC.on && REC.ring.length < 4000) {
-                          var i = K.indexOf('!');   
+                          var i = K.indexOf('!');   /* r24: lazy - rows only */
                           REC.ring.push({ cls: K.substring(0, i),
                                           m: K.substring(i + 1), a: jargs(args),
                                           r: '', x: String(e2).substring(0, 80) });
@@ -5938,7 +5848,7 @@ jobs:
               }
               try {
                   if (p.rec && REC.on && REC.ring.length < 4000) {
-                      var j = K.indexOf('!');   
+                      var j = K.indexOf('!');   /* r24: lazy - rows only */
                       REC.ring.push({ cls: K.substring(0, j),
                                       m: K.substring(j + 1), a: jargs(args),
                                       r: jstr(out), x: '' });
@@ -6016,7 +5926,7 @@ jobs:
               var K = cls + '!' + mn;
               var L = LAYERS[K];
               if (!L) {
-                  var jc = Java.use(cls);   
+                  var jc = Java.use(cls);   /* caller decides the <clinit> policy */
                   var node = null;
                   try { node = jc[mn]; } catch (eN) {}
                   var ovs = node && node.overloads;
@@ -6032,7 +5942,6 @@ jobs:
               L.parts[kind] = state || {};
               return L.ovs.length;
           }
-
           function uninstall_layer(cls, mn, kind) {
               var K = cls + '!' + mn;
               var L = LAYERS[K];
@@ -6045,7 +5954,6 @@ jobs:
                   delete LAYERS[K];
               }
           }
-
           function uninstall_all(kind) {
               Object.keys(LAYERS).forEach(function (K) {
                   var i = K.indexOf('!');
@@ -6066,7 +5974,7 @@ jobs:
               var now = Date.now();
               if (!gLoadedSet || now - gLoadedAt > 3000) {
                   dt_rebuild_loaded_set();
-                  gLoadedRechecked = false;   
+                  gLoadedRechecked = false;   /* new cache generation */
               }
               if (gLoadedSet && gLoadedSet[cls]) return true;
               if (!gLoadedRechecked) {
@@ -6075,16 +5983,14 @@ jobs:
               }
               return !!(gLoadedSet && gLoadedSet[cls]);
           }
-
           function use_loaded(cls) {
               if (!dt_is_loaded(cls))
                   throw new Error('class not loaded yet: ' + cls +
                                   ' (its <clinit> will not be forced)');
               return Java.use(cls);
           }
-
-          var gDeferred = [];        
-          var gWatcherOvs = null;    
+          var gDeferred = [];        /* queued installs: {kind, cls, fn} */
+          var gWatcherOvs = null;    /* loadClass overloads we hooked, for restore */
           function defer_install(kind, cls, fn) {
               gDeferred.push({ kind: kind, cls: cls, fn: fn });
               if (!gWatcherOvs) install_load_watcher();
@@ -6097,7 +6003,7 @@ jobs:
                       var CL = Java.use('java.lang.ClassLoader');
                       var ovs = [];
                       CL.loadClass.overloads.forEach(function (ov) {
-                          if (ov.argumentTypes.length !== 1) return;   
+                          if (ov.argumentTypes.length !== 1) return;   /* name only */
                           ov.implementation = function (name) {
                               var c = ov.apply(this, [name]);
                               try { pump_deferred(String(name)); } catch (e0) {}
@@ -6199,7 +6105,6 @@ jobs:
                   sendMsg('hookAdded', { name: key });
               }
           }
-
           function do_addTracker(cls, method) {
               var key = cls + '.' + method;
               if (!install_layer(cls, method, 'trk', { key: key }))
@@ -6207,7 +6112,6 @@ jobs:
               trackers[key] = { on: true };
               sendMsg('info', { msg: 'tracker added ' + key });
           }
-
           function do_trackField(cls, field) {
               var key = cls + '.' + field;
               var jc = Java.use(cls);
@@ -6301,7 +6205,6 @@ jobs:
                   delete patches[key];
                   sendMsg('info', { msg: 'patch removed ' + key });
               },
-
               addHook: function (cls, method, mode, code) {
                   var key = cls + '.' + method;
                   var ml = String(mode).toLowerCase();
@@ -6339,7 +6242,6 @@ jobs:
                       sendMsg('info', { msg: 'hook removed ' + key });
                   });
               },
-
               addTracker: function (cls, method) {
                   var key = cls + '.' + method;
                   Java.perform(function () {
@@ -6398,7 +6300,6 @@ jobs:
                       sendMsg('info', { msg: 'tracker removed ' + name });
                   });
               },
-
               startRecorder: function (filter, cap) {
                   if (REC.on || REC.busy) return;
                   Java.perform(function () {
@@ -6410,7 +6311,7 @@ jobs:
                       } catch (e0) {}
                       REC.filter = (filter === undefined || filter === null) ? '' :
                                     String(filter);
-                      if (!REC.filter) REC.filter = pkg;   
+                      if (!REC.filter) REC.filter = pkg;   /* default: own package */
                       if (filter === '.') REC.filter = '.';
                       REC.cap = (typeof cap === 'number' && cap > 0) ?
                                 Math.floor(cap) : 1500;
@@ -6435,7 +6336,6 @@ jobs:
                   rec_flush();
                   sendMsg('recorderStopped', { installed: REC.installed });
               },
-
               startMonitor: function () {
                   if (MON.on) return;
                   MON.on = true;
@@ -6447,11 +6347,10 @@ jobs:
                   MON.on = false;
                   mon_flush();
                   Java.perform(function () {
-                      uninstall_all('mon');    
+                      uninstall_all('mon');    /* r23: really unhook */
                   });
                   sendMsg('monitorStopped', {});
               },
-
               evalScript: function (src) {
                   try {
                       var r = (new Function('Java', 'send', 'console', String(src)))(
@@ -6521,7 +6420,6 @@ jobs:
                                              count: 0, error: err });
                   });
               },
-
               listLoadedClasses: function (filter, qid, mode, sys, cs) {
                   Java.perform(function () {
                       try {
@@ -6730,7 +6628,7 @@ jobs:
               readStaticFields: function (cls) {
                   Java.perform(function () {
                       try {
-                          var jc = use_loaded(cls);   
+                          var jc = use_loaded(cls);   /* r23: no forced <clinit> */
                           var fs = jc.class.getDeclaredFields();
                           var out = [];
                           for (var i = 0; i < fs.length; i++) {
@@ -6960,7 +6858,6 @@ jobs:
               });
               return gSmaliFactory;
           }
-
           function smali_compile(src) {
               var out = { err: '', dex: null };
               Java.perform(function () {
@@ -7010,7 +6907,6 @@ jobs:
               });
               return out;
           }
-
           function smali_load(art) {
               var r = { ok: false, err: '', hook: null };
               var dexBytes = art && art.dex;
@@ -7064,7 +6960,6 @@ jobs:
                   return null;
               }
           }
-
           function apk_paths() {
               var out = [];
               try {
@@ -7145,7 +7040,6 @@ jobs:
                        total: 0 };
           var gLastScanHits = {};
           var gLastSearch = { f: '', mode: 0 };
-
           function scan_finish() {
               SCAN.on = false;
               gLastScanHits = SCAN.hits;
@@ -7154,7 +7048,6 @@ jobs:
                                      ' matching class(es) (scan done)' });
               page_out(matches, SCAN.qid, SCAN.total);
           }
-
           function scan_step() {
               if (!SCAN.on) return;
               var L = baksmali_libs();
@@ -7193,7 +7086,7 @@ jobs:
                   if (!SCAN.want[cls]) continue;
                   var matched = false, mh = null, fh = null;
                   try {
-                      if (SCAN.md === 1) {                       
+                      if (SCAN.md === 1) {                       /* method name */
                           var mit = cd.getMethods().iterator();
                           while (mit.hasNext()) {
                               var mm = mit.next();
@@ -7204,7 +7097,7 @@ jobs:
                                   break;
                               }
                           }
-                      } else if (SCAN.md === 2) {                
+                      } else if (SCAN.md === 2) {                /* field name */
                           var fit = cd.getFields().iterator();
                           while (fit.hasNext()) {
                               var ff = fit.next();
@@ -7215,7 +7108,7 @@ jobs:
                                   break;
                               }
                           }
-                      } else {                                   
+                      } else {                                   /* code text   */
                           var m2 = cd.getMethods().iterator();
                           while (m2.hasNext()) {
                               var m3 = m2.next();
@@ -7279,7 +7172,6 @@ jobs:
               return Java.use('java.lang.String').$new(
                   Java.array('byte', all), 'UTF-8');
           }
-
           function rm_rf(f) {
               try {
                   if (f.isDirectory()) {
@@ -7435,7 +7327,6 @@ jobs:
         run: |
           cat > sample-app/app/src/main/java/com/dextool/app/DexToolApp.java << 'DXTAPPJ'
           package com.dextool.app;
-
           import android.app.Application;
           import android.util.Log;
           import java.io.File;
@@ -7444,11 +7335,9 @@ jobs:
           import java.io.IOException;
           import java.io.InputStream;
           import java.io.OutputStream;
-
           public class DexToolApp extends Application {
               private static final String TAG = "DexToolApp";
               private static final String DL  = "/sdcard/Download";
-
               @Override
               public void onCreate() {
                   super.onCreate();
@@ -7464,7 +7353,6 @@ jobs:
                   }
                   retargetNativeLogs();
               }
-
               private void retargetNativeLogs() {
                   try {
                       File d = new File(getFilesDir(), "dextool-logs");
@@ -7503,7 +7391,6 @@ jobs:
                   t.setDaemon(true);
                   t.start();
               }
-
               private void writeBootMarker() {
                   try {
                       new File(DL).mkdirs();
@@ -7512,7 +7399,6 @@ jobs:
                       }
                   } catch (IOException e) { Log.w(TAG, "boot marker: "+e.getMessage()); }
               }
-
               private void startCopierThread() {
                   Thread t = new Thread(() -> {
                       while (true) {
@@ -7539,13 +7425,12 @@ jobs:
                   for (File destDir : exportDirs()) {
                       try {
                           copyInto(srcDir, destDir, names);
-                      } catch (IOException e) {      
+                      } catch (IOException e) {      /* one failing dir must not block the other */
                           if (first == null) first = e;
                       }
                   }
                   if (first != null) Log.w(TAG, "copyLogs: " + first.getMessage());
               }
-
               private void copyInto(File srcDir, File destDir, String[] names) throws IOException {
                   destDir.mkdirs();
                   for (String n : names) {
@@ -7564,7 +7449,6 @@ jobs:
                       if (!t.renameTo(d)) t.delete();
                   }
               }
-
               private void installUncaughtHandler() {
                   Thread.UncaughtExceptionHandler prev =
                       Thread.getDefaultUncaughtExceptionHandler();
@@ -7590,7 +7474,6 @@ jobs:
         run: |
           cat > sample-app/app/src/main/java/com/dextool/app/MainActivity.java << 'DXTMAINAJ'
           package com.dextool.app;
-
           import android.app.Activity;
           import android.opengl.GLSurfaceView;
           import static android.opengl.GLES20.glClearColor;
@@ -7600,10 +7483,8 @@ jobs:
           import android.os.Bundle;
           import javax.microedition.khronos.egl.EGLConfig;
           import javax.microedition.khronos.opengles.GL10;
-
           public class MainActivity extends Activity {
               private GLSurfaceView mGLView;
-
               @Override
               protected void onCreate(Bundle b) {
                   super.onCreate(b);
@@ -7622,7 +7503,6 @@ jobs:
                   });
                   setContentView(mGLView);
               }
-
               @Override protected void onResume() { super.onResume(); mGLView.onResume(); }
               @Override protected void onPause()  { super.onPause();  mGLView.onPause();  }
           }
@@ -7751,6 +7631,752 @@ jobs:
 
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+          ## Fixes in this version (r28)
+
+          The menu was reshaped into the structure of the reference source the
+          user supplied (the IL2CPP Tool by mIsmanXP - Main.cpp, ClassesTab.cpp,
+          Tool.cpp), adapted to the Frida dex tool. Same engine, RPCs and
+          agent; menu.cpp carries the restructure, agent.js adds five small
+          things (hookHit, dumpLoadedClasses, dumpObject, the package name in
+          ready, the r28 banner).
+
+          - **One window, main tabs:** Tools / Tracer / Patches / Dumper /
+          Recorder / Monitor / Script / Settings - the reference's
+          Tools / Tracer / Dumper / Settings skeleton with the project's own
+          tabs kept after it.
+          - **Tools:** the reference "Fullscreen" checkbox + the inner tabber
+          (AutoSelectNewTabs | FittingPolicyScroll | TabListPopupButton) with
+          the LEADING "+" tab button, closeable Class Explorer tabs
+          ("Classes" / "Classes [N]" / the filter text), one tab per opened
+          class and one "[0x..]" tab per inspected object (the reference
+          DrawTabMap). The r26 floating windows are gone - everything lives
+          in tabs and popups like the real tool.
+          - **Methods:** TREE NODES with the reference coloring - traced
+          methods green with a "Hit Count N | " prefix - and the three
+          reference sub-tabs Call / Patch / Trace (the r27 Hook editor merged
+          into Trace; the context menu, long-press and "..." button kept).
+          - **Tracer tab:** "Traced method count", the Quick Restore popup and
+          the traced list (trackers with their event log, hooks with their
+          enable/edit controls); the r27 Trackers + Hooks managers merged in
+          under "Manual add" so no feature was lost.
+          - **Hit flashes:** the agent counts every call through an explicit
+          hook/tracker layer (500 ms throttle) and the menu paints
+          "name (Ndx)" lines on the BACKGROUND draw list - green flash, fade
+          out - the reference HookerData::visited overlay.
+          - **Dumper tab:** DUMP writes every loaded class to
+          dextool-classes.txt in the app files dir (agent rpc
+          dumpLoadedClasses) with a Done + "Copy path" echo; object tabs dump
+          one instance as JSON (dumpObject) through the reference
+          "Dump to file" ProceedPopUp.
+          - **Object tabs:** click-to-edit field rows, the class's Methods
+          popup (tap opens the class tab with that method expanded) and the
+          reference Saved Objects section in the Object Finder popup.
+          - **Settings:** the reference "Display" section with the 7-step
+          Scale combo (Smallest..Largest) replacing the free slider (the
+          opacity / theme / scroll / y-bias knobs stay) and an "Info" section
+          leading with the package name (new ready payload) + Arch.
+          - **Popups:** the Object Finder and the Full Method View are popups
+          now (the reference keeps pickers in popups); the deferred-open
+          pattern mirrors the reference PopUpSelector.
+
+          ## Fixes in this version (r26)
+
+          Field spec: a full menu RESTRUCTURE. Same engine and RPCs - the
+          UI is reorganized around windows and the exact tab set the spec
+          names.
+
+          - **Main tabs, exact order:** Classes, Patches, Trackers, Hooks,
+            Recorder, Monitor, Script, Settings (was Settings-first with
+            "Tracker").
+          - **Secondary bar:** the opened classes are tabs under the main
+            bar; the far-right **+** button opens a NEW Class Explorer
+            window. Tapping a class tab raises that class's window.
+          - **Class Explorer windows:** package/family dropdown (com.game,
+            com.android, ... derived from the loaded list) with an **All**
+            checkbox, the search field + **Filter** button, and a pink
+            **Options** button whose popup holds **Case sensitive**,
+            **Filter by Class / Method / Field**, the advanced **code-text**
+            search (same baksmali const-string scan as r25) and the System
+            classes gate. The filtered class list fills the window; tapping
+            a class opens its Inspector. Case sensitivity now reaches the
+            agent (listLoadedClasses gained a `cs` argument - mode 0 AND
+            the dex scan honor it).
+          - **Class Inspector windows** (one per opened class, floating,
+            movable): **Inspector** button (opens the Object Finder for the
+            class), **Static Fields** section (values read on demand), the
+            Methods list and the full Fields list. **-** collapses the
+            window, **X** closes it.
+          - **Method expansion:** tapping a method opens the 4 spec
+            sub-tabs in place:
+            - **Caller** - one input per parameter (primitives int32/
+              int64/float/double/string/boolean/byte are plain text;
+              OBJECT parameters get a **Find...** button that opens the
+              Object Finder for the parameter's class), the **Call count**
+              input, **Call** and **Call in Main Thread** buttons (the
+              agent loops and runs each call via
+              Java.scheduleOnMainThread), and a per-call results log
+              ("call 3/10: ..."). Object args travel as {"handle":N} and
+              callMethod passes the retained instance as the REAL object
+              - text-only args could never do that.
+            - **Patcher** - manual value, **Patch NOP** (auto return by
+              method logic) and **Redirect** (forces the return value on
+              every subsequent call), plus the r25 live IO-probe editor.
+            - **Tracer** - track this method + live event log.
+            - **Hooker** - Java/Smali/Nop hook editor for the method.
+          - **Method context menu:** right-click (or the "..." button on
+            touch) offers Open in new window (duplicate Inspector), Full
+            Method View (real smali in its own window), Copy Method Name
+            and Copy Class Name (clipboard + an on-screen echo - the touch
+            bridge has no system clipboard backend).
+          - **Object Finder window:** **Find Objects** (Java.choose),
+            **Create Object** ($new() through the no-arg constructor,
+            retained like a scan match), a manual reference field and a
+            results list in the spec's "Name (i/N)" shape. A click fills
+            the caller parameter that opened it or selects the object for
+            the Inspector/Instances view.
+          - r25 kept: frame pump, method source view, one-tap Nop, IO
+            patching, network monitor detail window, green code-text marks,
+            sorted filtered class list.
+
+          ## Fixes in this version (r25)
+
+          Field report: the menu worked on one app but HANGS, LAGS and FREEZES
+          on other apps ("when I touch the app, the touch I had previously
+          made on the menu works"), plus feature requests for the Hooks,
+          Monitor and Classes sections.
+
+          - **Frame pump (the freeze fix):** the menu is drawn inside the
+            host's `eglSwapBuffers` hook - it only advances when the host
+            renders a frame. Games render continuously, but most other apps
+            render ON DEMAND and can go seconds without swapping; every
+            queued menu touch/keystroke just waited for the next swap, which
+            is exactly the reported "touch the app and the earlier menu touch
+            works". The agent now polls `dextool_want_frames()` (new JNI
+            export, 0/1/2) from a 30 ms timer and `postInvalidate()`s the
+            captured activity's DecorView while frames are wanted: full rate
+            with the menu visible, slow rate (FAB only) while hidden.
+            `postInvalidate()` is the thread-safe variant, works on the JS
+            thread, and continuous-rendering hosts coalesce the extra
+            invalidations.
+          - **Method source view (Hooks tab + "Src" button):** the real body
+            of the method, disassembled on-device by a bundled baksmali
+            (org.smali 2.5.2 - baksmali is not on Google Maven for 3.x; the
+            org.jf packages coexist with the com.android.tools.smali 3.0.7
+            assembler). Smali mode gets a "Copy body -> editor" button. Java
+            decompilation is NOT bundled - a decompiler is heavy and would
+            run inside the host process, so both modes show the bytecode.
+          - **One-tap Nop:** the Classes > Methods rows have a Nop button that
+            adds a noop hook immediately - it returns the default value for
+            the method's return type (void -> plain return, numeric -> 0,
+            boolean -> false, object/array -> null). The Hooks mode combo
+            label is now "Nop (auto)".
+          - **Method input/output patching ("IO" button):** arms a one-shot
+            probe; the method's next call reports its captured current
+            argument values and return value (toString-safe rendering) into
+            an editor. Only the checkbox-marked rows are patched from then
+            on - arguments are replaced before the original call, the return
+            value after. "Refresh values" re-probes, "Stop patching" unhooks.
+          - **Network monitor:** okhttp calls now log a REQUEST row AND a
+            RESPONSE row - the response body is peeked (up to 4 KB, without
+            consuming the original) and the request body is read through an
+            okio Buffer when accessible; `HttpURLConnection.getInputStream`
+            is hooked for the response side of plain-HTTP apps. Clicking any
+            row opens a DETAIL window: type, http method, URL, the app
+            method that sent/received it (clickable - opens the class), the
+            note and the payload preview.
+          - **Classes tab:** the list is SORTED ALPHABETICALLY and android/
+            androidx/com.android/com.google/java/javax/dalvik/kotlin classes
+            are HIDDEN by default (a System checkbox brings them back).
+            Search has 4 modes: class name, method name, field name and CODE
+            TEXT - the last one scans every method's const-string
+            instructions and every static String field value of the app's
+            dex files (dexlib2, chunked 150 classDefs/15 ms so the agent
+            never stalls, capped at 4000 hits, cancellable by a newer
+            search). Classes a code-text search reports get their matched
+            methods/fields painted GREEN when opened (modes 1/2 mark name
+            matches the same way).
+          - **Known limitations, documented:** only classes inside the host
+            APK (base + split APKs) are scannable for source/code-text;
+            classes from dynamic `InMemoryDexClassLoader`s are outside the
+            window. The monitor still cannot see inside TLS - payload
+            previews come from the Java layer (okhttp/URLConnection).
+
+          ## Fixes in this version (r24)
+
+          Patch #3 of the audits: severe performance bugs (the menu froze on
+          heavier apps - logcat "Skipped 40 frames! The application may be
+          doing too much work on its main thread") plus logic and CI
+          leftovers.
+
+          - **Field-tracker flooding (agent):** `field_layer_emit` sent a
+            `trackerEvent` on EVERY method call of the tracked class, changed
+            value or not - hot classes flooded the bridge and froze the menu.
+            The field is now polled at most every 20 ms, events are emitted
+            only when the value actually changed, and at most once per 100 ms
+            per field.
+          - **`dt_is_loaded` race (agent):** the 3 s loaded-class cache could
+            predate a class actually loading, and `loadClass` never fires
+            again for a class that is already loaded - the queued install
+            waited forever. A cache miss now forces ONE rebuild of the set
+            (once per cache generation) before the class is declared
+            unloaded.
+          - **Dispatcher overhead (agent):** the LAYERS key was substring'd
+            on every hooked call; class/method names are parsed lazily now
+            (only recorder rows need them), and the touch dispatcher keeps
+            doing the minimum on the main thread.
+          - **Eaten gestures no longer leak UP (agent):** `gTouchEat` was
+            cleared on UP/CANCEL before the consume check, so the app got an
+            UP for a gesture whose DOWN the menu had consumed. The flag is
+            captured first, cleared second, consumed last.
+          - **Enter searches now (menu.cpp + agent):** the class filter
+            declares `EnterReturnsTrue`, but the phone IME's Done/Search only
+            hid the keyboard. `onEditorAction` forwards an `imeEnter` message
+            first; the menu injects a real `ImGuiKey_Enter` press (DOWN, then
+            UP next frame) before the field is released.
+          - **Opacity is background-only (menu.cpp):** `style.Alpha` faded
+            everything - text included - on top of the window background
+            alpha. `style.Alpha` is gone; `SetNextWindowBgAlpha(s_opacity)`
+            is the single opacity source.
+          - **agentStatus JSON escaping (frida_bridge.cpp):** the GumJS start
+            failure text (`err->message`) was pasted into the JSON envelope
+            unescaped; quotes inside it produced an envelope the menu could
+            not parse. Escaped now.
+          - **IME ladder stops when the keyboard is up (agent):** every retry
+            re-sent `showSoftInput` and logged "showSoftInput sent -> true"
+            up to 4x per tap. Retries check `isAcceptingText()` (logged
+            once), and each show request carries a session token - a newer
+            request or Done/hide invalidates the pending ladder.
+          - **Console keeps rolling (menu.cpp):** the 400-line guard dropped
+            every new line once full, so the console appeared to stop. It
+            keeps the newest 400 lines now.
+          - **Auto-scroll targets the list (menu.cpp):** the Recorder/Script
+            auto-scroll ran after `EndChild()` and scrolled the PARENT
+            window; it now runs inside the child list.
+          - **CI:** the push trigger is restricted to `dev` (it fired from
+            every branch and pushed to `dev`); the menu title says r24.
+          - **Known limitation, documented:** frida-java-bridge's `Java.use`
+            ALWAYS forces `<clinit>` on a loaded-but-uninitialized class.
+            The loadClass deferral only avoids classes that are not loaded
+            YET - it cannot avoid initialization of loaded classes, because
+            the bridge offers no non-initializing use(). Stated here and in
+            the agent source instead of pretending it is fixed.
+
+          ## Fixes in this version (r23)
+
+          Patch #2 of the 47-item audit: the 22 open items plus the 7 partial
+          ones finished.
+
+          - **Message routing (menu.cpp):** every agent message is dispatched on
+            the EXACT `"type"` value (`jtype()`); `jhas()` is colon-anchored, so
+            a payload that merely contains a word can no longer hijack another
+            branch.
+          - **Click-through (overlay.cpp + agent):** menu.cpp/overlay publish the
+            rects of every live ImGui window each frame; the Java touch hook asks
+            `dextool_hit_test(rawX, rawY)` BEFORE the app sees the gesture and
+            consumes the whole gesture when it starts on the menu - taps no
+            longer leak to the host app.
+          - **Touch map:** the view probe scores SurfaceView/TextureView
+            candidates against the overlay's REAL GL surface size
+            (`dextool_display_size`); overlay.cpp dropped its clamping, so taps
+            outside the view no longer snap onto edge widgets.
+          - **Hook layering (agent):** one registry (`LAYERS`) per
+            class+method - Hook, Tracker, field-Tracker, Recorder and Monitor
+            stack on the same method through a single dispatcher instead of
+            overwriting each other's `ov.implementation`.
+          - **Recorder/Monitor Stop really unhooks:** stopping removes the
+            layer and restores the original implementation.
+          - **Instance-method Call:** `listInstances` retains every instance
+            (`Java.retain`) and returns `{str, handle, fields:[{n,t,v}]}`;
+            `callMethod`/`setInstanceField` address instances by handle - real
+            receivers. Static-only calls without a handle are refused with a
+            hint. The old `"##"/";"` value protocol (which corrupted values
+            containing `|`, `#`, `;`) is gone.
+          - **Instance editor:** buffers are keyed by class + list generation +
+            index - no more stale text across classes.
+          - **Class initialization:** hooks/trackers only `Java.use` classes
+            that are ALREADY loaded; anything else is deferred and installed by
+            a `loadClass` watcher when the app loads the class. Known
+            limitation (see r24 below): `Java.use` still forces `<clinit>` on
+            loaded-but-uninitialized classes - the bridge offers no
+            non-initializing use().
+          - **Tracker side effects:** field/tracker values go through
+            `field_repr()` - primitives and boxes only, everything else is
+            `@class#identityHashCode`; the app's `toString()` is never called
+            inside hooks (no more recursion/crash).
+          - **Search:** class filter searches on Enter/button only (no more
+            per-keystroke `enumerateLoadedClasses`); stale pages of an older
+            query are dropped via the qid generation counter.
+          - **IME focus order:** the OLD field's deferred deactivation no longer
+            closes the keyboard of the NEW field (owner-ID check).
+          - **IME focus restore:** the app's previously focused view is
+            remembered and gets focus back when the keyboard closes (Done/back/
+            hide) - the hidden EditText no longer keeps focus forever.
+          - **UI polish:** window opacity applied once (was squared); the X
+            button force-returns the toggle FAB when it was disabled.
+          - **Agent status:** failed GumJS starts are delivered to the menu
+            (`agentStatus`) and shown in Settings instead of "waiting" forever.
+          - **Main thread:** the 500 ms `Thread.sleep` in DexToolApp.onCreate is
+            gone.
+          - **GL state:** vertex-attrib enable flags (0..7) are saved and
+            restored around the overlay draw alongside the VAO binding.
+          - **`my_terminate`:** retires only the slots belonging to the
+            terminated display (slots record their `dpy`).
+          - **Stale GL names:** parked worlds "forget" their backend GL handles
+            (`ImGui_ImplOpenGL3_ForgetDeviceObjects`, appended to the backend by
+            CI) so adoption can never delete a name the new context recycled;
+            owner migration now PARKS the old world instead of leaking it.
+          - **Build:** Dobby is pinned to a specific commit; `.so`/`.jar`
+            binaries and the generated embed header are no longer committed.
+
+          ## Fixes in this version (r22)
+
+          Third-party audit (47 items): the 18 patch-fixed items are ported
+          INTO the generated sources and merged with the r19-r21 IME fixes
+          (the audit's raw patch targeted a pre-r19 snapshot - its
+          ime_on_text hunk would not apply over the r21 code). The audit's
+          "build committed sources only" workflow was NOT adopted: this
+          workflow stays self-contained and regenerates the sources, so the
+          fixes cannot be reverted by a push.
+
+          1. Overlay input: ONE ordered queue - deletions keep their order
+             before insertions (autocorrect no longer scrambles text), and
+             UTF-16 surrogate halves are recombined via
+             AddInputCharacterUTF16, so astral characters survive. The agent
+             now counts IME deletions in code points (ImGui deletes one
+             character per backspace - unit counting over-deleted fields).
+
+          2. Overlay GL: the double-draw guard spans the real eglSwapBuffers
+             call (libEGL forwards to eglSwapBuffersWithDamageKHR, also
+             hooked - the menu was drawn twice per frame); texture binding
+             restored on unit 0; owner-migration stale test fixed; no second
+             renderer Shutdown when adopting a parked world; dead
+             ImFontConfig removed.
+
+          3. Logger: FILE* checked under the lock (retarget race), private
+             crash log rotated on retarget (dextool-crash.prev.log is real
+             now), stdout/stderr follow the new crash fd, the runtime's
+             existing sigaltstack is preserved, terminate handler survives
+             "no active exception".
+
+          4. frida_bridge: early agent messages (the one-shot "ready") are
+             queued and replayed when the menu registers; uncaught GumJS
+             errors are logged to the crash log and forwarded to the Script
+             console; dropped frida_post calls are logged.
+
+          5. Agent: Script tab code actually runs (new Function body);
+             Java(JS) hooks install (mode strings normalised); orig() keeps
+             receiver + args; Patch OFF/delete restores the snapshotted
+             original; recorder pre-filters loaded classes; tracker callers
+             exclude the tracked method; OkHttp enqueue also monitored;
+             readable script console (cstr); smali jar extracted atomically
+             + read-only (Android 14) + assembled via ClassFactory with both
+             Main class names; single-ByteBuffer InMemoryDexClassLoader
+             (minSdk 26); dead code removed (DOTS/DMAX, parse_rules,
+             lit_to_java, CONS_Dummy, gDispSize).
+
+          6. DexToolApp: crash.prev.log exported, copyLogs synchronized,
+             logs also exported to the app-specific external dir (no
+             permission needed on Android 11+).
+
+          7. CI: the smali fat jar is DEXED with d8 (+ antlr-runtime) - ART
+             loads classes.dex, never .class files, and the ANTLR runtime
+             was missing, so the Smali mode could not work on-device; 16 KB
+             page alignment (-Wl,-z,max-page-size=16384) for Android 15+;
+             debug keystore cached so APK updates keep one signature; dead
+             smali_runtime.cpp removed from the build.
+
+          ## Fixes in this version (r21)
+
+          1. Field evidence (r20 build, device logs, both failures pinned by
+             the r20 stage tags): tap 1 dies with "stage decor.addView:
+             decor.addView typeof undefined" on every ladder attempt - the
+             wrapper returned by win.getDecorView() does not resolve
+             ViewGroup methods on this bridge, so the hidden EditText could
+             never be attached. After the addContentView patch the keyboard
+             opens and the ladder completes ("bridge up after ladder").
+
+          2. Second symptom: the first keystroke typed the literal
+             "[object Object]" into the menu, then nothing. The Editable
+             handed to afterTextChanged() had no bridged toString either,
+             so ed.toString() fell through to QuickJS's
+             Object.prototype.toString - it does NOT throw, it silently
+             returns that constant, the watcher stores it as IME.prev and
+             every later diff comes out empty.
+
+          3. Fix 1 (per field fix-spec): the hidden EditText is attached
+             via act.addContentView(edit, lp) - a plain public Activity
+             method on the same wrapper whose hashCode/getWindow/
+             getSystemService all work. The win/decor stages are gone;
+             the r19 early guard now probes BOTH act.getWindow and
+             act.addContentView before any state mutation.
+
+          4. Fix 2 (per field fix-spec, hardened): ime_read_text() re-wraps
+             the Editable through Java.cast(ed, CharSequence).toString()
+             (the same cast machinery as the proven InputMethodManager
+             cast), falls back to a java.lang.Object cast, then to
+             CharSequence.toString.call(ed). Every path rejects the
+             "[object Object]" poison literal, and a total read failure
+             returns null so ime_on_text() SKIPS the delta - the naive
+             fallback (cur = '') would have fired backspaces for the whole
+             field.
+
+          ## Fixes in this version (r20)
+
+          1. Field evidence (r19 build, device logs): capture and retention
+             work ("activity captured & retained via touch hook"), every
+             r19 typeof guard passed silently, and each ladder attempt
+             dies inside the hidden-EditText factory with
+             {"fn":"ime_create_edit","msg":"not a function"}.
+
+          2. Why the exact call was still unknown: the GumJS backend is
+             QuickJS, and QuickJS reports any broken call as a bare
+             "not a function" WITHOUT the callee name (unlike V8's
+             "x.y is not a function"). A bare message cannot distinguish
+             window.getDecorView() from EditText.$new(),
+             FrameLayout$LayoutParams.$new(), decor.addView(),
+             Java.registerClass() or the listener installs.
+
+          3. Fix: ime_stage(name, fn) wraps every call in the IME path
+             (factory + ime_try_show). Each callee is typeof-verified
+             before the call and every failure rethrows as
+             "stage <name>: <original>", so the next [agent error]
+             payload names the exact call (e.g. "stage decor.addView:
+             not a function"). Zero behavior change on success.
+
+          4. One-shot view-map probe: after the first activity capture the
+             touch hook measures the overlay view once and logs
+             "ime: view map probe ok" or the exact failure - report_map()
+             and find_gl_view() swallow their own errors, so the same
+             failure class used to hide there.
+
+          ## Fixes in this version (r19)
+
+          1. Symptom (field report on r18): tapping a text field logged
+             `[agent error] ... ime_ensure ... not a function` and the
+             keyboard never opened.
+
+          2. What the truncated log could not say: the verbatim payload is
+             {"type":"error","fn":"<name>","msg":"<message>"}, so it is
+             ambiguous whether the TypeError was thrown AT the ime_ensure()
+             call site or INSIDE ime_ensure() and reported through its own
+             {fn:'ime_ensure'} channel. r19 makes both shapes impossible
+             and turns every remaining failure into a named-member report.
+
+          3. Factory rename + legacy alias: the hidden-EditText factory is
+             now ime_create_edit() (canonical name); ime_ensure() stays
+             defined as a DELEGATING alias to it, so any stale ime_ensure()
+             reference in any build resolves to the REAL factory. Note:
+             an EMPTY stub (function ime_ensure() {}) would make
+             ime_try_show() bail on edit === null and the keyboard would
+             never open - the alias must delegate.
+
+          4. Defensive invocation (fix-spec step 2): ime_try_show() no
+             longer calls ime_ensure() directly - it resolves the factory
+             through typeof checks (ime_create_edit, falling back to the
+             alias) and, if both bindings were ever lost, logs BOTH
+             typeofs through the {fn:'ime_try_show'} channel instead of
+             throwing a bare "ime_ensure is not a function".
+
+          5. Retained-wrapper verification: ime_set_act() probes the
+             Java.retain() result for a real Activity method and re-wraps
+             it through Java.cast() (global reference + full method
+             dispatch) if a bridge ever returned a bare handle object.
+             Verified against the frida-java-bridge 5.x sources:
+             retain() returns obj.$clone(env) -> new C($h, $t, env) with
+             owned=true -> newGlobalRef + method-capable Proxy wrapper,
+             so current builds are unaffected by the probe (one typeof).
+
+          6. Exact-member diagnostics: ime_create_edit() typeof-guards
+             act.getWindow, setBackgroundDrawable/setBackground and
+             setAlpha. If a member is missing, the error payload names it
+             (e.g. "retained activity lacks act.getWindow (typeof
+             undefined)") instead of a bare "X is not a function".
+
+          ## Fixes in this version (r18)
+
+          1. JNI crash / keyboard dead (field report on r17): "JNI DETECTED
+             ERROR IN APPLICATION: use of invalid jobject" -> SIGABRT.
+             Root cause: the r17 touch-hook capture stored `this` RAW in
+             the long-lived IME.act. A Java wrapper handed to a hook
+             implementation is only valid for the duration of that
+             callback - its JNI reference is a LOCAL reference that dies
+             when the callback returns (the frida-java-bridge docs say
+             exactly this and provide Java.retain() for it: "Duplicates a
+             JavaScript wrapper for later use outside replacement
+             method"). The IME logic later calling
+             getSystemService()/showSoftInput() on the stale object aborts
+             the process: the keyboard never opens and the app dies.
+
+          2. Fix: every assignment into IME.act now goes through
+             ime_set_act(), which stores a Java.retain()-ed wrapper (a
+             GLOBAL JNI reference - valid after the callback returned,
+             from any thread) and releases the previous retained activity
+             when the tracked one changes, so activity switches never
+             leak global references. The bridge does not export
+             Java.release(), so cleanup calls the wrapper's $dispose()
+             ("eagerly deletes the underlying JNI global reference"),
+             preferring Java.release() if a future bridge provides it.
+
+          3. Retention applied to ALL capture sources, not just the touch
+             hook: the onResume hook, the Application lifecycle callback,
+             the ActivityThread.mActivities walk and the Java.choose heap
+             scan all hand out equally callback-scoped wrappers - patching
+             only the touch hook would have left the same SIGABRT one
+             resume away (onResume can even fire before the first touch).
+
+          4. Capture logging rebuilt: "ime: activity captured & retained
+             via <source>" fires per NEW activity (identity-checked with
+             .equals - cheap, once per switch, never per touch event), so
+             it covers first capture AND switches. The r17
+             once-per-agent flag is retired, and the "IME host activity"
+             info line moved into ime_set_act so every source reports
+             identically and exactly once.
+
+          ## Fixes in this version (r17)
+
+          1. IME failure, root cause: missing Activity capture in the touch
+             hook (field report on r16). The dispatchTouchEvent hook
+             intercepted taps, forwarded them to native and could even
+             CONSUME them - but it never assigned IME.act. Only the
+             onResume hook did, and that hook is lost when the agent
+             attaches after the first resume (hot start: no further resume
+             fires until the user leaves and returns). ime_show() was then
+             thrown back to the fragile ActivityThread.mActivities walk /
+             Java.choose heap scan, which on many hosts fails to find the
+             resumed activity, so showSoftInput was never called. The
+             touch hook now assigns IME.act = this on every event: the tap
+             that opens the menu is itself proof of a live, resumed
+             activity. Logged once per agent ("ime: activity captured via
+             touch hook"), not at event rate.
+
+          2. Stale activity selection: find_current_activity_sync() only
+             checked the paused/stopped record flags - a finishing or
+             destroyed Activity passed, and getSystemService() then
+             succeeded while showSoftInput silently no-opped. The walk
+             filters dead activities out now (isFinishing()/isDestroyed(),
+             not even eligible as the last-resort fallback), and the
+             Java.choose heap scan does the same: destroyed instances
+             linger until GC, so onMatch now keeps scanning past them and
+             only stops at a live one.
+
+          3. Weak diagnostics fixed: the "no activity yet" warning
+             carries its payload now (walk threw <exception> vs. walk
+             empty vs. only dead/paused records), an empty walk logs what
+             it saw, ime_try_show() logs a skipped attempt instead of
+             returning false silently, showSoftInput's real return value
+             is logged, and a final stage line 2.2 s after the ladder
+             reports whether the bridge is up - with the reason when it
+             is not (no activity captured vs. show kept failing).
+
+          4. Kept from r16: the async resolver callback performs the show
+             itself (ime_act_resolved -> ime_try_show(false),
+             main-thread scheduled, no text reset), and the retry ladder
+             resolves through BOTH layers (sync walk first, heap scan
+             second).
+
+          ## Fixes in this version (r16)
+
+          1. The keyboard STILL failed to open on some hosts (field report
+             on r15). Three residual timing defects, all fixed:
+             a) the async resolve_current_activity() callback stored
+                IME.act but never attempted the show - when every sync
+                retry missed and the heap scan landed after the retry
+                ladder was done, showSoftInput never ran. The callback
+                performs the show itself now (ime_act_resolved),
+                scheduled on the main thread, without resetting text.
+             b) the retry ladder ran the SYNCHRONOUS ActivityThread walk
+                only, so an activity found only by the async heap scan
+                was never picked up. The ladder calls
+                resolve_current_activity() now (sync walk first, heap
+                scan second).
+             c) ime_try_show() called ime_reset_text() on EVERY attempt;
+                a retry landing while the user was already typing wiped
+                the hidden EditText (and the TextWatcher diff then
+                re-sent the surviving text as fresh insertions). Only
+                the first attempt of a focus session resets now.
+
+          2. Crash-log plumbing (duplicated blocks / wrong directory):
+             a) the Java copier appended the WHOLE source file every 5s
+                (FileOutputStream(d, true)) - every pulled log held one
+                copy per 5s of uptime. It now writes a temp file and
+                rename(2)s it over the target: atomic, no duplication,
+                no torn reads; files unchanged since the last pass are
+                skipped.
+             b) JNI_OnLoad runs inside System.loadLibrary, BEFORE
+                Application.onCreate finishes - currentApplication() was
+                null there, so native logs landed in /sdcard/Download
+                (unwritable under scoped storage on modern devices) while
+                the copier read filesDir/dextool-logs. DexToolApp now
+                hands getFilesDir()/dextool-logs to the native logger
+                right after loadLibrary (nativeSetLogDir ->
+                logger_retarget; files reopened append-only, so nothing
+                already written is lost).
+             c) the uncaught-exception handler appends JAVA_CRASH to the
+                SOURCE log now (an entry written straight to the
+                Download copy was clobbered by the next copier pass) and
+                pushes an immediate copy pass.
+             d) the native crash fd opens with O_APPEND - concurrent
+                writes (native signal handler, Java handler, copier)
+                cannot clobber each other's offsets. Fatal-signal capture
+                (SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE: signal, si_code,
+                fault addr, PC, module+offset) and the streamed logcat
+                tombstone backtrace were already in place from r15.
+
+          ## Fixes in this version (r15)
+
+          1. The keyboard STILL failed to open on some hosts (code-audit
+             follow-up on r14). Three causes, all fixed:
+             a) the Java.choose heap-scan fallback consumed its result
+                synchronously - Java.choose is ASYNC, onMatch ran after
+                `return found`, so the fallback always returned null.
+                Activity resolution is now callback-based
+                (find_current_activity_sync + resolve_current_activity(cb)).
+             b) ime_show() hit `if (!IME.act) return;` BEFORE the retry
+                ladder, so the hidden EditText + TextWatcher were never
+                created; the showSoftInput retries are armed
+                unconditionally now and each retry re-resolves the
+                activity and retries the keyboard.
+             c) the instance-field editor and the method-call argument
+                fields used raw ImGui::InputText and never asked for the
+                keyboard; every editable field goes through the
+                ime_textfield wrapper now.
+
+          2. Touch mapping rebuilt on ONE coordinate space (the -80 px Y
+             bias is gone): the hook forwards getRawX()/getRawY() (screen
+             coords), the agent measures the GL view (largest
+             SurfaceView/GLSurfaceView/TextureView, content-view fallback)
+             with getLocationOnScreen(), and map_touch() scales BOTH axes
+             proportionally: imgui = (raw - viewOrigin) * (DisplaySize /
+             viewSize). The old scheme mixed view-local getX()/getY() with
+             a window-relative content-view rect, hardcoded the Y scale to
+             1.0 and patched the residue with a device-specific -80 px bias
+             (the logged surface delta was 128 px, so the bias was wrong
+             even on its own terms). Bias default is 0; the Settings slider
+             stays for exotic hosts; the saved-config key was renamed
+             (yoff -> ybias) so a stale -80 cannot fight the new mapping.
+
+          3. Backspace race (overlay.cpp): dextool_backspace() set a single
+             bool, so N backspaces arriving within one frame collapsed into
+             ONE deleted character (characters were queued, backspaces were
+             not). It is a counter now.
+
+          4. smali_runtime.cpp extract_jar(): stored the java.io.File from
+             getFilesDir() in a jstring and fed it to GetStringUTFChars - a
+             JNI type mismatch that would crash the process the moment the
+             native Smali path ran. Calls getAbsolutePath() properly now
+             (with exception checks).
+
+          5. Log paths now MATCH: the native side logs to
+             getFilesDir()/dextool-logs/ - exactly what the DexToolApp
+             copier reads (before: native wrote /sdcard/Download while the
+             copier read the private dir, so neither saw the other; under
+             scoped storage the /sdcard writes failed silently). The JNI
+             markers live in the same folder; /sdcard/Download stays as a
+             fallback when the JVM is not reachable.
+
+          6. Build/git hygiene: the nolib APK is built from a scratch copy,
+             so the committed DexToolApp.java keeps its System.loadLibrary()
+             call (the old sed -i stripped it from the working tree, leaving
+             a misleading "libtool.so loaded" log); the nolib variant also
+             drops that log line. .gitignore covers .gradle/, build/,
+             local.properties, .idea/, captures/ and *.iml, and the commit
+             step untracks them.
+
+          ## Fixes in r14 (still in)
+
+          1. The keyboard never opened. ime_show() dereferenced `act` - a
+             variable that does not exist in that scope - so EVERY attempt to
+             show the system IME died with a ReferenceError before
+             showSoftInput was ever called, and the single 150 ms retry was
+             skipped too (it lives after the throw). Fixed: the IME call uses
+             IME.act; the activity is resolved from four sources (lifecycle
+             callbacks, the onResume hook, the ActivityThread.mActivities
+             walk, and a Java.choose heap-scan fallback); showSoftInput is
+             retried at 150/450/900 ms with a fresh requestFocus; every IME
+             step is written to the logs, so the next field report shows
+             exactly which step failed and on which activity.
+
+          2. SIGABRT during agent load ("opened and run but no menu", crash
+             log: CRASH signal=6 right after "script created, loading agent",
+             with zero JS messages). All Java-touching init (lifecycle
+             tracker, Activity hooks) is deferred out of gum_script_load_sync
+             into the JS job queue, and each step writes a phase marker
+             through the new dextool_agent_log() export into
+             dextool-crash.log + dextool-debug.log. A host that kills itself
+             (anti-tamper) now shows the exact phase that triggered it - and
+             the load itself can no longer abort.
+
+          3. "Tapping the app's own menu spawns a small clone of our menu" +
+             the clone being untouchable. When the owner context died (app
+             menu, dialog, keyboard relayout), the parked ImGui world was
+             ADOPTED by whatever surface reached 8 swaps next - including
+             small popup/dialog surfaces, which rendered the whole menu
+             inside their tiny window (and the clone ignored taps because the
+             touch map belongs to the main surface). ensure_ownership() now
+             refuses ownership for surfaces far smaller than the parked world
+             (area < 50% or a dimension < 45%); tiny surfaces (< 220x220)
+             never win election at all. Rejections are logged
+             ("skip small surface").
+
+          4. Diagnostics: logger_init records VmRSS + MemAvailable (the
+             "crash when I open any app" class - lmkd kills are invisible to
+             signal handlers) and the agent phase markers above.
+
+          ## Fixes in r12-r13 (still in)
+
+          1. "Open a class and the app freezes" - the field log shows the tap on
+             a class is the last event the UI ever processed. Two independent
+             causes, both fixed:
+             a) menu.cpp locked g_mtx a SECOND time in tab_classes() (MLK inside
+                MLK), and class_tab_content() nested again - with the plain
+                mutex the render thread self-deadlocked, sitting inside the
+                eglSwapBuffers hook, which froze the host's GL thread: the
+                whole app hung. g_mtx is a RECURSIVE mutex now and the stray
+                lock is gone.
+             b) openClass() read every STATIC field value (f.get(null)); a
+                static read can run the class's <clinit>, which may block
+                forever inside app code. openClass() now lists names/types
+                only; a "Read static values" button in the Fields sub-tab
+                loads the values on demand for the open class.
+             Tapping a recorded row / tracker caller froze the app through the
+             same path (it opens the class tab too).
+
+          2. Y-axis scaling mismatch ("must tap above top items / below bottom
+             items, only the center is right"). map_touch() scaled Y by
+             ds.y / g_map.h - the view rect is TALLER than the GL surface
+             (960 vs 832), so a false 0.867 factor pulled taps toward the
+             center. Y is now a pure translation (sy = 1.0); the static
+             status-bar offset is handled by the existing "Touch Y offset"
+             slider (g_bias_y).
+
+          3. The built-in on-screen keyboard is REMOVED. Text fields use the
+             PHONE's own keyboard: focusing a field posts showIme to the agent,
+             which focuses a hidden 1x1 EditText on the resumed activity and
+             opens the system IME. A TextWatcher diffs each edit against the
+             previous text (.toString() - the method; the r10 bug was
+             String(editable) -> "[object Object]") and forwards the delta to
+             libtool.so as dextool_add_char()/dextool_backspace(). Done on the
+             IME releases the ImGui field, so the next tap re-opens the
+             keyboard; tapping the active field again re-opens it too.
+
+          4. The Classes tab lists ALL loaded classes BY DEFAULT - no
+             "+ search" gate. The agent streams the full list in pages of 400
+             with a query id (r11 mechanism, now triggered automatically when
+             the tab opens); the filter row re-queries with a substring.
+
+          5. Recorder: Stop now also ABORTS a still-running installation (r11
+             kept hooking classes after Stop, so the tab looked stuck on
+             "installing ..."). Progress messages are throttled to one per
+             250 ms (the r11 log flooded ~200 recorderProgress lines per
+             install) and install chunks are 12 classes instead of 25, so the
+             JS thread never stalls for seconds.
+
+          Also (r11, still in): scoped recorder (package filter + method cap),
+          eglTerminate slot retirement against the GL_INVALID_VALUE abort
+          class, park/adopt of the ImGui world across context death, UI state
+          persistence to <logdir>/dextool-ui.conf.
+
 
           ## Usage
 
