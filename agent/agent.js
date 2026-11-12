@@ -1,9 +1,22 @@
 'use strict';
-/* Dex-tool agent (r25). All Java logic lives here (frida-java-bridge);
+/* Dex-tool agent (r26). All Java logic lives here (frida-java-bridge);
    libtool.so only feeds input/GL. Messages both ways are JSON via
    send()/recv(); the C++ menu decodes them in menu.cpp.
 
-   r25 changes (field report: menu hangs/lags/freezes on OTHER apps +
+   r26 changes (menu restructure per the field spec - Class Explorer
+   windows, Inspector windows, Caller/Patcher/Tracer/Hooker sub-tabs,
+   Object Finder):
+   - callMethod gained count (N calls, per-call callResult with
+     idx/of) and main (Java.scheduleOnMainThread - the spec's "Call
+     in Main Thread" button).
+   - Object args travel as {"handle":N} - call_with_args resolves the
+     retained instance, so the Object Finder can feed an actual object
+     into any parameter (the old text-only args could not).
+   - createInstance: the Object Finder's "Create Object" - $new() via
+     the no-arg constructor, retained like a Java.choose match.
+   - listLoadedClasses gained cs (case-sensitive compare for mode 0
+     and the dex scan; the Explorer Options popup checkbox).
+   - r25 changes (field report: menu hangs/lags/freezes on OTHER apps +
    feature requests for the Hooks/Monitor/Classes sections):
    - FRAME PUMP (the freeze fix): the menu is drawn inside the
      eglSwapBuffers hook, so a host that renders on demand (most
@@ -1835,13 +1848,31 @@ function call_with_args(ov, argStrings, isCtor, recv) {
     /* map the text args onto the overload's parameter types.
        r23: `recv` is the retained-instance receiver for instance
        methods (the old call was ov.apply(null, ...) - no receiver,
-       so instance methods could never be invoked). */
+       so instance methods could never be invoked).
+       r26: an arg may be {"handle":N} - a retained instance picked
+       in the Object Finder is passed as the ACTUAL object (the old
+       text-only args could only ever send strings/null). */
     var params = ov.argumentTypes;
     var real = [];
     for (var i = 0; i < params.length; i++) {
-        real.push(coerce_arg(params[i].name, argStrings[i]));
+        var a = argStrings[i];
+        if (a && typeof a === 'object' && typeof a.handle === 'number') {
+            var inst = inst_get(a.handle);
+            if (!inst)
+                throw new Error('object #' + a.handle +
+                    ' expired - Find Objects again');
+            real.push(inst);
+            continue;
+        }
+        real.push(coerce_arg(params[i].name, a));
     }
     return ov.apply(recv || null, real);
+}
+
+/* r26: case-sensitivity for the dex scan matches (Explorer Options) */
+function scan_hit(s) {
+    if (SCAN.cs) return s.indexOf(SCAN.fRaw) !== -1;
+    return s.toLowerCase().indexOf(SCAN.f) !== -1;
 }
 
 var gModCls = null;
@@ -2628,14 +2659,17 @@ rpc.exports = {
     },
 
     /* ---- classes ---- */
-    listLoadedClasses: function (filter, qid, mode, sys) {
+    listLoadedClasses: function (filter, qid, mode, sys, cs) {
         Java.perform(function () {
             try {
                 var all = Java.enumerateLoadedClassesSync();
-                var f = (filter || '').toLowerCase();
+                var fRaw = String(filter || '');
+                var f = fRaw.toLowerCase();
                 var md = (typeof mode === 'number') ? mode : 0;
                 var includeSys = (sys === true || sys === 1);
-                gLastSearch = { f: f, mode: md };   /* r25: green marks */
+                /* r26: Case sensitive (Explorer Options popup) */
+                var csm = (cs === true || cs === 1);
+                gLastSearch = { f: f, fRaw: fRaw, mode: md, cs: csm };
                 if (!includeSys) {
                     all = all.filter(function (n) {
                         return !is_system_cls(n);
@@ -2643,9 +2677,10 @@ rpc.exports = {
                 }
                 /* r25: alphabetical order (field spec) */
                 all.sort();
-                if (!f || md === 0) {
-                    var out0 = f ? all.filter(function (n) {
-                        return n.toLowerCase().indexOf(f) !== -1;
+                if (!fRaw || md === 0) {
+                    var out0 = fRaw ? all.filter(function (n) {
+                        return csm ? n.indexOf(fRaw) !== -1
+                                   : n.toLowerCase().indexOf(f) !== -1;
                     }) : all;
                     page_out(out0, qid, all.length);
                     return;
@@ -2659,6 +2694,8 @@ rpc.exports = {
                 SCAN.on = true;
                 SCAN.qid = (typeof qid === 'number') ? qid : 0;
                 SCAN.f = f;
+                SCAN.fRaw = fRaw;
+                SCAN.cs = csm;
                 SCAN.md = md;
                 SCAN.want = want;
                 SCAN.matches = [];
@@ -2698,7 +2735,9 @@ rpc.exports = {
                             var nm;
                             try { nm = String(ms[i].getName()); }
                             catch (eN) { continue; }
-                            if (nm.toLowerCase().indexOf(fl) !== -1 &&
+                            if ((gLastSearch.cs ?
+                                     nm.indexOf(gLastSearch.fRaw) !== -1 :
+                                     nm.toLowerCase().indexOf(fl) !== -1) &&
                                 hm.indexOf(nm) === -1) hm.push(nm);
                         }
                     } else if (gLastSearch.mode === 2) {
@@ -2707,7 +2746,9 @@ rpc.exports = {
                             var fn;
                             try { fn = String(fs[j].getName()); }
                             catch (eF) { continue; }
-                            if (fn.toLowerCase().indexOf(fl) !== -1 &&
+                            if ((gLastSearch.cs ?
+                                     fn.indexOf(gLastSearch.fRaw) !== -1 :
+                                     fn.toLowerCase().indexOf(fl) !== -1) &&
                                 hf.indexOf(fn) === -1) hf.push(fn);
                         }
                     } else if (gLastSearch.mode === 3) {
@@ -2955,50 +2996,91 @@ rpc.exports = {
             } catch (e) {}
         });
     },
-    callMethod: function (cls, method, args, handle) {
+    /* r26: count = call N times with the same args (the Caller tab's
+       Call Count input; every call reports its own callResult with
+       idx/of), main = run each call on the app's MAIN thread via
+       Java.scheduleOnMainThread (the spec's "Call in Main Thread"). */
+    callMethod: function (cls, method, args, handle, count, main) {
+        var n = 1;
+        if (typeof count === 'number' && count > 0) n = Math.min(count, 50);
+        var onMain = (main === true || main === 1);
+        var done = 0;
+        var once = function () {
+            Java.perform(function () {
+                try {
+                    /* r23: use_loaded - no forced <clinit> on unloaded
+                       classes */
+                    var jc = use_loaded(cls);
+                    var recv = inst_get(handle);
+                    var node = null;
+                    try { node = jc[method]; } catch (e0) {}
+                    if (!node || !node.overloads || !node.overloads.length)
+                        throw new Error('method not found: ' + method);
+                    var ovs = node.overloads;
+                    var want = args ? args.length : 0;
+                    var best = null;
+                    for (var i = 0; i < ovs.length; i++) {
+                        if (ovs[i].argumentTypes.length === want) {
+                            best = ovs[i];
+                            break;
+                        }
+                    }
+                    if (!best) best = ovs[0];
+                    var r;
+                    if (recv) {
+                        /* r23: instance-method call WITH a receiver */
+                        r = call_with_args(best, args || [], false, recv);
+                    } else {
+                        if (!is_static_method(jc, method))
+                            throw new Error('instance method - Find ' +
+                                'instances, pick one (or use the Object ' +
+                                'Finder), then Call (a retained handle is ' +
+                                'required as the receiver)');
+                        r = call_with_args(best, args || [], false, null);
+                    }
+                    sendMsg('callResult', {
+                        class: cls, ok: 1, result: jstr(r), error: '',
+                        idx: done, of: n
+                    });
+                } catch (e) {
+                    sendMsg('callResult', {
+                        class: cls, ok: 0, result: '',
+                        error: String(e.message || e), idx: done, of: n
+                    });
+                }
+                done++;
+                if (done < n) {
+                    setTimeout(function () {
+                        if (onMain) Java.scheduleOnMainThread(once);
+                        else once();
+                    }, 30);
+                }
+            });
+        };
+        if (onMain) Java.scheduleOnMainThread(once);
+        else once();
+    },
+
+    /* r26: Object Finder "Create Object" - $new() through the no-arg
+       constructor, retained like a Java.choose match. Creating an
+       instance REQUIRES the class, so the <clinit> cost of Java.use
+       is accepted here (use_loaded would refuse to ever create one). */
+    createInstance: function (cls) {
         Java.perform(function () {
             try {
-                /* r23: use_loaded - no forced <clinit> on unloaded
-                   classes */
-                var jc = use_loaded(cls);
-                var recv = inst_get(handle);
-                var node = null;
-                try { node = jc[method]; } catch (e0) {}
-                if (!node || !node.overloads || !node.overloads.length)
-                    throw new Error('method not found: ' + method);
-                var ovs = node.overloads;
-                var want = args ? args.length : 0;
-                var best = null;
-                for (var i = 0; i < ovs.length; i++) {
-                    if (ovs[i].argumentTypes.length === want) {
-                        best = ovs[i];
-                        break;
-                    }
-                }
-                if (!best) best = ovs[0];
-                if (recv) {
-                    /* r23: instance-method call WITH a receiver (the
-                       audit's "callMethod fails because it has no
-                       receiver") */
-                    var r = call_with_args(best, args || [], false, recv);
-                    sendMsg('callResult', {
-                        class: cls, ok: 1, result: jstr(r), error: ''
-                    });
-                    return;
-                }
-                if (!is_static_method(jc, method))
-                    throw new Error('instance method - Find instances, ' +
-                        'pick one, then Call (a retained handle is ' +
-                        'required as the receiver)');
-                var r2 = call_with_args(best, args || [], false, null);
-                sendMsg('callResult', {
-                    class: cls, ok: 1, result: jstr(r2), error: ''
-                });
+                var jc = Java.use(cls);
+                var inst = jc.$new();
+                var h = inst_put(inst);
+                var lbl = '';
+                try { lbl = String(inst); }
+                catch (eL) { lbl = '(toString failed)'; }
+                if (lbl.length > 160) lbl = lbl.substring(0, 157) + '...';
+                sendMsg('instanceCreated', { class: cls, str: lbl,
+                                             handle: h });
             } catch (e) {
-                sendMsg('callResult', {
-                    class: cls, ok: 0, result: '',
-                    error: String(e.message || e)
-                });
+                sendMsg('error', { fn: 'createInstance',
+                    msg: String(e.message || e) +
+                         ' (needs a no-arg constructor)' });
             }
         });
     }
@@ -3346,7 +3428,7 @@ function scan_step() {
                 while (mit.hasNext()) {
                     var mm = mit.next();
                     var mn = String(mm.getName());
-                    if (mn.toLowerCase().indexOf(SCAN.f) !== -1) {
+                    if (scan_hit(mn)) {
                         matched = true;
                         mh = [mn];
                         break;
@@ -3357,7 +3439,7 @@ function scan_step() {
                 while (fit.hasNext()) {
                     var ff = fit.next();
                     var fn = String(ff.getName());
-                    if (fn.toLowerCase().indexOf(SCAN.f) !== -1) {
+                    if (scan_hit(fn)) {
                         matched = true;
                         fh = [fn];
                         break;
@@ -3373,7 +3455,7 @@ function scan_step() {
                     var iit = impl.getInstructions().iterator();
                     while (iit.hasNext()) {
                         var s = ins_const_string(L, iit.next());
-                        if (s && s.toLowerCase().indexOf(SCAN.f) !== -1) {
+                        if (s && scan_hit(s)) {
                             matched = true;
                             var nm = String(m3.getName());
                             if (!mh) mh = [];
@@ -3399,8 +3481,7 @@ function scan_step() {
                             var ev = sf.getInitialValue();
                             if (ev) {
                                 var sv = Java.cast(ev, L.StrVal).getValue();
-                                if (sv && String(sv).toLowerCase()
-                                          .indexOf(SCAN.f) !== -1) {
+                                if (sv && scan_hit(String(sv))) {
                                     matched = true;
                                     if (fh.indexOf(sfn) === -1 && fh.length < 40)
                                         fh.push(sfn);
@@ -3509,7 +3590,7 @@ var FN_ARGS = {
     startMonitor:    [],
     stopMonitor:     [],
     evalScript:      ['src'],
-    listLoadedClasses: ['filter', 'qid', 'mode', 'sys'],
+    listLoadedClasses: ['filter', 'qid', 'mode', 'sys', 'cs'],
     getMethodSrc:    ['class', 'method'],
     getMethodIO:     ['class', 'method'],
     setMethodIO:     ['class', 'method', 'args', 'ret'],
@@ -3519,7 +3600,8 @@ var FN_ARGS = {
     hideIme:         [],
     listInstances:   ['class'],
     setInstanceField:['class', 'index', 'field', 'value', 'handle'],
-    callMethod:      ['class', 'method', 'args', 'handle']
+    callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
+    createInstance:  ['class']
 };
 
 /* r14: phased startup. gum_script_load_sync must ALWAYS return:
@@ -3544,6 +3626,6 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    sendMsg('ready', { msg: 'Dex-tool agent r25 loaded' });
+    sendMsg('ready', { msg: 'Dex-tool agent r26 loaded' });
     agentLog('phase: ready sent');
 }, 0);
