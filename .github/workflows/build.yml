@@ -32,7 +32,9 @@ jobs:
           case "$BEFORE" in
             ''|0000000000000000000000000000000000000000) exit 0 ;;
           esac
-          CHANGED="$(git diff --name-only "$BEFORE" "${{ github.sha }}" -- src agent sample-app README.md || true)"
+          # r32 R9: src/smali_runtime.{cpp,h} are hand-maintained
+          # (CI does not generate them since r21) - exclude them
+          CHANGED="$(git diff --name-only "$BEFORE" "${{ github.sha }}" -- src agent sample-app README.md ':(exclude)src/smali_runtime.cpp' ':(exclude)src/smali_runtime.h' || true)"
           if [ -n "$CHANGED" ]; then
             echo "::warning::These files are regenerated from the heredocs and will be overwritten by this run:"
             printf '%s\n' "$CHANGED"
@@ -365,9 +367,13 @@ jobs:
           static struct sigaction g_prev_act[32];
           static bool             g_prev_set[32];
           static char             g_alt_stack[64 * 1024];
-          static int crash_ux(char* dst, unsigned long v) {
-              /* r30 M2: async-signal-safe hex formatter (no stdio) */
+          static int crash_ux(char* dst, int cap, unsigned long v) {
+              /* r30 M2: async-signal-safe hex formatter (no stdio).
+                 r32 R4: capacity-bounded - the old version wrote up to 18
+                 bytes with no limit, one longer literal away from a stack
+                 buffer overflow inside a signal handler. */
               int n = 0;
+              if (cap < 3) return 0;
               dst[n++] = '0';
               dst[n++] = 'x';
               char tmp[18];
@@ -377,8 +383,36 @@ jobs:
                   tmp[t++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
                   v >>= 4;
               } while (v && t < 16);
-              while (t) dst[n++] = tmp[--t];
+              while (t && n < cap) dst[n++] = tmp[--t];
               return n;
+          }
+          /* r32 R3: module map snapshot taken at install time, where blocking
+             is safe. The crash handler only READS this array - no file I/O,
+             no dladdr, no loader lock - so the log names the faulting module
+             again while staying async-signal-safe. */
+          #define CR_MOD_MAX 128
+          struct CrMod { unsigned long base, end; char name[80]; };
+          static struct CrMod g_cr_mods[CR_MOD_MAX];
+          static volatile int g_cr_mod_n = 0;
+          static void crash_mods_scan(void) {
+              FILE* f = fopen("/proc/self/maps", "r");
+              if (!f) return;
+              char line[512];
+              while (fgets(line, sizeof(line), f)) {
+                  if (g_cr_mod_n >= CR_MOD_MAX) break;
+                  unsigned long b = 0, e = 0;
+                  char perms[8] = "", path[256] = "";
+                  if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %255[^\n]",
+                             &b, &e, perms, path) < 3) continue;
+                  size_t len = strlen(path);
+                  if (len < 3 || strcmp(path + len - 3, ".so") != 0) continue;
+                  struct CrMod* m = &g_cr_mods[g_cr_mod_n++];
+                  m->base = b;
+                  m->end  = e;
+                  const char* slash = strrchr(path, '/');
+                  snprintf(m->name, sizeof(m->name), "%s", slash ? slash + 1 : path);
+              }
+              fclose(f);
           }
           static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
               uintptr_t pc = 0;
@@ -392,21 +426,43 @@ jobs:
                   /* r30 M2: async-signal-safe only - no snprintf (stdio lock)
                      and no dladdr (loader lock): they can deadlock exactly on
                      the crash they are supposed to report. write() only. */
-                  char m[160];
+                  char m[320];   /* r32 R4: room for the module fields too */
                   size_t n = 0;
                   const char* q = "CRASH signal=";
                   while (*q && n < sizeof(m) - 1) m[n++] = *q++;
-                  n += (size_t)crash_ux(m + n, (unsigned long)sig);
+                  n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n), (unsigned long)sig);
                   q = " code=";
                   while (*q && n < sizeof(m) - 1) m[n++] = *q++;
-                  n += (size_t)crash_ux(m + n, (unsigned long)(si ? si->si_code : 0));
+                  n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n),
+                                        (unsigned long)(si ? si->si_code : 0));
                   q = " addr=";
                   while (*q && n < sizeof(m) - 1) m[n++] = *q++;
-                  n += (size_t)crash_ux(m + n,
+                  n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n),
                                         (unsigned long)(si ? (uintptr_t)si->si_addr : 0));
                   q = " pc=";
                   while (*q && n < sizeof(m) - 1) m[n++] = *q++;
-                  n += (size_t)crash_ux(m + n, (unsigned long)pc);
+                  n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n), (unsigned long)pc);
+                  /* r32 R3: name the faulting module from the install-time
+                     snapshot (read-only here - signal safe) */
+                  int cmi = -1;
+                  for (int i = 0; i < g_cr_mod_n && pc; i++) {
+                      if ((unsigned long)pc >= g_cr_mods[i].base &&
+                          (unsigned long)pc <  g_cr_mods[i].end) { cmi = i; break; }
+                  }
+                  if (cmi >= 0) {
+                      const char* q2 = " in ";
+                      while (*q2 && n < sizeof(m) - 1) m[n++] = *q2++;
+                      const char* nm = g_cr_mods[cmi].name;
+                      while (*nm && n < sizeof(m) - 1) m[n++] = *nm++;
+                      q2 = " base=";
+                      while (*q2 && n < sizeof(m) - 1) m[n++] = *q2++;
+                      n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n),
+                                            g_cr_mods[cmi].base);
+                      q2 = " off=+";
+                      while (*q2 && n < sizeof(m) - 1) m[n++] = *q2++;
+                      n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n),
+                                            (unsigned long)pc - g_cr_mods[cmi].base);
+                  }
                   if (n < sizeof(m) - 1) m[n++] = '\n';
                   m[n] = 0;
                   log_crash_raw(m);
@@ -469,6 +525,7 @@ jobs:
                   }
               }
               install_crash_sig(SIGSEGV);
+              crash_mods_scan();   /* r32 R3: snapshot the module map while blocking is safe */
               install_crash_sig(SIGABRT);
               install_crash_sig(SIGBUS);
               install_crash_sig(SIGILL);
@@ -498,7 +555,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r31: M4 real JSON tree parser with shallowest-match key lookup, surrogate pairs and a depth cap, M7 releaseHandle frees retained instances on object tab close, M8 lock-free frame pump via atomic mirror, CI warns on hand edits to generated files. r30: flash-loop lock, deque containers, hook-mode fix, dumpObject args, touch/GL/logger fixes, signal-safe crash handler)");
+              log_info("logger_init done (build r32: R1 dumpObject FN_ARGS keyed by the JSON key the menu sends, R2 s_visible atomic - checkbox regression fixed, R3 signal-safe module map snapshot for the crash log, R4 bounded crash_ux, R5 park leak counted, R6 parse-once JSON cache, R7 auto-list sends cs, R8 dump preview matches agent, R9 warning excludes smali_runtime, R10 release sweep on tab close and saved-object removal, push gated to canonical repo. r31: real JSON tree parser, releaseHandle, lock-free frame pump)");
           }
           void logger_retarget(const char* base_dir) {
               if (!base_dir || !base_dir[0]) return;
@@ -626,6 +683,7 @@ jobs:
           JNIEXPORT bool dextool_hit_test(float x, float y);
           JNIEXPORT int  dextool_display_size();  /* (w<<16)|h, 0 until the overlay is up */
           JNIEXPORT int  dextool_want_frames();
+          int  overlay_park_count();   /* r32 R5: imgui_park_without_gl counter */
           JNIEXPORT void dextool_agent_log(const char* msg); /* r14: agent phase markers -> logs */
           #ifdef __cplusplus
           }
@@ -667,6 +725,7 @@ jobs:
           static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
           static fn_terminate   g_orig_terminate   = nullptr;
           IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects();
+          static std::atomic<int> g_park_leaks{0};   /* r32 R5 */
           static void imgui_park_without_gl() {
               /* r30 H6: ForgetDeviceObjects issues glDelete* against whatever
                  context is current - on a foreign context that destroys the
@@ -675,6 +734,15 @@ jobs:
               ImGuiIO& io = ImGui::GetIO();
               io.BackendRendererName     = nullptr;
               io.BackendRendererUserData = nullptr;
+              /* r32 R5: known leak - ImGui_ImplOpenGL3_Data (and its
+                 GlslVersionString) has no GL-free destructor, so it stays
+                 allocated until the process dies. Counted so repeated
+                 context churn is visible (Info panel); trading it for H6's
+                 foreign-context deletes is deliberate. */
+              g_park_leaks++;
+          }
+          int overlay_park_count() {
+              return g_park_leaks.load(std::memory_order_relaxed);
           }
           static std::atomic<bool> g_gum_inited {false};
           static JavaVM*           g_jvm        = nullptr;
@@ -1643,10 +1711,11 @@ jobs:
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
-          /* Dex-tool menu (r31): M4 real JSON tree parser (shallowest-match
-             lookup, surrogate pairs, depth cap), M7 releaseHandle on object
-             tab close, M8 lock-free frame pump via atomic mirror. r30:
-             flash-loop lock, deque tab containers, dead trigger removed. */
+          /* Dex-tool menu (r32): R2 s_visible atomic (checkbox regression),
+             R6 parse-once JSON cache, R7 auto-list cs, R8 dump preview,
+             R10 release sweep on class tab close / saved object removal.
+             r31: real JSON tree parser, releaseHandle on object tab close,
+             lock-free frame pump. */
           #include "menu.h"
           #include "overlay.h"
           #include "frida_bridge.h"
@@ -1655,7 +1724,8 @@ jobs:
           #include "imgui_internal.h"
           #include <string>
           #include <deque>   /* r30 C2: stable refs across push_back */
-          #include <atomic>  /* r31 M8: lock-free frame-pump mirror */
+          #include <atomic>  /* r31 M8: lock-free pump (r32 R2: s_visible itself) */
+          #include <mutex>   /* r32 R6: parse-once JSON cache */
           #include <vector>
           #include <cstdio>
           #include <cstring>
@@ -1674,8 +1744,10 @@ jobs:
           static int   s_theme      = 0;
           static float s_ovl_scroll = 1.5f;   /* whole-menu drag speed */
           static float s_lst_scroll = 1.2f;   /* inner list drag speed */
-          static bool  s_visible    = true;
-          static std::atomic<bool> s_visible_pub{ true };  /* r31 M8 */
+          static std::atomic<bool> s_visible{ true };
+          /* r32 R2: the variable itself is atomic - r31's separate mirror was
+             only updated by three of the four writers, so the Settings
+             "Menu visible" checkbox did nothing. One variable, no invariant. */
           static bool  s_show_fab   = true;
           static float s_y_off      = 0.0f;   /* manual touch Y bias (px); r15: default 0 - the screen-space touch map is mathematically exact, the slider stays for exotic hosts */
           static bool  s_agent_ready = false;
@@ -1857,6 +1929,11 @@ jobs:
               char edit[256] = {};         /* its edit buffer                   */
           };
           static std::deque<ObjTab> s_objtabs;
+          static bool objtab_open(long h) {   /* r32 R10: handle still on screen? */
+              for (auto& t : s_objtabs)
+                  if (t.handle == h) return true;
+              return false;
+          }
           static long s_objfocus = -1;     /* handle of the tab to select       */
           struct SavedObj { std::string cls, str; long handle = -1; };
           static std::vector<SavedObj> s_saved;
@@ -2124,32 +2201,45 @@ jobs:
               }
               return r;
           }
+          static std::mutex g_jcache_mtx;     /* r32 R6: parse once per msg */
+          static std::string g_jcache_in;
+          static bool g_jcache_ok = false;
+          static JVal g_jcache_tree;
+          /* Lookup with a one-entry cache: repeated lookups on the same
+             payload (a message handler makes several) reuse the parsed tree.
+             The mutex makes it safe whichever thread calls in; the whole
+             lookup happens under the lock, so the tree cannot be re-parsed
+             mid-walk. */
+          static const JVal* jlookup_locked(const std::string& j, const char* key) {
+              if (j != g_jcache_in) {
+                  g_jcache_in = j;
+                  g_jcache_tree = JVal();
+                  g_jcache_ok = jparse_root(j, g_jcache_tree);
+              }
+              return g_jcache_ok ? jfind_bfs(g_jcache_tree, key) : nullptr;
+          }
           static std::vector<std::string> jarr(const std::string& j, const char* key) {
               std::vector<std::string> r;
-              JVal root;
-              if (!jparse_root(j, root)) return r;
-              const JVal* v = jfind_bfs(root, key);
-              if (!v || v->kind != 2) return r;
-              for (auto& e : v->arr)
-                  if (e.kind == 3) r.push_back(e.str);
+              std::lock_guard<std::mutex> lk(g_jcache_mtx);
+              const JVal* v = jlookup_locked(j, key);
+              if (v && v->kind == 2)
+                  for (auto& e : v->arr)
+                      if (e.kind == 3) r.push_back(e.str);
               return r;
           }
           static std::string jstr(const std::string& j, const char* key) {
-              JVal root;
-              if (!jparse_root(j, root)) return "";
-              const JVal* v = jfind_bfs(root, key);
+              std::lock_guard<std::mutex> lk(g_jcache_mtx);
+              const JVal* v = jlookup_locked(j, key);
               return (v && v->kind == 3) ? v->str : "";
           }
           static long jnum(const std::string& j, const char* key, long dflt = 0) {
-              JVal root;
-              if (!jparse_root(j, root)) return dflt;
-              const JVal* v = jfind_bfs(root, key);
+              std::lock_guard<std::mutex> lk(g_jcache_mtx);
+              const JVal* v = jlookup_locked(j, key);
               return (v && v->kind == 4) ? (long)v->num : dflt;
           }
           static bool jhas(const std::string& j, const char* key) {
-              JVal root;
-              if (!jparse_root(j, root)) return false;
-              return jfind_bfs(root, key) != nullptr;
+              std::lock_guard<std::mutex> lk(g_jcache_mtx);
+              return jlookup_locked(j, key) != nullptr;
           }
           static std::string jtype(const std::string& j) {
               return jstr(j, "type");
@@ -2157,15 +2247,15 @@ jobs:
           static std::vector<std::string> jobjarr(const std::string& j,
                                                   const char* key) {
               std::vector<std::string> r;
-              JVal root;
-              if (!jparse_root(j, root)) return r;
-              const JVal* v = jfind_bfs(root, key);
-              if (!v || v->kind != 2) return r;
-              for (auto& e : v->arr)
-                  if (e.kind == 1) r.push_back(jdump(e));
+              std::lock_guard<std::mutex> lk(g_jcache_mtx);
+              const JVal* v = jlookup_locked(j, key);
+              if (v && v->kind == 2)
+                  for (auto& e : v->arr)
+                      if (e.kind == 1) r.push_back(jdump(e));
               return r;
           }
-          /* ---- end r31 JSON tree ---- */
+          /* ---- end r31/r32 JSON tree ---- */
+
           static void post_rpc(const char* fn, const std::string& args) {
               std::string m = "{\"type\":\"rpc\",\"fn\":\"";
               m += fn; m += "\",\"args\":"; m += args; m += "}";
@@ -2817,8 +2907,11 @@ jobs:
                                   "opens when a field is focused.");
               if (ImGui::Checkbox("Show toggle button", &s_show_fab))
                   s_conf_dirty = true;
-              if (ImGui::Checkbox("Menu visible", &s_visible))
+              bool vis_ck = s_visible;    /* r32 R2: atomic has no bool* */
+              if (ImGui::Checkbox("Menu visible", &vis_ck)) {
+                  s_visible.store(vis_ck);
                   s_conf_dirty = true;
+              }
               if (!s_visible && !s_show_fab)
                   ImGui::TextColored(ImVec4(1, .6f, 0, 1),
                       "Menu hidden with no toggle button - it was re-enabled.");
@@ -2826,6 +2919,7 @@ jobs:
               ImGui::Separator();
               ImGui::Text("Info");
               ImGui::Text("Package: %s", s_pkg.c_str());
+              ImGui::Text("GL context parks: %d", overlay_park_count());  /* r32 R5 */
               s_ovl_ready = overlay_ready();
               float dw=0, dh=0;
               overlay_get_display_size(&dw, &dh);
@@ -3465,6 +3559,12 @@ jobs:
                                      sv.handle, sv.str);
                       ImGui::SameLine();
                       if (ImGui::SmallButton("Remove")) {
+                          /* r32 R10: free the retained instance too */
+                          if (sv.handle > 0 && !objtab_open(sv.handle)) {
+                              std::string a = "{\"handle\":" +
+                                              std::to_string(sv.handle) + "}";
+                              post_rpc("releaseHandle", a);
+                          }
                           s_saved.erase(s_saved.begin() + k);
                           ImGui::PopID();
                           continue;
@@ -4096,8 +4196,15 @@ jobs:
                   ImGui::EndPopup();
               }
               if (ImGui::BeginPopup("ObjDumpPopup")) {
-                  char fn[128];
-                  snprintf(fn, sizeof(fn), "dextool-object-0x%lx.json", t.handle);
+                  char fn[160];
+                  {   /* r32 R8: mirror the agent's real dump filename
+                         (dots -> underscores, hex handle) - the old preview
+                         showed a name the agent never wrote */
+                      std::string sn;
+                      for (char ch : t.cls) sn += (ch == '.') ? '_' : ch;
+                      snprintf(fn, sizeof(fn), "dextool-object-%s-0x%lx.json",
+                               sn.c_str(), (unsigned long)t.handle);
+                  }
                   ImGui::Text("File will be saved as %s", fn);
                   ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 50, 255));
                   ImGui::Text("Note: This may take a while depending on the size "
@@ -4459,9 +4566,10 @@ jobs:
                   MULK();
               }
               if (qid)
-                  post_rpc("listLoadedClasses",
+                  post_rpc("listLoadedClasses",   /* r32 R7: send cs like run_search */
                            "{\"filter\":\"\",\"qid\":" + std::to_string(qid)
                            + ",\"mode\":0"
+                           + ",\"cs\":" + (s_search_cs ? "true" : "false")
                            + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}");
               if (ImGui::Checkbox("Fullscreen", &s_fullscreen)) {
                   if (s_fullscreen) {
@@ -4536,6 +4644,16 @@ jobs:
                           ImGui::EndTabItem();
                       }
                       if (!open) {
+                          /* r32 R10: release the instances this tab retained -
+                             the LRU used to pin them until 200 newer scans.
+                             Handles with an open object tab stay. */
+                          for (auto& in : c.instances) {
+                              if (in.handle > 0 && !objtab_open(in.handle)) {
+                                  std::string a = "{\"handle\":" +
+                                                  std::to_string(in.handle) + "}";
+                                  post_rpc("releaseHandle", a);
+                              }
+                          }
                           s_classes.erase(s_classes.begin() + i);
                           continue;
                       }
@@ -4627,14 +4745,12 @@ jobs:
                   s_fab_drag = false;
                   if (!s_fab_moved && !fab_press) {
                       /* tap released just off the button: still a tap */
-                      s_visible = !s_visible;
-                      s_visible_pub.store(s_visible);
+                      s_visible = !s_visible;   /* r32 R2: atomic store */
                       s_conf_dirty = true;
                   }
               }
               if (fab_press && !s_fab_moved) {  /* r29: single tap toggles */
-                  s_visible = !s_visible;
-                  s_visible_pub.store(s_visible);
+                  s_visible = !s_visible;   /* r32 R2: atomic store */
                   s_conf_dirty = true;
               }
               ImGui::End();
@@ -4711,17 +4827,17 @@ jobs:
               }
           }
           int menu_frame_pump_level() {
-              /* r31 M8: no mutex - s_visible is mirrored into an atomic, so
-                 the JS thread's frame pump can no longer stall behind a
-                 whole-frame render lock */
-              if (s_visible_pub.load(std::memory_order_relaxed)) return 2;
+              /* r31 M8: no mutex - s_visible is std::atomic<bool>, so the JS
+                 thread's frame pump never stalls behind a whole-frame render
+                 lock (r32 R2: the variable itself, not a mirror) */
+              if (s_visible.load(std::memory_order_relaxed)) return 2;
               return overlay_ready() ? 1 : 0;       /* FAB-only slow pump  */
           }
           void menu_draw() {
               ImGuiIO& io = ImGui::GetIO();
               ImVec2 ds = io.DisplaySize;
               apply_theme();
-              bool vis = s_visible_pub.load(std::memory_order_relaxed);  /* r31 M8 */
+              bool vis = s_visible.load(std::memory_order_relaxed);  /* r31 M8 / r32 R2 */
               if (!vis) {
                   draw_fab(ds);
                   MLK();
@@ -4794,11 +4910,10 @@ jobs:
               }
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.3 (r31)", &open, wflags);
+              ImGui::Begin("Dex-tool v1.3 (r32)", &open, wflags);
               if (!open) {
                   MLK();
-                  s_visible = false;
-                  s_visible_pub.store(false);
+                  s_visible.store(false);   /* r32 R2 */
                   s_conf_dirty = true;
                   if (!s_show_fab) s_show_fab = true;
                   MULK();
@@ -4950,10 +5065,10 @@ jobs:
       - name: Generate agent.js
         run: |
           cat > agent/agent.js << 'DXTAGNT'
-          /* Dex-tool agent (r31): M7 releaseHandle export - the menu frees
-             retained instances when their object tab closes. r30: hook-mode
-             prefix match + unknown-mode report, dumpObject FN_ARGS, stale
-             handle reporting. */
+          /* Dex-tool agent (r32): R1 dumpObject FN_ARGS keyed by the JSON
+             key the menu sends ("class") - the per-object dump works again.
+             r31: releaseHandle export. r30: hook-mode prefix match +
+             unknown-mode report, stale handle reporting. */
           'use strict';
           function sendMsg(type, payload) { send({ type: type, payload: payload }); }
           var gAgentLog = null;
@@ -6486,7 +6601,11 @@ jobs:
                   if (ml.indexOf('java') === 0) mode = 'Java';
                   else if (ml === 'smali') mode = 'Smali';
                   else if (ml.indexOf('nop') === 0 || ml.indexOf('noop') === 0)
-                      mode = 'noop';   /* r30 C3: the UI sends "Nop (auto)" */
+                      /* 'nop' matches the hook editor's "Nop (auto)" (r30 C3),
+                         'noop' matches the Patcher's Patch NOP button - two
+                         different sources, both needed; not a copy-paste
+                         leftover (r32 re-check) */
+                      mode = 'noop';
                   Java.perform(function () {
                       if (!dt_is_loaded(cls)) {
                           defer_install('hook', cls, function () {
@@ -7520,8 +7639,12 @@ jobs:
               callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
               createInstance:  ['class'],
               dumpLoadedClasses: [],              /* r30 C4 */
-              dumpObject:      ['cls', 'handle'],/* r30 C4: per-object dump
-                                                     was dead (undefined args) */
+              dumpObject:      ['class', 'handle'],/* r32 R1: FN_ARGS resolves
+                                                     by JSON key and the menu
+                                                     sends "class" - r30 wired
+                                                     the export's parameter
+                                                     name ('cls'), so the dump
+                                                     stayed dead */
               releaseHandle:   ['handle']         /* r31 M7 */
           };
           agentLog('phase: deferred init scheduled');
@@ -7546,7 +7669,7 @@ jobs:
                   var appR = ATr.currentApplication();
                   if (appR) pkgR = String(appR.getPackageName());
               } catch (eP) {}
-              sendMsg('ready', { msg: 'Dex-tool agent r31 loaded', pkg: pkgR });
+              sendMsg('ready', { msg: 'Dex-tool agent r32 loaded', pkg: pkgR });
               agentLog('phase: ready sent');
           }, 0);
           DXTAGNT
@@ -7920,8 +8043,10 @@ jobs:
           The workflow `.github/workflows/build.yml` IS the source of truth: it
           writes `src/`, `agent/agent.js`, `sample-app/` and this README from
           inline heredocs, builds `libtool.so` + the sample APK with the NDK and
-          commits the generated tree back. Hand edits under `src/` are
-          overwritten by the next CI run - change the heredocs, not the tree.
+          commits the generated tree back. Hand edits under `src/` (except
+          `src/smali_runtime.{cpp,h}`, which CI does not generate since
+          r21) are overwritten by the next CI run - change the heredocs,
+          not the tree.
 
           ## Known limitations
 
@@ -7937,6 +8062,44 @@ jobs:
 
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+          ## Fixes in this version (r32)
+
+          - **R1** dumpObject in FN_ARGS was keyed by the export's parameter
+            name ('cls'), but the dispatcher resolves by JSON key and the
+            menu sends "class" - the per-object dump has been dead since
+            r30. Now ['class', 'handle'].
+          - **R2** r31 regression: the Settings "Menu visible" checkbox wrote
+            s_visible while menu_draw read only the atomic mirror, so the
+            checkbox did nothing. s_visible is now std::atomic<bool> itself
+            and the mirror is gone - one variable, every writer updates it.
+          - **R3** the crash log names the faulting module again: the module
+            map is snapshotted at install time (blocking is fine there) and
+            the handler only READS the snapshot, which stays async-signal-
+            safe - no dladdr, no file I/O in-handler.
+          - **R4** crash_ux() takes a capacity bound; the crash line buffer
+            grew to 320 bytes so the restored module fields fit.
+          - **R5** imgui_park_without_gl() documents its backend-data leak
+            and counts parks (Info panel: "GL context parks").
+          - **R6** the JSON helpers parse each message once: a mutex-guarded
+            one-entry cache keyed on the payload reuses the tree for
+            repeated lookups instead of re-parsing per lookup.
+          - **R7** the automatic class listing now sends "cs" like manual
+            searches, so the Case-sensitive toggle is consistent.
+          - **R8** the object-dump popup preview shows the agent's real
+            filename (class with dots replaced, hex handle).
+          - **R9** the CI hand-edit warning excludes src/smali_runtime.{cpp,h}
+            (hand-maintained since r21); the README notes the exception.
+          - **R10** closing a class tab releases the handles its Instances
+            list retained (skipping handles with open object tabs); removing
+            a Saved Object releases its handle. The retain leak is closed on
+            all three paths.
+          - The push back to dev is gated on the canonical repository, so a
+            fork running this workflow cannot rewrite its own tree.
+          - The review's C3 cleanup note was re-checked and declined: the
+            'nop' / 'noop' prefixes come from two different UI sources and
+            are both needed; the code now carries a comment saying so.
+
 
           ## Fixes in this version (r31)
 
@@ -8873,10 +9036,12 @@ jobs:
             README.md \
             .gitignore \
             .github/workflows/build.yml
-          if git diff --cached --quiet; then
+          if [ "${{ github.repository }}" != "Mrakbrlalhzar/Dex-tool" ]; then
+            echo "r32: fork detected - the regenerated tree is not pushed (push is gated to the canonical repo)."
+          elif git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "fix r31: M4 real JSON tree parser (shallowest-match lookup, surrogate pairs, depth cap) replacing substring scans, M7 releaseHandle frees retained instances on object tab close, M8 lock-free frame pump via atomic mirror, CI warns on hand edits to generated files [skip ci]"
+            git commit -m "fix r32: R1 dumpObject FN_ARGS keyed by the JSON key the menu sends, R2 s_visible atomic (checkbox regression), R3 signal-safe module map snapshot for the crash log, R4 bounded crash_ux, R5 park leak counted, R6 parse-once JSON cache, R7 auto-list sends cs, R8 dump filename preview matches agent, R9 hand-edit warning excludes smali_runtime, R10 release sweep on class tab close and saved-object removal, push gated to canonical repo [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
