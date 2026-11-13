@@ -377,6 +377,16 @@ static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     io.ConfigWindowsMoveFromTitleBarOnly = true;  /* touch friendly */
+    /* r34 G1: touch input - a finger jitters more than 6px, which
+       turned single taps into drags (tabs needed a double tap) */
+    io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
+    io.MouseDragThreshold = 15.0f;
+    ImGui::GetStyle().TouchExtraPadding =
+        ImVec2(2.0f, 2.0f);   /* r34 G1: style field since 1.51 */
+#ifdef IMGUI_HAS_DOCK
+    /* r34 G4: docking branch - inspectors dock to the bottom strip */
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+#endif
     ImGui::StyleColorsDark();
     ImGui::GetStyle().WindowRounding = 6.0f;
     if (io.Fonts->Fonts.empty() || g_font_dirty) build_fonts(io);

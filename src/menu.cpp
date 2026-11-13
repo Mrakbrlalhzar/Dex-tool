@@ -1,11 +1,13 @@
-/* Dex-tool menu (r33): the UI round - independent detachable
-   class windows (per-window qid-routed results), keyboard fix
-   (EnterReturnsTrue removed), dynamic client-side filter,
-   reflection-based method search with name/param/return options,
-   TreeNode class layout, FindInstancesPopup + CreateInstancePopup,
-   family window closes on pick, minimize button, no-scroll strip.
-   r32: FN_ARGS keys, atomic s_visible, module snapshot, cache. */
+/* Dex-tool menu (r34): touch input round - io touch settings
+   (IsTouchScreen, drag threshold 15, touch padding), AutoSelectAll
+   removed from the IME fields, hint search field, class list
+   clipped over the filtered rows, docking-branch inspectors
+   (auto-dock bottom strip, native undock, Fill/Restore). r33:
+   independent class windows, qid routing, TreeNode layout. */
 #include "menu.h"
+#ifdef IMGUI_HAS_DOCK
+#include "imgui_internal.h"   /* r34 G4: DockBuilderDockWindow */
+#endif
 #include "overlay.h"
 #include "frida_bridge.h"
 #include "logger.h"
@@ -73,9 +75,10 @@ struct ClassTab {
     int  sel_inst = -1;
     bool inst_wait = false;             /* r29: heap scan in flight */
     bool inst_creat = false;            /* r29: $new in flight      */
-    /* r33 F7/F8: floating class window + constructor picker */
-    bool attached = true;               /* pinned below owner window */
-    int  owner_expl = 0;                /* explorer id, 0 = main     */
+    /* r33 F7/F8 / r34 G4: inspector window + constructor picker */
+    bool no_dock = false;               /* "new window": skip dock   */
+    bool dock_init = false;             /* queued into the dock node */
+    bool fill = false;                  /* fullscreen toggle         */
     bool free_init = false;
     std::vector<MethodSig> ctors;
     bool ctor_wait = false;
@@ -147,7 +150,6 @@ struct ExplorerWin {
     bool detached = false;        /* floated out of the tab bar      */
     bool free_init = false;
     ImVec2 free_pos{0, 0}, free_size{0, 0};
-    ImVec4 self_rect{0, 0, 0, 0}; /* rect while floating (attach)    */
     /* r33 F5: method-search options */
     char mname[96] = {}, ptyp[96] = {}, rtyp[96] = {};
 };
@@ -576,8 +578,7 @@ static std::string win_title(const ClassTab& c) {
     /* r33: ### keeps the window id stable across renames */
     return short_name(c.cname) + "###cw" + std::to_string(c.uid);
 }
-static ClassTab* open_inspector(const std::string& name, bool switch_tab,
-                                int owner_id = 0) {
+static ClassTab* open_inspector(const std::string& name, bool switch_tab) {
     if (name.empty()) return nullptr;
     ClassTab* out = nullptr;
     MLK();
@@ -588,7 +589,6 @@ static ClassTab* open_inspector(const std::string& name, bool switch_tab,
         nt.cname   = name;
         nt.uid     = ++s_tab_uid_seq;
         nt.waiting = true;
-        nt.owner_expl = owner_id;   /* r33 F7: attach below the opener */
         s_classes.push_back(nt);
         out = &s_classes.back();
     }
@@ -831,10 +831,16 @@ static void ime_frame_prelude() {
         io.AddKeyEvent(ImGuiKey_Enter, enter_down);
     }
 }
-static bool ime_textfield(const char* label, char* buf, size_t cap,
-                          ImGuiInputTextFlags extra = 0) {
-    bool used = ImGui::InputText(label, buf, cap,
-                                 ImGuiInputTextFlags_AutoSelectAll | extra);
+static float s_dock_h = 0.f;  /* r34 G4: bottom dock strip height */
+static bool ime_field_core(const char* label, const char* hint,
+                           char* buf, size_t cap,
+                           ImGuiInputTextFlags extra) {
+    /* r34 G2: AutoSelectAll is gone - on touch a re-tap selected
+       the whole word and the next letter replaced it. The hint
+       overload keeps a stable id for the live search fields. */
+    bool used = (hint && hint[0])
+        ? ImGui::InputTextWithHint(label, hint, buf, cap, extra)
+        : ImGui::InputText(label, buf, cap, extra);
     if (ImGui::IsItemActivated()) {
         s_ime_active = true;
         s_ime_owner  = ImGui::GetItemID();
@@ -849,6 +855,15 @@ static bool ime_textfield(const char* label, char* buf, size_t cap,
         ime_show();     /* re-tap while active: keyboard was closed */
     }
     return used;
+}
+static bool ime_textfield(const char* label, char* buf, size_t cap,
+                          ImGuiInputTextFlags extra = 0) {
+    return ime_field_core(label, nullptr, buf, cap, extra);
+}
+static bool ime_hintfield(const char* label, const char* hint,
+                          char* buf, size_t cap,
+                          ImGuiInputTextFlags extra = 0) {
+    return ime_field_core(label, hint, buf, cap, extra);
 }
 static bool ime_multiline(const char* label, char* buf, size_t cap,
                           ImVec2 size) {
@@ -2789,12 +2804,14 @@ static void explorer_body(ExplorerWin& e) {
     }
     ImGui::SameLine();
     ImGui::Checkbox("All", &e.all_fam);
-    /* r33 F4: no EnterReturnsTrue - the r24 enter-clear path used
-       to drop every letter after the first and clear the box on
-       re-tap. Without the flag this box behaves like the family
-       search box (which always worked). */
+    /* r33 F4 / r34 G2: no EnterReturnsTrue (the r24 enter-clear
+       path dropped every letter after the first), no AutoSelectAll
+       (a re-tap wiped the word); hint + stable id, continuous
+       submission, persistent buffer - the live filter below reads
+       the buffer every frame via IsItemEdited-style re-render */
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 84.f);
-    ime_textfield("##esearch", e.search, sizeof(e.search));
+    ime_hintfield("##esearch", "Search classes...",
+                  e.search, sizeof(e.search));
     ImGui::PopItemWidth();
     ImGui::SameLine();
     bool do_query = false;
@@ -2807,10 +2824,26 @@ static void explorer_body(ExplorerWin& e) {
                           ImVec4(0.88f, 0.34f, 0.58f, 1.f));
     if (ImGui::Button("Options")) ImGui::OpenPopup("explOpts");
     ImGui::PopStyleColor(3);
+    /* r34 G3: filter FIRST - the counter and the clipper both use
+       the filtered list (clipping over the raw size drew a phantom
+       scrollbar past the last row), and empty names never render */
+    std::vector<const std::string*> rows;
+    rows.reserve(e.res.size());
+    for (auto& nm : e.res) {
+        if (nm.empty()) continue;
+        if (e.search[0]) {
+            if (e.case_sensitive) {
+                if (!strstr(nm.c_str(), e.search)) continue;
+            } else if (!contains_ci(nm, e.search)) continue;
+        }
+        if (!e.all_fam && e.family < (int)s_families.size() &&
+            family_of(nm) != s_families[e.family]) continue;
+        rows.push_back(&nm);
+    }
     ImGui::SameLine();
     if (e.wait) ImGui::TextDisabled("(listing...)");
-    else ImGui::TextDisabled("%ld of %ld loaded classes",
-                             e.shown, e.total);
+    else ImGui::TextDisabled("%lu of %ld loaded classes",
+                             (unsigned long)rows.size(), e.total);
     if (ImGui::BeginPopup("explOpts")) {
         ImGui::Checkbox("Case sensitive", &e.case_sensitive);
         ImGui::TextDisabled("Filter by:");
@@ -2847,22 +2880,15 @@ static void explorer_body(ExplorerWin& e) {
     ImGui::Separator();
     /* r33 F5: dynamic client-side filter - rows shrink as you type,
        exactly like the family search box */
-    ImGui::BeginChild("explst", ImVec2(0, 0), true);
+    ImGui::BeginChild("explst", ImVec2(0, -s_dock_h), true);
     ImGuiListClipper clip;
-    clip.Begin((int)e.res.size());
+    clip.Begin((int)rows.size());   /* r34 G3: filtered size */
     while (clip.Step()) {
         for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) {
-            const std::string& nm = e.res[k];
-            if (e.search[0]) {
-                if (e.case_sensitive) {
-                    if (!strstr(nm.c_str(), e.search)) continue;
-                } else if (!contains_ci(nm, e.search)) continue;
-            }
-            if (!e.all_fam && e.family < (int)s_families.size() &&
-                family_of(nm) != s_families[e.family]) continue;
+            const std::string& nm = *rows[k];
             ImGui::PushID(k);
             if (ImGui::Selectable(nm.c_str()))
-                open_inspector(nm, false, e.id);
+                open_inspector(nm, false);
             /* r33 F7: long-press a row -> new window / copy name */
             bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
             static bool row_wheel = false;
@@ -2881,9 +2907,10 @@ static void explorer_body(ExplorerWin& e) {
             if (rclk || lng) ImGui::OpenPopup("clsrow");
             if (ImGui::BeginPopup("clsrow")) {
                 if (ImGui::MenuItem("Open in new window")) {
-                    ClassTab* nt2 = open_inspector(nm, false, e.id);
+                    ClassTab* nt2 = open_inspector(nm, false);
                     if (nt2) {
-                        nt2->attached  = false;
+                        nt2->no_dock   = true;   /* r34 G4: float it */
+                        nt2->dock_init = true;
                         nt2->free_init = false;
                     }
                     ImGui::CloseCurrentPopup();
@@ -2907,8 +2934,13 @@ static void class_tab_body(ClassTab& c) {
        are sub-nodes - the horizontal sub-tab bar is gone. Action
        buttons live in the toolbar row, separated by Separator. */
     MLK();
+    if (ImGui::SmallButton(c.fill ? "Restore##ct" : "Fill##ct")) {
+        c.fill = !c.fill;               /* r34 G4-5: fullscreen toggle */
+        if (!c.fill) c.dock_init = false;   /* re-dock on restore */
+    }
+    ImGui::SameLine();
     if (ImGui::SmallButton("Refresh##ct"))
-        open_inspector(c.cname, false, c.owner_expl);
+        open_inspector(c.cname, false);
     ImGui::SameLine();
     if (ImGui::SmallButton("Copy class##ct"))
         copy_text("class", c.cname);
@@ -3048,7 +3080,8 @@ static void tab_tools() {
             ClassTab* nt2 = open_inspector(s_dup_req, false);
             if (nt2) {
                 MLK();
-                nt2->attached  = false;
+                nt2->no_dock   = true;   /* r34: floats, not docked */
+                nt2->dock_init = true;
                 nt2->free_init = false;
                 MULK();
             }
@@ -3210,17 +3243,8 @@ static void draw_resize_handles() {
         s_rz = -1;
     }
 }
-/* r33: attach targets - a detached class window can pin itself
-   below the main menu or below any floating class-list window */
-static ImVec4 s_rect_main(0, 0, 0, 0);
-static ImVec4 owner_rect_of(int owner_id) {
-    if (owner_id != 0) {
-        for (auto& x : s_explorers)
-            if (x.id == owner_id && x.self_rect.z > 0)
-                return x.self_rect;
-    }
-    return s_rect_main;
-}
+/* r34 G4: class inspectors dock through the docking branch now -
+   no manual attach map is needed */
 static void explorer_windows() {
     /* r33 F6: detached class-list windows float free; long-press
        the title strip to attach the window back to the main menu */
@@ -3246,9 +3270,6 @@ static void explorer_windows() {
             continue;
         }
         explorer_body(e);
-        e.self_rect = ImVec4(
-            ImGui::GetWindowPos().x, ImGui::GetWindowPos().y,
-            ImGui::GetWindowSize().x, ImGui::GetWindowSize().y);
         ImGuiIO& io = ImGui::GetIO();
         ImVec2 wpos = ImGui::GetWindowPos();
         float band = ImGui::GetFrameHeight();
@@ -3288,9 +3309,11 @@ static void explorer_windows() {
     }
 }
 static void class_windows() {
-    /* r33 F7: class detail windows. Attached ones follow the
-       bottom edge of their owner window; dragging the title
-       detaches, long-pressing it opens the attach/close menu. */
+    /* r34 G4: inspectors are ordinary windows. New ones are queued
+       into the main window's bottom DockSpace (in menu_draw) and
+       dock on their first frame; dragging the tab undocks them and
+       dragging back re-docks (native docking). Fill/Restore in the
+       toolbar floats the window fullscreen and re-docks on undo. */
     for (int i = 0; i < (int)s_classes.size(); ) {
         ClassTab& c = s_classes[i];
         if (c.win_close) {
@@ -3308,27 +3331,32 @@ static void class_windows() {
             continue;
         }
         std::string ttl = win_title(c);
-        ImVec4 own = owner_rect_of(c.owner_expl);
-        if (c.attached && own.z > 0) {
-            float py = own.y + own.w;
+        ImGuiWindowFlags wfl = ImGuiWindowFlags_NoCollapse;
+        if (c.fill) {
+#ifdef IMGUI_HAS_DOCK
+            /* r34: a docked window ignores pos/size - pop it out
+               of its dock node first, then float fullscreen */
+            ImGuiWindow* w = ImGui::FindWindowByName(ttl.c_str());
+            if (w && w->DockNode) {
+                w->DockNode = nullptr;
+                w->DockId   = 0;
+            }
+#endif
             ImGuiIO& tio = ImGui::GetIO();
-            if (py > tio.DisplaySize.y - 200.f)
-                py = tio.DisplaySize.y - 200.f;
-            if (py < 0) py = 0;
-            ImGui::SetNextWindowPos(ImVec2(own.x, py),
-                                    ImGuiCond_Always);
-        }
-        if (!c.free_init) {
+            ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(tio.DisplaySize,
+                                     ImGuiCond_Always);
+#ifdef IMGUI_HAS_DOCK
+            wfl |= ImGuiWindowFlags_NoDocking;
+#endif
+        } else if (!c.free_init) {
             ImGui::SetNextWindowSize(ImVec2(460, 480),
                                      ImGuiCond_Appearing);
             c.free_init = true;
         }
-        ImGui::SetNextWindowSizeConstraints(ImVec2(280, 220),
-                                            ImVec2(1400, 1400));
         bool open = true;
-        if (!ImGui::Begin(ttl.c_str(), &open)) {
+        if (!ImGui::Begin(ttl.c_str(), &open, wfl)) {
             ImGui::End();
-            if (!open) c.win_close = true;
             i++;
             continue;
         }
@@ -3337,61 +3365,6 @@ static void class_windows() {
             s_focus_win.clear();
         }
         class_tab_body(c);
-        ImGuiIO& io = ImGui::GetIO();
-        ImVec2 wpos = ImGui::GetWindowPos();
-        float band = ImGui::GetFrameHeight();
-        bool in_title = ImGui::IsWindowHovered() &&
-                        io.MousePos.y >= wpos.y &&
-                        io.MousePos.y <= wpos.y + band;
-        static float t_t0 = 0;
-        static bool  t_on = false;
-        static int   t_id = 0;
-        if (in_title && io.MouseDown[0] && (!t_on || t_id != c.uid)) {
-            t_on = true;
-            t_id = c.uid;
-            t_t0 = (float)ImGui::GetTime();
-        }
-        if (!io.MouseDown[0]) t_on = false;
-        if (t_on && t_id == c.uid && in_title && c.attached &&
-            ImGui::IsMouseDragging(0, 12.f)) {
-            MLK();
-            c.attached = false;      /* dragging the title = detach */
-            MULK();
-            t_on = false;
-        }
-        if (t_on && t_id == c.uid && in_title &&
-            !ImGui::IsMouseDragging(0, 12.f) &&
-            ImGui::GetTime() - t_t0 > 0.55f) {
-            t_on = false;
-            ImGui::OpenPopup("clsattach");
-        }
-        if (ImGui::BeginPopup("clsattach")) {
-            if (ImGui::MenuItem("Free window (detach)")) {
-                MLK();
-                c.attached = false;
-                MULK();
-            }
-            if (ImGui::MenuItem("Attach below main menu")) {
-                MLK();
-                c.attached = true;
-                c.owner_expl = 0;
-                MULK();
-            }
-            for (auto& x : s_explorers) {
-                char xl[160];
-                snprintf(xl, sizeof(xl), "Attach below %s##at%d",
-                         x.search[0] ? x.search : "Classes", x.id);
-                if (ImGui::MenuItem(xl)) {
-                    MLK();
-                    c.attached   = true;
-                    c.owner_expl = x.id;
-                    MULK();
-                }
-            }
-            if (ImGui::MenuItem("Close"))
-                open = false;
-            ImGui::EndPopup();
-        }
         if (!open) c.win_close = true;
         ImGui::End();
         i++;
@@ -3484,7 +3457,7 @@ void menu_draw() {
     }
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r33)", &open, wflags);
+    ImGui::Begin("Dex-tool v1.3 (r34)", &open, wflags);
     {
         /* r33 F1: minimize button - sits in the title bar, left of
            the X; the cursor is restored so the layout is untouched.
@@ -3499,9 +3472,20 @@ void menu_draw() {
             s_conf_dirty = true;
         }
         ImGui::SetCursorPos(cp);
-        s_rect_main = ImVec4(wp2.x, wp2.y,
-                             ImGui::GetWindowSize().x,
-                             ImGui::GetWindowSize().y);
+        /* r34 G4: reserve the bottom strip when an inspector will
+           dock; the main-window children shrink by s_dock_h */
+        bool dock_wanted = false;
+        for (auto& c : s_classes)
+            if (!c.win_close && !c.no_dock && !c.fill) {
+                dock_wanted = true;
+                break;
+            }
+#ifdef IMGUI_HAS_DOCK
+        s_dock_h = dock_wanted
+            ? ImGui::GetWindowSize().y * 0.45f : 0.f;
+#else
+        (void)dock_wanted;   /* r34: no docking branch - no strip */
+#endif
     }
     if (!open) {
         MLK();
@@ -3532,6 +3516,21 @@ void menu_draw() {
         }
         ImGui::EndTabBar();
     }
+#ifdef IMGUI_HAS_DOCK
+    /* r34 G4: dock node for the inspectors - queued windows dock on
+       their first Begin; dragging a docked tab out undocks it, and
+       the tab bar shows it while it stays inside */
+    for (auto& c : s_classes) {
+        if (c.win_close || c.dock_init) continue;
+        if (c.fill || c.no_dock) { c.dock_init = true; continue; }
+        ImGui::DockBuilderDockWindow(win_title(c).c_str(),
+                                     ImGui::GetID("MainDock"));
+        c.dock_init = true;
+    }
+    if (s_dock_h > 0.f)
+        ImGui::DockSpace(ImGui::GetID("MainDock"),
+                         ImVec2(0, s_dock_h));
+#endif
     if (s_clip_msg[0] && conf_now_ms() - s_clip_ms < 2500)
         ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1), "%s", s_clip_msg);
     families_window();

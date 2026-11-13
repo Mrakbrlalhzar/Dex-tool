@@ -1,9 +1,10 @@
-/* Dex-tool agent (r33): F5 method/field search runs on Java
-   reflection with name/param/return filters (no baksmali needed);
-   F8 createInstance takes constructor args and listConstructors
-   feeds the creation popup. r32: FN_ARGS by JSON key. r31:
-   releaseHandle. r30: hook-mode prefix match + unknown-mode
-   report, stale handle reporting. */
+/* Dex-tool agent (r34): G2 guards the delayed echo of a
+   programmatic EditText clear (it used to reach the menu as
+   backspaces - the "single character" search reset). r33:
+   reflection method/field search with name/param/return filters,
+   createInstance args, listConstructors. r32: FN_ARGS by JSON
+   key. r31: releaseHandle. r30: hook-mode prefix match +
+   unknown-mode report, stale handle reporting. */
 'use strict';
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
 var gAgentLog = null;
@@ -315,6 +316,15 @@ function ime_on_text(ed) {
         if (IME.silent) { IME.prev = cur; return; }   /* programmatic */
         var prev = IME.prev;
         if (cur === prev) return;
+        if (cur === '' && Date.now() - (IME.clearAt || 0) < 400) {
+            /* r34 G2: the watcher fires AFTER ime_reset_text
+               returned, so the silent flag is already down - this
+               is the echo of our own clear, not a user edit.
+               Forwarding it used to wipe the field with
+               backspaces (the "single character" reset). */
+            IME.prev = '';
+            return;
+        }
         var s = 0;
         while (s < prev.length && s < cur.length && prev[s] === cur[s]) s++;
         var e = 0;
@@ -337,6 +347,7 @@ function ime_reset_text() {
         if (IME.edit) IME.edit.setText('');
         IME.prev = '';
         IME.silent = false;
+        IME.clearAt = Date.now();   /* r34 G2: echo guard window */
     } catch (e) { IME.silent = false; }
 }
 function ime_stage(name, fn) {
@@ -2767,6 +2778,6 @@ setTimeout(function () {
         var appR = ATr.currentApplication();
         if (appR) pkgR = String(appR.getPackageName());
     } catch (eP) {}
-    sendMsg('ready', { msg: 'Dex-tool agent r33 loaded', pkg: pkgR });
+    sendMsg('ready', { msg: 'Dex-tool agent r34 loaded', pkg: pkgR });
     agentLog('phase: ready sent');
 }, 0);

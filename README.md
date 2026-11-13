@@ -37,6 +37,47 @@ not the tree.
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Changes in this version (r34) - touch input + docking
+
+- **Single-tap tabs**: the ImGui context now sets
+  `ImGuiConfigFlags_IsTouchScreen`, `io.MouseDragThreshold = 15.0f`
+  and `io.TouchExtraPadding = (2, 2)` at creation. Finger jitter
+  beyond the old 6 px default was turning taps into drags, which
+  canceled the click - tabs (and everything else) now need one
+  tap. The injection path was verified while at it: touches go
+  straight through `AddMousePosEvent` / `AddMouseButtonEvent` and
+  IME text through `AddInputCharacter`, with no artificial
+  delays.
+- **Search field reset**: two causes fixed. `AutoSelectAll` is
+  removed from every IME text field - on touch a re-tap selected
+  the whole word so the next letter replaced it. And the agent now
+  ignores the delayed watcher callback of its own programmatic
+  EditText clear (a 400 ms echo window); that echo used to reach
+  the menu as a burst of backspaces, wiping what you typed. The
+  class search uses `InputTextWithHint` with a stable id,
+  persistent buffer and continuous submission; there is no
+  `SetKeyboardFocusHere` anywhere.
+- **Class list count and phantom scroll**: the row filter now runs
+  first, the counter shows the filtered count (`X of Y` where X is
+  the number of rows actually rendered), and `ImGuiListClipper` is
+  initialized with the filtered size - previously it clipped over
+  the raw size, which reserved scroll height for rows that never
+  rendered (the "748 of 748" / empty-void behavior). Empty names
+  are never rendered.
+- **Dockable inspector**: the build now uses the imgui
+  `v1.90.4-docking` branch with `ImGuiConfigFlags_DockingEnable`.
+  A `DockSpace` strip sits at the bottom of the main window (the
+  tabs stay at the top and the class list stays visible); every
+  new inspector is queued with `DockBuilderDockWindow` and docks
+  there on its first frame. Dragging its tab out undocks it into
+  a floating window and dragging it back re-docks - native ImGui
+  docking, no manual attach code. A **Fill / Restore** button in
+  the inspector toolbar toggles fullscreen and re-docks on
+  restore. "Open in new window" opens floating without docking.
+  All docking code is guarded with `#ifdef IMGUI_HAS_DOCK`, so the
+  build still compiles if the docking headers are unavailable.
+
+
 ## Changes in this version (r33) - the UI round
 
 User-reported issues; the class-browser flow is rebuilt around

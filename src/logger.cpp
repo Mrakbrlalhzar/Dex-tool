@@ -217,7 +217,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r33: UI round - independent detachable class windows with qid-routed results, keyboard fix (EnterReturnsTrue removed), dynamic client-side filter, reflection method/field search with name/param/return options, TreeNode class layout, FindInstancesPopup, CreateInstancePopup with constructor args, family window closes on pick, minimize button, tab strip not a scroll region. r32: FN_ARGS keys, atomic s_visible, module snapshot, parse cache, release sweeps)");
+    log_info("logger_init done (build r34: touch io settings (IsTouchScreen, drag threshold 15, touch padding), AutoSelectAll removed from IME fields, hint search field, class list clipped over filtered rows, docking-branch inspectors auto-dock to a bottom strip with native undock and Fill/Restore. r33: independent class windows with qid routing, TreeNode layout, popups for find/create instance)");
 }
 void logger_retarget(const char* base_dir) {
     if (!base_dir || !base_dir[0]) return;
