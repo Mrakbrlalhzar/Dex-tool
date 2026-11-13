@@ -198,7 +198,7 @@ jobs:
 
       - name: Clone ImGui 1.90.4
         run: |
-          git clone --depth 1 --branch v1.90.4 \
+          git clone --depth 1 --branch v1.90.4-docking \
             https://github.com/ocornut/imgui.git imgui
           ls imgui/backends/imgui_impl_opengl3.cpp
           cat >> imgui/backends/imgui_impl_opengl3.cpp << 'DXTIMGI'
@@ -555,7 +555,7 @@ jobs:
                            "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
                   log_info(mm);
               }
-              log_info("logger_init done (build r33: UI round - independent detachable class windows with qid-routed results, keyboard fix (EnterReturnsTrue removed), dynamic client-side filter, reflection method/field search with name/param/return options, TreeNode class layout, FindInstancesPopup, CreateInstancePopup with constructor args, family window closes on pick, minimize button, tab strip not a scroll region. r32: FN_ARGS keys, atomic s_visible, module snapshot, parse cache, release sweeps)");
+              log_info("logger_init done (build r34: touch io settings (IsTouchScreen, drag threshold 15, touch padding), AutoSelectAll removed from IME fields, hint search field, class list clipped over filtered rows, docking-branch inspectors auto-dock to a bottom strip with native undock and Fill/Restore. r33: independent class windows with qid routing, TreeNode layout, popups for find/create instance)");
           }
           void logger_retarget(const char* base_dir) {
               if (!base_dir || !base_dir[0]) return;
@@ -1072,6 +1072,16 @@ jobs:
               io.IniFilename = nullptr;
               io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
               io.ConfigWindowsMoveFromTitleBarOnly = true;  /* touch friendly */
+              /* r34 G1: touch input - a finger jitters more than 6px, which
+                 turned single taps into drags (tabs needed a double tap) */
+              io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
+              io.MouseDragThreshold = 15.0f;
+              ImGui::GetStyle().TouchExtraPadding =
+                  ImVec2(2.0f, 2.0f);   /* r34 G1: style field since 1.51 */
+          #ifdef IMGUI_HAS_DOCK
+              /* r34 G4: docking branch - inspectors dock to the bottom strip */
+              io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+          #endif
               ImGui::StyleColorsDark();
               ImGui::GetStyle().WindowRounding = 6.0f;
               if (io.Fonts->Fonts.empty() || g_font_dirty) build_fonts(io);
@@ -1711,14 +1721,16 @@ jobs:
       - name: Generate menu.cpp
         run: |
           cat > src/menu.cpp << 'DXTMNC'
-          /* Dex-tool menu (r33): the UI round - independent detachable
-             class windows (per-window qid-routed results), keyboard fix
-             (EnterReturnsTrue removed), dynamic client-side filter,
-             reflection-based method search with name/param/return options,
-             TreeNode class layout, FindInstancesPopup + CreateInstancePopup,
-             family window closes on pick, minimize button, no-scroll strip.
-             r32: FN_ARGS keys, atomic s_visible, module snapshot, cache. */
+          /* Dex-tool menu (r34): touch input round - io touch settings
+             (IsTouchScreen, drag threshold 15, touch padding), AutoSelectAll
+             removed from the IME fields, hint search field, class list
+             clipped over the filtered rows, docking-branch inspectors
+             (auto-dock bottom strip, native undock, Fill/Restore). r33:
+             independent class windows, qid routing, TreeNode layout. */
           #include "menu.h"
+          #ifdef IMGUI_HAS_DOCK
+          #include "imgui_internal.h"   /* r34 G4: DockBuilderDockWindow */
+          #endif
           #include "overlay.h"
           #include "frida_bridge.h"
           #include "logger.h"
@@ -1786,9 +1798,10 @@ jobs:
               int  sel_inst = -1;
               bool inst_wait = false;             /* r29: heap scan in flight */
               bool inst_creat = false;            /* r29: $new in flight      */
-              /* r33 F7/F8: floating class window + constructor picker */
-              bool attached = true;               /* pinned below owner window */
-              int  owner_expl = 0;                /* explorer id, 0 = main     */
+              /* r33 F7/F8 / r34 G4: inspector window + constructor picker */
+              bool no_dock = false;               /* "new window": skip dock   */
+              bool dock_init = false;             /* queued into the dock node */
+              bool fill = false;                  /* fullscreen toggle         */
               bool free_init = false;
               std::vector<MethodSig> ctors;
               bool ctor_wait = false;
@@ -1860,7 +1873,6 @@ jobs:
               bool detached = false;        /* floated out of the tab bar      */
               bool free_init = false;
               ImVec2 free_pos{0, 0}, free_size{0, 0};
-              ImVec4 self_rect{0, 0, 0, 0}; /* rect while floating (attach)    */
               /* r33 F5: method-search options */
               char mname[96] = {}, ptyp[96] = {}, rtyp[96] = {};
           };
@@ -2289,8 +2301,7 @@ jobs:
               /* r33: ### keeps the window id stable across renames */
               return short_name(c.cname) + "###cw" + std::to_string(c.uid);
           }
-          static ClassTab* open_inspector(const std::string& name, bool switch_tab,
-                                          int owner_id = 0) {
+          static ClassTab* open_inspector(const std::string& name, bool switch_tab) {
               if (name.empty()) return nullptr;
               ClassTab* out = nullptr;
               MLK();
@@ -2301,7 +2312,6 @@ jobs:
                   nt.cname   = name;
                   nt.uid     = ++s_tab_uid_seq;
                   nt.waiting = true;
-                  nt.owner_expl = owner_id;   /* r33 F7: attach below the opener */
                   s_classes.push_back(nt);
                   out = &s_classes.back();
               }
@@ -2544,10 +2554,16 @@ jobs:
                   io.AddKeyEvent(ImGuiKey_Enter, enter_down);
               }
           }
-          static bool ime_textfield(const char* label, char* buf, size_t cap,
-                                    ImGuiInputTextFlags extra = 0) {
-              bool used = ImGui::InputText(label, buf, cap,
-                                           ImGuiInputTextFlags_AutoSelectAll | extra);
+          static float s_dock_h = 0.f;  /* r34 G4: bottom dock strip height */
+          static bool ime_field_core(const char* label, const char* hint,
+                                     char* buf, size_t cap,
+                                     ImGuiInputTextFlags extra) {
+              /* r34 G2: AutoSelectAll is gone - on touch a re-tap selected
+                 the whole word and the next letter replaced it. The hint
+                 overload keeps a stable id for the live search fields. */
+              bool used = (hint && hint[0])
+                  ? ImGui::InputTextWithHint(label, hint, buf, cap, extra)
+                  : ImGui::InputText(label, buf, cap, extra);
               if (ImGui::IsItemActivated()) {
                   s_ime_active = true;
                   s_ime_owner  = ImGui::GetItemID();
@@ -2562,6 +2578,15 @@ jobs:
                   ime_show();     /* re-tap while active: keyboard was closed */
               }
               return used;
+          }
+          static bool ime_textfield(const char* label, char* buf, size_t cap,
+                                    ImGuiInputTextFlags extra = 0) {
+              return ime_field_core(label, nullptr, buf, cap, extra);
+          }
+          static bool ime_hintfield(const char* label, const char* hint,
+                                    char* buf, size_t cap,
+                                    ImGuiInputTextFlags extra = 0) {
+              return ime_field_core(label, hint, buf, cap, extra);
           }
           static bool ime_multiline(const char* label, char* buf, size_t cap,
                                     ImVec2 size) {
@@ -4502,12 +4527,14 @@ jobs:
               }
               ImGui::SameLine();
               ImGui::Checkbox("All", &e.all_fam);
-              /* r33 F4: no EnterReturnsTrue - the r24 enter-clear path used
-                 to drop every letter after the first and clear the box on
-                 re-tap. Without the flag this box behaves like the family
-                 search box (which always worked). */
+              /* r33 F4 / r34 G2: no EnterReturnsTrue (the r24 enter-clear
+                 path dropped every letter after the first), no AutoSelectAll
+                 (a re-tap wiped the word); hint + stable id, continuous
+                 submission, persistent buffer - the live filter below reads
+                 the buffer every frame via IsItemEdited-style re-render */
               ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 84.f);
-              ime_textfield("##esearch", e.search, sizeof(e.search));
+              ime_hintfield("##esearch", "Search classes...",
+                            e.search, sizeof(e.search));
               ImGui::PopItemWidth();
               ImGui::SameLine();
               bool do_query = false;
@@ -4520,10 +4547,26 @@ jobs:
                                     ImVec4(0.88f, 0.34f, 0.58f, 1.f));
               if (ImGui::Button("Options")) ImGui::OpenPopup("explOpts");
               ImGui::PopStyleColor(3);
+              /* r34 G3: filter FIRST - the counter and the clipper both use
+                 the filtered list (clipping over the raw size drew a phantom
+                 scrollbar past the last row), and empty names never render */
+              std::vector<const std::string*> rows;
+              rows.reserve(e.res.size());
+              for (auto& nm : e.res) {
+                  if (nm.empty()) continue;
+                  if (e.search[0]) {
+                      if (e.case_sensitive) {
+                          if (!strstr(nm.c_str(), e.search)) continue;
+                      } else if (!contains_ci(nm, e.search)) continue;
+                  }
+                  if (!e.all_fam && e.family < (int)s_families.size() &&
+                      family_of(nm) != s_families[e.family]) continue;
+                  rows.push_back(&nm);
+              }
               ImGui::SameLine();
               if (e.wait) ImGui::TextDisabled("(listing...)");
-              else ImGui::TextDisabled("%ld of %ld loaded classes",
-                                       e.shown, e.total);
+              else ImGui::TextDisabled("%lu of %ld loaded classes",
+                                       (unsigned long)rows.size(), e.total);
               if (ImGui::BeginPopup("explOpts")) {
                   ImGui::Checkbox("Case sensitive", &e.case_sensitive);
                   ImGui::TextDisabled("Filter by:");
@@ -4560,22 +4603,15 @@ jobs:
               ImGui::Separator();
               /* r33 F5: dynamic client-side filter - rows shrink as you type,
                  exactly like the family search box */
-              ImGui::BeginChild("explst", ImVec2(0, 0), true);
+              ImGui::BeginChild("explst", ImVec2(0, -s_dock_h), true);
               ImGuiListClipper clip;
-              clip.Begin((int)e.res.size());
+              clip.Begin((int)rows.size());   /* r34 G3: filtered size */
               while (clip.Step()) {
                   for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) {
-                      const std::string& nm = e.res[k];
-                      if (e.search[0]) {
-                          if (e.case_sensitive) {
-                              if (!strstr(nm.c_str(), e.search)) continue;
-                          } else if (!contains_ci(nm, e.search)) continue;
-                      }
-                      if (!e.all_fam && e.family < (int)s_families.size() &&
-                          family_of(nm) != s_families[e.family]) continue;
+                      const std::string& nm = *rows[k];
                       ImGui::PushID(k);
                       if (ImGui::Selectable(nm.c_str()))
-                          open_inspector(nm, false, e.id);
+                          open_inspector(nm, false);
                       /* r33 F7: long-press a row -> new window / copy name */
                       bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
                       static bool row_wheel = false;
@@ -4594,9 +4630,10 @@ jobs:
                       if (rclk || lng) ImGui::OpenPopup("clsrow");
                       if (ImGui::BeginPopup("clsrow")) {
                           if (ImGui::MenuItem("Open in new window")) {
-                              ClassTab* nt2 = open_inspector(nm, false, e.id);
+                              ClassTab* nt2 = open_inspector(nm, false);
                               if (nt2) {
-                                  nt2->attached  = false;
+                                  nt2->no_dock   = true;   /* r34 G4: float it */
+                                  nt2->dock_init = true;
                                   nt2->free_init = false;
                               }
                               ImGui::CloseCurrentPopup();
@@ -4620,8 +4657,13 @@ jobs:
                  are sub-nodes - the horizontal sub-tab bar is gone. Action
                  buttons live in the toolbar row, separated by Separator. */
               MLK();
+              if (ImGui::SmallButton(c.fill ? "Restore##ct" : "Fill##ct")) {
+                  c.fill = !c.fill;               /* r34 G4-5: fullscreen toggle */
+                  if (!c.fill) c.dock_init = false;   /* re-dock on restore */
+              }
+              ImGui::SameLine();
               if (ImGui::SmallButton("Refresh##ct"))
-                  open_inspector(c.cname, false, c.owner_expl);
+                  open_inspector(c.cname, false);
               ImGui::SameLine();
               if (ImGui::SmallButton("Copy class##ct"))
                   copy_text("class", c.cname);
@@ -4761,7 +4803,8 @@ jobs:
                       ClassTab* nt2 = open_inspector(s_dup_req, false);
                       if (nt2) {
                           MLK();
-                          nt2->attached  = false;
+                          nt2->no_dock   = true;   /* r34: floats, not docked */
+                          nt2->dock_init = true;
                           nt2->free_init = false;
                           MULK();
                       }
@@ -4923,17 +4966,8 @@ jobs:
                   s_rz = -1;
               }
           }
-          /* r33: attach targets - a detached class window can pin itself
-             below the main menu or below any floating class-list window */
-          static ImVec4 s_rect_main(0, 0, 0, 0);
-          static ImVec4 owner_rect_of(int owner_id) {
-              if (owner_id != 0) {
-                  for (auto& x : s_explorers)
-                      if (x.id == owner_id && x.self_rect.z > 0)
-                          return x.self_rect;
-              }
-              return s_rect_main;
-          }
+          /* r34 G4: class inspectors dock through the docking branch now -
+             no manual attach map is needed */
           static void explorer_windows() {
               /* r33 F6: detached class-list windows float free; long-press
                  the title strip to attach the window back to the main menu */
@@ -4959,9 +4993,6 @@ jobs:
                       continue;
                   }
                   explorer_body(e);
-                  e.self_rect = ImVec4(
-                      ImGui::GetWindowPos().x, ImGui::GetWindowPos().y,
-                      ImGui::GetWindowSize().x, ImGui::GetWindowSize().y);
                   ImGuiIO& io = ImGui::GetIO();
                   ImVec2 wpos = ImGui::GetWindowPos();
                   float band = ImGui::GetFrameHeight();
@@ -5001,9 +5032,11 @@ jobs:
               }
           }
           static void class_windows() {
-              /* r33 F7: class detail windows. Attached ones follow the
-                 bottom edge of their owner window; dragging the title
-                 detaches, long-pressing it opens the attach/close menu. */
+              /* r34 G4: inspectors are ordinary windows. New ones are queued
+                 into the main window's bottom DockSpace (in menu_draw) and
+                 dock on their first frame; dragging the tab undocks them and
+                 dragging back re-docks (native docking). Fill/Restore in the
+                 toolbar floats the window fullscreen and re-docks on undo. */
               for (int i = 0; i < (int)s_classes.size(); ) {
                   ClassTab& c = s_classes[i];
                   if (c.win_close) {
@@ -5021,27 +5054,32 @@ jobs:
                       continue;
                   }
                   std::string ttl = win_title(c);
-                  ImVec4 own = owner_rect_of(c.owner_expl);
-                  if (c.attached && own.z > 0) {
-                      float py = own.y + own.w;
+                  ImGuiWindowFlags wfl = ImGuiWindowFlags_NoCollapse;
+                  if (c.fill) {
+          #ifdef IMGUI_HAS_DOCK
+                      /* r34: a docked window ignores pos/size - pop it out
+                         of its dock node first, then float fullscreen */
+                      ImGuiWindow* w = ImGui::FindWindowByName(ttl.c_str());
+                      if (w && w->DockNode) {
+                          w->DockNode = nullptr;
+                          w->DockId   = 0;
+                      }
+          #endif
                       ImGuiIO& tio = ImGui::GetIO();
-                      if (py > tio.DisplaySize.y - 200.f)
-                          py = tio.DisplaySize.y - 200.f;
-                      if (py < 0) py = 0;
-                      ImGui::SetNextWindowPos(ImVec2(own.x, py),
-                                              ImGuiCond_Always);
-                  }
-                  if (!c.free_init) {
+                      ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+                      ImGui::SetNextWindowSize(tio.DisplaySize,
+                                               ImGuiCond_Always);
+          #ifdef IMGUI_HAS_DOCK
+                      wfl |= ImGuiWindowFlags_NoDocking;
+          #endif
+                  } else if (!c.free_init) {
                       ImGui::SetNextWindowSize(ImVec2(460, 480),
                                                ImGuiCond_Appearing);
                       c.free_init = true;
                   }
-                  ImGui::SetNextWindowSizeConstraints(ImVec2(280, 220),
-                                                      ImVec2(1400, 1400));
                   bool open = true;
-                  if (!ImGui::Begin(ttl.c_str(), &open)) {
+                  if (!ImGui::Begin(ttl.c_str(), &open, wfl)) {
                       ImGui::End();
-                      if (!open) c.win_close = true;
                       i++;
                       continue;
                   }
@@ -5050,61 +5088,6 @@ jobs:
                       s_focus_win.clear();
                   }
                   class_tab_body(c);
-                  ImGuiIO& io = ImGui::GetIO();
-                  ImVec2 wpos = ImGui::GetWindowPos();
-                  float band = ImGui::GetFrameHeight();
-                  bool in_title = ImGui::IsWindowHovered() &&
-                                  io.MousePos.y >= wpos.y &&
-                                  io.MousePos.y <= wpos.y + band;
-                  static float t_t0 = 0;
-                  static bool  t_on = false;
-                  static int   t_id = 0;
-                  if (in_title && io.MouseDown[0] && (!t_on || t_id != c.uid)) {
-                      t_on = true;
-                      t_id = c.uid;
-                      t_t0 = (float)ImGui::GetTime();
-                  }
-                  if (!io.MouseDown[0]) t_on = false;
-                  if (t_on && t_id == c.uid && in_title && c.attached &&
-                      ImGui::IsMouseDragging(0, 12.f)) {
-                      MLK();
-                      c.attached = false;      /* dragging the title = detach */
-                      MULK();
-                      t_on = false;
-                  }
-                  if (t_on && t_id == c.uid && in_title &&
-                      !ImGui::IsMouseDragging(0, 12.f) &&
-                      ImGui::GetTime() - t_t0 > 0.55f) {
-                      t_on = false;
-                      ImGui::OpenPopup("clsattach");
-                  }
-                  if (ImGui::BeginPopup("clsattach")) {
-                      if (ImGui::MenuItem("Free window (detach)")) {
-                          MLK();
-                          c.attached = false;
-                          MULK();
-                      }
-                      if (ImGui::MenuItem("Attach below main menu")) {
-                          MLK();
-                          c.attached = true;
-                          c.owner_expl = 0;
-                          MULK();
-                      }
-                      for (auto& x : s_explorers) {
-                          char xl[160];
-                          snprintf(xl, sizeof(xl), "Attach below %s##at%d",
-                                   x.search[0] ? x.search : "Classes", x.id);
-                          if (ImGui::MenuItem(xl)) {
-                              MLK();
-                              c.attached   = true;
-                              c.owner_expl = x.id;
-                              MULK();
-                          }
-                      }
-                      if (ImGui::MenuItem("Close"))
-                          open = false;
-                      ImGui::EndPopup();
-                  }
                   if (!open) c.win_close = true;
                   ImGui::End();
                   i++;
@@ -5197,7 +5180,7 @@ jobs:
               }
               ImGui::SetNextWindowBgAlpha(s_opacity);
               bool open = vis;
-              ImGui::Begin("Dex-tool v1.3 (r33)", &open, wflags);
+              ImGui::Begin("Dex-tool v1.3 (r34)", &open, wflags);
               {
                   /* r33 F1: minimize button - sits in the title bar, left of
                      the X; the cursor is restored so the layout is untouched.
@@ -5212,9 +5195,20 @@ jobs:
                       s_conf_dirty = true;
                   }
                   ImGui::SetCursorPos(cp);
-                  s_rect_main = ImVec4(wp2.x, wp2.y,
-                                       ImGui::GetWindowSize().x,
-                                       ImGui::GetWindowSize().y);
+                  /* r34 G4: reserve the bottom strip when an inspector will
+                     dock; the main-window children shrink by s_dock_h */
+                  bool dock_wanted = false;
+                  for (auto& c : s_classes)
+                      if (!c.win_close && !c.no_dock && !c.fill) {
+                          dock_wanted = true;
+                          break;
+                      }
+          #ifdef IMGUI_HAS_DOCK
+                  s_dock_h = dock_wanted
+                      ? ImGui::GetWindowSize().y * 0.45f : 0.f;
+          #else
+                  (void)dock_wanted;   /* r34: no docking branch - no strip */
+          #endif
               }
               if (!open) {
                   MLK();
@@ -5245,6 +5239,21 @@ jobs:
                   }
                   ImGui::EndTabBar();
               }
+          #ifdef IMGUI_HAS_DOCK
+              /* r34 G4: dock node for the inspectors - queued windows dock on
+                 their first Begin; dragging a docked tab out undocks it, and
+                 the tab bar shows it while it stays inside */
+              for (auto& c : s_classes) {
+                  if (c.win_close || c.dock_init) continue;
+                  if (c.fill || c.no_dock) { c.dock_init = true; continue; }
+                  ImGui::DockBuilderDockWindow(win_title(c).c_str(),
+                                               ImGui::GetID("MainDock"));
+                  c.dock_init = true;
+              }
+              if (s_dock_h > 0.f)
+                  ImGui::DockSpace(ImGui::GetID("MainDock"),
+                                   ImVec2(0, s_dock_h));
+          #endif
               if (s_clip_msg[0] && conf_now_ms() - s_clip_ms < 2500)
                   ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1), "%s", s_clip_msg);
               families_window();
@@ -5379,12 +5388,13 @@ jobs:
       - name: Generate agent.js
         run: |
           cat > agent/agent.js << 'DXTAGNT'
-          /* Dex-tool agent (r33): F5 method/field search runs on Java
-             reflection with name/param/return filters (no baksmali needed);
-             F8 createInstance takes constructor args and listConstructors
-             feeds the creation popup. r32: FN_ARGS by JSON key. r31:
-             releaseHandle. r30: hook-mode prefix match + unknown-mode
-             report, stale handle reporting. */
+          /* Dex-tool agent (r34): G2 guards the delayed echo of a
+             programmatic EditText clear (it used to reach the menu as
+             backspaces - the "single character" search reset). r33:
+             reflection method/field search with name/param/return filters,
+             createInstance args, listConstructors. r32: FN_ARGS by JSON
+             key. r31: releaseHandle. r30: hook-mode prefix match +
+             unknown-mode report, stale handle reporting. */
           'use strict';
           function sendMsg(type, payload) { send({ type: type, payload: payload }); }
           var gAgentLog = null;
@@ -5696,6 +5706,15 @@ jobs:
                   if (IME.silent) { IME.prev = cur; return; }   /* programmatic */
                   var prev = IME.prev;
                   if (cur === prev) return;
+                  if (cur === '' && Date.now() - (IME.clearAt || 0) < 400) {
+                      /* r34 G2: the watcher fires AFTER ime_reset_text
+                         returned, so the silent flag is already down - this
+                         is the echo of our own clear, not a user edit.
+                         Forwarding it used to wipe the field with
+                         backspaces (the "single character" reset). */
+                      IME.prev = '';
+                      return;
+                  }
                   var s = 0;
                   while (s < prev.length && s < cur.length && prev[s] === cur[s]) s++;
                   var e = 0;
@@ -5718,6 +5737,7 @@ jobs:
                   if (IME.edit) IME.edit.setText('');
                   IME.prev = '';
                   IME.silent = false;
+                  IME.clearAt = Date.now();   /* r34 G2: echo guard window */
               } catch (e) { IME.silent = false; }
           }
           function ime_stage(name, fn) {
@@ -8148,7 +8168,7 @@ jobs:
                   var appR = ATr.currentApplication();
                   if (appR) pkgR = String(appR.getPackageName());
               } catch (eP) {}
-              sendMsg('ready', { msg: 'Dex-tool agent r33 loaded', pkg: pkgR });
+              sendMsg('ready', { msg: 'Dex-tool agent r34 loaded', pkg: pkgR });
               agentLog('phase: ready sent');
           }, 0);
           DXTAGNT
@@ -8541,6 +8561,47 @@ jobs:
 
           Standalone runtime instrumentation for Android APKs.
           libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+          ## Changes in this version (r34) - touch input + docking
+
+          - **Single-tap tabs**: the ImGui context now sets
+            `ImGuiConfigFlags_IsTouchScreen`, `io.MouseDragThreshold = 15.0f`
+            and `io.TouchExtraPadding = (2, 2)` at creation. Finger jitter
+            beyond the old 6 px default was turning taps into drags, which
+            canceled the click - tabs (and everything else) now need one
+            tap. The injection path was verified while at it: touches go
+            straight through `AddMousePosEvent` / `AddMouseButtonEvent` and
+            IME text through `AddInputCharacter`, with no artificial
+            delays.
+          - **Search field reset**: two causes fixed. `AutoSelectAll` is
+            removed from every IME text field - on touch a re-tap selected
+            the whole word so the next letter replaced it. And the agent now
+            ignores the delayed watcher callback of its own programmatic
+            EditText clear (a 400 ms echo window); that echo used to reach
+            the menu as a burst of backspaces, wiping what you typed. The
+            class search uses `InputTextWithHint` with a stable id,
+            persistent buffer and continuous submission; there is no
+            `SetKeyboardFocusHere` anywhere.
+          - **Class list count and phantom scroll**: the row filter now runs
+            first, the counter shows the filtered count (`X of Y` where X is
+            the number of rows actually rendered), and `ImGuiListClipper` is
+            initialized with the filtered size - previously it clipped over
+            the raw size, which reserved scroll height for rows that never
+            rendered (the "748 of 748" / empty-void behavior). Empty names
+            are never rendered.
+          - **Dockable inspector**: the build now uses the imgui
+            `v1.90.4-docking` branch with `ImGuiConfigFlags_DockingEnable`.
+            A `DockSpace` strip sits at the bottom of the main window (the
+            tabs stay at the top and the class list stays visible); every
+            new inspector is queued with `DockBuilderDockWindow` and docks
+            there on its first frame. Dragging its tab out undocks it into
+            a floating window and dragging it back re-docks - native ImGui
+            docking, no manual attach code. A **Fill / Restore** button in
+            the inspector toolbar toggles fullscreen and re-docks on
+            restore. "Open in new window" opens floating without docking.
+            All docking code is guarded with `#ifdef IMGUI_HAS_DOCK`, so the
+            build still compiles if the docking headers are unavailable.
+
 
           ## Changes in this version (r33) - the UI round
 
@@ -9571,7 +9632,7 @@ jobs:
           elif git diff --cached --quiet; then
             echo "Nothing new to commit."
           else
-            git commit -m "ui r33: independent detachable class windows (qid-routed results, no default window, no numbering), EnterReturnsTrue removed (first-letter keyboard bug), dynamic client-side class filter, reflection-based method/field search with name/param/return filters, TreeNode class layout, FindInstancesPopup + CreateInstancePopup with constructor args, family window closes on pick, minimize button, tab strip not a scroll region [skip ci]"
+            git commit -m "touch r34: io touch settings (IsTouchScreen, MouseDragThreshold 15, TouchExtraPadding) for single-tap tabs, AutoSelectAll removed from IME fields plus agent clear-echo guard (search reset fix), class list clipped over filtered rows with filtered counter, imgui v1.90.4-docking with inspectors auto-docked to a bottom DockSpace strip and native undock/undock plus Fill/Restore [skip ci]"
             git push origin HEAD:dev
             echo "Pushed to dev."
           fi
