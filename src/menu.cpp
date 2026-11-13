@@ -1,8 +1,10 @@
-/* Dex-tool menu (r32): R2 s_visible atomic (checkbox regression),
-   R6 parse-once JSON cache, R7 auto-list cs, R8 dump preview,
-   R10 release sweep on class tab close / saved object removal.
-   r31: real JSON tree parser, releaseHandle on object tab close,
-   lock-free frame pump. */
+/* Dex-tool menu (r33): the UI round - independent detachable
+   class windows (per-window qid-routed results), keyboard fix
+   (EnterReturnsTrue removed), dynamic client-side filter,
+   reflection-based method search with name/param/return options,
+   TreeNode class layout, FindInstancesPopup + CreateInstancePopup,
+   family window closes on pick, minimize button, no-scroll strip.
+   r32: FN_ARGS keys, atomic s_visible, module snapshot, cache. */
 #include "menu.h"
 #include "overlay.h"
 #include "frida_bridge.h"
@@ -71,6 +73,16 @@ struct ClassTab {
     int  sel_inst = -1;
     bool inst_wait = false;             /* r29: heap scan in flight */
     bool inst_creat = false;            /* r29: $new in flight      */
+    /* r33 F7/F8: floating class window + constructor picker */
+    bool attached = true;               /* pinned below owner window */
+    int  owner_expl = 0;                /* explorer id, 0 = main     */
+    bool free_init = false;
+    std::vector<MethodSig> ctors;
+    bool ctor_wait = false;
+    int  ctor_sel = -1;
+    char ctor_args[8][128] = {};
+    char ctor_filter[96] = {};
+    char inst_filter[96] = {};
     int  gen = -1;                      /* r23: instance-list generation; part of the editor buffer key */
     int  sub = 0;                       /* 0 Instances 1 Static Fields 2 Methods 3 Fields */
     int  expanded = -1;                 /* index into methods, -1 none   */
@@ -127,6 +139,17 @@ struct ExplorerWin {
     bool case_sensitive = false;
     int  filter_by = 0;           /* 0 Class 1 Method 2 Field        */
     bool advanced = false;        /* string search inside class code */
+    /* r33: independent windows - every window owns its results */
+    long qid = -1;                /* the search this window sent     */
+    bool wait = false;
+    std::vector<std::string> res; /* this window's own class rows    */
+    long shown = 0, total = 0;
+    bool detached = false;        /* floated out of the tab bar      */
+    bool free_init = false;
+    ImVec2 free_pos{0, 0}, free_size{0, 0};
+    ImVec4 self_rect{0, 0, 0, 0}; /* rect while floating (attach)    */
+    /* r33 F5: method-search options */
+    char mname[96] = {}, ptyp[96] = {}, rtyp[96] = {};
 };
 static std::deque<ExplorerWin> s_explorers;
 static std::vector<std::string> s_families;   /* com.game, com.android... */
@@ -167,24 +190,15 @@ static char s_hcls[200]={}, s_hmth[128]={}, s_hcode[4096]={};
 static int  s_hmode=0, s_hedit=-1;
 static char s_tcls[200]={}, s_tmth[128]={};
 static char s_script[16384]="// Frida JS - Java, send, console are available\n";
-static char s_search[160]="";
-static int  s_search_mode = 0;
-static bool s_search_sys  = false;
-static bool s_search_cs   = false;
+static bool s_search_sys  = false;   /* r33: only the system toggle
+                                        stays global; every class
+                                        window owns its filter, its
+                                        results and its qid */
 static char s_hsrc[16384] = "";
 static char s_hsrc_note[200] = "";
 static bool s_hsrc_have = false;
 static int  s_mon_sel = -1;
-static std::vector<std::string> s_search_res;
-static bool s_cls_auto_done=false;   /* full class list requested once
-                                        per agent session */
-static int  s_search_total=0, s_search_shown=0;
-static bool s_search_wait=false;
-static int  s_search_seq=0, s_search_qid=-1;
-static bool s_search_page0=false;    /* r23: set when a NEW qid is sent;
-                                        the first page OF THAT QID clears
-                                        the list - stale pages of an older
-                                        qid are dropped, not mixed in */
+static int  s_search_seq=0;
 static std::string s_next_tab;           /* top tab to select */
 static bool    s_fullscreen = false;
 static ImVec2  s_fs_last_pos(0, 0), s_fs_last_size(0, 0);
@@ -222,8 +236,8 @@ static bool objtab_open(long h) {   /* r32 R10: handle still on screen? */
     return false;
 }
 static long s_objfocus = -1;     /* handle of the tab to select       */
-struct SavedObj { std::string cls, str; long handle = -1; };
-static std::vector<SavedObj> s_saved;
+/* r33 F8: SavedObj is gone - the Save option was removed per
+   request (it did not work and was not needed). */
 static bool  s_dump_wait = false;
 static bool  s_dump_done = false;
 static long  s_dump_count = 0;
@@ -559,9 +573,11 @@ static std::string short_name(const std::string& cls) {
     return (d == std::string::npos) ? cls : cls.substr(d + 1);
 }
 static std::string win_title(const ClassTab& c) {
-    return short_name(c.cname) + "##t" + std::to_string(c.uid);
+    /* r33: ### keeps the window id stable across renames */
+    return short_name(c.cname) + "###cw" + std::to_string(c.uid);
 }
-static ClassTab* open_inspector(const std::string& name, bool switch_tab) {
+static ClassTab* open_inspector(const std::string& name, bool switch_tab,
+                                int owner_id = 0) {
     if (name.empty()) return nullptr;
     ClassTab* out = nullptr;
     MLK();
@@ -572,6 +588,7 @@ static ClassTab* open_inspector(const std::string& name, bool switch_tab) {
         nt.cname   = name;
         nt.uid     = ++s_tab_uid_seq;
         nt.waiting = true;
+        nt.owner_expl = owner_id;   /* r33 F7: attach below the opener */
         s_classes.push_back(nt);
         out = &s_classes.back();
     }
@@ -861,7 +878,10 @@ void menu_init() {
         std::string ty = jtype(j);
         if (ty == "ready") {
             s_agent_ready = true;
-            s_cls_auto_done = false;  /* new agent: re-list classes */
+            /* r33: a new agent session re-lists in every open class
+               window (each window owns its qid now) */
+            for (auto& x : s_explorers)
+                x.qid = -1;
             snprintf(s_agent_note, sizeof(s_agent_note), "%s",
                      jstr(j, "msg").c_str());
             s_pkg = jstr(j, "pkg");
@@ -977,20 +997,23 @@ void menu_init() {
                 }
             }
         } else if (ty == "classList") {
+            /* r33 F6: results are routed to the window that sent
+               the qid - every class window has its own list now */
             long qid  = jnum(j, "qid");
             long page = jnum(j, "page");
-            if (qid == (long)s_search_qid) {
-                if (!s_search_page0) {
-                    s_search_res.clear();
-                    s_search_page0 = true;
-                }
-                for (auto& c : jarr(j, "classes")) s_search_res.push_back(c);
-                s_search_total = (int)jnum(j, "total");
-                s_search_shown = (int)jnum(j, "shown");
+            ExplorerWin* ew = nullptr;
+            for (auto& x : s_explorers)
+                if (x.qid == qid) { ew = &x; break; }
+            if (ew) {
+                if (page == 0) ew->res.clear();
+                for (auto& cc : jarr(j, "classes"))
+                    ew->res.push_back(cc);
+                ew->total = jnum(j, "total");
+                ew->shown = jnum(j, "shown");
                 if (page + 1 >= jnum(j, "pages")) {
-                    s_search_wait = false;
+                    ew->wait = false;
                     s_families.clear();
-                    for (auto& n : s_search_res) {
+                    for (auto& n : ew->res) {
                         std::string f = family_of(n);
                         if (!f.empty() &&
                             std::find(s_families.begin(), s_families.end(),
@@ -1048,6 +1071,19 @@ void menu_init() {
             }
             push_console("[finder]", "created " + jstr(j, "class") +
                          " -> handle " + std::to_string(in.handle));
+        } else if (ty == "ctorList") {
+            /* r33 F8: constructor list for CreateInstancePopup */
+            ClassTab* cc = find_tab(jstr(j, "class"));
+            if (cc) {
+                cc->ctors.clear();
+                cc->ctor_wait = false;
+                for (auto& o : jobjarr(j, "ctors")) {
+                    MethodSig m;
+                    m.name   = jstr(o, "name");
+                    m.params = jstr(o, "params");
+                    cc->ctors.push_back(m);
+                }
+            }
         } else if (ty == "callResult") {
             ClassTab* c = find_tab(jstr(j, "class"));
             if (c) {
@@ -1424,6 +1460,7 @@ static void tab_tracer() {
     ImGui::EndChild();
     mark_scroll_item(s_lst_scroll);
     if (ImGui::CollapsingHeader("Manual add")) {
+        ImGui::PushItemWidth(-FLT_MIN);   /* r33 F9 */
         static const char* modes[] = {"Java(JS)", "Smali", "Nop (auto)"};
         if (s_hedit >= 0 && s_hedit < (int)s_hooks.size()) {
             HookRow& e = s_hooks[s_hedit];
@@ -1498,6 +1535,7 @@ static void tab_tracer() {
             MULK();
             s_tcls[0] = s_tmth[0] = 0;
         }
+        ImGui::PopItemWidth();   /* r33 F9 */
     }
 }
 static void tab_dumper() {
@@ -1695,26 +1733,32 @@ static void class_tab_body(ClassTab& c);
 static void of_deliver(ClassTab* dst, long handle,
                        const std::string& str);
 static std::string s_dup_req;
-static void run_search(const char* text, int mode, bool cs) {
+static void run_search(ExplorerWin& e) {
     MLK();
-    snprintf(s_search, sizeof(s_search), "%s", text);
-    s_search_mode = mode;
-    s_search_cs   = cs;
-    s_search_wait = true;
+    e.wait = true;
     int sqid = ++s_search_seq;
-    s_search_qid   = sqid;     /* r23: generation armed at SEND time */
-    s_search_page0 = false;
+    e.qid = sqid;              /* r23/r33: generation armed at SEND time */
     MULK();
-    std::string a = "{\"filter\":\"" + jesc(s_search)
+    std::string a = "{\"filter\":\"" + jesc(e.search)
                    + "\",\"qid\":" + std::to_string(sqid)
-                   + ",\"mode\":" + std::to_string(mode)
+                   + ",\"mode\":" +
+                   std::to_string(e.advanced ? 3 : e.filter_by)
                    + ",\"sys\":" + (s_search_sys ? "true" : "false")
-                   + ",\"cs\":" + (cs ? "true" : "false") + "}";
+                   + ",\"cs\":" + (e.case_sensitive ? "true" : "false");
+    if (e.filter_by == 1 && !e.advanced) {
+        /* r33 F5: method-search options */
+        a += ",\"mn\":\"" + jesc(e.mname) + "\",\"pt\":\"" +
+             jesc(e.ptyp) + "\",\"rt\":\"" + jesc(e.rtyp) + "\"}";
+    } else {
+        a += "}";
+    }
     post_rpc("listLoadedClasses", a);
 }
 static void inst_view(ClassTab& c) {
-    /* r29: the single place to find / create / pick instances (the
-       Object Finder popup and the Inspector button are merged in) */
+    /* r33 F8/F21-26: instances live in popups. FindInstancesPopup:
+       filter box + scrollable list, closes when a row is picked.
+       CreateInstancePopup: constructor list + search + parameter
+       inputs. The manual text box and the Save buttons are gone. */
     MLK();
     bool picking = (s_arg_uid >= 0 && s_arg_cls[0] &&
                     c.cname == s_arg_cls);
@@ -1722,68 +1766,116 @@ static void inst_view(ClassTab& c) {
         ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1),
                            "picking an instance for arg%d (%s)",
                            s_arg_idx, s_arg_typ);
-    if (ImGui::Button("Find instances##fi")) {
+    ImGui::PushItemWidth(-FLT_MIN);
+    if (ImGui::Button("Find instances##fi", ImVec2(-FLT_MIN, 0)))
+        ImGui::OpenPopup("FindInstancesPopup");
+    if (ImGui::Button("Create instance##ci", ImVec2(-FLT_MIN, 0))) {
         std::string a = "{\"class\":\"" + jesc(c.cname) + "\"}";
-        post_rpc("listInstances", a);
-        c.inst_wait = true;
+        post_rpc("listConstructors", a);
+        c.ctor_wait = true;
+        c.ctor_sel  = -1;
+        ImGui::OpenPopup("CreateInstancePopup");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Create instance##ci")) {
-        post_rpc("createInstance",
-                 "{\"class\":\"" + jesc(c.cname) + "\"}");
-        c.inst_creat = true;
-    }
-    ImGui::SameLine();
+    ImGui::PopItemWidth();
     if (picking && ImGui::SmallButton("Cancel pick##cp")) {
         s_arg_uid = -1; s_arg_idx = -1; s_arg_cls[0] = 0;
     }
-    static char s_man[128] = {};      /* manual handle/value entry */
-    ImGui::SetNextItemWidth(200);
-    ime_textfield("##ivman", s_man, sizeof(s_man));
-    ImGui::SameLine();
-    if (ImGui::Button("Use##ivman") && s_man[0]) {
-        bool used = false;
-        for (auto& cc : s_classes)
-            if (picking && cc.uid == s_arg_uid && s_arg_idx >= 0 &&
-                s_arg_idx < 8) {
-                snprintf(cc.call_args[s_arg_idx],
-                         sizeof(cc.call_args[0]), "%s", s_man);
-                used = true;
-                break;
-            }
-        if (!used) c.of_note = std::string("manual: ") + s_man;
-        if (picking) { s_arg_uid = -1; s_arg_idx = -1; s_arg_cls[0] = 0; }
-        s_man[0] = 0;
-    }
-    ImGui::TextDisabled("tap [0x..] for an object tab; click a row to"
-                        " select it");
     if (c.inst_wait)  ImGui::TextDisabled("(scanning the heap...)");
     if (c.inst_creat) ImGui::TextDisabled("(constructing...)");
-    for (int i = 0; i < (int)c.instances.size(); i++) {
-        ImGui::PushID(i);
-        InstInfo& in = c.instances[i];
-        bool sel = (c.sel_inst == i);
-        char lbl[256];
-        snprintf(lbl, sizeof(lbl), "#%d %s", i, in.str.c_str());
-        if (ImGui::Selectable(lbl, sel))
-            of_deliver(picking ? nullptr : &c, in.handle, in.str);
-        ImGui::SameLine();
-        char ob[48];
-        snprintf(ob, sizeof(ob), "[0x%lx]##ot", in.handle);
-        if (ImGui::SmallButton(ob))
-            open_obj_tab(c.cname, in.handle, in.str);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Save##ivsv")) {
-            bool have = false;
-            for (auto& sv : s_saved)
-                if (sv.handle == in.handle) { have = true; break; }
-            if (!have)
-                s_saved.push_back({c.cname, in.str, in.handle});
+    if (ImGui::BeginPopup("FindInstancesPopup")) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ime_textfield("Filter instances...", c.inst_filter,
+                      sizeof(c.inst_filter));
+        ImGui::BeginChild("finstl", ImVec2(0, fit_h(.42f, 150)), true);
+        int vis = 0;
+        for (int i = 0; i < (int)c.instances.size(); i++) {
+            InstInfo& in = c.instances[i];
+            if (c.inst_filter[0] &&
+                !contains_ci(in.str, c.inst_filter)) continue;
+            vis++;
+            ImGui::PushID(8800 + i);
+            char lbl[256];
+            snprintf(lbl, sizeof(lbl), "#%d %s", i, in.str.c_str());
+            bool sel = (c.sel_inst == i);
+            if (ImGui::Selectable(lbl, sel)) {
+                of_deliver(picking ? nullptr : &c, in.handle, in.str);
+                ImGui::CloseCurrentPopup();   /* r33: close on pick */
+            }
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 16.f);
+            if (ImGui::SmallButton("o"))    /* open its object tab */
+                open_obj_tab(c.cname, in.handle, in.str);
+            ImGui::PopID();
         }
-        ImGui::PopID();
+        if (!vis && !c.inst_wait)
+            ImGui::TextDisabled(c.instances.empty()
+                ? "no instances found yet"
+                : "nothing matches the filter");
+        ImGui::EndChild();
+        ImGui::EndPopup();
     }
-    if (c.instances.empty() && !c.inst_wait && !c.inst_creat)
-        ImGui::TextDisabled("no instances yet - tap Find instances");
+    if (ImGui::BeginPopup("CreateInstancePopup")) {
+        if (c.ctor_wait) {
+            ImGui::TextDisabled("(fetching constructors...)");
+        } else if (c.ctors.empty()) {
+            ImGui::TextDisabled("no constructors (class unloaded?)");
+        } else {
+            /* r33 F8: search box for the constructor parameters */
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ime_textfield("Search constructors...", c.ctor_filter,
+                          sizeof(c.ctor_filter));
+            ImGui::BeginChild("ctorsl", ImVec2(0, 110), true);
+            for (int k = 0; k < (int)c.ctors.size(); k++) {
+                if (c.ctor_filter[0] &&
+                    !contains_ci(c.ctors[k].params, c.ctor_filter) &&
+                    !contains_ci(c.ctors[k].name, c.ctor_filter))
+                    continue;
+                ImGui::PushID(8900 + k);
+                char slbl[320];
+                snprintf(slbl, sizeof(slbl), "%s(%s)",
+                         c.ctors[k].name.c_str(),
+                         c.ctors[k].params.c_str());
+                if (ImGui::Selectable(slbl, c.ctor_sel == k)) {
+                    c.ctor_sel = k;
+                    for (int a2 = 0; a2 < 8; a2++) c.ctor_args[a2][0] = 0;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+            if (c.ctor_sel >= 0 && c.ctor_sel < (int)c.ctors.size()) {
+                ImGui::Separator();
+                std::vector<std::string> ps =
+                    split_params(c.ctors[c.ctor_sel].params);
+                if ((int)ps.size() > 8) ps.resize(8);
+                ImGui::TextDisabled("arguments for constructor %d:",
+                                    c.ctor_sel + 1);
+                ImGui::PushItemWidth(-FLT_MIN);
+                for (int k = 0; k < (int)ps.size(); k++) {
+                    ImGui::PushID(9100 + k);
+                    char al[96];
+                    snprintf(al, sizeof(al), "arg%d (%s)", k,
+                             ps[k].c_str());
+                    ime_textfield(al, c.ctor_args[k],
+                                  sizeof(c.ctor_args[0]));
+                    ImGui::PopID();
+                }
+                ImGui::PopItemWidth();
+                if (ImGui::Button("Create", ImVec2(-FLT_MIN, 0))) {
+                    std::string a = "{\"class\":\"" + jesc(c.cname)
+                                  + "\",\"args\":[";
+                    for (int k = 0; k < (int)ps.size(); k++) {
+                        if (k) a += ",";
+                        a += "\"" + jesc(c.ctor_args[k]) + "\"";
+                    }
+                    a += "]}";
+                    post_rpc("createInstance", a);
+                    c.inst_creat = true;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::TextDisabled("tap a row to select it; [o] opens its object tab");
     if (c.sel_inst >= 0 && c.sel_inst < (int)c.instances.size()) {
         InstInfo& in = c.instances[c.sel_inst];
         ImGui::Separator();
@@ -1804,68 +1896,26 @@ static void inst_view(ClassTab& c) {
                 }
             }
         }
+        ImGui::PushItemWidth(-FLT_MIN);
         for (int f = 0; f < (int)in.fields.size() && f < 32; f++) {
             FieldInfo& fi = in.fields[f];
             ImGui::PushID(1000 + f);
             ImGui::Text("%s (%s)", fi.name.c_str(), fi.type.c_str());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Track##ft")) {
-                std::string a = "{\"class\":\"" + jesc(c.cname)
-                              + "\",\"field\":\"" + jesc(fi.name) + "\"}";
-                post_rpc("trackField", a);
-                s_trackers.push_back({c.cname + "." + fi.name, true, {}});
-            }
-            ImGui::Text("  value:");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(140);
             ime_textfield("##fv", nv[f], sizeof(nv[f]));
-            ImGui::SameLine();
-            if (ImGui::Button("Set##fs")) {
-                long h = in.handle;
+            if (ImGui::Button("Patch##nvp", ImVec2(-FLT_MIN, 0))) {
                 std::string a = "{\"class\":\"" + jesc(c.cname)
-                              + "\",\"handle\":" + std::to_string(h)
-                              + ",\"index\":" + std::to_string(c.sel_inst)
+                              + "\",\"handle\":" +
+                              std::to_string(in.handle)
                               + ",\"field\":\"" + jesc(fi.name)
                               + "\",\"value\":\"" + jesc(nv[f]) + "\"}";
                 post_rpc("setInstanceField", a);
             }
             ImGui::PopID();
         }
+        ImGui::PopItemWidth();
     }
-    /* r29: Saved Objects moved here from the Object Finder */
-    if (ImGui::CollapsingHeader("Saved Objects")) {
-        for (int k = 0; k < (int)s_saved.size(); ) {
-            ImGui::PushID(9500 + k);
-            SavedObj& sv = s_saved[k];
-            char lbl2[280];
-            snprintf(lbl2, sizeof(lbl2), "%s [0x%lx]",
-                     short_name(sv.cls).c_str(), sv.handle);
-            if (ImGui::Button(lbl2, ImVec2(
-                    ImGui::GetContentRegionAvail().x - 70.f, 0)))
-                of_deliver(picking ? nullptr : &c,
-                           sv.handle, sv.str);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Remove")) {
-                /* r32 R10: free the retained instance too */
-                if (sv.handle > 0 && !objtab_open(sv.handle)) {
-                    std::string a = "{\"handle\":" +
-                                    std::to_string(sv.handle) + "}";
-                    post_rpc("releaseHandle", a);
-                }
-                s_saved.erase(s_saved.begin() + k);
-                ImGui::PopID();
-                continue;
-            }
-            ImGui::PopID();
-            k++;
-        }
-        if (s_saved.empty())
-            ImGui::TextDisabled("Nothing...");
-    }
-    mark_scroll_item(s_lst_scroll);
     MULK();
 }
-
 static void static_fields_view(ClassTab& c) {
     MLK();
     if (ImGui::SmallButton("Read static values"))
@@ -1947,11 +1997,11 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
         char lb[96];
         snprintf(lb, sizeof(lb), "arg%d (%s)", k, ps[k].c_str());
         if (prim) {
-            ImGui::SetNextItemWidth(210);
+            ImGui::SetNextItemWidth(-FLT_MIN);   /* r33 F9 */
             ime_textfield(lb, c.call_args[k], sizeof(c.call_args[k]));
         } else {
             ImGui::Text("%s", lb);
-            ImGui::SetNextItemWidth(-52.f);
+            ImGui::SetNextItemWidth(-FLT_MIN);   /* r33 F9 */
             std::string prev = c.call_args[k][0] ?
                 std::string(c.call_args[k]) : "(pick instance)";
             if (ImGui::BeginCombo("##co", prev.c_str())) {
@@ -2003,7 +2053,7 @@ static void caller_tab(ClassTab& c, const MethodSig& m) {
                     ImGui::TextDisabled("no instances - use Find / Create");
                 ImGui::EndCombo();
             }
-            ImGui::SetNextItemWidth(-52.f);
+            ImGui::SetNextItemWidth(-FLT_MIN);   /* r33 F9 */
             ime_textfield("##cov", c.call_args[k], sizeof(c.call_args[k]));
         }
         ImGui::PopID();
@@ -2657,6 +2707,7 @@ static void families_window() {
         if (ImGui::Selectable(famc[f], sel)) {
             e->family  = f;
             e->all_fam = false;
+            s_fam_open = false;   /* r33 F3: close after picking one */
         }
     }
     if (nf == 0)
@@ -2709,9 +2760,9 @@ static void fm_window() {
     ImGui::End();
 }
 static void explorer_body(ExplorerWin& e) {
-    bool do_search = false;
-    if (s_families.empty() && !s_search_res.empty() && !s_search_wait) {
-        for (auto& n : s_search_res) {
+    MLK();
+    if (s_families.empty() && !e.res.empty() && !e.wait) {
+        for (auto& n : e.res) {
             std::string f = family_of(n);
             if (!f.empty() &&
                 std::find(s_families.begin(), s_families.end(), f)
@@ -2738,13 +2789,16 @@ static void explorer_body(ExplorerWin& e) {
     }
     ImGui::SameLine();
     ImGui::Checkbox("All", &e.all_fam);
+    /* r33 F4: no EnterReturnsTrue - the r24 enter-clear path used
+       to drop every letter after the first and clear the box on
+       re-tap. Without the flag this box behaves like the family
+       search box (which always worked). */
     ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 84.f);
-    do_search |= ime_textfield("##esearch", e.search,
-                               sizeof(e.search),
-                               ImGuiInputTextFlags_EnterReturnsTrue);
+    ime_textfield("##esearch", e.search, sizeof(e.search));
     ImGui::PopItemWidth();
     ImGui::SameLine();
-    if (ImGui::Button("Filter")) do_search = true;
+    bool do_query = false;
+    if (ImGui::Button("Filter")) do_query = true;
     ImGui::PushStyleColor(ImGuiCol_Button,
                           ImVec4(0.94f, 0.44f, 0.66f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
@@ -2754,10 +2808,9 @@ static void explorer_body(ExplorerWin& e) {
     if (ImGui::Button("Options")) ImGui::OpenPopup("explOpts");
     ImGui::PopStyleColor(3);
     ImGui::SameLine();
-    if (s_search_wait) ImGui::TextDisabled("(listing...)");
+    if (e.wait) ImGui::TextDisabled("(listing...)");
     else ImGui::TextDisabled("%ld of %ld loaded classes",
-                             (long)s_search_shown,
-                             (long)s_search_total);
+                             e.shown, e.total);
     if (ImGui::BeginPopup("explOpts")) {
         ImGui::Checkbox("Case sensitive", &e.case_sensitive);
         ImGui::TextDisabled("Filter by:");
@@ -2772,38 +2825,93 @@ static void explorer_body(ExplorerWin& e) {
                 "Code text (advanced: string inside class code)",
                 fb == 3))
             e.advanced = true;
+        if (e.filter_by == 1 && !e.advanced) {
+            /* r33 F5: method name / parameter type / return type */
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ime_textfield("Method name", e.mname, sizeof(e.mname));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ime_textfield("Parameter type", e.ptyp, sizeof(e.ptyp));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ime_textfield("Return type", e.rtyp, sizeof(e.rtyp));
+        }
         bool sys = s_search_sys;
         if (ImGui::Checkbox("System classes", &sys))
             s_search_sys = sys;
         ImGui::EndPopup();
     }
+    if (do_query || (s_agent_ready && e.qid < 0 && !e.wait)) {
+        if (!do_query) e.search[0] = 0;  /* r33 F6: auto-list per window */
+        run_search(e);
+    }
     ImGui::Separator();
+    /* r33 F5: dynamic client-side filter - rows shrink as you type,
+       exactly like the family search box */
     ImGui::BeginChild("explst", ImVec2(0, 0), true);
     ImGuiListClipper clip;
-    clip.Begin((int)s_search_res.size());
+    clip.Begin((int)e.res.size());
     while (clip.Step()) {
         for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) {
-            const std::string& nm = s_search_res[k];
+            const std::string& nm = e.res[k];
+            if (e.search[0]) {
+                if (e.case_sensitive) {
+                    if (!strstr(nm.c_str(), e.search)) continue;
+                } else if (!contains_ci(nm, e.search)) continue;
+            }
             if (!e.all_fam && e.family < (int)s_families.size() &&
                 family_of(nm) != s_families[e.family]) continue;
             ImGui::PushID(k);
             if (ImGui::Selectable(nm.c_str()))
-                open_inspector(nm, false);
+                open_inspector(nm, false, e.id);
+            /* r33 F7: long-press a row -> new window / copy name */
+            bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            static bool row_wheel = false;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                row_wheel = false;
+            ImGuiIO& pio = ImGui::GetIO();
+            if (pio.MouseWheel != 0.f || pio.MouseWheelH != 0.f)
+                row_wheel = true;
+            bool lng = ImGui::IsItemHovered() &&
+                       ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+                       !row_wheel &&
+                       !ImGui::IsMouseDragging(ImGuiMouseButton_Left,
+                                               10.f) &&
+                       pio.MouseDownDuration[ImGuiMouseButton_Left] >
+                           0.55f;
+            if (rclk || lng) ImGui::OpenPopup("clsrow");
+            if (ImGui::BeginPopup("clsrow")) {
+                if (ImGui::MenuItem("Open in new window")) {
+                    ClassTab* nt2 = open_inspector(nm, false, e.id);
+                    if (nt2) {
+                        nt2->attached  = false;
+                        nt2->free_init = false;
+                    }
+                    ImGui::CloseCurrentPopup();
+                }
+                if (ImGui::MenuItem("Copy class name"))
+                    copy_text("class", nm);
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 16.f);
+            if (ImGui::SmallButton("C"))    /* copy the class name */
+                copy_text("class", nm);
             ImGui::PopID();
         }
     }
     ImGui::EndChild();
     mark_scroll_item(s_lst_scroll);
-    if (do_search)
-        run_search(e.search, e.advanced ? 3 : e.filter_by,
-                   e.case_sensitive);
+    MULK();
 }
 static void class_tab_body(ClassTab& c) {
-    ImGui::PushTextWrapPos();
-    ImGui::TextUnformatted(c.cname.c_str());
-    ImGui::PopTextWrapPos();
+    /* r33 F10: the class name is a root TreeNode, the categories
+       are sub-nodes - the horizontal sub-tab bar is gone. Action
+       buttons live in the toolbar row, separated by Separator. */
+    MLK();
     if (ImGui::SmallButton("Refresh##ct"))
-        open_inspector(c.cname, false);
+        open_inspector(c.cname, false, c.owner_expl);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy class##ct"))
+        copy_text("class", c.cname);
     ImGui::SameLine();
     if (c.of_handle >= 0)
         ImGui::TextColored(ImVec4(0, 1, 0, 1), "%s",
@@ -2812,52 +2920,45 @@ static void class_tab_body(ClassTab& c) {
         ImGui::TextDisabled(c.waiting ? "(waiting for agent...)"
                                       : "(no data - tap Refresh)");
     ImGui::Separator();
-    static const char* subs[] = {"Instances", "Static Fields",
-                                 "Methods", "Fields"};
-    char sl[40];
-    if (ImGui::BeginTabBar("clssub")) {
-        for (int si = 0; si < 4; si++) {
-            snprintf(sl, sizeof(sl), "%s##cs%d", subs[si], si);
-            if (ImGui::BeginTabItem(sl)) {
-                c.sub = si;
-                if      (si == 0) inst_view(c);
-                else if (si == 1) static_fields_view(c);
-                else if (si == 2) methods_view(c);
-                else              fields_view(c);
-                ImGui::EndTabItem();
-            }
+    char rl[400];
+    snprintf(rl, sizeof(rl), "%s###root%d",
+             short_name(c.cname).c_str(), c.uid);
+    if (ImGui::TreeNodeEx(rl, ImGuiTreeNodeFlags_DefaultOpen |
+                             ImGuiTreeNodeFlags_SpanAvailWidth |
+                             ImGuiTreeNodeFlags_FramePadding)) {
+        ImGui::Indent();          /* r33 F10-3: nested hierarchy */
+        if (ImGui::TreeNodeEx("Instances",
+                              ImGuiTreeNodeFlags_SpanAvailWidth)) {
+            inst_view(c);
+            ImGui::TreePop();
         }
-        ImGui::EndTabBar();
+        if (ImGui::TreeNodeEx("Static Fields",
+                              ImGuiTreeNodeFlags_SpanAvailWidth)) {
+            static_fields_view(c);
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNodeEx("Methods",
+                              ImGuiTreeNodeFlags_SpanAvailWidth |
+                              ImGuiTreeNodeFlags_DefaultOpen)) {
+            methods_view(c);
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNodeEx("Fields",
+                              ImGuiTreeNodeFlags_SpanAvailWidth)) {
+            fields_view(c);
+            ImGui::TreePop();
+        }
+        ImGui::Unindent();
+        ImGui::TreePop();
     }
+    MULK();
 }
 static void tab_tools() {
+    /* r33 F6: no default class window and no automatic listing any
+       more - the "+" button opens a window (which lists on its
+       own), X closes it, and windows are independent of each other */
     MLK();
-    bool agent_ready = s_agent_ready;
-    bool need_auto   = !s_cls_auto_done && !s_search_wait &&
-                       s_search_res.empty();
-    int  qid         = 0;
-    if (agent_ready && need_auto) {
-        s_cls_auto_done = true;
-        s_search_wait   = true;
-        qid = ++s_search_seq;
-        s_search_qid   = qid;      /* r23: generation armed at SEND time */
-        s_search_page0 = false;
-    }
-    bool want_expl = s_explorers.empty();
     MULK();
-    if (want_expl) {
-        ExplorerWin e{};
-        e.id = ++s_expl_seq;
-        MLK();
-        s_explorers.push_back(e);
-        MULK();
-    }
-    if (qid)
-        post_rpc("listLoadedClasses",   /* r32 R7: send cs like run_search */
-                 "{\"filter\":\"\",\"qid\":" + std::to_string(qid)
-                 + ",\"mode\":0"
-                 + ",\"cs\":" + (s_search_cs ? "true" : "false")
-                 + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}");
     if (ImGui::Checkbox("Fullscreen", &s_fullscreen)) {
         if (s_fullscreen) {
             s_fs_last_pos  = ImGui::GetWindowPos();
@@ -2885,17 +2986,14 @@ static void tab_tools() {
                 s_focus_expl = e.id;
             }
         }
-        int exi = 0;
         for (int i = 0; i < (int)s_explorers.size(); ) {
             ExplorerWin& e = s_explorers[i];
+            if (e.detached) { i++; continue; }   /* floats elsewhere */
             bool open = true;
             char lbl[192];
-            if (e.search[0])
-                snprintf(lbl, sizeof(lbl), "%s", e.search);
-            else if (exi == 0)
-                snprintf(lbl, sizeof(lbl), "Classes");
-            else
-                snprintf(lbl, sizeof(lbl), "Classes [%d]", e.id);
+            /* r33 F6: no numbering - the id is a hidden suffix */
+            snprintf(lbl, sizeof(lbl), "%s##x%d",
+                     e.search[0] ? e.search : "Classes", e.id);
             ImGuiTabItemFlags fl = 0;
             if (s_focus_expl == e.id) {
                 fl |= ImGuiTabItemFlags_SetSelected;
@@ -2903,58 +3001,57 @@ static void tab_tools() {
             }
             if (ImGui::BeginTabItem(lbl, &open, fl)) {
                 explorer_body(e);
+                {
+                    /* r33 F6: long-press the tab strip (0.6s, then
+                       drag >= 14px) to float this window out of the
+                       tab bar */
+                    ImGuiIO& tio = ImGui::GetIO();
+                    static float lp_t0 = 0;
+                    static bool  lp_on = false;
+                    static int   lp_id = 0;
+                    static ImVec2 lp_p0(0, 0);
+                    ImVec2 wpos = ImGui::GetWindowPos();
+                    float band = ImGui::GetFrameHeight() * 2.f;
+                    bool in_strip = tio.MousePos.y >= wpos.y &&
+                                    tio.MousePos.y <= wpos.y + band;
+                    if (in_strip && tio.MouseDown[0] &&
+                        (!lp_on || lp_id != e.id)) {
+                        lp_on = true;
+                        lp_id = e.id;
+                        lp_t0 = (float)ImGui::GetTime();
+                        lp_p0 = tio.MousePos;
+                    }
+                    if (!tio.MouseDown[0]) lp_on = false;
+                    if (lp_on && lp_id == e.id && in_strip &&
+                        ImGui::GetTime() - lp_t0 > 0.6f) {
+                        float dx = tio.MousePos.x - lp_p0.x;
+                        float dy = tio.MousePos.y - lp_p0.y;
+                        if (dx * dx + dy * dy > 196.f) {
+                            MLK();
+                            e.detached  = true;
+                            e.free_init = false;
+                            MULK();
+                            lp_on = false;
+                        }
+                    }
+                }
                 ImGui::EndTabItem();
             }
             if (!open) {
                 s_explorers.erase(s_explorers.begin() + i);
                 continue;   /* no i++ - the next tab shifted in */
             }
-            exi++;
-            i++;
-        }
-        if (s_explorers.empty()) {
-            ExplorerWin e{};
-            e.id = ++s_expl_seq;
-            s_explorers.push_back(e);
-        }
-        for (int i = 0; i < (int)s_classes.size(); ) {
-            ClassTab& c = s_classes[i];
-            bool open = true;
-            std::string lbl = win_title(c);
-            ImGuiTabItemFlags fl = 0;
-            if (s_focus_win == lbl) {
-                fl |= ImGuiTabItemFlags_SetSelected;
-                s_focus_win.clear();
-            }
-            if (ImGui::BeginTabItem(lbl.c_str(), &open, fl)) {
-                class_tab_body(c);
-                ImGui::EndTabItem();
-            }
-            if (!open) {
-                /* r32 R10: release the instances this tab retained -
-                   the LRU used to pin them until 200 newer scans.
-                   Handles with an open object tab stay. */
-                for (auto& in : c.instances) {
-                    if (in.handle > 0 && !objtab_open(in.handle)) {
-                        std::string a = "{\"handle\":" +
-                                        std::to_string(in.handle) + "}";
-                        post_rpc("releaseHandle", a);
-                    }
-                }
-                s_classes.erase(s_classes.begin() + i);
-                continue;
-            }
             i++;
         }
         if (!s_dup_req.empty()) {
-            ClassTab nt{};
-            nt.cname   = s_dup_req;
-            nt.uid     = ++s_tab_uid_seq;
-            nt.waiting = true;
-            s_classes.push_back(nt);
-            s_focus_win = win_title(s_classes.back());
-            std::string a = "{\"class\":\"" + jesc(s_dup_req) + "\"}";
-            post_rpc("openClass", a);
+            /* r33: "Open in new tab" now floats its own window */
+            ClassTab* nt2 = open_inspector(s_dup_req, false);
+            if (nt2) {
+                MLK();
+                nt2->attached  = false;
+                nt2->free_init = false;
+                MULK();
+            }
             s_dup_req.clear();
         }
         for (int i = 0; i < (int)s_objtabs.size(); ) {
@@ -3113,6 +3210,193 @@ static void draw_resize_handles() {
         s_rz = -1;
     }
 }
+/* r33: attach targets - a detached class window can pin itself
+   below the main menu or below any floating class-list window */
+static ImVec4 s_rect_main(0, 0, 0, 0);
+static ImVec4 owner_rect_of(int owner_id) {
+    if (owner_id != 0) {
+        for (auto& x : s_explorers)
+            if (x.id == owner_id && x.self_rect.z > 0)
+                return x.self_rect;
+    }
+    return s_rect_main;
+}
+static void explorer_windows() {
+    /* r33 F6: detached class-list windows float free; long-press
+       the title strip to attach the window back to the main menu */
+    for (int i = 0; i < (int)s_explorers.size(); ) {
+        ExplorerWin& e = s_explorers[i];
+        if (!e.detached) { i++; continue; }
+        char ttl[192];
+        snprintf(ttl, sizeof(ttl), "%s###ex%d",
+                 e.search[0] ? e.search : "Classes", e.id);
+        if (!e.free_init) {
+            ImGui::SetNextWindowPos(ImVec2(70, 130),
+                                    ImGuiCond_Appearing);
+            ImGui::SetNextWindowSize(ImVec2(420, 420),
+                                     ImGuiCond_Appearing);
+            e.free_init = true;
+        }
+        ImGui::SetNextWindowSizeConstraints(ImVec2(260, 200),
+                                            ImVec2(1400, 1400));
+        bool open = true;
+        if (!ImGui::Begin(ttl, &open)) {
+            ImGui::End();
+            i++;
+            continue;
+        }
+        explorer_body(e);
+        e.self_rect = ImVec4(
+            ImGui::GetWindowPos().x, ImGui::GetWindowPos().y,
+            ImGui::GetWindowSize().x, ImGui::GetWindowSize().y);
+        ImGuiIO& io = ImGui::GetIO();
+        ImVec2 wpos = ImGui::GetWindowPos();
+        float band = ImGui::GetFrameHeight();
+        bool in_title = ImGui::IsWindowHovered() &&
+                        io.MousePos.y >= wpos.y &&
+                        io.MousePos.y <= wpos.y + band;
+        static float t_t0 = 0;
+        static bool  t_on = false;
+        static int   t_id = 0;
+        if (in_title && io.MouseDown[0] && (!t_on || t_id != e.id)) {
+            t_on = true;
+            t_id = e.id;
+            t_t0 = (float)ImGui::GetTime();
+        }
+        if (!io.MouseDown[0]) t_on = false;
+        if (t_on && t_id == e.id && in_title && !ImGui::IsMouseDragging(0, 12.f) &&
+            ImGui::GetTime() - t_t0 > 0.55f) {
+            t_on = false;
+            ImGui::OpenPopup("exattach");
+        }
+        if (ImGui::BeginPopup("exattach")) {
+            if (ImGui::MenuItem("Attach to main menu")) {
+                MLK();
+                e.detached = false;
+                MULK();
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::End();
+        if (!open) {
+            MLK();
+            s_explorers.erase(s_explorers.begin() + i);
+            MULK();
+            continue;   /* no i++ */
+        }
+        i++;
+    }
+}
+static void class_windows() {
+    /* r33 F7: class detail windows. Attached ones follow the
+       bottom edge of their owner window; dragging the title
+       detaches, long-pressing it opens the attach/close menu. */
+    for (int i = 0; i < (int)s_classes.size(); ) {
+        ClassTab& c = s_classes[i];
+        if (c.win_close) {
+            /* r32 R10: release the instances this window retained */
+            MLK();
+            for (auto& in : c.instances) {
+                if (in.handle > 0 && !objtab_open(in.handle)) {
+                    std::string a = "{\"handle\":" +
+                                    std::to_string(in.handle) + "}";
+                    post_rpc("releaseHandle", a);
+                }
+            }
+            s_classes.erase(s_classes.begin() + i);
+            MULK();
+            continue;
+        }
+        std::string ttl = win_title(c);
+        ImVec4 own = owner_rect_of(c.owner_expl);
+        if (c.attached && own.z > 0) {
+            float py = own.y + own.w;
+            ImGuiIO& tio = ImGui::GetIO();
+            if (py > tio.DisplaySize.y - 200.f)
+                py = tio.DisplaySize.y - 200.f;
+            if (py < 0) py = 0;
+            ImGui::SetNextWindowPos(ImVec2(own.x, py),
+                                    ImGuiCond_Always);
+        }
+        if (!c.free_init) {
+            ImGui::SetNextWindowSize(ImVec2(460, 480),
+                                     ImGuiCond_Appearing);
+            c.free_init = true;
+        }
+        ImGui::SetNextWindowSizeConstraints(ImVec2(280, 220),
+                                            ImVec2(1400, 1400));
+        bool open = true;
+        if (!ImGui::Begin(ttl.c_str(), &open)) {
+            ImGui::End();
+            if (!open) c.win_close = true;
+            i++;
+            continue;
+        }
+        if (s_focus_win == ttl) {
+            ImGui::SetWindowFocus(ttl.c_str());
+            s_focus_win.clear();
+        }
+        class_tab_body(c);
+        ImGuiIO& io = ImGui::GetIO();
+        ImVec2 wpos = ImGui::GetWindowPos();
+        float band = ImGui::GetFrameHeight();
+        bool in_title = ImGui::IsWindowHovered() &&
+                        io.MousePos.y >= wpos.y &&
+                        io.MousePos.y <= wpos.y + band;
+        static float t_t0 = 0;
+        static bool  t_on = false;
+        static int   t_id = 0;
+        if (in_title && io.MouseDown[0] && (!t_on || t_id != c.uid)) {
+            t_on = true;
+            t_id = c.uid;
+            t_t0 = (float)ImGui::GetTime();
+        }
+        if (!io.MouseDown[0]) t_on = false;
+        if (t_on && t_id == c.uid && in_title && c.attached &&
+            ImGui::IsMouseDragging(0, 12.f)) {
+            MLK();
+            c.attached = false;      /* dragging the title = detach */
+            MULK();
+            t_on = false;
+        }
+        if (t_on && t_id == c.uid && in_title &&
+            !ImGui::IsMouseDragging(0, 12.f) &&
+            ImGui::GetTime() - t_t0 > 0.55f) {
+            t_on = false;
+            ImGui::OpenPopup("clsattach");
+        }
+        if (ImGui::BeginPopup("clsattach")) {
+            if (ImGui::MenuItem("Free window (detach)")) {
+                MLK();
+                c.attached = false;
+                MULK();
+            }
+            if (ImGui::MenuItem("Attach below main menu")) {
+                MLK();
+                c.attached = true;
+                c.owner_expl = 0;
+                MULK();
+            }
+            for (auto& x : s_explorers) {
+                char xl[160];
+                snprintf(xl, sizeof(xl), "Attach below %s##at%d",
+                         x.search[0] ? x.search : "Classes", x.id);
+                if (ImGui::MenuItem(xl)) {
+                    MLK();
+                    c.attached   = true;
+                    c.owner_expl = x.id;
+                    MULK();
+                }
+            }
+            if (ImGui::MenuItem("Close"))
+                open = false;
+            ImGui::EndPopup();
+        }
+        if (!open) c.win_close = true;
+        ImGui::End();
+        i++;
+    }
+}
 int menu_frame_pump_level() {
     /* r31 M8: no mutex - s_visible is std::atomic<bool>, so the JS
        thread's frame pump never stalls behind a whole-frame render
@@ -3178,7 +3462,10 @@ void menu_draw() {
         }
     }
     MULK();
-    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse;
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse |
+                              /* r33 F9: the top bar must never
+                                 scroll out of view */
+                              ImGuiWindowFlags_NoScrollbar;
     if (s_fullscreen) {
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ds);
@@ -3197,7 +3484,25 @@ void menu_draw() {
     }
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r32)", &open, wflags);
+    ImGui::Begin("Dex-tool v1.3 (r33)", &open, wflags);
+    {
+        /* r33 F1: minimize button - sits in the title bar, left of
+           the X; the cursor is restored so the layout is untouched.
+           Edge resize already excludes the top edge (r29 handles:
+           left/right/bottom, the top edge moves the window). */
+        ImVec2 cp = ImGui::GetCursorPos();
+        ImVec2 wp2 = ImGui::GetWindowPos();
+        ImGui::SetCursorScreenPos(ImVec2(
+            wp2.x + ImGui::GetWindowSize().x - 56.f, wp2.y + 3.f));
+        if (ImGui::SmallButton("v##minbtn")) {
+            s_visible.store(false);
+            s_conf_dirty = true;
+        }
+        ImGui::SetCursorPos(cp);
+        s_rect_main = ImVec4(wp2.x, wp2.y,
+                             ImGui::GetWindowSize().x,
+                             ImGui::GetWindowSize().y);
+    }
     if (!open) {
         MLK();
         s_visible.store(false);   /* r32 R2 */
@@ -3231,10 +3536,19 @@ void menu_draw() {
         ImGui::TextColored(ImVec4(.4f, 1.f, .5f, 1), "%s", s_clip_msg);
     families_window();
     fm_window();
+    explorer_windows();   /* r33 F6: detached class-list windows */
+    class_windows();      /* r33 F7: class detail windows */
     if (!s_fullscreen) draw_resize_handles();
     ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
     ImGui::End();
-    mark_rect(wp.x, wp.y, ws.x, ws.y, s_ovl_scroll);
+    {   /* r33 F2: the title+tab strip is NOT a scroll region any
+           more - single taps there reach the tabs immediately
+           (the reported double-tap-to-open issue) */
+        float band = ImGui::GetFrameHeight() * 2.1f;
+        if (ws.y > band + 40.f)
+            mark_rect(wp.x, wp.y + band, ws.x, ws.y - band,
+                      s_ovl_scroll);
+    }
     overlay_publish_scroll_regions(s_regions);
     s_regions.clear();
     if (s_conf_dirty && s_conf_path[0] &&

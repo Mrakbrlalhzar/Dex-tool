@@ -217,7 +217,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r32: R1 dumpObject FN_ARGS keyed by the JSON key the menu sends, R2 s_visible atomic - checkbox regression fixed, R3 signal-safe module map snapshot for the crash log, R4 bounded crash_ux, R5 park leak counted, R6 parse-once JSON cache, R7 auto-list sends cs, R8 dump preview matches agent, R9 warning excludes smali_runtime, R10 release sweep on tab close and saved-object removal, push gated to canonical repo. r31: real JSON tree parser, releaseHandle, lock-free frame pump)");
+    log_info("logger_init done (build r33: UI round - independent detachable class windows with qid-routed results, keyboard fix (EnterReturnsTrue removed), dynamic client-side filter, reflection method/field search with name/param/return options, TreeNode class layout, FindInstancesPopup, CreateInstancePopup with constructor args, family window closes on pick, minimize button, tab strip not a scroll region. r32: FN_ARGS keys, atomic s_visible, module snapshot, parse cache, release sweeps)");
 }
 void logger_retarget(const char* base_dir) {
     if (!base_dir || !base_dir[0]) return;

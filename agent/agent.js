@@ -1,7 +1,9 @@
-/* Dex-tool agent (r32): R1 dumpObject FN_ARGS keyed by the JSON
-   key the menu sends ("class") - the per-object dump works again.
-   r31: releaseHandle export. r30: hook-mode prefix match +
-   unknown-mode report, stale handle reporting. */
+/* Dex-tool agent (r33): F5 method/field search runs on Java
+   reflection with name/param/return filters (no baksmali needed);
+   F8 createInstance takes constructor args and listConstructors
+   feeds the creation popup. r32: FN_ARGS by JSON key. r31:
+   releaseHandle. r30: hook-mode prefix match + unknown-mode
+   report, stale handle reporting. */
 'use strict';
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
 var gAgentLog = null;
@@ -1364,6 +1366,21 @@ function pump_deferred(loadedName) {
     }
 }
 var patches = {}, hooks = {}, trackers = {};
+function r33_mopt(mref) {
+    /* r33 F5: openClass highlight honors param/return filters */
+    try {
+        if (gLastSearch.pt) {
+            var ps = mref.getParameterTypes(), pk = false;
+            for (var p = 0; p < ps.length; p++)
+                if (scan_match(gLastSearch.pt,
+                        String(ps[p].getName()))) { pk = true; break; }
+            if (!pk) return false;
+        }
+        if (gLastSearch.rt && !scan_match(gLastSearch.rt,
+                String(mref.getReturnType().getName()))) return false;
+    } catch (e0) {}
+    return true;
+}
 function do_addHook(cls, method, mode, code) {
     var key = cls + '.' + method;
     var jc = Java.use(cls);
@@ -1759,7 +1776,8 @@ rpc.exports = {
                                    count: 0, error: err });
         });
     },
-    listLoadedClasses: function (filter, qid, mode, sys, cs) {
+    listLoadedClasses: function (filter, qid, mode, sys, cs,
+                                 mn, pt, rt) {
         Java.perform(function () {
             try {
                 var all = Java.enumerateLoadedClassesSync();
@@ -1768,7 +1786,10 @@ rpc.exports = {
                 var md = (typeof mode === 'number') ? mode : 0;
                 var includeSys = (sys === true || sys === 1);
                 var csm = (cs === true || cs === 1);
-                gLastSearch = { f: f, fRaw: fRaw, mode: md, cs: csm };
+                gLastSearch = { f: f, fRaw: fRaw, mode: md, cs: csm,
+                                mn: String(mn || ''),
+                                pt: String(pt || ''),
+                                rt: String(rt || '') };
                 if (!includeSys) {
                     all = all.filter(function (n) {
                         return !is_system_cls(n);
@@ -1793,6 +1814,12 @@ rpc.exports = {
                 SCAN.fRaw = fRaw;
                 SCAN.cs = csm;
                 SCAN.md = md;
+                SCAN.mn = gLastSearch.mn;   /* r33 F5 */
+                SCAN.pt = gLastSearch.pt;
+                SCAN.rt = gLastSearch.rt;
+                SCAN.sys = includeSys;
+                SCAN.list = null;
+                SCAN.ri = 0;
                 SCAN.want = want;
                 SCAN.matches = [];
                 SCAN.hits = {};
@@ -1826,6 +1853,7 @@ rpc.exports = {
                             if ((gLastSearch.cs ?
                                      nm.indexOf(gLastSearch.fRaw) !== -1 :
                                      nm.toLowerCase().indexOf(fl) !== -1) &&
+                                r33_mopt(ms[i]) &&
                                 hm.indexOf(nm) === -1) hm.push(nm);
                         }
                     } else if (gLastSearch.mode === 2) {
@@ -2102,11 +2130,65 @@ rpc.exports = {
         if (onMain) Java.scheduleOnMainThread(once);
         else once();
     },
-    createInstance: function (cls) {
+    listConstructors: function (cls) {
+        /* r33 F8: constructor list for the CreateInstancePopup */
         Java.perform(function () {
             try {
                 var jc = Java.use(cls);
-                var inst = jc.$new();
+                var cs = jc.class.getDeclaredConstructors();
+                var out = [];
+                for (var i = 0; i < cs.length && out.length < 32; i++) {
+                    var ps = cs[i].getParameterTypes(), pn = [];
+                    for (var p = 0; p < ps.length; p++)
+                        pn.push(String(ps[p].getName()));
+                    out.push({
+                        name: cls.substring(cls.lastIndexOf('.') + 1),
+                        params: pn.join(', ') });
+                }
+                sendMsg('ctorList', { class: cls, ctors: out });
+            } catch (e) {
+                sendMsg('error', { fn: 'listConstructors',
+                                   msg: String(e.message || e) });
+            }
+        });
+    },
+    createInstance: function (cls, args) {
+        Java.perform(function () {
+            try {
+                var jc = Java.use(cls);
+                /* r33 F8: dynamic construction - "@handle:N"
+                   resolves a retained instance, numbers and
+                   booleans coerce, everything else stays a string */
+                var av = [];
+                if (args && args.length) {
+                    for (var ai = 0; ai < args.length; ai++) {
+                        var raw = args[ai];
+                        if (raw === null || raw === undefined) {
+                            av.push(null);
+                            continue;
+                        }
+                        var sv = String(raw);
+                        if (sv.indexOf('@handle:') === 0) {
+                            var oh =
+                                inst_get(parseInt(sv.substring(8), 10));
+                            if (!oh)
+                                throw new Error('instance handle ' +
+                                    'gone (GC): ' + sv);
+                            av.push(oh);
+                        } else if (sv === 'true') {
+                            av.push(true);
+                        } else if (sv === 'false') {
+                            av.push(false);
+                        } else if (/^-?\d+$/.test(sv)) {
+                            av.push(parseInt(sv, 10));
+                        } else if (/^-?(\d+\.\d*|\.\d+)([eE][-+]?\d+)?$/.test(sv)) {
+                            av.push(parseFloat(sv));
+                        } else {
+                            av.push(sv);
+                        }
+                    }
+                }
+                var inst = jc.$new.apply(jc, av);
                 var h = inst_put(inst);
                 var lbl = '';
                 try { lbl = String(inst); }
@@ -2117,7 +2199,7 @@ rpc.exports = {
             } catch (e) {
                 sendMsg('error', { fn: 'createInstance',
                     msg: String(e.message || e) +
-                         ' (needs a no-arg constructor)' });
+                         ' (check the constructor arguments)' });
             }
         });
     }
@@ -2359,7 +2441,9 @@ function page_out(list, qid, total) {
 }
 var SCAN = { on: false, qid: -1, f: '', md: 0, want: {}, wantList: [],
              matches: [], hits: {}, dexes: null, di: 0, it: null,
-             total: 0 };
+             total: 0,
+             mn: '', pt: '', rt: '', sys: false,
+             list: null, ri: 0 };   /* r33 F5: reflection scan */
 var gLastScanHits = {};
 var gLastSearch = { f: '', mode: 0 };
 function scan_finish() {
@@ -2370,8 +2454,87 @@ function scan_finish() {
                            ' matching class(es) (scan done)' });
     page_out(matches, SCAN.qid, SCAN.total);
 }
+function scan_match(pat, s) {
+    /* r33 F5: pattern match honoring the case-sensitive flag */
+    if (!pat) return true;
+    return SCAN.cs
+        ? s.indexOf(pat) !== -1
+        : s.toLowerCase().indexOf(String(pat).toLowerCase()) !== -1;
+}
 function scan_step() {
     if (!SCAN.on) return;
+    /* r33 F5: method(1)/field(2) searches run on Java reflection -
+       no baksmali/dexlib2 dependency (the old path died silently
+       wherever smali-fat.jar failed to load). Mode 3 (code text)
+       still needs the disassembler and says so when it is gone. */
+    if (SCAN.md === 1 || SCAN.md === 2) {
+        try {
+            if (!SCAN.list) {
+                var allL = Java.enumerateLoadedClassesSync();
+                if (!SCAN.sys)
+                    allL = allL.filter(function (n) {
+                        return !is_system_cls(n); });
+                allL.sort();
+                SCAN.list = allL;
+                SCAN.ri = 0;
+            }
+            var budget = 30;
+            while (budget-- > 0) {
+                if (SCAN.ri >= SCAN.list.length ||
+                    SCAN.matches.length >= 4000) {
+                    scan_finish();
+                    return;
+                }
+                var cls = SCAN.list[SCAN.ri++];
+                try {
+                    var jc = Java.use(cls);
+                    var mh = [], fh = [], matched = false;
+                    if (SCAN.md === 1) {
+                        var ms = jc.class.getDeclaredMethods();
+                        for (var i = 0; i < ms.length; i++) {
+                            var mn = String(ms[i].getName());
+                            if (!scan_match(SCAN.mn, mn)) continue;
+                            if (SCAN.pt) {
+                                var ps = ms[i].getParameterTypes();
+                                var pk = false;
+                                for (var p = 0; p < ps.length; p++)
+                                    if (scan_match(SCAN.pt,
+                                            String(ps[p].getName()))) {
+                                        pk = true;
+                                        break;
+                                    }
+                                if (!pk) continue;
+                            }
+                            if (SCAN.rt && !scan_match(SCAN.rt,
+                                    String(ms[i].getReturnType()
+                                        .getName()))) continue;
+                            matched = true;
+                            mh.push(mn);
+                        }
+                    } else {
+                        var fs = jc.class.getDeclaredFields();
+                        for (var j2 = 0; j2 < fs.length; j2++) {
+                            var fn = String(fs[j2].getName());
+                            if (scan_match(SCAN.fRaw, fn)) {
+                                matched = true;
+                                fh.push(fn);
+                            }
+                        }
+                    }
+                    if (matched) {
+                        SCAN.matches.push(cls);
+                        SCAN.hits[cls] = { m: mh, f: fh };
+                    }
+                } catch (eC) {}
+            }
+            setTimeout(scan_step, 15);
+        } catch (eR) {
+            SCAN.on = false;
+            sendMsg('error', { fn: 'listLoadedClasses',
+                               msg: String(eR.message || eR) });
+        }
+        return;
+    }
     var L = baksmali_libs();
     if (!L) { SCAN.on = false;
               sendMsg('error', { fn: 'listLoadedClasses',
@@ -2559,7 +2722,8 @@ var FN_ARGS = {
     startMonitor:    [],
     stopMonitor:     [],
     evalScript:      ['src'],
-    listLoadedClasses: ['filter', 'qid', 'mode', 'sys', 'cs'],
+    listLoadedClasses: ['filter', 'qid', 'mode', 'sys', 'cs',
+                        'mn', 'pt', 'rt'],   /* r33 F5 */
     getMethodSrc:    ['class', 'method'],
     getMethodIO:     ['class', 'method'],
     setMethodIO:     ['class', 'method', 'args', 'ret'],
@@ -2570,7 +2734,8 @@ var FN_ARGS = {
     listInstances:   ['class'],
     setInstanceField:['class', 'index', 'field', 'value', 'handle'],
     callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
-    createInstance:  ['class'],
+    createInstance:  ['class', 'args'],  /* r33 F8 */
+    listConstructors: ['class'],         /* r33 F8 */
     dumpLoadedClasses: [],              /* r30 C4 */
     dumpObject:      ['class', 'handle'],/* r32 R1: FN_ARGS resolves
                                            by JSON key and the menu
@@ -2602,6 +2767,6 @@ setTimeout(function () {
         var appR = ATr.currentApplication();
         if (appR) pkgR = String(appR.getPackageName());
     } catch (eP) {}
-    sendMsg('ready', { msg: 'Dex-tool agent r32 loaded', pkg: pkgR });
+    sendMsg('ready', { msg: 'Dex-tool agent r33 loaded', pkg: pkgR });
     agentLog('phase: ready sent');
 }, 0);

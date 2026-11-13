@@ -37,6 +37,57 @@ not the tree.
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Changes in this version (r33) - the UI round
+
+User-reported issues; the class-browser flow is rebuilt around
+independent, detachable windows.
+
+- **Search box keyboard bug**: the class search field used
+  ImGuiInputTextFlags_EnterReturnsTrue, which runs through the
+  r24 "enter then release field" path - every letter after the
+  first was dropped and the box cleared on re-tap. The flag is
+  gone; the box now behaves like the family search box.
+- **Dynamic search**: class rows filter as you type (client-side,
+  like the family box); the Filter button re-queries the agent.
+- **Independent windows**: results are routed by qid to the window
+  that sent the search - searching in one window no longer changes
+  the others. No window is opened by default; no "[id]" numbering
+  (the id is a hidden suffix).
+- **Method / field / string search**: modes 1 and 2 now scan via
+  Java reflection - no baksmali dependency (the old path died
+  silently wherever smali-fat.jar failed to load) - and support
+  method-name + parameter-type + return-type filters (Options
+  popup when Method is selected). Mode 3 (code text) still needs
+  the disassembler and reports honestly when it is unavailable.
+- **Class windows**: opening a class pops a window attached below
+  the window it came from. Dragging or long-pressing the title
+  detaches it; the title menu re-attaches it below the main menu
+  or any open class-list window. Class rows have a long-press
+  menu (open in new window / copy class name) and a copy button.
+- **TreeNode layout**: the class window renders the class name as
+  a root TreeNode (DefaultOpen | SpanAvailWidth | FramePadding)
+  with Instances / Static Fields / Methods / Fields sub-nodes and
+  indented children; the horizontal button row is gone. Buttons
+  sit in a clean toolbar row separated by Separator; inputs use
+  -FLT_MIN widths.
+- **Find instances**: a floating popup with a filter box and a
+  scrollable result list; picking a row closes the popup.
+- **Create instance**: a popup lists the class's constructors
+  with a search box; each parameter gets an input; @handle:
+  tokens, numbers and booleans are coerced agent-side. The
+  null-object shortcut, the manual text box and the Save buttons
+  are removed.
+- **Family window** closes after picking a family.
+- **Main window**: a minimize button sits in the title bar next
+  to the X; the title+tab strip is no longer a scroll region
+  (single taps on tabs land immediately - the reported
+  double-tap-to-open issue); the window no longer scrolls its top
+  bar away; the Manual add inputs fit the width.
+- **Detached class-list windows**: long-press a tab (0.6 s, then
+  drag) to float it out of the tab bar; long-press a floating
+  title to attach it back to the main menu.
+
+
 ## Fixes in this version (r32)
 
 - **R1** dumpObject in FN_ARGS was keyed by the export's parameter
