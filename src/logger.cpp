@@ -217,7 +217,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r34: touch io settings (IsTouchScreen, drag threshold 15, touch padding), AutoSelectAll removed from IME fields, hint search field, class list clipped over filtered rows, docking-branch inspectors auto-dock to a bottom strip with native undock and Fill/Restore. r33: independent class windows with qid routing, TreeNode layout, popups for find/create instance)");
+    log_info("logger_init done (build r35: density-correct phone UI - sizes in dp via agent-reported density, 14dp body font, apply_theme owns colours and metrics with a semantic palette, ImGui Tables for field lists, dp-sized FAB and window minimums, touch release clears hover, ImGui 1.93.0-docking with the single-click API. r34: touch io settings, docking inspectors with Fill/Restore)");
 }
 void logger_retarget(const char* base_dir) {
     if (!base_dir || !base_dir[0]) return;

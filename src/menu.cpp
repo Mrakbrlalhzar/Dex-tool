@@ -1,9 +1,10 @@
-/* Dex-tool menu (r34): touch input round - io touch settings
-   (IsTouchScreen, drag threshold 15, touch padding), AutoSelectAll
-   removed from the IME fields, hint search field, class list
-   clipped over the filtered rows, docking-branch inspectors
-   (auto-dock bottom strip, native undock, Fill/Restore). r33:
-   independent class windows, qid routing, TreeNode layout. */
+/* Dex-tool menu (r35): density-correct phone UI - every size in
+   dp via overlay_dp(), font = 14dp body x preset multiplier,
+   apply_theme() owns colours AND metrics (ScaleAllSizes from a
+   pristine base), semantic palette, ImGui Tables for field
+   lists, dp-sized chrome, touch release clears hover, 1.93
+   single-click API on the class rows. r34: touch io settings,
+   docking-branch inspectors. */
 #include "menu.h"
 #ifdef IMGUI_HAS_DOCK
 #include "imgui_internal.h"   /* r34 G4: DockBuilderDockWindow */
@@ -210,8 +211,21 @@ static const char* k_scale_names[7] = { "Smallest", "Smaller", "Small",
                                         "Default", "Large", "Larger",
                                         "Largest" };
 static const float k_scale_px[7]    = { 10.f, 13.f, 16.f, 18.f, 22.f,
-                                        26.f, 32.f };
+                                        26.f, 32.f };   /* legacy cfg */
+/* r35 C: the 7 presets are now multipliers of a dp-derived base;
+   k_scale_px is kept only to map a legacy font= config value */
+static const float k_scale_rel[7]   = { 0.80f, 0.90f, 1.00f, 1.10f,
+                                        1.25f, 1.40f, 1.60f };
+static float dt_font_px() {
+    int i = s_scale; if (i < 0) i = 0; if (i > 6) i = 6;
+    return overlay_dp(14.0f) * k_scale_rel[i];   /* 14dp body text */
+}
+/* r35 C: style scale factor - 13 px was the old default body size */
+static float s_font_px_k() {
+    return s_font_size > 0.f ? (s_font_size / 13.0f) : 1.0f;
+}
 struct HitFlash { std::string name; long count; float time; float gone; };
+static ImVec4 s_menu_rect(0, 0, 0, 0);  /* r35 D5: flash anchor */
 static std::vector<HitFlash> s_flash;
 static void flash_hit(const std::string& name, long count) {
     for (auto& f : s_flash) {
@@ -540,6 +554,13 @@ static long jnum(const std::string& j, const char* key, long dflt = 0) {
     const JVal* v = jlookup_locked(j, key);
     return (v && v->kind == 4) ? (long)v->num : dflt;
 }
+/* r35 B: jnum truncates to long - density 3.0 would arrive as 3;
+   keep the double for float fields */
+static double jnumf(const std::string& j, const char* key, double dflt = 0) {
+    std::lock_guard<std::mutex> lk(g_jcache_mtx);
+    const JVal* v = jlookup_locked(j, key);
+    return (v && v->kind == 4) ? v->num : dflt;
+}
 static bool jhas(const std::string& j, const char* key) {
     std::lock_guard<std::mutex> lk(g_jcache_mtx);
     return jlookup_locked(j, key) != nullptr;
@@ -741,7 +762,7 @@ static void conf_load() {
         *eq = 0;
         char* k = ln;
         float v = strtof(eq + 1, nullptr);
-        if      (!strcmp(k, "font"))   s_font_size = v;
+        if      (!strcmp(k, "font"))   s_font_size = v;  /* legacy, re-derived below */
         else if (!strcmp(k, "opacity")) s_opacity  = v;
         else if (!strcmp(k, "theme"))  s_theme    = (int)v;
         else if (!strcmp(k, "ovl"))    s_ovl_scroll = v;
@@ -762,7 +783,7 @@ static void conf_load() {
             if (d < best) { best = d; s_scale = i; }
         }
     }
-    s_font_size = k_scale_px[s_scale];
+    s_font_size = dt_font_px();   /* r35 C: density-derived */
 }
 static void conf_save() {
     FILE* f = fopen(s_conf_path, "w");
@@ -787,16 +808,122 @@ static void copy_text(const std::string& what, const std::string& text) {
              what.c_str(), t.c_str());
     s_clip_ms = conf_now_ms();
 }
+/* r35 C: semantic palette - accent for interactive states, the
+   pink stays as the secondary accent (Options button, plots) */
+static ImVec4 dt_accent2() {
+    return ImVec4(0.98f, 0.44f, 0.66f, 1.00f);
+}
+static void dt_apply_palette(int theme) {
+    ImGuiStyle& st = ImGui::GetStyle();
+    const ImVec4 accent = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    const bool  dark = (theme != 1);
+    const ImVec4 bg   = dark ? ImVec4(0.06f, 0.07f, 0.09f, 1.0f)
+                             : ImVec4(0.94f, 0.95f, 0.97f, 1.0f);
+    const ImVec4 bg2  = dark ? ImVec4(0.10f, 0.11f, 0.13f, 1.0f)
+                             : ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
+    const ImVec4 bg3  = dark ? ImVec4(0.13f, 0.15f, 0.18f, 1.0f)
+                             : ImVec4(0.86f, 0.88f, 0.91f, 1.0f);
+    const ImVec4 txt  = dark ? ImVec4(0.92f, 0.93f, 0.95f, 1.0f)
+                             : ImVec4(0.10f, 0.11f, 0.13f, 1.0f);
+    const ImVec4 txtd = dark ? ImVec4(0.50f, 0.52f, 0.56f, 1.0f)
+                             : ImVec4(0.40f, 0.42f, 0.46f, 1.0f);
+    const ImVec4 line = dark ? ImVec4(0.20f, 0.22f, 0.26f, 1.0f)
+                             : ImVec4(0.78f, 0.80f, 0.84f, 1.0f);
+
+    st.Colors[ImGuiCol_WindowBg]         = bg;
+    st.Colors[ImGuiCol_ChildBg]          = bg2;
+    st.Colors[ImGuiCol_PopupBg]          = bg2;
+    st.Colors[ImGuiCol_TitleBg]          = bg2;
+    st.Colors[ImGuiCol_TitleBgActive]    = bg3;
+    st.Colors[ImGuiCol_TitleBgCollapsed] = bg3;
+    st.Colors[ImGuiCol_FrameBg]          = bg3;
+    st.Colors[ImGuiCol_FrameBgHovered]   =
+        dark ? ImVec4(0.18f, 0.21f, 0.26f, 1.f)
+             : ImVec4(0.80f, 0.83f, 0.88f, 1.f);
+    st.Colors[ImGuiCol_FrameBgActive]    = accent;
+    st.Colors[ImGuiCol_Button]           = bg3;
+    st.Colors[ImGuiCol_ButtonHovered]    = accent;
+    st.Colors[ImGuiCol_ButtonActive]     = accent;
+    st.Colors[ImGuiCol_Header]           = bg3;
+    st.Colors[ImGuiCol_HeaderHovered]    = accent;
+    st.Colors[ImGuiCol_HeaderActive]     = accent;
+#if IMGUI_VERSION_NUM >= 19090
+    st.Colors[ImGuiCol_Tab]              = bg2;
+    st.Colors[ImGuiCol_TabHovered]       = bg3;
+    st.Colors[ImGuiCol_TabSelected]      = accent;
+    st.Colors[ImGuiCol_TabSelectedOverline] = accent;
+#endif
+    st.Colors[ImGuiCol_Text]             = txt;
+    st.Colors[ImGuiCol_TextDisabled]     = txtd;
+    st.Colors[ImGuiCol_Separator]        = line;
+    st.Colors[ImGuiCol_SeparatorHovered] = accent;
+    st.Colors[ImGuiCol_SeparatorActive]  = accent;
+    st.Colors[ImGuiCol_CheckMark]        = accent;
+    st.Colors[ImGuiCol_ResizeGrip]       = accent;
+    st.Colors[ImGuiCol_ResizeGripHovered]= accent;
+    st.Colors[ImGuiCol_ScrollbarBg]      = ImVec4(0, 0, 0, 0);
+    st.Colors[ImGuiCol_ScrollbarGrab]    = line;
+    st.Colors[ImGuiCol_ScrollbarGrabHovered] = accent;
+    st.Colors[ImGuiCol_ScrollbarGrabActive]  = accent;
+    st.Colors[ImGuiCol_NavHighlight]     = accent;
+    st.Colors[ImGuiCol_NavWindowingHighlight] = accent;
+    st.Colors[ImGuiCol_PlotLines]        = dt_accent2();
+}
+
+static ImGuiStyle s_style_base;       /* pristine metrics per theme */
+static bool       s_style_base_set = false;
+
 static void apply_theme() {
+    ImGuiStyle& st = ImGui::GetStyle();
+
+    /* 1. colours - only when the theme changes (r30 M9) */
     static int applied = -1;
-    if (applied != s_theme) {   /* r30 M9: on change, not every frame */
+    if (applied != s_theme) {
         applied = s_theme;
         switch (s_theme) {
             case 0: ImGui::StyleColorsDark();    break;
             case 1: ImGui::StyleColorsLight();   break;
             case 2: ImGui::StyleColorsClassic(); break;
         }
+        dt_apply_palette(s_theme);
+        s_style_base = st;                 /* capture pristine metrics */
+        s_style_base_set = true;
     }
+    if (!s_style_base_set) {
+        s_style_base = st;
+        s_style_base_set = true;
+    }
+
+    /* 2. metrics - always in sync with the current font size.
+       ScaleAllSizes() is cumulative, so reset to the base first. */
+    float k = s_font_px_k();
+    st = s_style_base;
+    st.ScaleAllSizes(k);
+    st.WindowRounding    = 6.0f * k;
+    st.ChildRounding     = 4.0f * k;
+    st.FrameRounding     = 4.0f * k;
+    st.PopupRounding     = 4.0f * k;
+    st.GrabRounding      = 4.0f * k;
+    st.TabRounding       = 4.0f * k;
+    st.ScrollbarRounding = 4.0f * k;
+    st.WindowPadding     = ImVec2( 8.f * k,  8.f * k);
+    st.FramePadding      = ImVec2(10.f * k,  8.f * k);  /* touch-sized */
+    st.ItemSpacing       = ImVec2( 8.f * k,  6.f * k);
+    st.ItemInnerSpacing  = ImVec2( 6.f * k,  6.f * k);
+    st.CellPadding       = ImVec2( 6.f * k,  4.f * k);
+    st.IndentSpacing     = 20.0f * k;
+    st.ScrollbarSize     = 16.0f * k;
+    st.GrabMinSize       = 20.0f * k;
+    st.TouchExtraPadding = ImVec2( 3.f * k,  3.f * k);
+    st.WindowBorderSize  = 1.0f;
+    st.FrameBorderSize   = 0.0f;
+    st.ChildBorderSize   = 0.0f;
+
+    /* 3. 1.92+ font scaling - density is already baked into the px */
+#if IMGUI_VERSION_NUM >= 19200
+    st.FontScaleMain = 1.0f;
+    st.FontScaleDpi  = 1.0f;
+#endif
     ImGui::GetIO().FontGlobalScale = 1.0f;   /* real size comes from the
                                                atlas, not from scaling */
 }
@@ -893,6 +1020,21 @@ void menu_init() {
         std::string ty = jtype(j);
         if (ty == "ready") {
             s_agent_ready = true;
+            /* r35 B: density arrives once per agent session; the
+               font rebuilds and apply_theme() rescales the metrics
+               on the next frame (it runs every frame now) */
+            {
+                float dens = (float)jnumf(j, "density", 0.0);
+                if (dens > 0.5f && dens < 8.0f &&
+                    dens != overlay_density()) {
+                    overlay_set_density(dens);
+                    MLK();
+                    s_font_size  = dt_font_px();
+                    overlay_request_font_rebuild(s_font_size);
+                    s_conf_dirty = true;
+                    MULK();
+                }
+            }
             /* r33: a new agent session re-lists in every open class
                window (each window owns its qid now) */
             for (auto& x : s_explorers)
@@ -1215,7 +1357,7 @@ static void tab_settings() {
             bool sel = (i == s_scale);
             if (ImGui::Selectable(k_scale_names[i], sel)) {
                 s_scale    = i;
-                s_font_size = k_scale_px[i];
+                s_font_size = dt_font_px();   /* r35 C */
                 overlay_request_font_rebuild(s_font_size);
                 s_conf_dirty = true;
             }
@@ -1942,17 +2084,38 @@ static void static_fields_view(ClassTab& c) {
         if (f.value != "(instance)") nst++;
     ImGui::TextDisabled("%d static fields", nst);
     ImGui::Separator();
+    /* r35 F: aligned columns + zebra rows instead of a flat
+       BulletText stream */
+    const ImGuiTableFlags tf = ImGuiTableFlags_BordersInnerH |
+                               ImGuiTableFlags_RowBg |
+                               ImGuiTableFlags_SizingFixedFit;
+    if (!ImGui::BeginTable("sfldtbl", 4, tf)) { MULK(); return; }
+    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed,
+                            overlay_dp(76.f));
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed,
+                            overlay_dp(58.f));
+    ImGui::TableSetupColumn("Value",
+                            ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed,
+                            overlay_dp(86.f));
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableHeadersRow();
     for (int i = 0; i < (int)c.fields.size(); i++) {
         FieldInfo& f = c.fields[i];
         if (f.value == "(instance)") continue;
         ImGui::PushID(5000 + i);
         bool hitf = c.hit(c.hits_f, f.name);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
         if (hitf) ImGui::PushStyleColor(ImGuiCol_Text,
                    ImVec4(0.25f, 0.95f, 0.35f, 1.f));
-        ImGui::BulletText("%s : %s = %s", f.name.c_str(),
-                          f.type.c_str(), f.value.c_str());
+        ImGui::TextUnformatted(f.name.c_str());
         if (hitf) ImGui::PopStyleColor();
-        ImGui::SameLine();
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", f.type.c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(f.value.c_str());
+        ImGui::TableNextColumn();
         if (ImGui::SmallButton("Patch##fp")) {
             snprintf(s_pcls, sizeof(s_pcls), "%s", c.cname.c_str());
             snprintf(s_pfld, sizeof(s_pfld), "%s", f.name.c_str());
@@ -1968,6 +2131,7 @@ static void static_fields_view(ClassTab& c) {
         }
         ImGui::PopID();
     }
+    ImGui::EndTable();
     MULK();
 }
 static void fields_view(ClassTab& c) {
@@ -1975,15 +2139,40 @@ static void fields_view(ClassTab& c) {
     ImGui::TextDisabled("%lu fields (static values: Static Fields tab)",
                         (unsigned long)c.fields.size());
     if (!ImGui::TreeNode("Fields##ftn")) { MULK(); return; }
+    /* r35 F: same table layout as the Static Fields tab */
+    const ImGuiTableFlags tf2 = ImGuiTableFlags_BordersInnerH |
+                                ImGuiTableFlags_RowBg |
+                                ImGuiTableFlags_SizingFixedFit;
+    if (!ImGui::BeginTable("fldtbl", 4, tf2)) {
+        ImGui::TreePop();
+        MULK();
+        return;
+    }
+    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed,
+                            overlay_dp(76.f));
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed,
+                            overlay_dp(58.f));
+    ImGui::TableSetupColumn("Value",
+                            ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed,
+                            overlay_dp(86.f));
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableHeadersRow();
     for (int i = 0; i < (int)c.fields.size(); i++) {
         FieldInfo& f = c.fields[i];
         ImGui::PushID(6000 + i);
         bool hitf = c.hit(c.hits_f, f.name);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
         if (hitf) ImGui::PushStyleColor(ImGuiCol_Text,
                    ImVec4(0.25f, 0.95f, 0.35f, 1.f));
-        ImGui::BulletText("%s : %s", f.name.c_str(), f.type.c_str());
+        ImGui::TextUnformatted(f.name.c_str());
         if (hitf) ImGui::PopStyleColor();
-        ImGui::SameLine();
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", f.type.c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(f.value.c_str());
+        ImGui::TableNextColumn();
         if (ImGui::SmallButton("Patch##fp2")) {
             snprintf(s_pcls, sizeof(s_pcls), "%s", c.cname.c_str());
             snprintf(s_pfld, sizeof(s_pfld), "%s", f.name.c_str());
@@ -1999,6 +2188,7 @@ static void fields_view(ClassTab& c) {
         }
         ImGui::PopID();
     }
+    ImGui::EndTable();
     ImGui::TreePop();
     MULK();
 }
@@ -2694,9 +2884,11 @@ static void families_window() {
         if (x.id == s_fam_uid) { e = &x; break; }
     if (!e) { MULK(); s_fam_open = false; return; }
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(ImVec2(340, 420), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(overlay_dp(240.f),
+                                    overlay_dp(300.f)),
+                             ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(
-        ImVec2(240, 180),
+        ImVec2(overlay_dp(200.f), overlay_dp(140.f)),
         ImVec2(io.DisplaySize.x * .9f, io.DisplaySize.y * .9f));
     ImGui::SetNextWindowPos(
         ImVec2(io.DisplaySize.x * .3f, io.DisplaySize.y * .25f),
@@ -2739,7 +2931,7 @@ static void fm_window() {
         ImVec2(io.DisplaySize.x * .62f, io.DisplaySize.y * .7f),
         ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(
-        ImVec2(320, 220),
+        ImVec2(overlay_dp(220.f), overlay_dp(150.f)),
         ImVec2(io.DisplaySize.x * .95f, io.DisplaySize.y * .95f));
     ImGui::SetNextWindowPos(
         ImVec2(io.DisplaySize.x * .5f, io.DisplaySize.y * .4f),
@@ -2816,12 +3008,10 @@ static void explorer_body(ExplorerWin& e) {
     ImGui::SameLine();
     bool do_query = false;
     if (ImGui::Button("Filter")) do_query = true;
-    ImGui::PushStyleColor(ImGuiCol_Button,
-                          ImVec4(0.94f, 0.44f, 0.66f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                          ImVec4(0.98f, 0.55f, 0.74f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                          ImVec4(0.88f, 0.34f, 0.58f, 1.f));
+    /* r35 C: the pink is now the palette's secondary accent */
+    ImGui::PushStyleColor(ImGuiCol_Button,        dt_accent2());
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dt_accent2());
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  dt_accent2());
     if (ImGui::Button("Options")) ImGui::OpenPopup("explOpts");
     ImGui::PopStyleColor(3);
     /* r34 G3: filter FIRST - the counter and the clipper both use
@@ -2887,8 +3077,17 @@ static void explorer_body(ExplorerWin& e) {
         for (int k = clip.DisplayStart; k < clip.DisplayEnd; k++) {
             const std::string& nm = *rows[k];
             ImGui::PushID(k);
-            if (ImGui::Selectable(nm.c_str()))
+            if (ImGui::Selectable(nm.c_str())) {
+#if IMGUI_VERSION_NUM >= 19300
+                /* r35 E: single-click API - a double tap opens the
+                   inspector once (singles resolve after
+                   io.MouseSingleClickDelay) */
+                if (ImGui::GetItemClickedCountWithSingleClickDelay() >= 1)
+                    open_inspector(nm, false);
+#else
                 open_inspector(nm, false);
+#endif
+            }
             /* r33 F7: long-press a row -> new window / copy name */
             bool rclk = ImGui::IsItemClicked(ImGuiMouseButton_Right);
             static bool row_wheel = false;
@@ -3123,11 +3322,13 @@ static bool    s_fab_moved = false;
 static ImVec2  s_fab_grab(0, 0), s_fab_orig(0, 0);
 static void draw_fab(ImVec2 ds) {
     if (!s_show_fab) return;
-    if (s_fab_pos.x < 0) s_fab_pos = ImVec2(ds.x - 90.f, ds.y - 110.f);
+    if (s_fab_pos.x < 0)
+        s_fab_pos = ImVec2(ds.x - overlay_dp(72.f),
+                           ds.y - overlay_dp(96.f));
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(s_fab_pos, ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 22.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, overlay_dp(14.f));
     ImGui::PushStyleColor(ImGuiCol_Button,
         s_visible ? ImVec4(.25f, .55f, .25f, .85f)
                   : ImVec4(.55f, .30f, .55f, .85f));
@@ -3139,8 +3340,10 @@ static void draw_fab(ImVec2 ds) {
                  ImGuiWindowFlags_NoFocusOnAppearing);
     /* r29: a fast tap completes within one frame - handle the press
        directly (the empty handler needed a second tap before) */
+    /* r35 G: dp-sized - Android's 48dp minimum touch target */
     bool fab_press = ImGui::Button(s_visible ? "HIDE" : "MENU",
-                                   ImVec2(64, 44));
+                                   ImVec2(overlay_dp(56.f),
+                                          overlay_dp(48.f)));
     if (ImGui::IsItemActive()) {
         if (!s_fab_drag) {
             s_fab_drag  = true;
@@ -3154,8 +3357,10 @@ static void draw_fab(ImVec2 ds) {
             s_fab_pos = ImVec2(s_fab_orig.x + d.x, s_fab_orig.y + d.y);
             if (s_fab_pos.x < 0)  s_fab_pos.x = 0;
             if (s_fab_pos.y < 0)  s_fab_pos.y = 0;
-            if (s_fab_pos.x > ds.x - 80) s_fab_pos.x = ds.x - 80;
-            if (s_fab_pos.y > ds.y - 60) s_fab_pos.y = ds.y - 60;
+            if (s_fab_pos.x > ds.x - overlay_dp(64.f))
+                s_fab_pos.x = ds.x - overlay_dp(64.f);
+            if (s_fab_pos.y > ds.y - overlay_dp(56.f))
+                s_fab_pos.y = ds.y - overlay_dp(56.f);
             ImGui::SetWindowPos(s_fab_pos);
         }
     } else if (s_fab_drag) {
@@ -3181,7 +3386,7 @@ static void draw_resize_handles() {
     ImVec2 wp = ImGui::GetWindowPos();
     ImVec2 ws = ImGui::GetWindowSize();
     ImGuiIO& io = ImGui::GetIO();
-    const float T  = 12.f;
+    const float T  = overlay_dp(10.f);   /* r35 G: dp-sized strips */
     const float th = ImGui::GetFrameHeight();
     static int   s_rz = -1;          /* 0 left 1 right 2 bottom */
     static ImVec2 m0(0, 0), p0(0, 0), s0(0, 0);
@@ -3255,13 +3460,16 @@ static void explorer_windows() {
         snprintf(ttl, sizeof(ttl), "%s###ex%d",
                  e.search[0] ? e.search : "Classes", e.id);
         if (!e.free_init) {
-            ImGui::SetNextWindowPos(ImVec2(70, 130),
+            ImGui::SetNextWindowPos(ImVec2(overlay_dp(10.f),
+                                           overlay_dp(16.f)),
                                     ImGuiCond_Appearing);
-            ImGui::SetNextWindowSize(ImVec2(420, 420),
+            ImGui::SetNextWindowSize(ImVec2(overlay_dp(280.f),
+                                            overlay_dp(280.f)),
                                      ImGuiCond_Appearing);
             e.free_init = true;
         }
-        ImGui::SetNextWindowSizeConstraints(ImVec2(260, 200),
+        ImGui::SetNextWindowSizeConstraints(
+            ImVec2(overlay_dp(180.f), overlay_dp(140.f)),
                                             ImVec2(1400, 1400));
         bool open = true;
         if (!ImGui::Begin(ttl, &open)) {
@@ -3350,7 +3558,8 @@ static void class_windows() {
             wfl |= ImGuiWindowFlags_NoDocking;
 #endif
         } else if (!c.free_init) {
-            ImGui::SetNextWindowSize(ImVec2(460, 480),
+            ImGui::SetNextWindowSize(ImVec2(overlay_dp(300.f),
+                                            overlay_dp(320.f)),
                                      ImGuiCond_Appearing);
             c.free_init = true;
         }
@@ -3404,8 +3613,19 @@ void menu_draw() {
         float dt = io.DeltaTime;
         float lh = ImGui::CalcTextSize("X").y;
         if (lh <= 0.f) lh = 18.f;
-        int maxline = (int)((ds.y - 150.f) / lh) - 5;
+        /* r35 D5: was a fixed (20, 150) px origin that landed on the
+           tab strip on high-DPI devices - anchor to the menu window
+           and scale with density */
+        bool mok = s_menu_rect.z > 0.f;
+        float fx = mok ? s_menu_rect.x + overlay_dp(10.f)
+                       : overlay_dp(10.f);
+        float fy = mok ? s_menu_rect.y + overlay_dp(34.f)
+                       : overlay_dp(24.f);
+        float fmaxh = mok ? s_menu_rect.w - overlay_dp(44.f)
+                          : ds.y * 0.5f;
+        int maxline = (int)(fmaxh / lh);
         if (maxline > 10) maxline = 10;
+        if (maxline < 1) maxline = 1;
         int i = 0;
         for (int k = 0; k < (int)s_flash.size(); ) {
             HitFlash& f = s_flash[k];
@@ -3419,7 +3639,7 @@ void menu_draw() {
                 char lbl[300];
                 snprintf(lbl, sizeof(lbl), "%s (%ldx)",
                          f.name.c_str(), f.count);
-                ImVec2 pos(20.f, 150.f + lh * (float)i);
+                ImVec2 pos(fx, fy + lh * (float)i);
                 ImVec2 ts = ImGui::CalcTextSize(lbl);
                 float g = f.time > 0.f
                               ? (f.time > 1.f ? 1.f : f.time) : 0.f;
@@ -3449,15 +3669,20 @@ void menu_draw() {
             ImGui::SetNextWindowPos(s_fs_last_pos);
             ImGui::SetNextWindowSize(s_fs_last_size);
         }
-        ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
+        ImGui::SetNextWindowPos(ImVec2(overlay_dp(8.f),
+                                       overlay_dp(8.f)),
+                                ImGuiCond_Once);
+        /* r35 G: minimums in dp - the window is usable on any
+           density (was 420x300 absolute px) */
         ImGui::SetNextWindowSizeConstraints(
-            ImVec2(420, 300), ImVec2(ds.x * .95f, ds.y * .95f));
+            ImVec2(overlay_dp(280.f), overlay_dp(180.f)),
+            ImVec2(ds.x * .95f, ds.y * .95f));
         ImGui::SetNextWindowSize(ImVec2(ds.x * .8f, ds.y * .85f),
                                  ImGuiCond_Once);
     }
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r34)", &open, wflags);
+    ImGui::Begin("Dex-tool (r35)", &open, wflags);
     {
         /* r33 F1: minimize button - sits in the title bar, left of
            the X; the cursor is restored so the layout is untouched.
@@ -3539,6 +3764,7 @@ void menu_draw() {
     class_windows();      /* r33 F7: class detail windows */
     if (!s_fullscreen) draw_resize_handles();
     ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    s_menu_rect = ImVec4(wp.x, wp.y, ws.x, ws.y);   /* r35 D5 */
     ImGui::End();
     {   /* r33 F2: the title+tab strip is NOT a scroll region any
            more - single taps there reach the tabs immediately

@@ -1,7 +1,8 @@
-/* Dex-tool agent (r34): G2 guards the delayed echo of a
-   programmatic EditText clear (it used to reach the menu as
-   backspaces - the "single character" search reset). r33:
-   reflection method/field search with name/param/return filters,
+/* Dex-tool agent (r35): B reports DisplayMetrics density/dpi in
+   the ready payload so the menu sizes the UI in real dp (the
+   overlay draws in physical pixels). r34: G2 guarded the delayed
+   echo of a programmatic EditText clear. r33: reflection
+   method/field search with name/param/return filters,
    createInstance args, listConstructors. r32: FN_ARGS by JSON
    key. r31: releaseHandle. r30: hook-mode prefix match +
    unknown-mode report, stale handle reporting. */
@@ -2772,12 +2773,21 @@ setTimeout(function () {
         sendMsg('error', { fn: 'touchhook',
                            msg: String(eT && eT.message || eT) });
     }
-    var pkgR = '';
+    var pkgR = '', densR = 1.0, dpiR = 0;
     try {
         var ATr = Java.use('android.app.ActivityThread');
         var appR = ATr.currentApplication();
-        if (appR) pkgR = String(appR.getPackageName());
+        if (appR) {
+            pkgR = String(appR.getPackageName());
+            try {
+                var dm = appR.getResources().getDisplayMetrics();
+                densR = parseFloat(String(dm.density)) || 1.0;
+                dpiR  = parseInt(String(dm.densityDpi)) || 0;
+            } catch (eDm) {}
+        }
     } catch (eP) {}
-    sendMsg('ready', { msg: 'Dex-tool agent r34 loaded', pkg: pkgR });
+    /* r35 B: density lets the menu size the UI in real dp */
+    sendMsg('ready', { msg: 'Dex-tool agent r35 loaded', pkg: pkgR,
+                       density: densR, dpi: dpiR });
     agentLog('phase: ready sent');
 }, 0);

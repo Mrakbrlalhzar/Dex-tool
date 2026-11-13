@@ -9,6 +9,10 @@ void overlay_start(JavaVM* vm);
 bool overlay_ready();
 void overlay_get_display_size(float* w, float* h);
 void overlay_request_font_rebuild(float size);
+/* r35 B: device density - the UI sizes everything in dp */
+void  overlay_set_density(float d);
+float overlay_density(void);
+float overlay_dp(float v);        /* dp -> ImGui (physical) pixels */
 void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed);
 void overlay_set_touch_bias(float dy);
 void overlay_touch_map_desc(char* buf, int n);

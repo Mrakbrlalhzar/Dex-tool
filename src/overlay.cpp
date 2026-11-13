@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <cmath>
+#include <cfloat>      /* r35 D: FLT_MAX on release */
 #include <unistd.h>
 #include <ctime>
 #include <pthread.h>
@@ -221,6 +222,18 @@ void overlay_request_font_rebuild(float size) {
     g_font_size  = size;
     g_font_dirty = true;
 }
+
+/* r35 B: density normalization. The overlay renders in PHYSICAL
+   pixels (eglQuerySurface), so an 18 px font is ~6 dp on a density-3
+   phone - 2.3x smaller than Android body text. The agent reports
+   DisplayMetrics.density in the ready payload; every size in the
+   menu goes through overlay_dp() from now on. */
+static std::atomic<float> g_density{ 2.0f };   /* sane fallback */
+void  overlay_set_density(float d) {
+    if (d > 0.5f && d < 8.0f) g_density.store(d);
+}
+float overlay_density(void) { return g_density.load(); }
+float overlay_dp(float v)   { return v * overlay_density(); }
 void overlay_publish_scroll_regions(const std::vector<float>& xywh_speed) {
     g_scroll_regions = xywh_speed;
 }
@@ -387,8 +400,13 @@ static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
     /* r34 G4: docking branch - inspectors dock to the bottom strip */
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 #endif
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().WindowRounding = 6.0f;
+#if IMGUI_VERSION_NUM >= 19300
+    /* r35 E: 1.93 single-click API; must exceed MouseDoubleClickTime */
+    io.MouseSingleClickDelay = 0.35f;
+#endif
+    /* r35 H: apply_theme() in menu.cpp owns the whole style now -
+       forcing Dark here made a saved Light theme revert after a GL
+       context loss while the Settings combo still said Light */
     if (io.Fonts->Fonts.empty() || g_font_dirty) build_fonts(io);
     ImGui_ImplOpenGL3_Init("#version 100");
     s->last_frame_ms = now_ms();
@@ -613,9 +631,16 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
         bool   have_prev = false;
         for (const TouchEvent& t : q) {
             ImVec2 p = map_touch(t.x, t.y, ds);
+            /* r35 D: 1.93.0 Android backend parity - clear the mouse
+               position on touch release so the item under the finger
+               stops being hovered (buttons stayed lit after a tap) */
+            if (t.phase == 1) {
+                io.AddMouseButtonEvent(0, false);
+                io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+                continue;
+            }
             io.AddMousePosEvent(p.x, p.y);
             if (t.phase == 0) io.AddMouseButtonEvent(0, true);
-            if (t.phase == 1) io.AddMouseButtonEvent(0, false);
             if (t.phase == 2) {
                 /* r30 H5: MOVE no longer fabricates a button press -
                    a queue-overflowed DOWN used to leave the virtual

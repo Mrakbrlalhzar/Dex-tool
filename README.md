@@ -37,6 +37,44 @@ not the tree.
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
 
+## Changes in this version (r35) - density-correct phone UI
+
+The tool targets regular Android apps, so the review's dp-correct
+phone path was taken. All of the review's patches are in:
+
+- **A - ImGui 1.93.0-docking** (was v1.90.4-docking). The backend
+  "forget device objects" helper was updated for the 1.92+ dynamic
+  font atlas (`FontTexture` no longer exists; the backend recreates
+  textures itself). `io.MouseSingleClickDelay` is set at init.
+- **B - density**: the agent reports `DisplayMetrics.density`/`dpi`
+  in the ready payload; the menu re-derives the font, rebuilds it
+  and rescales the style on arrival. Every size in the menu now
+  goes through `overlay_dp()` - the UI is the same physical size on
+  a 720p and a 1440p phone (it used to be ~2.3x too small).
+- **C - design system**: font presets are multipliers of 14 dp body
+  text (config `scale=` key unchanged, no migration); `apply_theme()`
+  owns colours (semantic palette, accent blue, pink as secondary)
+  AND metrics - `ScaleAllSizes()` from a pristine base with
+  `k = font_px / 13`, so the style scales with the font instead of
+  clipping text at 32 px. The hardcoded pink button uses the
+  palette's secondary accent now.
+- **D - touch release clears the mouse position** (1.93 Android
+  backend parity): buttons no longer stay hovered/lit after a tap.
+- **E - 1.93 single-click API**: class rows open via
+  `GetItemClickedCountWithSingleClickDelay()`, so a double tap
+  opens one inspector, not two.
+- **F - ImGui Tables** for the Static Fields and Fields lists:
+  aligned Name/Type/Value/Actions columns, zebra rows, frozen
+  header (methods keep their expandable TreeNodes on purpose).
+- **G - dp-sized chrome**: FAB is 56x48 dp with a 48 dp-min touch
+  target, resize strips 10 dp, all window minimums in dp.
+- **H - style ownership**: the style init in `slot_init()` is gone;
+  the theme no longer silently reverts to Dark after a GL context
+  loss.
+- **D5/D9**: the hit-flash list is anchored to the menu window and
+  density-scaled; the stale "v1.3" left the title bar.
+
+
 ## Changes in this version (r34) - touch input + docking
 
 - **Single-tap tabs**: the ImGui context now sets
@@ -65,7 +103,7 @@ libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
   rendered (the "748 of 748" / empty-void behavior). Empty names
   are never rendered.
 - **Dockable inspector**: the build now uses the imgui
-  `v1.90.4-docking` branch with `ImGuiConfigFlags_DockingEnable`.
+  `v1.93.0-docking` branch with `ImGuiConfigFlags_DockingEnable`.
   A `DockSpace` strip sits at the bottom of the main window (the
   tabs stay at the top and the class list stays visible); every
   new inspector is queued with `DockBuilderDockWindow` and docks
@@ -1038,5 +1076,5 @@ persistence to <logdir>/dextool-ui.conf.
 
     frida-gum 16.7.19   QuickJS / GumJS scripting runtime
     Dobby (LSPosed)     inline function hook framework
-    ImGui 1.90.4        immediate-mode overlay GUI (ES2 mode)
+    ImGui 1.93.0-docking  immediate-mode overlay GUI (ES2 mode)
     smali 3.0.7         runtime .smali to DEX assembler (bundled JAR)
