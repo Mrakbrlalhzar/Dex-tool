@@ -29,9 +29,13 @@ static void ts(char* buf, size_t n) {
 static struct sigaction g_prev_act[32];
 static bool             g_prev_set[32];
 static char             g_alt_stack[64 * 1024];
-static int crash_ux(char* dst, unsigned long v) {
-    /* r30 M2: async-signal-safe hex formatter (no stdio) */
+static int crash_ux(char* dst, int cap, unsigned long v) {
+    /* r30 M2: async-signal-safe hex formatter (no stdio).
+       r32 R4: capacity-bounded - the old version wrote up to 18
+       bytes with no limit, one longer literal away from a stack
+       buffer overflow inside a signal handler. */
     int n = 0;
+    if (cap < 3) return 0;
     dst[n++] = '0';
     dst[n++] = 'x';
     char tmp[18];
@@ -41,8 +45,36 @@ static int crash_ux(char* dst, unsigned long v) {
         tmp[t++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
         v >>= 4;
     } while (v && t < 16);
-    while (t) dst[n++] = tmp[--t];
+    while (t && n < cap) dst[n++] = tmp[--t];
     return n;
+}
+/* r32 R3: module map snapshot taken at install time, where blocking
+   is safe. The crash handler only READS this array - no file I/O,
+   no dladdr, no loader lock - so the log names the faulting module
+   again while staying async-signal-safe. */
+#define CR_MOD_MAX 128
+struct CrMod { unsigned long base, end; char name[80]; };
+static struct CrMod g_cr_mods[CR_MOD_MAX];
+static volatile int g_cr_mod_n = 0;
+static void crash_mods_scan(void) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (g_cr_mod_n >= CR_MOD_MAX) break;
+        unsigned long b = 0, e = 0;
+        char perms[8] = "", path[256] = "";
+        if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %255[^\n]",
+                   &b, &e, perms, path) < 3) continue;
+        size_t len = strlen(path);
+        if (len < 3 || strcmp(path + len - 3, ".so") != 0) continue;
+        struct CrMod* m = &g_cr_mods[g_cr_mod_n++];
+        m->base = b;
+        m->end  = e;
+        const char* slash = strrchr(path, '/');
+        snprintf(m->name, sizeof(m->name), "%s", slash ? slash + 1 : path);
+    }
+    fclose(f);
 }
 static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
     uintptr_t pc = 0;
@@ -56,21 +88,43 @@ static void crash_sig_action(int sig, siginfo_t* si, void* uc) {
         /* r30 M2: async-signal-safe only - no snprintf (stdio lock)
            and no dladdr (loader lock): they can deadlock exactly on
            the crash they are supposed to report. write() only. */
-        char m[160];
+        char m[320];   /* r32 R4: room for the module fields too */
         size_t n = 0;
         const char* q = "CRASH signal=";
         while (*q && n < sizeof(m) - 1) m[n++] = *q++;
-        n += (size_t)crash_ux(m + n, (unsigned long)sig);
+        n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n), (unsigned long)sig);
         q = " code=";
         while (*q && n < sizeof(m) - 1) m[n++] = *q++;
-        n += (size_t)crash_ux(m + n, (unsigned long)(si ? si->si_code : 0));
+        n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n),
+                              (unsigned long)(si ? si->si_code : 0));
         q = " addr=";
         while (*q && n < sizeof(m) - 1) m[n++] = *q++;
-        n += (size_t)crash_ux(m + n,
+        n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n),
                               (unsigned long)(si ? (uintptr_t)si->si_addr : 0));
         q = " pc=";
         while (*q && n < sizeof(m) - 1) m[n++] = *q++;
-        n += (size_t)crash_ux(m + n, (unsigned long)pc);
+        n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n), (unsigned long)pc);
+        /* r32 R3: name the faulting module from the install-time
+           snapshot (read-only here - signal safe) */
+        int cmi = -1;
+        for (int i = 0; i < g_cr_mod_n && pc; i++) {
+            if ((unsigned long)pc >= g_cr_mods[i].base &&
+                (unsigned long)pc <  g_cr_mods[i].end) { cmi = i; break; }
+        }
+        if (cmi >= 0) {
+            const char* q2 = " in ";
+            while (*q2 && n < sizeof(m) - 1) m[n++] = *q2++;
+            const char* nm = g_cr_mods[cmi].name;
+            while (*nm && n < sizeof(m) - 1) m[n++] = *nm++;
+            q2 = " base=";
+            while (*q2 && n < sizeof(m) - 1) m[n++] = *q2++;
+            n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n),
+                                  g_cr_mods[cmi].base);
+            q2 = " off=+";
+            while (*q2 && n < sizeof(m) - 1) m[n++] = *q2++;
+            n += (size_t)crash_ux(m + n, (int)(sizeof(m) - n),
+                                  (unsigned long)pc - g_cr_mods[cmi].base);
+        }
         if (n < sizeof(m) - 1) m[n++] = '\n';
         m[n] = 0;
         log_crash_raw(m);
@@ -133,6 +187,7 @@ void logger_init(const char* base_dir) {
         }
     }
     install_crash_sig(SIGSEGV);
+    crash_mods_scan();   /* r32 R3: snapshot the module map while blocking is safe */
     install_crash_sig(SIGABRT);
     install_crash_sig(SIGBUS);
     install_crash_sig(SIGILL);
@@ -162,7 +217,7 @@ void logger_init(const char* base_dir) {
                  "mem: VmRSS=%ldkB MemAvailable=%ldkB", rss, avail);
         log_info(mm);
     }
-    log_info("logger_init done (build r31: M4 real JSON tree parser with shallowest-match key lookup, surrogate pairs and a depth cap, M7 releaseHandle frees retained instances on object tab close, M8 lock-free frame pump via atomic mirror, CI warns on hand edits to generated files. r30: flash-loop lock, deque containers, hook-mode fix, dumpObject args, touch/GL/logger fixes, signal-safe crash handler)");
+    log_info("logger_init done (build r32: R1 dumpObject FN_ARGS keyed by the JSON key the menu sends, R2 s_visible atomic - checkbox regression fixed, R3 signal-safe module map snapshot for the crash log, R4 bounded crash_ux, R5 park leak counted, R6 parse-once JSON cache, R7 auto-list sends cs, R8 dump preview matches agent, R9 warning excludes smali_runtime, R10 release sweep on tab close and saved-object removal, push gated to canonical repo. r31: real JSON tree parser, releaseHandle, lock-free frame pump)");
 }
 void logger_retarget(const char* base_dir) {
     if (!base_dir || !base_dir[0]) return;

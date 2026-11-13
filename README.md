@@ -17,8 +17,10 @@ resize, IME-aware text fields.
 The workflow `.github/workflows/build.yml` IS the source of truth: it
 writes `src/`, `agent/agent.js`, `sample-app/` and this README from
 inline heredocs, builds `libtool.so` + the sample APK with the NDK and
-commits the generated tree back. Hand edits under `src/` are
-overwritten by the next CI run - change the heredocs, not the tree.
+commits the generated tree back. Hand edits under `src/` (except
+`src/smali_runtime.{cpp,h}`, which CI does not generate since
+r21) are overwritten by the next CI run - change the heredocs,
+not the tree.
 
 ## Known limitations
 
@@ -34,6 +36,44 @@ overwritten by the next CI run - change the heredocs, not the tree.
 
 Standalone runtime instrumentation for Android APKs.
 libtool.so for armeabi-v7a + arm64-v8a. No root. API 26+.
+
+## Fixes in this version (r32)
+
+- **R1** dumpObject in FN_ARGS was keyed by the export's parameter
+  name ('cls'), but the dispatcher resolves by JSON key and the
+  menu sends "class" - the per-object dump has been dead since
+  r30. Now ['class', 'handle'].
+- **R2** r31 regression: the Settings "Menu visible" checkbox wrote
+  s_visible while menu_draw read only the atomic mirror, so the
+  checkbox did nothing. s_visible is now std::atomic<bool> itself
+  and the mirror is gone - one variable, every writer updates it.
+- **R3** the crash log names the faulting module again: the module
+  map is snapshotted at install time (blocking is fine there) and
+  the handler only READS the snapshot, which stays async-signal-
+  safe - no dladdr, no file I/O in-handler.
+- **R4** crash_ux() takes a capacity bound; the crash line buffer
+  grew to 320 bytes so the restored module fields fit.
+- **R5** imgui_park_without_gl() documents its backend-data leak
+  and counts parks (Info panel: "GL context parks").
+- **R6** the JSON helpers parse each message once: a mutex-guarded
+  one-entry cache keyed on the payload reuses the tree for
+  repeated lookups instead of re-parsing per lookup.
+- **R7** the automatic class listing now sends "cs" like manual
+  searches, so the Case-sensitive toggle is consistent.
+- **R8** the object-dump popup preview shows the agent's real
+  filename (class with dots replaced, hex handle).
+- **R9** the CI hand-edit warning excludes src/smali_runtime.{cpp,h}
+  (hand-maintained since r21); the README notes the exception.
+- **R10** closing a class tab releases the handles its Instances
+  list retained (skipping handles with open object tabs); removing
+  a Saved Object releases its handle. The retain leak is closed on
+  all three paths.
+- The push back to dev is gated on the canonical repository, so a
+  fork running this workflow cannot rewrite its own tree.
+- The review's C3 cleanup note was re-checked and declined: the
+  'nop' / 'noop' prefixes come from two different UI sources and
+  are both needed; the code now carries a comment saying so.
+
 
 ## Fixes in this version (r31)
 

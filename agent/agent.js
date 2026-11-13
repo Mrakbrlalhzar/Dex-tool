@@ -1,7 +1,7 @@
-/* Dex-tool agent (r31): M7 releaseHandle export - the menu frees
-   retained instances when their object tab closes. r30: hook-mode
-   prefix match + unknown-mode report, dumpObject FN_ARGS, stale
-   handle reporting. */
+/* Dex-tool agent (r32): R1 dumpObject FN_ARGS keyed by the JSON
+   key the menu sends ("class") - the per-object dump works again.
+   r31: releaseHandle export. r30: hook-mode prefix match +
+   unknown-mode report, stale handle reporting. */
 'use strict';
 function sendMsg(type, payload) { send({ type: type, payload: payload }); }
 var gAgentLog = null;
@@ -1534,7 +1534,11 @@ rpc.exports = {
         if (ml.indexOf('java') === 0) mode = 'Java';
         else if (ml === 'smali') mode = 'Smali';
         else if (ml.indexOf('nop') === 0 || ml.indexOf('noop') === 0)
-            mode = 'noop';   /* r30 C3: the UI sends "Nop (auto)" */
+            /* 'nop' matches the hook editor's "Nop (auto)" (r30 C3),
+               'noop' matches the Patcher's Patch NOP button - two
+               different sources, both needed; not a copy-paste
+               leftover (r32 re-check) */
+            mode = 'noop';
         Java.perform(function () {
             if (!dt_is_loaded(cls)) {
                 defer_install('hook', cls, function () {
@@ -2568,8 +2572,12 @@ var FN_ARGS = {
     callMethod:      ['class', 'method', 'args', 'handle', 'count', 'main'],
     createInstance:  ['class'],
     dumpLoadedClasses: [],              /* r30 C4 */
-    dumpObject:      ['cls', 'handle'],/* r30 C4: per-object dump
-                                           was dead (undefined args) */
+    dumpObject:      ['class', 'handle'],/* r32 R1: FN_ARGS resolves
+                                           by JSON key and the menu
+                                           sends "class" - r30 wired
+                                           the export's parameter
+                                           name ('cls'), so the dump
+                                           stayed dead */
     releaseHandle:   ['handle']         /* r31 M7 */
 };
 agentLog('phase: deferred init scheduled');
@@ -2594,6 +2602,6 @@ setTimeout(function () {
         var appR = ATr.currentApplication();
         if (appR) pkgR = String(appR.getPackageName());
     } catch (eP) {}
-    sendMsg('ready', { msg: 'Dex-tool agent r31 loaded', pkg: pkgR });
+    sendMsg('ready', { msg: 'Dex-tool agent r32 loaded', pkg: pkgR });
     agentLog('phase: ready sent');
 }, 0);

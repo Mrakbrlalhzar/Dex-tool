@@ -1,7 +1,8 @@
-/* Dex-tool menu (r31): M4 real JSON tree parser (shallowest-match
-   lookup, surrogate pairs, depth cap), M7 releaseHandle on object
-   tab close, M8 lock-free frame pump via atomic mirror. r30:
-   flash-loop lock, deque tab containers, dead trigger removed. */
+/* Dex-tool menu (r32): R2 s_visible atomic (checkbox regression),
+   R6 parse-once JSON cache, R7 auto-list cs, R8 dump preview,
+   R10 release sweep on class tab close / saved object removal.
+   r31: real JSON tree parser, releaseHandle on object tab close,
+   lock-free frame pump. */
 #include "menu.h"
 #include "overlay.h"
 #include "frida_bridge.h"
@@ -10,7 +11,8 @@
 #include "imgui_internal.h"
 #include <string>
 #include <deque>   /* r30 C2: stable refs across push_back */
-#include <atomic>  /* r31 M8: lock-free frame-pump mirror */
+#include <atomic>  /* r31 M8: lock-free pump (r32 R2: s_visible itself) */
+#include <mutex>   /* r32 R6: parse-once JSON cache */
 #include <vector>
 #include <cstdio>
 #include <cstring>
@@ -29,8 +31,10 @@ static float s_opacity    = 0.92f;
 static int   s_theme      = 0;
 static float s_ovl_scroll = 1.5f;   /* whole-menu drag speed */
 static float s_lst_scroll = 1.2f;   /* inner list drag speed */
-static bool  s_visible    = true;
-static std::atomic<bool> s_visible_pub{ true };  /* r31 M8 */
+static std::atomic<bool> s_visible{ true };
+/* r32 R2: the variable itself is atomic - r31's separate mirror was
+   only updated by three of the four writers, so the Settings
+   "Menu visible" checkbox did nothing. One variable, no invariant. */
 static bool  s_show_fab   = true;
 static float s_y_off      = 0.0f;   /* manual touch Y bias (px); r15: default 0 - the screen-space touch map is mathematically exact, the slider stays for exotic hosts */
 static bool  s_agent_ready = false;
@@ -212,6 +216,11 @@ struct ObjTab {
     char edit[256] = {};         /* its edit buffer                   */
 };
 static std::deque<ObjTab> s_objtabs;
+static bool objtab_open(long h) {   /* r32 R10: handle still on screen? */
+    for (auto& t : s_objtabs)
+        if (t.handle == h) return true;
+    return false;
+}
 static long s_objfocus = -1;     /* handle of the tab to select       */
 struct SavedObj { std::string cls, str; long handle = -1; };
 static std::vector<SavedObj> s_saved;
@@ -479,32 +488,45 @@ static std::string jdump(const JVal& v) {
     }
     return r;
 }
+static std::mutex g_jcache_mtx;     /* r32 R6: parse once per msg */
+static std::string g_jcache_in;
+static bool g_jcache_ok = false;
+static JVal g_jcache_tree;
+/* Lookup with a one-entry cache: repeated lookups on the same
+   payload (a message handler makes several) reuse the parsed tree.
+   The mutex makes it safe whichever thread calls in; the whole
+   lookup happens under the lock, so the tree cannot be re-parsed
+   mid-walk. */
+static const JVal* jlookup_locked(const std::string& j, const char* key) {
+    if (j != g_jcache_in) {
+        g_jcache_in = j;
+        g_jcache_tree = JVal();
+        g_jcache_ok = jparse_root(j, g_jcache_tree);
+    }
+    return g_jcache_ok ? jfind_bfs(g_jcache_tree, key) : nullptr;
+}
 static std::vector<std::string> jarr(const std::string& j, const char* key) {
     std::vector<std::string> r;
-    JVal root;
-    if (!jparse_root(j, root)) return r;
-    const JVal* v = jfind_bfs(root, key);
-    if (!v || v->kind != 2) return r;
-    for (auto& e : v->arr)
-        if (e.kind == 3) r.push_back(e.str);
+    std::lock_guard<std::mutex> lk(g_jcache_mtx);
+    const JVal* v = jlookup_locked(j, key);
+    if (v && v->kind == 2)
+        for (auto& e : v->arr)
+            if (e.kind == 3) r.push_back(e.str);
     return r;
 }
 static std::string jstr(const std::string& j, const char* key) {
-    JVal root;
-    if (!jparse_root(j, root)) return "";
-    const JVal* v = jfind_bfs(root, key);
+    std::lock_guard<std::mutex> lk(g_jcache_mtx);
+    const JVal* v = jlookup_locked(j, key);
     return (v && v->kind == 3) ? v->str : "";
 }
 static long jnum(const std::string& j, const char* key, long dflt = 0) {
-    JVal root;
-    if (!jparse_root(j, root)) return dflt;
-    const JVal* v = jfind_bfs(root, key);
+    std::lock_guard<std::mutex> lk(g_jcache_mtx);
+    const JVal* v = jlookup_locked(j, key);
     return (v && v->kind == 4) ? (long)v->num : dflt;
 }
 static bool jhas(const std::string& j, const char* key) {
-    JVal root;
-    if (!jparse_root(j, root)) return false;
-    return jfind_bfs(root, key) != nullptr;
+    std::lock_guard<std::mutex> lk(g_jcache_mtx);
+    return jlookup_locked(j, key) != nullptr;
 }
 static std::string jtype(const std::string& j) {
     return jstr(j, "type");
@@ -512,15 +534,15 @@ static std::string jtype(const std::string& j) {
 static std::vector<std::string> jobjarr(const std::string& j,
                                         const char* key) {
     std::vector<std::string> r;
-    JVal root;
-    if (!jparse_root(j, root)) return r;
-    const JVal* v = jfind_bfs(root, key);
-    if (!v || v->kind != 2) return r;
-    for (auto& e : v->arr)
-        if (e.kind == 1) r.push_back(jdump(e));
+    std::lock_guard<std::mutex> lk(g_jcache_mtx);
+    const JVal* v = jlookup_locked(j, key);
+    if (v && v->kind == 2)
+        for (auto& e : v->arr)
+            if (e.kind == 1) r.push_back(jdump(e));
     return r;
 }
-/* ---- end r31 JSON tree ---- */
+/* ---- end r31/r32 JSON tree ---- */
+
 static void post_rpc(const char* fn, const std::string& args) {
     std::string m = "{\"type\":\"rpc\",\"fn\":\"";
     m += fn; m += "\",\"args\":"; m += args; m += "}";
@@ -1172,8 +1194,11 @@ static void tab_settings() {
                         "opens when a field is focused.");
     if (ImGui::Checkbox("Show toggle button", &s_show_fab))
         s_conf_dirty = true;
-    if (ImGui::Checkbox("Menu visible", &s_visible))
+    bool vis_ck = s_visible;    /* r32 R2: atomic has no bool* */
+    if (ImGui::Checkbox("Menu visible", &vis_ck)) {
+        s_visible.store(vis_ck);
         s_conf_dirty = true;
+    }
     if (!s_visible && !s_show_fab)
         ImGui::TextColored(ImVec4(1, .6f, 0, 1),
             "Menu hidden with no toggle button - it was re-enabled.");
@@ -1181,6 +1206,7 @@ static void tab_settings() {
     ImGui::Separator();
     ImGui::Text("Info");
     ImGui::Text("Package: %s", s_pkg.c_str());
+    ImGui::Text("GL context parks: %d", overlay_park_count());  /* r32 R5 */
     s_ovl_ready = overlay_ready();
     float dw=0, dh=0;
     overlay_get_display_size(&dw, &dh);
@@ -1820,6 +1846,12 @@ static void inst_view(ClassTab& c) {
                            sv.handle, sv.str);
             ImGui::SameLine();
             if (ImGui::SmallButton("Remove")) {
+                /* r32 R10: free the retained instance too */
+                if (sv.handle > 0 && !objtab_open(sv.handle)) {
+                    std::string a = "{\"handle\":" +
+                                    std::to_string(sv.handle) + "}";
+                    post_rpc("releaseHandle", a);
+                }
                 s_saved.erase(s_saved.begin() + k);
                 ImGui::PopID();
                 continue;
@@ -2451,8 +2483,15 @@ static void obj_tab_body(ObjTab& t) {
         ImGui::EndPopup();
     }
     if (ImGui::BeginPopup("ObjDumpPopup")) {
-        char fn[128];
-        snprintf(fn, sizeof(fn), "dextool-object-0x%lx.json", t.handle);
+        char fn[160];
+        {   /* r32 R8: mirror the agent's real dump filename
+               (dots -> underscores, hex handle) - the old preview
+               showed a name the agent never wrote */
+            std::string sn;
+            for (char ch : t.cls) sn += (ch == '.') ? '_' : ch;
+            snprintf(fn, sizeof(fn), "dextool-object-%s-0x%lx.json",
+                     sn.c_str(), (unsigned long)t.handle);
+        }
         ImGui::Text("File will be saved as %s", fn);
         ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 50, 255));
         ImGui::Text("Note: This may take a while depending on the size "
@@ -2814,9 +2853,10 @@ static void tab_tools() {
         MULK();
     }
     if (qid)
-        post_rpc("listLoadedClasses",
+        post_rpc("listLoadedClasses",   /* r32 R7: send cs like run_search */
                  "{\"filter\":\"\",\"qid\":" + std::to_string(qid)
                  + ",\"mode\":0"
+                 + ",\"cs\":" + (s_search_cs ? "true" : "false")
                  + ",\"sys\":" + (s_search_sys ? "true" : "false") + "}");
     if (ImGui::Checkbox("Fullscreen", &s_fullscreen)) {
         if (s_fullscreen) {
@@ -2891,6 +2931,16 @@ static void tab_tools() {
                 ImGui::EndTabItem();
             }
             if (!open) {
+                /* r32 R10: release the instances this tab retained -
+                   the LRU used to pin them until 200 newer scans.
+                   Handles with an open object tab stay. */
+                for (auto& in : c.instances) {
+                    if (in.handle > 0 && !objtab_open(in.handle)) {
+                        std::string a = "{\"handle\":" +
+                                        std::to_string(in.handle) + "}";
+                        post_rpc("releaseHandle", a);
+                    }
+                }
                 s_classes.erase(s_classes.begin() + i);
                 continue;
             }
@@ -2982,14 +3032,12 @@ static void draw_fab(ImVec2 ds) {
         s_fab_drag = false;
         if (!s_fab_moved && !fab_press) {
             /* tap released just off the button: still a tap */
-            s_visible = !s_visible;
-            s_visible_pub.store(s_visible);
+            s_visible = !s_visible;   /* r32 R2: atomic store */
             s_conf_dirty = true;
         }
     }
     if (fab_press && !s_fab_moved) {  /* r29: single tap toggles */
-        s_visible = !s_visible;
-        s_visible_pub.store(s_visible);
+        s_visible = !s_visible;   /* r32 R2: atomic store */
         s_conf_dirty = true;
     }
     ImGui::End();
@@ -3066,17 +3114,17 @@ static void draw_resize_handles() {
     }
 }
 int menu_frame_pump_level() {
-    /* r31 M8: no mutex - s_visible is mirrored into an atomic, so
-       the JS thread's frame pump can no longer stall behind a
-       whole-frame render lock */
-    if (s_visible_pub.load(std::memory_order_relaxed)) return 2;
+    /* r31 M8: no mutex - s_visible is std::atomic<bool>, so the JS
+       thread's frame pump never stalls behind a whole-frame render
+       lock (r32 R2: the variable itself, not a mirror) */
+    if (s_visible.load(std::memory_order_relaxed)) return 2;
     return overlay_ready() ? 1 : 0;       /* FAB-only slow pump  */
 }
 void menu_draw() {
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 ds = io.DisplaySize;
     apply_theme();
-    bool vis = s_visible_pub.load(std::memory_order_relaxed);  /* r31 M8 */
+    bool vis = s_visible.load(std::memory_order_relaxed);  /* r31 M8 / r32 R2 */
     if (!vis) {
         draw_fab(ds);
         MLK();
@@ -3149,11 +3197,10 @@ void menu_draw() {
     }
     ImGui::SetNextWindowBgAlpha(s_opacity);
     bool open = vis;
-    ImGui::Begin("Dex-tool v1.3 (r31)", &open, wflags);
+    ImGui::Begin("Dex-tool v1.3 (r32)", &open, wflags);
     if (!open) {
         MLK();
-        s_visible = false;
-        s_visible_pub.store(false);
+        s_visible.store(false);   /* r32 R2 */
         s_conf_dirty = true;
         if (!s_show_fab) s_show_fab = true;
         MULK();

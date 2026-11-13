@@ -23,6 +23,7 @@ JNIEXPORT bool dextool_want_mouse();
 JNIEXPORT bool dextool_hit_test(float x, float y);
 JNIEXPORT int  dextool_display_size();  /* (w<<16)|h, 0 until the overlay is up */
 JNIEXPORT int  dextool_want_frames();
+int  overlay_park_count();   /* r32 R5: imgui_park_without_gl counter */
 JNIEXPORT void dextool_agent_log(const char* msg); /* r14: agent phase markers -> logs */
 #ifdef __cplusplus
 }

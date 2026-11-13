@@ -30,6 +30,7 @@ static fn_swap_dmg    g_orig_swap_dmg    = nullptr;
 static fn_destroy_ctx g_orig_destroy_ctx = nullptr;
 static fn_terminate   g_orig_terminate   = nullptr;
 IMGUI_IMPL_API void ImGui_ImplOpenGL3_ForgetDeviceObjects();
+static std::atomic<int> g_park_leaks{0};   /* r32 R5 */
 static void imgui_park_without_gl() {
     /* r30 H6: ForgetDeviceObjects issues glDelete* against whatever
        context is current - on a foreign context that destroys the
@@ -38,6 +39,15 @@ static void imgui_park_without_gl() {
     ImGuiIO& io = ImGui::GetIO();
     io.BackendRendererName     = nullptr;
     io.BackendRendererUserData = nullptr;
+    /* r32 R5: known leak - ImGui_ImplOpenGL3_Data (and its
+       GlslVersionString) has no GL-free destructor, so it stays
+       allocated until the process dies. Counted so repeated
+       context churn is visible (Info panel); trading it for H6's
+       foreign-context deletes is deliberate. */
+    g_park_leaks++;
+}
+int overlay_park_count() {
+    return g_park_leaks.load(std::memory_order_relaxed);
 }
 static std::atomic<bool> g_gum_inited {false};
 static JavaVM*           g_jvm        = nullptr;
