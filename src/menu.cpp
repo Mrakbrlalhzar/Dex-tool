@@ -88,6 +88,10 @@ struct ClassTab {
     char ctor_filter[96] = {};
     char inst_filter[96] = {};
     int  gen = -1;                      /* r23: instance-list generation; part of the editor buffer key */
+    char nv[32][128] = {};              /* r36: per-class instance-field edit buffers */
+    int  nv_used = 0;
+    std::string nv_key;                 /* r36: replaces the shared static key */
+    int  nv_idx = -1;
     int  sub = 0;                       /* 0 Instances 1 Static Fields 2 Methods 3 Fields */
     int  expanded = -1;                 /* index into methods, -1 none   */
     int  msub = 0;                      /* 0 Call 1 Patch 2 Trace 3 Hook */
@@ -1054,6 +1058,11 @@ void menu_init() {
                 std::string nm = jstr(j, "name");
                 long ct = jnum(j, "count");
                 if (!nm.empty()) {
+                    /* r36: bound the map - a long session on a busy
+                       app used to grow it without limit (memory) */
+                    if (s_hits.find(nm) == s_hits.end() &&
+                        s_hits.size() >= 512)
+                        s_hits.erase(s_hits.begin());
                     s_hits[nm] = ct;
                     flash_hit(nm, ct);
                 }
@@ -2037,23 +2046,31 @@ static void inst_view(ClassTab& c) {
         InstInfo& in = c.instances[c.sel_inst];
         ImGui::Separator();
         ImGui::Text("fields of #%d:", c.sel_inst);
-        static char        nv[32][128];
-        static std::string nv_key;
-        static int         nv_idx = -1;
+        /* r36: per-class buffers - the r23 static nv[32][128] was ONE
+           global set keyed by class+gen+index, so two open class
+           windows fought over the same edit text */
+        char        nv[32][128];
         {
             std::string key = c.cname + "#" + std::to_string(c.gen);
-            if (key != nv_key || nv_idx != c.sel_inst) {
-                nv_key = key;
-                nv_idx = c.sel_inst;
+            if (key != c.nv_key || c.nv_idx != c.sel_inst) {
+                c.nv_key = key;
+                c.nv_idx = c.sel_inst;
                 for (int f = 0; f < 32; f++) {
                     nv[f][0] = 0;
                     if (f < (int)in.fields.size())
                         snprintf(nv[f], sizeof(nv[f]), "%s",
                                  in.fields[f].value.c_str());
                 }
+            } else {
+                for (int f = 0; f < 32; f++) {
+                    if (f < (int)c.nv_used && f < (int)in.fields.size())
+                        memcpy(nv[f], c.nv[f], sizeof(nv[f]));
+                    else nv[f][0] = 0;
+                }
             }
         }
         ImGui::PushItemWidth(-FLT_MIN);
+        int used = 0;
         for (int f = 0; f < (int)in.fields.size() && f < 32; f++) {
             FieldInfo& fi = in.fields[f];
             ImGui::PushID(1000 + f);
@@ -2068,7 +2085,11 @@ static void inst_view(ClassTab& c) {
                 post_rpc("setInstanceField", a);
             }
             ImGui::PopID();
+            used++;
         }
+        /* r36: keep this frame's edits for the next frame (per class) */
+        memcpy(c.nv, nv, sizeof(nv));
+        c.nv_used = used;
         ImGui::PopItemWidth();
     }
     MULK();
@@ -2127,7 +2148,9 @@ static void static_fields_view(ClassTab& c) {
             std::string a = "{\"class\":\"" + jesc(c.cname)
                           + "\",\"field\":\"" + jesc(f.name) + "\"}";
             post_rpc("trackField", a);
+            MLK();   /* r36: JS thread mutates s_trackers under g_mtx */
             s_trackers.push_back({c.cname + "." + f.name, true, {}});
+            MULK();
         }
         ImGui::PopID();
     }
@@ -2184,7 +2207,9 @@ static void fields_view(ClassTab& c) {
             std::string a = "{\"class\":\"" + jesc(c.cname)
                           + "\",\"field\":\"" + jesc(f.name) + "\"}";
             post_rpc("trackField", a);
+            MLK();   /* r36: JS thread mutates s_trackers under g_mtx */
             s_trackers.push_back({c.cname + "." + f.name, true, {}});
+            MULK();
         }
         ImGui::PopID();
     }
@@ -2464,7 +2489,9 @@ static void trace_tab(ClassTab& c, const MethodSig& m) {
             std::string a = "{\"class\":\"" + jesc(c.cname)
                           + "\",\"method\":\"" + jesc(m.name) + "\"}";
             post_rpc("addTracker", a);
+            MLK();   /* r36: JS thread pushes tracker rows under g_mtx */
             s_trackers.push_back({tname, false, {}});
+            MULK();
         }
         ImGui::SameLine();
         ImGui::TextDisabled("not tracking yet");
@@ -2506,19 +2533,23 @@ static void trace_tab(ClassTab& c, const MethodSig& m) {
                       + "\",\"mode\":\"" + modes[c.hook_mode]
                       + "\",\"code\":\"" + jesc(c.hook_code) + "\"}";
         post_rpc("addHook", a);
+        MLK();   /* r36: JS thread mutates s_hooks under g_mtx */
         s_hooks.push_back({c.cname, m.name, c.hook_mode, c.hook_code,
                            true, "..."});
+        MULK();
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Remove hook")) {
         std::string a = "{\"class\":\"" + jesc(c.cname)
                       + "\",\"method\":\"" + jesc(m.name) + "\"}";
         post_rpc("removeHook", a);
+        MLK();
         for (int k = (int)s_hooks.size() - 1; k >= 0; k--) {
             if (s_hooks[k].cls == c.cname && s_hooks[k].method == m.name) {
                 s_hooks.erase(s_hooks.begin() + k);
             }
         }
+        MULK();
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Method source")) {
@@ -2803,7 +2834,9 @@ static void obj_tab_body(ObjTab& t) {
             std::string a = "{\"class\":\"" + jesc(t.cls)
                           + "\",\"field\":\"" + jesc(fi.name) + "\"}";
             post_rpc("trackField", a);
+            MLK();   /* r36: JS thread mutates s_trackers under g_mtx */
             s_trackers.push_back({t.cls + "." + fi.name, true, {}});
+            MULK();
         }
         ImGui::PopID();
     }
@@ -3341,9 +3374,14 @@ static void draw_fab(ImVec2 ds) {
     /* r29: a fast tap completes within one frame - handle the press
        directly (the empty handler needed a second tap before) */
     /* r35 G: dp-sized - Android's 48dp minimum touch target */
+    bool fab_pressed = false;   /* r36: latched - Button may return true AND
+                                   the release branch below may also fire in
+                                   the same frame (release arrives with the
+                                   click), which double-toggled the menu */
     bool fab_press = ImGui::Button(s_visible ? "HIDE" : "MENU",
                                    ImVec2(overlay_dp(56.f),
                                           overlay_dp(48.f)));
+    if (fab_press) fab_pressed = true;
     if (ImGui::IsItemActive()) {
         if (!s_fab_drag) {
             s_fab_drag  = true;
@@ -3365,8 +3403,8 @@ static void draw_fab(ImVec2 ds) {
         }
     } else if (s_fab_drag) {
         s_fab_drag = false;
-        if (!s_fab_moved && !fab_press) {
-            /* tap released just off the button: still a tap */
+        if (!s_fab_moved && !fab_pressed) {
+            /* tap released just off the button: still a tap (r29) */
             s_visible = !s_visible;   /* r32 R2: atomic store */
             s_conf_dirty = true;
         }
@@ -3429,12 +3467,19 @@ static void draw_resize_handles() {
             float right = p0.x + s0.x;
             np.x = p0.x + dx;
             if (np.x < 0) np.x = 0;
-            if (np.x > right - 420.f) np.x = right - 420.f;
+            /* r36: the left-edge minimum was a raw 420 px - it allowed
+               the window to shrink below the dp-derived size minimum
+               and, on a 1440p phone, blocked almost nothing */
+            float minw = overlay_dp(280.f);
+            if (np.x > right - minw) np.x = right - minw;
             ns.x = right - np.x;
+            if (ns.x < minw) { ns.x = minw; np.x = right - minw; }
         } else if (s_rz == 1) {
             ns.x = s0.x + dx;
+            if (ns.x < overlay_dp(280.f)) ns.x = overlay_dp(280.f);
         } else {
             ns.y = s0.y + dy;
+            if (ns.y < overlay_dp(180.f)) ns.y = overlay_dp(180.f);
         }
         if (ns.x > io.DisplaySize.x * .95f)
             ns.x = io.DisplaySize.x * .95f;
@@ -3690,8 +3735,12 @@ void menu_draw() {
            left/right/bottom, the top edge moves the window). */
         ImVec2 cp = ImGui::GetCursorPos();
         ImVec2 wp2 = ImGui::GetWindowPos();
+        ImVec2 wsz2 = ImGui::GetWindowSize();
+        /* r36: dp-sized offsets - raw 56/3 px put the button 3x off
+           on a density-3 phone and overlapped the collapse arrow */
+        float mw = ImGui::CalcTextSize("v").x + ImGui::GetStyle().FramePadding.x * 2.f;
         ImGui::SetCursorScreenPos(ImVec2(
-            wp2.x + ImGui::GetWindowSize().x - 56.f, wp2.y + 3.f));
+            wp2.x + wsz2.x - overlay_dp(20.f) - mw, wp2.y + overlay_dp(6.f)));
         if (ImGui::SmallButton("v##minbtn")) {
             s_visible.store(false);
             s_conf_dirty = true;
