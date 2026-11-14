@@ -112,15 +112,25 @@ function pump_frames() {
         if (!gWantFrames) return;
         var lvl = 0;
         try { lvl = gWantFrames(); } catch (eL) { return; }
-        if (!lvl || !IME || !IME.act) return;
+        if (!lvl) return;
         gPumpTick++;
         if (lvl === 1 && (gPumpTick % 4) !== 0) return;
+        /* r36: IME.act was a hard gate - an app whose touches never go
+           through Activity.dispatchTouchEvent (native-activity games)
+           captured no activity, so the FAB-only pump stalled and the
+           menu never woke up. Resolve on demand instead. */
+        var act = IME.act;
+        if (!act) {
+            try { act = find_current_activity_sync(); } catch (eA) { return; }
+            if (act) ime_set_act(act, 'frame pump');
+        }
+        if (!act) return;
         if (!gPumpLogged) {
             gPumpLogged = 1;
             agentLog('frame pump: on (level ' + lvl + ')');
         }
         var w = null, dv = null;
-        try { w = IME.act.getWindow(); } catch (eW) { return; }
+        try { w = act.getWindow(); } catch (eW) { return; }
         if (!w) return;
         try { dv = w.getDecorView(); } catch (eD) { return; }
         if (!dv) return;
@@ -2038,6 +2048,7 @@ rpc.exports = {
                 Java.choose(cls, {
                     onMatch: function (inst) {
                         try {
+                            if (rows.length >= 20) return 'stop';
                             var h = inst_put(inst);
                             var lbl = '';
                             try { lbl = String(inst); }
@@ -2047,7 +2058,6 @@ rpc.exports = {
                             rows.push({ str: lbl, handle: h,
                                         fields: field_rows(jc, inst) });
                         } catch (e0) {}
-                        if (rows.length >= 20) return 'stop';
                     },
                     onComplete: function () {
                         sendMsg('instanceList', { class: cls, gen: gen,
