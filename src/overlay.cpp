@@ -111,8 +111,17 @@ static void clear_window_rects() {
     std::lock_guard<std::mutex> lk(g_win_mtx);
     g_window_rects.clear();
 }
-static float g_font_size  = 18.0f;
-static bool  g_font_dirty = false;
+/* r36: written by the JS thread (ready payload -> density -> font
+   rebuild), read by the render thread - atomics, not plain globals */
+static std::atomic<bool>  g_font_dirty {false};
+static std::atomic<float> g_font_size_at {18.0f};
+static float take_font_request(float size) {
+    if (size < 10.f) size = 10.f;
+    if (size > 40.f) size = 40.f;
+    g_font_size_at.store(size);
+    g_font_dirty.store(true);
+    return size;
+}
 static char  g_font_path[128] = "";
 static std::mutex g_disp_mtx;
 static float g_disp_w = 0.f, g_disp_h = 0.f;
@@ -217,10 +226,7 @@ void overlay_get_display_size(float* w, float* h) {
     if (h) *h = g_disp_h;
 }
 void overlay_request_font_rebuild(float size) {
-    if (size < 10.f) size = 10.f;
-    if (size > 40.f) size = 40.f;
-    g_font_size  = size;
-    g_font_dirty = true;
+    take_font_request(size);   /* r36: atomic */
 }
 
 /* r35 B: density normalization. The overlay renders in PHYSICAL
@@ -352,13 +358,14 @@ static void build_fonts(ImGuiIO& io) {
     resolve_font_path();
     io.Fonts->Clear();
     bool ok = false;
+    float fs = g_font_size_at.load();
     if (g_font_path[0]) {
-        ok = io.Fonts->AddFontFromFileTTF(g_font_path, g_font_size,
+        ok = io.Fonts->AddFontFromFileTTF(g_font_path, fs,
                                          nullptr, nullptr) != nullptr;
     }
     if (!ok) io.Fonts->AddFontDefault();
     io.Fonts->Build();
-    g_font_dirty = false;
+    g_font_dirty.store(false);
 }
 static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
     EGLint w = 1080, h = 1920;
@@ -407,14 +414,14 @@ static void slot_init(EGLDisplay dpy, EGLSurface surf, Slot* s) {
     /* r35 H: apply_theme() in menu.cpp owns the whole style now -
        forcing Dark here made a saved Light theme revert after a GL
        context loss while the Settings combo still said Light */
-    if (io.Fonts->Fonts.empty() || g_font_dirty) build_fonts(io);
+    if (io.Fonts->Fonts.empty() || g_font_dirty.load()) build_fonts(io);
     ImGui_ImplOpenGL3_Init("#version 100");
     s->last_frame_ms = now_ms();
     {
         std::lock_guard<std::mutex> lk(g_disp_mtx);
         g_disp_w = (float)w; g_disp_h = (float)h;
     }
-    LOGI("[overlay] ImGui up OK (%dx%d, font %.0fpx)", w, h, g_font_size);
+    LOGI("[overlay] ImGui up OK (%dx%d, font %.0fpx)", w, h, g_font_size_at.load());
 }
 static void slot_destroy(EGLContext ctx) {
     std::lock_guard<std::mutex> lk(g_tick_mtx);
@@ -675,7 +682,7 @@ static void overlay_tick(EGLDisplay dpy, EGLSurface surf) {
     }
     menu_init_once();
     maybe_estimate_map();     /* native fallback until the agent measures */
-    if (g_font_dirty) {
+    if (g_font_dirty.load()) {
         build_fonts(io);
         ImGui_ImplOpenGL3_DestroyDeviceObjects();
     }
